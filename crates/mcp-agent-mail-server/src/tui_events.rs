@@ -395,6 +395,8 @@ pub enum MailEvent {
         subject: String,
         thread_id: String,
         project: String,
+        /// Truncated excerpt of `body_md` (first ~200 chars) for dashboard/preview use.
+        body_excerpt: String,
     },
     MessageReceived {
         seq: u64,
@@ -407,6 +409,8 @@ pub enum MailEvent {
         subject: String,
         thread_id: String,
         project: String,
+        /// Truncated excerpt of `body_md` (first ~200 chars) for dashboard/preview use.
+        body_excerpt: String,
     },
     ReservationGranted {
         seq: u64,
@@ -528,6 +532,7 @@ impl MailEvent {
         subject: impl Into<String>,
         thread_id: impl Into<String>,
         project: impl Into<String>,
+        body_excerpt: impl Into<String>,
     ) -> Self {
         Self::MessageSent {
             seq: 0,
@@ -540,6 +545,7 @@ impl MailEvent {
             subject: subject.into(),
             thread_id: thread_id.into(),
             project: project.into(),
+            body_excerpt: body_excerpt.into(),
         }
     }
 
@@ -551,6 +557,7 @@ impl MailEvent {
         subject: impl Into<String>,
         thread_id: impl Into<String>,
         project: impl Into<String>,
+        body_excerpt: impl Into<String>,
     ) -> Self {
         Self::MessageReceived {
             seq: 0,
@@ -563,6 +570,7 @@ impl MailEvent {
             subject: subject.into(),
             thread_id: thread_id.into(),
             project: project.into(),
+            body_excerpt: body_excerpt.into(),
         }
     }
 
@@ -2080,6 +2088,7 @@ mod tests {
             "m1",
             "t1",
             "p",
+            "",
         ));
         let _ = ring.push(MailEvent::message_sent(
             2,
@@ -2088,6 +2097,7 @@ mod tests {
             "m2",
             "t2",
             "p",
+            "",
         ));
         let _ = ring.push(MailEvent::tool_call_start(
             "fetch_inbox",
@@ -2102,6 +2112,7 @@ mod tests {
             "m3",
             "t3",
             "p",
+            "",
         ));
 
         let kinds: Vec<MailEventKind> = ring.iter_recent(10).iter().map(MailEvent::kind).collect();
@@ -2118,10 +2129,18 @@ mod tests {
     #[test]
     fn ring_buffer_evicts_oldest_when_only_high_severity_events_exist() {
         let ring = EventRingBuffer::with_capacity(3);
-        let _ = ring.push(MailEvent::message_sent(1, "A", vec![], "m1", "t1", "p"));
-        let _ = ring.push(MailEvent::message_sent(2, "A", vec![], "m2", "t2", "p"));
-        let _ = ring.push(MailEvent::message_sent(3, "A", vec![], "m3", "t3", "p"));
-        let _ = ring.push(MailEvent::message_received(4, "B", vec![], "m4", "t4", "p"));
+        let _ = ring.push(MailEvent::message_sent(1, "A", vec![], "m1", "t1", "p", ""));
+        let _ = ring.push(MailEvent::message_sent(2, "A", vec![], "m2", "t2", "p", ""));
+        let _ = ring.push(MailEvent::message_sent(3, "A", vec![], "m3", "t3", "p", ""));
+        let _ = ring.push(MailEvent::message_received(
+            4,
+            "B",
+            vec![],
+            "m4",
+            "t4",
+            "p",
+            "",
+        ));
 
         let seqs: Vec<u64> = ring.iter_recent(10).iter().map(MailEvent::seq).collect();
         assert_eq!(seqs, vec![2, 3, 4]);
@@ -2261,6 +2280,7 @@ mod tests {
                 subject: "start".to_string(),
                 thread_id: "br-10wc.15".to_string(),
                 project: "proj".to_string(),
+                body_excerpt: "Starting work on the task".to_string(),
             },
             MailEvent::MessageReceived {
                 seq: 4,
@@ -2273,6 +2293,7 @@ mod tests {
                 subject: "ack".to_string(),
                 thread_id: "br-10wc.15".to_string(),
                 project: "proj".to_string(),
+                body_excerpt: "Acknowledged".to_string(),
             },
             MailEvent::ReservationGranted {
                 seq: 5,
@@ -2447,8 +2468,8 @@ mod tests {
         let events: Vec<MailEvent> = vec![
             MailEvent::tool_call_start("t", Value::Null, None, None),
             MailEvent::tool_call_end("t", 1, None, 0, 0.0, vec![], None, None),
-            MailEvent::message_sent(1, "a", vec![], "s", "t", "p"),
-            MailEvent::message_received(1, "a", vec![], "s", "t", "p"),
+            MailEvent::message_sent(1, "a", vec![], "s", "t", "p", ""),
+            MailEvent::message_received(1, "a", vec![], "s", "t", "p", ""),
             MailEvent::reservation_granted("a", vec![], true, 60, "p"),
             MailEvent::reservation_released("a", vec![], "p"),
             MailEvent::agent_registered("n", "prog", "model", "p"),
@@ -2560,11 +2581,11 @@ mod tests {
             EventSeverity::Debug
         );
         assert_eq!(
-            MailEvent::message_sent(1, "a", vec![], "s", "t", "p").severity(),
+            MailEvent::message_sent(1, "a", vec![], "s", "t", "p", "").severity(),
             EventSeverity::Info
         );
         assert_eq!(
-            MailEvent::message_received(1, "a", vec![], "s", "t", "p").severity(),
+            MailEvent::message_received(1, "a", vec![], "s", "t", "p", "").severity(),
             EventSeverity::Info
         );
         assert_eq!(
@@ -2598,11 +2619,11 @@ mod tests {
                 EventSeverity::Debug,
             ),
             (
-                MailEvent::message_sent(1, "A", vec!["B".to_string()], "s", "t", "p"),
+                MailEvent::message_sent(1, "A", vec!["B".to_string()], "s", "t", "p", ""),
                 EventSeverity::Info,
             ),
             (
-                MailEvent::message_received(1, "A", vec!["B".to_string()], "s", "t", "p"),
+                MailEvent::message_received(1, "A", vec!["B".to_string()], "s", "t", "p", ""),
                 EventSeverity::Info,
             ),
             (
@@ -2712,6 +2733,7 @@ mod tests {
             "Re: progress update",
             "thread-1",
             "proj",
+            "",
         );
         let entry = event.to_event_log_entry();
 
@@ -3226,7 +3248,7 @@ mod tests {
         // Info-level events should always be accepted
         // message_sent is Info severity
         for _ in 0..10 {
-            let event = MailEvent::message_sent(1, "A", vec![], "s", "t", "p");
+            let event = MailEvent::message_sent(1, "A", vec![], "s", "t", "p", "");
             let result = ring.try_push(event);
             assert!(result.is_some(), "Info events should never be sampled");
         }
@@ -3650,8 +3672,8 @@ mod tests {
         let events = vec![
             MailEvent::tool_call_start("t", Value::Null, None, None),
             MailEvent::tool_call_end("t", 0, None, 0, 0.0, vec![], None, None),
-            MailEvent::message_sent(1, "A", vec![], "sub", "tid", "proj"),
-            MailEvent::message_received(1, "A", vec![], "sub", "tid", "proj"),
+            MailEvent::message_sent(1, "A", vec![], "sub", "tid", "proj", ""),
+            MailEvent::message_received(1, "A", vec![], "sub", "tid", "proj", ""),
             MailEvent::reservation_granted("A", vec![], true, 60, "proj"),
             MailEvent::reservation_released("A", vec![], "proj"),
             MailEvent::agent_registered("A", "cc", "opus", "proj"),
@@ -3675,7 +3697,7 @@ mod tests {
         let events = vec![
             MailEvent::tool_call_start("t", Value::Null, None, None),
             MailEvent::tool_call_end("t", 0, None, 0, 0.0, vec![], None, None),
-            MailEvent::message_sent(1, "A", vec![], "sub", "tid", "proj"),
+            MailEvent::message_sent(1, "A", vec![], "sub", "tid", "proj", ""),
             MailEvent::agent_registered("A", "cc", "opus", "proj"),
             MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1"),
         ];
@@ -3700,11 +3722,11 @@ mod tests {
             EventSource::Tooling
         );
         assert_eq!(
-            MailEvent::message_sent(1, "A", vec![], "s", "t", "p").source(),
+            MailEvent::message_sent(1, "A", vec![], "s", "t", "p", "").source(),
             EventSource::Mail
         );
         assert_eq!(
-            MailEvent::message_received(1, "A", vec![], "s", "t", "p").source(),
+            MailEvent::message_received(1, "A", vec![], "s", "t", "p", "").source(),
             EventSource::Mail
         );
         assert_eq!(
@@ -3768,11 +3790,11 @@ mod tests {
             MailEventKind::ToolCallEnd
         );
         assert_eq!(
-            MailEvent::message_sent(1, "A", vec![], "s", "t", "p").kind(),
+            MailEvent::message_sent(1, "A", vec![], "s", "t", "p", "").kind(),
             MailEventKind::MessageSent
         );
         assert_eq!(
-            MailEvent::message_received(1, "A", vec![], "s", "t", "p").kind(),
+            MailEvent::message_received(1, "A", vec![], "s", "t", "p", "").kind(),
             MailEventKind::MessageReceived
         );
         assert_eq!(
@@ -3957,6 +3979,7 @@ mod tests {
             "Test Subject",
             "thread-1",
             "my-project",
+            "",
         );
         let _ = ring.push(msg_event);
 
@@ -4050,7 +4073,7 @@ mod tests {
             EventSeverity::Debug
         );
         assert_eq!(
-            MailEvent::message_sent(1, "A", vec![], "s", "t", "p").severity(),
+            MailEvent::message_sent(1, "A", vec![], "s", "t", "p", "").severity(),
             EventSeverity::Info
         );
         assert_eq!(
@@ -4076,6 +4099,7 @@ mod tests {
             "Test Subject",
             "thread-1",
             "my-project",
+            "",
         );
 
         let row = TimelineRow::from_event(&event);
@@ -4323,6 +4347,7 @@ mod tests {
                         format!("Subject {i}"),
                         format!("thread-{}", i % 100),
                         "proj",
+                        "",
                     ));
                 }
                 3 => {

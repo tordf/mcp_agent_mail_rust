@@ -6690,6 +6690,20 @@ fn handle_migrate_cmd(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
 
+    if check && rollback {
+        return Err(CliError::InvalidArgument(
+            "--check and --rollback are mutually exclusive".to_string(),
+        ));
+    }
+    if rollback {
+        if path == ":memory:" {
+            return Err(CliError::InvalidArgument(
+                "cannot rollback an in-memory database".to_string(),
+            ));
+        }
+        return handle_migrate_rollback(Path::new(&path), backup_dir.as_deref(), force);
+    }
+
     if path == ":memory:" {
         ftui_runtime::ftui_println!("In-memory database — no migration needed.");
         return Ok(());
@@ -6701,22 +6715,7 @@ fn handle_migrate_cmd(
         ftui_runtime::ftui_println!("Run the server once to create it, then migrate.");
         return Ok(());
     }
-
-    if check && rollback {
-        return Err(CliError::InvalidArgument(
-            "--check and --rollback are mutually exclusive".to_string(),
-        ));
-    }
-    if rollback {
-        return handle_migrate_rollback(db_path, backup_dir.as_deref(), force);
-    }
-
-    // Step 1: Run schema migration first (ensures tables exist)
-    handle_migrate_with_database_url(&cfg.database_url)?;
-
-    // Step 2: Detect timestamp format
     let conn = open_db_sync_with_database_url(&cfg.database_url)?;
-    let before_counts = collect_table_row_counts(&conn);
     let format = migrate::detect_timestamp_format(&conn)
         .map_err(|e| CliError::Other(format!("format detection failed: {e}")))?;
 
@@ -6731,6 +6730,13 @@ fn handle_migrate_cmd(
         ftui_runtime::ftui_println!("No migration needed.");
         return Ok(());
     }
+
+    // Step 1: Run schema migration first (ensures tables exist)
+    handle_migrate_with_database_url(&cfg.database_url)?;
+
+    // Step 2: Capture pre-conversion row counts.
+    let conn = open_db_sync_with_database_url(&cfg.database_url)?;
+    let before_counts = collect_table_row_counts(&conn);
 
     if !format.needs_migration() {
         ftui_runtime::ftui_println!("Database is already in Rust format. No migration needed.");
@@ -7152,6 +7158,27 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
     l > c
 }
 
+const DEFAULT_SELF_UPDATE_API_URL: &str =
+    "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/releases/latest";
+const DEFAULT_SELF_UPDATE_RELEASES_BASE_URL: &str =
+    "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/download";
+
+fn self_update_api_url() -> String {
+    std::env::var("AM_SELF_UPDATE_API_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SELF_UPDATE_API_URL.to_string())
+}
+
+fn self_update_releases_base_url() -> String {
+    std::env::var("AM_SELF_UPDATE_RELEASES_BASE_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SELF_UPDATE_RELEASES_BASE_URL.to_string())
+}
+
 /// Check for updates against the GitHub releases API.
 fn check_for_update() -> UpdateCheckResult {
     let current = env!("CARGO_PKG_VERSION");
@@ -7186,10 +7213,9 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
         }
     };
 
-    let response = match rt.block_on(async {
+    let api_url = self_update_api_url();
+    let response = match rt.block_on(async move {
         let client = asupersync::http::h1::HttpClient::new();
-        let url =
-            "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/releases/latest";
         let headers = vec![
             ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
             (
@@ -7198,7 +7224,7 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
             ),
         ];
         client
-            .request(asupersync::http::h1::Method::Get, url, headers, vec![])
+            .request(asupersync::http::h1::Method::Get, &api_url, headers, vec![])
             .await
     }) {
         Ok(resp) => resp,
@@ -7305,9 +7331,8 @@ fn release_asset_url(version: &str, target: &str) -> (String, String) {
         "tar.xz"
     };
     let filename = format!("mcp-agent-mail-{target}.{ext}");
-    let url = format!(
-        "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/download/v{version}/{filename}"
-    );
+    let base = self_update_releases_base_url();
+    let url = format!("{base}/v{version}/{filename}");
     (url, filename)
 }
 
@@ -9156,6 +9181,27 @@ fn handle_doctor_check(
     )
 }
 
+fn open_db_for_doctor_check(database_url: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    if path == ":memory:" {
+        return mcp_agent_mail_db::DbConn::open_memory()
+            .map_err(|e| CliError::Other(format!("cannot open in-memory database: {e}")));
+    }
+    if !Path::new(&path).exists() {
+        return Err(CliError::Other(format!(
+            "database file does not exist: {path}"
+        )));
+    }
+    mcp_agent_mail_db::DbConn::open_file(&path)
+        .map_err(|e| CliError::Other(format!("cannot open database: {e}")))
+}
+
 fn beads_issue_awareness_counts_from(
     start: Option<&Path>,
 ) -> Result<(usize, usize, usize), String> {
@@ -9352,6 +9398,96 @@ fn classify_mcp_agent_mail_entry(
     McpAgentMailEntryKind::Unknown
 }
 
+fn detect_legacy_am_aliases_in_text(text: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lowered = line.to_ascii_lowercase();
+        if !lowered.contains("alias") || !lowered.contains("am=") {
+            continue;
+        }
+        let has_legacy_marker = lowered.contains("mcp_agent_mail")
+            || lowered.contains("run_server_with_token")
+            || lowered.contains("run_server")
+            || lowered.contains("python")
+            || lowered.contains("uvx")
+            || lowered.contains(" uv ");
+        if has_legacy_marker {
+            hits.push((idx + 1, line.to_string()));
+        }
+    }
+    hits
+}
+
+fn detect_legacy_am_aliases_in_rc_files(home: &Path) -> Vec<String> {
+    let candidates = [
+        ".zshrc",
+        ".zprofile",
+        ".zshenv",
+        ".bashrc",
+        ".bash_profile",
+        ".profile",
+        ".config/fish/config.fish",
+    ];
+    let mut findings = Vec::new();
+    for rel in candidates {
+        let path = home.join(rel);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (line_no, line) in detect_legacy_am_aliases_in_text(&content) {
+            findings.push(format!("{}:{}: {}", path.display(), line_no, line));
+        }
+    }
+    findings
+}
+
+fn detect_legacy_python_processes_from_ps(ps_output: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    for raw_line in ps_output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lowered = line.to_ascii_lowercase();
+        let has_legacy_marker = lowered.contains("mcp_agent_mail")
+            || lowered.contains("run_server_with_token")
+            || lowered.contains("run_server");
+        let looks_python_launcher =
+            lowered.contains("python") || lowered.contains("uvx") || lowered.contains("uv ");
+        if has_legacy_marker && looks_python_launcher {
+            hits.push(line.to_string());
+        }
+    }
+    hits
+}
+
+fn detect_legacy_python_processes() -> Result<Vec<String>, String> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("ps")
+            .arg("-eo")
+            .arg("pid=,args=")
+            .output()
+            .map_err(|e| format!("failed to run ps: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ps exited with status {}",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(detect_legacy_python_processes_from_ps(&text))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Vec::new())
+    }
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -9435,7 +9571,7 @@ fn handle_doctor_check_with(
         }
     }
 
-    // Check 1c: Pool initialization (including migrations)
+    // Check 1c: Non-mutating reopen probe (do not run migrations in doctor check).
     {
         if db_file_sanity_failed {
             checks.push(serde_json::json!({
@@ -9444,51 +9580,22 @@ fn handle_doctor_check_with(
                 "detail": "Skipped because db_file_sanity failed (potential corruption)",
             }));
         } else {
-            let pool_cfg = mcp_agent_mail_db::DbPoolConfig {
-                database_url: database_url.to_string(),
-                ..Default::default()
-            };
-            match mcp_agent_mail_db::pool::DbPool::new(&pool_cfg) {
-                Ok(pool) => {
-                    let pool_result: Result<(), String> = context::run_async(async {
-                        let cx = asupersync::Cx::for_request();
-                        match pool.acquire(&cx).await {
-                            asupersync::Outcome::Ok(_conn) => Ok(()),
-                            asupersync::Outcome::Err(e) => Err(CliError::Other(format!("{e}"))),
-                            asupersync::Outcome::Cancelled(_) => {
-                                Err(CliError::Other("cancelled".to_string()))
-                            }
-                            asupersync::Outcome::Panicked(p) => {
-                                Err(CliError::Other(format!("panic: {}", p.message())))
-                            }
-                        }
-                    })
-                    .map_err(|e| e.to_string());
-                    match pool_result {
-                        Ok(()) => {
-                            checks.push(serde_json::json!({
-                                "check": "pool_init",
-                                "status": "ok",
-                                "detail": "Pool initialization + migrations OK",
-                            }));
-                        }
-                        Err(msg) => {
-                            checks.push(serde_json::json!({
-                                "check": "pool_init",
-                                "status": "fail",
-                                "detail": format!("Pool/migration failure: {msg}"),
-                            }));
-                        }
-                    }
-                }
-                Err(e) => {
-                    checks.push(serde_json::json!({
-                        "check": "pool_init",
-                        "status": "fail",
-                        "detail": format!("Cannot create pool: {e}"),
-                    }));
-                }
-            }
+            let reopen_ok = open_db_for_doctor_check(database_url)
+                .and_then(|conn| {
+                    conn.query_sync("SELECT name FROM sqlite_master LIMIT 1", &[])
+                        .map(|_| ())
+                        .map_err(|e| CliError::Other(format!("reopen probe failed: {e}")))
+                })
+                .is_ok();
+            checks.push(serde_json::json!({
+                "check": "pool_init",
+                "status": if reopen_ok { "ok" } else { "fail" },
+                "detail": if reopen_ok {
+                    "Database reopen probe OK (doctor check kept non-mutating)"
+                } else {
+                    "Database reopen probe failed"
+                },
+            }));
         }
     }
 
@@ -9808,7 +9915,77 @@ fn handle_doctor_check_with(
         }));
     }
 
-    // Check 4b: PATH order — verify ~/.local/bin is in PATH and positioned correctly
+    // Check 4a: Legacy Python alias residue in shell rc files.
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let findings = detect_legacy_am_aliases_in_rc_files(&home);
+        if findings.is_empty() {
+            checks.push(serde_json::json!({
+                "check": "legacy_python_alias",
+                "status": "ok",
+                "detail": "No legacy Python `alias am=...` entries found in shell rc files",
+            }));
+        } else {
+            let listed = findings
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            let suffix = if findings.len() > 3 {
+                format!(" (+{} more)", findings.len() - 3)
+            } else {
+                String::new()
+            };
+            checks.push(serde_json::json!({
+                "check": "legacy_python_alias",
+                "status": "warn",
+                "detail": format!(
+                    "Found legacy Python alias entries. Fix: remove/comment them, then reload shell. {listed}{suffix}"
+                ),
+            }));
+        }
+    }
+
+    // Check 4b: Stale legacy Python processes.
+    {
+        match detect_legacy_python_processes() {
+            Ok(matches) if matches.is_empty() => checks.push(serde_json::json!({
+                "check": "stale_python_processes",
+                "status": "ok",
+                "detail": "No legacy mcp_agent_mail Python processes detected",
+            })),
+            Ok(matches) => {
+                let listed = matches
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let suffix = if matches.len() > 3 {
+                    format!(" (+{} more)", matches.len() - 3)
+                } else {
+                    String::new()
+                };
+                checks.push(serde_json::json!({
+                    "check": "stale_python_processes",
+                    "status": "warn",
+                    "detail": format!(
+                        "Legacy Python processes detected; stop them to avoid conflicts: {listed}{suffix}"
+                    ),
+                }));
+            }
+            Err(err) => checks.push(serde_json::json!({
+                "check": "stale_python_processes",
+                "status": "warn",
+                "detail": format!("Process probe unavailable: {err}"),
+            })),
+        }
+    }
+
+    // Check 4c: PATH order — verify ~/.local/bin is in PATH and positioned correctly
     {
         let install_dir = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -9882,7 +10059,64 @@ fn handle_doctor_check_with(
         }
     }
 
-    // Check 4c: MCP config health — verify config files exist and reference Rust binary
+    // Check 4d: Installed binary version matches this running CLI build.
+    {
+        let expected_path = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".local/bin/am");
+        let current_version = env!("CARGO_PKG_VERSION");
+
+        if !expected_path.exists() {
+            checks.push(serde_json::json!({
+                "check": "binary_version",
+                "status": "warn",
+                "detail": format!(
+                    "Expected installed binary not found at {}",
+                    expected_path.display()
+                ),
+            }));
+        } else {
+            match std::process::Command::new(&expected_path)
+                .arg("--version")
+                .output()
+            {
+                Ok(output) => {
+                    let combined = format!(
+                        "{} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let line = combined
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .map(str::trim)
+                        .unwrap_or("unknown");
+                    let status = if line.contains(current_version) {
+                        "ok"
+                    } else {
+                        "warn"
+                    };
+                    checks.push(serde_json::json!({
+                        "check": "binary_version",
+                        "status": status,
+                        "detail": format!(
+                            "{} (expected v{})",
+                            line,
+                            current_version
+                        ),
+                    }));
+                }
+                Err(err) => checks.push(serde_json::json!({
+                    "check": "binary_version",
+                    "status": "warn",
+                    "detail": format!("Version probe failed: {err}"),
+                })),
+            }
+        }
+    }
+
+    // Check 4e: MCP config health — verify config files exist and reference Rust binary
     {
         use mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default;
 
@@ -9982,10 +10216,42 @@ fn handle_doctor_check_with(
         }
     }
 
-    // Check 4d: Database format and health (br-28mgh.7.4)
+    // Check 4f: Update availability awareness from cached self-update check.
+    {
+        match read_update_cache() {
+            Some(UpdateCheckResult::UpdateAvailable {
+                current,
+                latest,
+                url,
+            }) => checks.push(serde_json::json!({
+                "check": "update_available",
+                "status": "warn",
+                "detail": format!(
+                    "Update available: {current} -> {latest} ({url})"
+                ),
+            })),
+            Some(UpdateCheckResult::UpToDate { current }) => checks.push(serde_json::json!({
+                "check": "update_available",
+                "status": "ok",
+                "detail": format!("Up to date (v{current})"),
+            })),
+            Some(UpdateCheckResult::CheckFailed { reason }) => checks.push(serde_json::json!({
+                "check": "update_available",
+                "status": "warn",
+                "detail": format!("Update check previously failed: {reason}"),
+            })),
+            None => checks.push(serde_json::json!({
+                "check": "update_available",
+                "status": "warn",
+                "detail": "No recent update-check cache. Run `am self-update --check`",
+            })),
+        }
+    }
+
+    // Check 4g: Database format and health (br-28mgh.7.4)
     {
         use mcp_agent_mail_db::migrate;
-        let conn_result = open_db_sync_with_database_url(database_url);
+        let conn_result = open_db_for_doctor_check(database_url);
 
         // 4d-i: Timestamp format
         let ts_check = conn_result
@@ -10131,7 +10397,7 @@ fn handle_doctor_check_with(
 
     // Check 5: Project-specific checks
     if let Some(ref slug) = project
-        && let Ok(conn) = open_db_sync_with_database_url(database_url)
+        && let Ok(conn) = open_db_for_doctor_check(database_url)
     {
         let rows = conn
             .query_sync(
@@ -11818,6 +12084,60 @@ mod tests {
                 "http://127.0.0.1:8765/mcp/".to_string(),
                 "http://127.0.0.1:8765/api/".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn detect_legacy_am_aliases_in_text_finds_python_aliases() {
+        let content = r#"
+            # legacy install line
+            alias am='cd ~/mcp_agent_mail && ./scripts/run_server_with_token.sh'
+            alias ll='ls -al'
+        "#;
+        let hits = detect_legacy_am_aliases_in_text(content);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 3);
+        assert!(
+            hits[0].1.contains("run_server_with_token"),
+            "expected legacy marker in {:?}",
+            hits[0]
+        );
+    }
+
+    #[test]
+    fn detect_legacy_am_aliases_in_text_ignores_non_legacy_aliases() {
+        let content = r#"
+            alias am='~/.local/bin/am'
+            alias am='am --help'
+            alias foo='python tool.py'
+        "#;
+        let hits = detect_legacy_am_aliases_in_text(content);
+        assert!(hits.is_empty(), "unexpected hits: {hits:?}");
+    }
+
+    #[test]
+    fn detect_legacy_python_processes_from_ps_filters_expected_lines() {
+        let ps_output = r#"
+           1234 python -m mcp_agent_mail serve-http
+           2234 uvx --from mcp_agent_mail run_server_with_token.sh
+           3234 /home/ubuntu/.local/bin/mcp-agent-mail serve
+           4234 bash -lc "echo hello"
+        "#;
+        let hits = detect_legacy_python_processes_from_ps(ps_output);
+        assert_eq!(hits.len(), 2, "unexpected hits: {hits:?}");
+        assert!(
+            hits.iter()
+                .any(|line| line.contains("python -m mcp_agent_mail"))
+        );
+        assert!(
+            hits.iter()
+                .any(|line| line.contains("uvx --from mcp_agent_mail"))
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|line| line.contains("mcp-agent-mail serve")),
+            "native rust process should not match"
         );
     }
 
@@ -23996,7 +24316,7 @@ fn handle_doctor_backups_with_storage_root(
     Ok(())
 }
 
-fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, _yes: bool) -> CliResult<()> {
+fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, yes: bool) -> CliResult<()> {
     if !backup_path.exists() {
         return Err(CliError::InvalidArgument(format!(
             "backup not found: {}",
@@ -24008,12 +24328,28 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, _yes: bool) -> Cli
     let dest_path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    if dest_path == ":memory:" {
+        return Err(CliError::InvalidArgument(
+            "cannot restore into an in-memory database (:memory:)".to_string(),
+        ));
+    }
 
     ftui_runtime::ftui_println!("Restore: {} -> {}", backup_path.display(), dest_path);
 
     if dry_run {
         ftui_runtime::ftui_println!("Dry run — no changes made.");
         return Ok(());
+    }
+    if !yes {
+        if !output::is_stdin_tty() {
+            return Err(CliError::Other(
+                "refusing to prompt on non-interactive stdin; pass --yes to apply".to_string(),
+            ));
+        }
+        if !confirm("Proceed with restore?", false)? {
+            ftui_runtime::ftui_println!("Restore cancelled.");
+            return Ok(());
+        }
     }
 
     std::fs::copy(&backup_path, &dest_path)?;
@@ -24101,15 +24437,24 @@ fn handle_doctor_reconstruct_with(
         return Ok(());
     }
 
-    // Rename the corrupt DB out of the way (if it exists).
+    // Rename the existing DB out of the way (if it exists), preserving a unique quarantine path.
+    let mut quarantined_original: Option<(PathBuf, PathBuf)> = None;
     if db_path.exists() {
         let base_name = db_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("storage.sqlite3");
-        let quarantine = db_path.with_file_name(format!("{base_name}.corrupt"));
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let mut quarantine = db_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
+        let mut suffix = 1_u32;
+        while quarantine.exists() {
+            quarantine =
+                db_path.with_file_name(format!("{base_name}.corrupt-{timestamp}-{suffix:02}"));
+            suffix = suffix.saturating_add(1);
+        }
         ftui_runtime::ftui_println!("Moving corrupt database to {}", quarantine.display());
         std::fs::rename(&db_path, &quarantine)?;
+        quarantined_original = Some((db_path.clone(), quarantine));
         // Also remove WAL/SHM sidecars if present.
         // SQLite names these by appending -wal/-shm to the full filename.
         for suffix in &["-wal", "-shm"] {
@@ -24127,8 +24472,16 @@ fn handle_doctor_reconstruct_with(
         storage_root.display()
     );
 
-    let stats = mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
-        .map_err(|e| CliError::Other(format!("reconstruction failed: {e}")))?;
+    let stats = match mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root) {
+        Ok(stats) => stats,
+        Err(e) => {
+            if let Some((original, quarantine)) = quarantined_original.as_ref() {
+                let _ = std::fs::remove_file(original);
+                let _ = std::fs::rename(quarantine, original);
+            }
+            return Err(CliError::Other(format!("reconstruction failed: {e}")));
+        }
+    };
 
     if json {
         ftui_runtime::ftui_println!(

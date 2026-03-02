@@ -1669,6 +1669,7 @@ impl MessageBrowserScreen {
                 &entry.subject,
                 &entry.thread_id,
                 &entry.project_slug,
+                &entry.body_md,
             )
         });
     }
@@ -2276,6 +2277,35 @@ impl MessageBrowserScreen {
         }
         self.detail_scroll = 0;
         self.search_dirty = false;
+
+        // Emit truthfulness diagnostic (br-2k3qx.2.2 / A2)
+        let rendered_count = u64::try_from(self.results.len()).unwrap_or(u64::MAX);
+        let raw_count_u64 = u64::try_from(self.total_results).unwrap_or(u64::MAX);
+        let dropped_count = raw_count_u64.saturating_sub(rendered_count);
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        let scope = format!(
+            "message_search.results;method={:?};live_added={live_added}",
+            self.search_method
+        );
+        state.push_screen_diagnostic(crate::tui_bridge::ScreenDiagnosticSnapshot {
+            screen: "messages".to_string(),
+            scope,
+            query_params: format!(
+                "query={};inbox_mode={:?};total={};rendered={rendered_count};live_added={live_added}",
+                if query.is_empty() { "(recent)" } else { &query },
+                self.inbox_mode,
+                self.total_results,
+            ),
+            raw_count: raw_count_u64,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
     }
 
     /// Search the live event ring buffer for `MessageSent`/`MessageReceived` events.
@@ -2293,7 +2323,7 @@ impl MessageBrowserScreen {
         events
             .iter()
             .filter_map(|e| {
-                let (id, from, to, subject, thread_id, project) = match e {
+                let (id, from, to, subject, thread_id, project, body_excerpt) = match e {
                     MailEvent::MessageSent {
                         id,
                         from,
@@ -2301,6 +2331,7 @@ impl MessageBrowserScreen {
                         subject,
                         thread_id,
                         project,
+                        body_excerpt,
                         ..
                     }
                     | MailEvent::MessageReceived {
@@ -2310,6 +2341,7 @@ impl MessageBrowserScreen {
                         subject,
                         thread_id,
                         project,
+                        body_excerpt,
                         ..
                     } => (
                         *id,
@@ -2318,6 +2350,7 @@ impl MessageBrowserScreen {
                         subject.as_str(),
                         thread_id.as_str(),
                         project.as_str(),
+                        body_excerpt.as_str(),
                     ),
                     _ => return None,
                 };
@@ -2339,7 +2372,7 @@ impl MessageBrowserScreen {
                     thread_id: thread_id.to_string(),
                     timestamp_iso: micros_to_iso(e.timestamp_micros()),
                     timestamp_micros: e.timestamp_micros(),
-                    body_md: String::new(),
+                    body_md: body_excerpt.to_string(),
                     importance: "normal".to_string(),
                     ack_required: false,
                     show_project,
@@ -6907,6 +6940,7 @@ mod tests {
             subject: "hello world".to_string(),
             thread_id: "t-1".to_string(),
             project: "myproj".to_string(),
+            body_excerpt: "Test body content".to_string(),
         });
         // Push a MessageReceived event
         let _ = state.push_event(MailEvent::MessageReceived {
@@ -6920,6 +6954,7 @@ mod tests {
             subject: "re: hello world".to_string(),
             thread_id: "t-1".to_string(),
             project: "myproj".to_string(),
+            body_excerpt: "Reply body content".to_string(),
         });
         // Push a non-message event (should be filtered out)
         let _ = state.push_event(MailEvent::http_request("GET", "/foo", 200, 1, "127.0.0.1"));

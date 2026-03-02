@@ -24,7 +24,7 @@ use mcp_agent_mail_core::bocpd::BocpdDetector;
 use mcp_agent_mail_core::conformal::ConformalPredictor;
 use mcp_agent_mail_core::evidence_ledger::evidence_ledger;
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use mcp_agent_mail_core::evidence_ledger::EvidenceLedgerEntry;
@@ -1424,6 +1424,31 @@ impl MailScreen for ToolMetricsScreen {
             self.snapshot_tick += 1;
             // Refresh evidence entries for the transparency panel.
             self.evidence_entries = evidence_ledger().recent(20);
+
+            let raw_count = u64::try_from(self.tool_map.len()).unwrap_or(u64::MAX);
+            let rendered_count = u64::try_from(self.sorted_tools.len()).unwrap_or(u64::MAX);
+            let dropped_count = raw_count.saturating_sub(rendered_count);
+            let sort_label = SORT_LABELS.get(self.sort_col).copied().unwrap_or("unknown");
+            let cfg = state.config_snapshot();
+            let transport_mode = cfg.transport_mode().to_string();
+            state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+                screen: "tool_metrics".to_string(),
+                scope: "tool_map.refresh".to_string(),
+                query_params: format!(
+                    "sort_col={sort_label};sort_asc={};view_mode={:?};anomaly_events={}",
+                    self.sort_asc,
+                    self.view_mode,
+                    self.anomaly_events.len(),
+                ),
+                raw_count,
+                rendered_count,
+                dropped_count,
+                timestamp_micros: chrono::Utc::now().timestamp_micros(),
+                db_url: cfg.database_url,
+                storage_root: cfg.storage_root,
+                transport_mode,
+                auth_enabled: cfg.auth_enabled,
+            });
         }
         // Checkpoint ranks every ~50 ticks for change tracking.
         if tick_count.is_multiple_of(50) {
@@ -2478,5 +2503,100 @@ mod tests {
             DisclosureLevel::Summary,
             "2 -> Summary"
         );
+    }
+
+    // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────
+
+    #[test]
+    fn env_flag_enabled_recognizes_truthy_values() {
+        std::env::set_var("_TEST_FLAG_T", "1");
+        assert!(env_flag_enabled("_TEST_FLAG_T"));
+        std::env::set_var("_TEST_FLAG_T", "true");
+        assert!(env_flag_enabled("_TEST_FLAG_T"));
+        std::env::set_var("_TEST_FLAG_T", "yes");
+        assert!(env_flag_enabled("_TEST_FLAG_T"));
+        std::env::set_var("_TEST_FLAG_T", "on");
+        assert!(env_flag_enabled("_TEST_FLAG_T"));
+        std::env::set_var("_TEST_FLAG_T", " TRUE ");
+        assert!(env_flag_enabled("_TEST_FLAG_T"));
+        std::env::remove_var("_TEST_FLAG_T");
+    }
+
+    #[test]
+    fn env_flag_enabled_rejects_falsy_and_missing() {
+        assert!(!env_flag_enabled("_NONEXISTENT_TEST_FLAG"));
+        std::env::set_var("_TEST_FLAG_F", "0");
+        assert!(!env_flag_enabled("_TEST_FLAG_F"));
+        std::env::set_var("_TEST_FLAG_F", "false");
+        assert!(!env_flag_enabled("_TEST_FLAG_F"));
+        std::env::set_var("_TEST_FLAG_F", "no");
+        assert!(!env_flag_enabled("_TEST_FLAG_F"));
+        std::env::set_var("_TEST_FLAG_F", "random");
+        assert!(!env_flag_enabled("_TEST_FLAG_F"));
+        std::env::remove_var("_TEST_FLAG_F");
+    }
+
+    #[test]
+    fn tool_stats_zero_calls_defaults() {
+        let stats = ToolStats::new("empty".into());
+        assert_eq!(stats.avg_ms(), 0);
+        assert_eq!(stats.err_pct(), 0.0);
+        assert_eq!(stats.calls, 0);
+        assert_eq!(stats.errors, 0);
+    }
+
+    #[test]
+    fn tool_stats_all_errors() {
+        let mut stats = ToolStats::new("fail".into());
+        stats.record(10, true);
+        stats.record(20, true);
+        stats.record(30, true);
+        assert_eq!(stats.calls, 3);
+        assert_eq!(stats.errors, 3);
+        assert!((stats.err_pct() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tool_stats_latency_window_bounded() {
+        let mut stats = ToolStats::new("bounded".into());
+        for i in 0..(LATENCY_HISTORY + 50) {
+            stats.record(i as u64, false);
+        }
+        assert_eq!(stats.recent_latencies.len(), LATENCY_HISTORY);
+    }
+
+    #[test]
+    fn view_mode_default_is_table() {
+        assert_eq!(ViewMode::Table, ViewMode::Table);
+        assert_ne!(ViewMode::Table, ViewMode::Dashboard);
+    }
+
+    #[test]
+    fn tool_change_point_fields() {
+        let cp = ToolChangePoint {
+            call_index: 42,
+            probability: 0.95,
+            pre_mean_ms: 50.0,
+            post_mean_ms: 500.0,
+        };
+        assert_eq!(cp.call_index, 42);
+        assert!(cp.post_mean_ms > cp.pre_mean_ms);
+    }
+
+    #[test]
+    fn sparkline_chars_length() {
+        assert_eq!(SPARK_CHARS.len(), 9);
+        assert_eq!(SPARK_CHARS[0], ' ');
+        assert_eq!(SPARK_CHARS[8], '\u{2588}');
+    }
+
+    #[test]
+    fn tool_stats_single_call_sparkline() {
+        let mut stats = ToolStats::new("single".into());
+        stats.record(100, false);
+        let spark = stats.sparkline_str();
+        assert_eq!(spark.chars().count(), 1);
+        // Single value normalizes to max → index 8
+        assert_eq!(spark.chars().next().unwrap(), SPARK_CHARS[8]);
     }
 }

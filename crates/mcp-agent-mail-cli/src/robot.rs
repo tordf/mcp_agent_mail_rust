@@ -1054,7 +1054,7 @@ fn build_status(
         && let Some((_, ref name)) = agent
     {
         actions.push(format!(
-            "am mail ack --project {project_slug} --agent {name}"
+            "am robot inbox --project {project_slug} --agent {name} --ack-overdue"
         ));
     }
     if let Some(top) = top_threads.first() {
@@ -1515,7 +1515,7 @@ fn build_thread(
         let ack_status = if ack_required == 0 {
             "none".to_string()
         } else {
-            let acked = conn
+            let acked_count = conn
                 .query_sync(
                     "SELECT COUNT(*) AS cnt FROM message_recipients
                      WHERE message_id = ? AND ack_ts IS NOT NULL",
@@ -1524,8 +1524,20 @@ fn build_thread(
                 .ok()
                 .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
                 .unwrap_or(0);
-            if acked > 0 {
+            let total_recipients = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS cnt FROM message_recipients WHERE message_id = ?",
+                    &[Value::BigInt(msg_id)],
+                )
+                .ok()
+                .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+                .unwrap_or(0);
+            if total_recipients > 0 && acked_count >= total_recipients {
                 "done".to_string()
+            } else if total_recipients > 0 && acked_count > 0 {
+                format!("partial ({acked_count}/{total_recipients})")
+            } else if acked_count > 0 {
+                format!("acked ({acked_count})")
             } else {
                 "required".to_string()
             }
@@ -1742,16 +1754,36 @@ fn build_message(
                 arr.iter()
                     .filter_map(|a| {
                         Some(AttachmentInfo {
-                            name: a.get("name")?.as_str()?.to_string(),
-                            size: a
-                                .get("size")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("unknown")
+                            name: a
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| {
+                                    a.get("path").and_then(|v| v.as_str()).and_then(|path| {
+                                        std::path::Path::new(path)
+                                            .file_name()
+                                            .and_then(std::ffi::OsStr::to_str)
+                                    })
+                                })
+                                .unwrap_or("attachment")
                                 .to_string(),
+                            size: a
+                                .get("bytes")
+                                .and_then(|v| v.as_u64())
+                                .or_else(|| a.get("size").and_then(|v| v.as_u64()))
+                                .map(|bytes| bytes.to_string())
+                                .or_else(|| {
+                                    a.get("size").and_then(|v| v.as_str()).map(str::to_string)
+                                })
+                                .unwrap_or_else(|| "unknown".to_string()),
                             mime_type: a
-                                .get("type")
+                                .get("media_type")
                                 .or_else(|| a.get("content_type"))
                                 .and_then(|s| s.as_str())
+                                .or_else(|| {
+                                    a.get("type")
+                                        .and_then(|s| s.as_str())
+                                        .filter(|kind| *kind != "file" && *kind != "inline")
+                                })
                                 .unwrap_or("application/octet-stream")
                                 .to_string(),
                         })
@@ -2885,7 +2917,7 @@ fn build_navigate(
 
             let rows = conn
                 .query_sync(
-                    "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, fr.released_ts
+                    "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, fr.released_ts, fr.created_ts
                      FROM file_reservations fr
                      JOIN agents a ON a.id = fr.agent_id
                      WHERE fr.project_id = ?
@@ -3573,7 +3605,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             let rows = conn
                 .query_sync(
-                    "SELECT m.id, m.subject, m.attachments, a.name AS sender_name
+                    "SELECT m.id, m.subject, m.attachments, a.name AS sender_name, m.created_ts
                      FROM messages m
                      JOIN agents a ON a.id = m.sender_id
                      WHERE m.project_id = ? AND m.attachments != '[]'
@@ -5326,6 +5358,169 @@ mod tests {
             }
             other => panic!("unexpected navigate result: {other:?}"),
         }
+    }
+
+    fn setup_robot_thread_message_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_thread_message_test.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT,
+                model TEXT
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                thread_id TEXT,
+                importance TEXT NOT NULL,
+                ack_required INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                body_md TEXT NOT NULL,
+                attachments TEXT
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
+            &empty,
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model)
+             VALUES
+                (1, 1, 'Alice', 'claude-code', 'opus'),
+                (2, 1, 'Bob', 'codex-cli', 'gpt-5'),
+                (3, 1, 'Carol', 'codex-cli', 'gpt-5')",
+            &empty,
+        )
+        .expect("insert agents");
+
+        (temp_dir, conn)
+    }
+
+    #[test]
+    fn test_build_thread_partial_ack_not_marked_done() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(100),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Ack test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("ACK-THREAD".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (1, 100, 2, 'to', NULL, 123456789),
+                (2, 100, 3, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let thread = build_thread(&conn, 1, "ACK-THREAD", Some(10), None, false)
+            .expect("build thread should succeed");
+        assert_eq!(thread.message_count, 1);
+        assert_eq!(thread.messages[0].ack, "partial (1/2)");
+    }
+
+    #[test]
+    fn test_build_message_attachment_parser_handles_current_meta_schema() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        let attachments = serde_json::json!([
+            {
+                "type": "file",
+                "media_type": "image/webp",
+                "bytes": 1234,
+                "path": "attachments/_webp/abc123.webp"
+            },
+            {
+                "name": "notes.txt",
+                "content_type": "text/plain",
+                "size": "98"
+            }
+        ])
+        .to_string();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(101),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Attachment test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("ATT-THREAD".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(attachments),
+            ],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (3, 101, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipient");
+
+        let message = build_message(&conn, 1, 101).expect("build message should succeed");
+        assert_eq!(message.attachments.len(), 2);
+        assert_eq!(message.attachments[0].name, "abc123.webp");
+        assert_eq!(message.attachments[0].size, "1234");
+        assert_eq!(message.attachments[0].mime_type, "image/webp");
+        assert_eq!(message.attachments[1].name, "notes.txt");
+        assert_eq!(message.attachments[1].size, "98");
+        assert_eq!(message.attachments[1].mime_type, "text/plain");
     }
 
     // ── is_prose_command ────────────────────────────────────────────────

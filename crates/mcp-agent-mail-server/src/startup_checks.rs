@@ -421,10 +421,31 @@ fn probe_storage_root(config: &Config) -> ProbeResult {
         });
     }
 
-    // Check writability by touching a temp file
-    let probe_path = root.join(".am_startup_probe");
-    match std::fs::write(&probe_path, b"ok") {
-        Ok(()) => {
+    // Check writability via a unique, create_new probe to avoid clobbering files.
+    let probe_nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe_path = root.join(format!(
+        ".am_startup_probe-{}-{probe_nonce}",
+        std::process::id()
+    ));
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe_path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(b"ok") {
+                drop(file);
+                let _ = std::fs::remove_file(&probe_path);
+                return ProbeResult::Fail(ProbeFailure {
+                    name: "storage",
+                    problem: format!("Storage directory {} is not writable: {e}", root.display()),
+                    fix: format!("Check permissions: chmod u+w {}", root.display()),
+                });
+            }
+            drop(file);
             let _ = std::fs::remove_file(&probe_path);
             ProbeResult::Ok { name: "storage" }
         }
@@ -922,6 +943,28 @@ mod tests {
         let result = probe_storage_root(&config);
         assert!(matches!(result, ProbeResult::Ok { .. }));
         assert!(tmp.is_dir());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn storage_probe_does_not_clobber_existing_probe_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("am_test_startup_probe_no_clobber_{nonce}"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let existing = tmp.join(".am_startup_probe");
+        std::fs::write(&existing, b"do-not-touch").unwrap();
+
+        let mut config = default_config();
+        config.storage_root = tmp.clone();
+        let result = probe_storage_root(&config);
+        assert!(matches!(result, ProbeResult::Ok { .. }));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"do-not-touch");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

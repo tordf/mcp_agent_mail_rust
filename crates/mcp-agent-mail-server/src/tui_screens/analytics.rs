@@ -21,7 +21,7 @@ use mcp_agent_mail_core::{
     quick_insight_feed,
 };
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg};
 use crate::tui_widgets::fancy::SummaryFooter;
 
@@ -2615,6 +2615,30 @@ impl MailScreen for AnalyticsScreen {
             // Rebuild viz snapshot here (in tick) so view() never does I/O.
             self.cached_viz = build_runtime_viz_snapshot(state);
             self.last_refresh_tick = Some(tick_count);
+
+            let raw_count = u64::try_from(self.feed.alerts_processed).unwrap_or(u64::MAX);
+            let rendered_count = u64::try_from(self.feed.cards.len()).unwrap_or(u64::MAX);
+            let dropped_count = raw_count.saturating_sub(rendered_count);
+            let cfg = state.config_snapshot();
+            let transport_mode = cfg.transport_mode().to_string();
+            state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+                screen: "analytics".to_string(),
+                scope: "insight_feed.refresh".to_string(),
+                query_params: format!(
+                    "severity_filter={};sort_mode={};cards_produced={}",
+                    self.severity_filter.label(),
+                    self.sort_mode.label(),
+                    self.feed.cards_produced,
+                ),
+                raw_count,
+                rendered_count,
+                dropped_count,
+                timestamp_micros: chrono::Utc::now().timestamp_micros(),
+                db_url: cfg.database_url,
+                storage_root: cfg.storage_root,
+                transport_mode,
+                auth_enabled: cfg.auth_enabled,
+            });
         }
 
         self.last_data_gen = current_gen;

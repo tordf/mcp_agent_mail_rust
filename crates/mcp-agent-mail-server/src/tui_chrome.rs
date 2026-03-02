@@ -1011,6 +1011,7 @@ pub fn render_status_line(
 pub fn render_help_overlay_sections(
     sections: &[crate::tui_keymap::HelpSection],
     scroll_offset: u16,
+    effects_enabled: bool,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -1038,6 +1039,9 @@ pub fn render_help_overlay_sections(
 
     let inner = block.inner(overlay_area);
     block.render(overlay_area, frame);
+    if effects_enabled {
+        render_help_overlay_title_gradient(frame, overlay_area);
+    }
 
     let key_col = if inner.width >= 70 {
         20
@@ -1116,6 +1120,29 @@ pub fn render_help_overlay_sections(
             line_idx += 1;
         }
     }
+}
+
+fn render_help_overlay_title_gradient(frame: &mut Frame<'_>, overlay_area: Rect) {
+    use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
+
+    if overlay_area.width <= 4 {
+        return;
+    }
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = "Keyboard Shortcuts";
+    let title_width = usize::from(overlay_area.width.saturating_sub(4)).min(title.len());
+    if title_width == 0 {
+        return;
+    }
+    let clipped = &title[..title_width];
+    let clipped_w = u16::try_from(clipped.len()).unwrap_or(overlay_area.width);
+    let title_area = Rect::new(overlay_area.x + 2, overlay_area.y, clipped_w, 1);
+    let gradient = ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.text_secondary)]);
+    StyledText::new(clipped)
+        .effect(TextEffect::HorizontalGradient { gradient })
+        .base_color(tp.status_accent)
+        .bold()
+        .render(title_area, frame);
 }
 
 /// Compute the centered help-overlay rectangle for a terminal frame area.
@@ -1862,6 +1889,30 @@ mod tests {
             &mut frame,
             Rect::new(0, 0, 120, 1),
         );
+    }
+
+    #[test]
+    fn render_help_overlay_sections_with_effects_enabled() {
+        let sections = vec![crate::tui_keymap::HelpSection {
+            title: "Global".to_string(),
+            description: Some("Common shortcuts".to_string()),
+            entries: vec![("q".to_string(), "Quit".to_string())],
+        }];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 40, &mut pool);
+        render_help_overlay_sections(&sections, 0, true, &mut frame, Rect::new(0, 0, 120, 40));
+    }
+
+    #[test]
+    fn render_help_overlay_sections_with_effects_disabled() {
+        let sections = vec![crate::tui_keymap::HelpSection {
+            title: "Global".to_string(),
+            description: Some("Common shortcuts".to_string()),
+            entries: vec![("q".to_string(), "Quit".to_string())],
+        }];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 40, &mut pool);
+        render_help_overlay_sections(&sections, 0, false, &mut frame, Rect::new(0, 0, 120, 40));
     }
 
     #[test]

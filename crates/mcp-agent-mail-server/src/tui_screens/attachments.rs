@@ -15,7 +15,7 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::{MetricTile, MetricTrend};
@@ -38,6 +38,14 @@ const RELOAD_INTERVAL_TICKS: u64 = 50;
 
 /// Maximum attachments to fetch from DB.
 const FETCH_LIMIT: usize = 500;
+
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 const ATTACHMENTS_DETAIL_GAP_THRESHOLD: u16 = 24;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -174,6 +182,7 @@ pub struct AttachmentExplorerScreen {
     // DB state
     db_conn: Option<DbConn>,
     db_conn_attempted: bool,
+    db_context_unavailable: bool,
     last_error: Option<String>,
     data_dirty: bool,
     last_reload_tick: u64,
@@ -202,6 +211,7 @@ impl AttachmentExplorerScreen {
             detail_scroll: 0,
             db_conn: None,
             db_conn_attempted: false,
+            db_context_unavailable: false,
             last_error: None,
             data_dirty: true,
             last_reload_tick: 0,
@@ -224,13 +234,21 @@ impl AttachmentExplorerScreen {
         if let Ok(path) = cfg.sqlite_path() {
             self.db_conn = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path).ok();
         }
+        self.db_context_unavailable = self.db_conn.is_none();
     }
 
     fn load_attachments(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let Some(conn) = self.db_conn.take() else {
+            // Connection open can fail transiently (startup race, WAL recovery in
+            // progress, temporary FS hiccup). Allow future retries.
+            self.db_conn_attempted = false;
+            self.db_context_unavailable = true;
+            self.data_dirty = false;
+            self.emit_db_unavailable_diagnostic(state, "database connection unavailable");
             return;
         };
+        self.db_context_unavailable = false;
 
         let sql = "SELECT m.id AS message_id, m.subject, m.attachments, m.created_ts, \
                    m.thread_id, a.name AS sender_name, p.slug AS project_slug \
@@ -315,6 +333,7 @@ impl AttachmentExplorerScreen {
                 }
                 self.last_error = None;
                 self.rebuild_display();
+                self.emit_load_diagnostic(state);
             }
             Err(e) => {
                 self.last_error = Some(format!("Query failed: {e}"));
@@ -323,6 +342,59 @@ impl AttachmentExplorerScreen {
 
         self.db_conn = Some(conn);
         self.data_dirty = false;
+    }
+
+    fn emit_load_diagnostic(&self, state: &TuiSharedState) {
+        let raw_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        let rendered_count = u64::try_from(self.display_indices.len()).unwrap_or(u64::MAX);
+        let dropped_count = raw_count.saturating_sub(rendered_count);
+        let sort_label = SORT_LABELS.get(self.sort_col).copied().unwrap_or("unknown");
+        let text_filter = sanitize_diagnostic_value(&self.text_filter);
+        let text_filter = if text_filter.is_empty() {
+            "all".to_string()
+        } else {
+            text_filter
+        };
+
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "attachments".to_string(),
+            scope: "attachment_explorer.results".to_string(),
+            query_params: format!(
+                "filter={text_filter};media_filter={};sort_col={sort_label};sort_asc={};fetch_limit={FETCH_LIMIT}",
+                self.media_filter.label(),
+                self.sort_asc,
+            ),
+            raw_count,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
+    }
+
+    #[allow(clippy::unused_self)] // consistent signature across screens
+    fn emit_db_unavailable_diagnostic(&self, state: &TuiSharedState, reason: &str) {
+        let reason = sanitize_diagnostic_value(reason);
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "attachments".to_string(),
+            scope: "attachment_explorer.db_unavailable".to_string(),
+            query_params: format!("filter=db_context_unavailable;reason={reason}"),
+            raw_count: 0,
+            rendered_count: 0,
+            dropped_count: 0,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
     }
 
     fn rebuild_display(&mut self) {
@@ -395,7 +467,11 @@ impl AttachmentExplorerScreen {
             return;
         }
         let len = self.display_indices.len();
-        let current = self.table_state.selected.unwrap_or(0);
+        let Some(current) = self.table_state.selected else {
+            self.table_state.selected = Some(0);
+            self.detail_scroll = 0;
+            return;
+        };
         let next = if delta > 0 {
             current.saturating_add(delta.unsigned_abs()).min(len - 1)
         } else {
@@ -421,6 +497,7 @@ impl AttachmentExplorerScreen {
                 &e.subject,
                 e.thread_id.as_deref().unwrap_or(""),
                 &e.project_slug,
+                "",
             )
         });
     }
@@ -580,6 +657,15 @@ impl AttachmentExplorerScreen {
         let table_area = Rect::new(area.x, y, area.width, table_h);
         y += table_h;
 
+        if self.db_context_unavailable {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let err_p = Paragraph::new(
+                " Database context unavailable. Check DB URL/project scope and refresh.",
+            )
+            .style(Style::default().fg(tp.severity_error));
+            err_p.render(table_area, frame);
+            return;
+        }
         if let Some(err) = &self.last_error {
             let tp = crate::tui_theme::TuiThemePalette::current();
             let err_p = Paragraph::new(format!(" Error: {err}"))
@@ -1571,5 +1657,214 @@ mod tests {
         let mut screen = AttachmentExplorerScreen::new();
         screen.move_selection(1);
         assert_eq!(screen.table_state.selected, None);
+    }
+
+    #[test]
+    fn move_selection_sets_first_row_when_unselected() {
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.display_indices = vec![0, 1, 2];
+        assert_eq!(screen.table_state.selected, None);
+
+        screen.move_selection(1);
+        assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    #[test]
+    fn load_attachments_clears_attempt_flag_when_no_connection() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.db_conn_attempted = true;
+
+        screen.load_attachments(&state);
+        assert!(!screen.db_conn_attempted);
+    }
+
+    // ── B8: DB context binding guardrail regression tests ─────────────
+
+    fn broken_db_state() -> std::sync::Arc<TuiSharedState> {
+        TuiSharedState::new(&Config {
+            database_url: "sqlite:////nonexistent/path/b8_test.sqlite3".to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn b8_attachments_db_unavailable_on_load_failure() {
+        let state = broken_db_state();
+        let mut screen = AttachmentExplorerScreen::new();
+
+        screen.load_attachments(&state);
+
+        assert!(
+            screen.db_context_unavailable,
+            "load_attachments without connection should set db_context_unavailable"
+        );
+
+        // Verify diagnostic was emitted
+        let diags = state.screen_diagnostics_since(0);
+        let att_diag = diags
+            .iter()
+            .find(|(_, d)| d.screen == "attachments" && d.scope.contains("db_unavailable"));
+        assert!(
+            att_diag.is_some(),
+            "should emit db_unavailable diagnostic"
+        );
+    }
+
+    #[test]
+    fn b8_attachments_banner_renders_when_unavailable() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.db_context_unavailable = true;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, ftui::layout::Rect::new(0, 0, 120, 30), &state);
+
+        let mut text = String::new();
+        for y in 0..frame.buffer.height() {
+            for x in 0..frame.buffer.width() {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    if let Some(ch) = cell.content.as_char() {
+                        text.push(ch);
+                    } else if !cell.is_continuation() {
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Database context unavailable"),
+            "should render degraded banner: {text}"
+        );
+    }
+
+    // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────
+
+    #[test]
+    fn sanitize_diagnostic_value_collapses_whitespace() {
+        assert_eq!(sanitize_diagnostic_value("a\nb\rc;d,e"), "a b c d e");
+        assert_eq!(sanitize_diagnostic_value(""), "");
+        assert_eq!(sanitize_diagnostic_value("  ok  "), "ok");
+    }
+
+    #[test]
+    fn type_label_no_slash_returns_full() {
+        let entry = AttachmentEntry {
+            media_type: "octetstream".into(),
+            bytes: 0,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".into(),
+            path: None,
+            message_id: 0,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.type_label(), "octetstream");
+    }
+
+    #[test]
+    fn type_label_empty_string() {
+        let entry = AttachmentEntry {
+            media_type: String::new(),
+            bytes: 0,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".into(),
+            path: None,
+            message_id: 0,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.type_label(), "");
+    }
+
+    #[test]
+    fn dims_display_one_dimension_zero() {
+        let entry = AttachmentEntry {
+            media_type: "image/png".into(),
+            bytes: 1024,
+            sha1: String::new(),
+            width: 100,
+            height: 0,
+            mode: "file".into(),
+            path: None,
+            message_id: 0,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.dims_display(), "");
+    }
+
+    #[test]
+    fn media_filter_documents_matches_various_doc_types() {
+        assert!(MediaFilter::Documents.matches("application/pdf"));
+        assert!(MediaFilter::Documents.matches("text/plain"));
+        assert!(MediaFilter::Documents.matches("text/html"));
+        assert!(MediaFilter::Documents.matches("application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+        assert!(!MediaFilter::Documents.matches("image/png"));
+        assert!(!MediaFilter::Documents.matches("audio/mp3"));
+    }
+
+    #[test]
+    fn media_filter_other_excludes_images_and_docs() {
+        assert!(!MediaFilter::Other.matches("image/webp"));
+        assert!(!MediaFilter::Other.matches("application/pdf"));
+        assert!(!MediaFilter::Other.matches("text/csv"));
+        assert!(MediaFilter::Other.matches("audio/mp3"));
+        assert!(MediaFilter::Other.matches("video/mp4"));
+        assert!(MediaFilter::Other.matches("application/zip"));
+    }
+
+    #[test]
+    fn media_filter_full_cycle() {
+        let f = MediaFilter::All;
+        let f = f.next();
+        assert_eq!(f, MediaFilter::Images);
+        let f = f.next();
+        assert_eq!(f, MediaFilter::Documents);
+        let f = f.next();
+        assert_eq!(f, MediaFilter::Other);
+        let f = f.next();
+        assert_eq!(f, MediaFilter::All);
+    }
+
+    #[test]
+    fn size_display_exact_boundaries() {
+        let make = |bytes: u64| AttachmentEntry {
+            media_type: "x/y".into(),
+            bytes,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".into(),
+            path: None,
+            message_id: 0,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+
+        assert_eq!(make(0).size_display(), "0 B");
+        assert_eq!(make(1023).size_display(), "1023 B");
+        assert_eq!(make(1024).size_display(), "1.0 KB");
+        assert_eq!(make(1_048_575).size_display(), "1024.0 KB");
+        assert_eq!(make(1_048_576).size_display(), "1.0 MB");
+        assert_eq!(make(10_485_760).size_display(), "10.0 MB");
     }
 }

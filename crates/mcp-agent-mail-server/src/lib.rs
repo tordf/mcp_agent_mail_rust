@@ -1923,6 +1923,7 @@ fn dispatch_compose_envelope(
                 &envelope.subject,
                 thread_str,
                 "default",
+                truncate_body_excerpt(&envelope.body_md),
             ));
 
             tracing::info!(
@@ -4133,7 +4134,7 @@ impl HttpState {
 
         // Legacy parity: bearer auth applies to all non-health routes (even unknown paths/methods),
         // so missing/invalid auth yields 401 instead of downstream 404/405/400.
-        if let Some(resp) = self.check_bearer_auth(&req) {
+        if let Some(resp) = self.check_bearer_auth(&req).await {
             return resp;
         }
 
@@ -4496,23 +4497,113 @@ impl HttpState {
         constant_time_eq(auth, expected_header.as_str())
     }
 
-    fn check_bearer_auth(&self, req: &Http1Request) -> Option<Http1Response> {
-        self.config.http_bearer_token.as_ref()?;
+    async fn check_bearer_auth(&self, req: &Http1Request) -> Option<Http1Response> {
+        if self.config.http_bearer_token.is_none() && !self.config.http_jwt_enabled {
+            return None;
+        }
+
+        let (path, _query) = split_path_query(&req.uri);
+        let is_mail_route = path == "/mail" || path.starts_with("/mail/");
 
         if self.allow_local_unauthenticated(req) {
             return None;
         }
 
         // Legacy parity: static bearer checks compare the full header value
-        // (no trimming/coercion). In mixed static+JWT mode, non-static bearer
-        // tokens are deferred to JWT validation in `check_rbac_and_rate_limit`.
+        // (no trimming/coercion).
         if self.has_expected_bearer_header(req) {
             return None;
         }
-        if self.config.http_jwt_enabled && Self::parse_bearer_token(req).is_ok() {
+
+        // D3: Accept bearer token from `?token=` query parameter only on /mail routes.
+        // Browser-opened URLs (e.g. health link) cannot set Authorization headers,
+        // so build_remote_url() embeds the token as a query param instead.
+        if is_mail_route && self.has_expected_query_token(req) {
             return None;
         }
+
+        // When JWT auth is enabled, validate bearer tokens here as an auth gate
+        // for all HTTP routes (including /mail/*), not just MCP JSON-RPC routes.
+        if self.config.http_jwt_enabled && self.decode_jwt(req).await.is_ok() {
+            return None;
+        }
+
+        // D4: For browser /mail routes, return actionable HTML; for machine /mail/api routes,
+        // preserve JSON 401 responses.
+        if is_mail_route {
+            let method_str = if matches!(req.method, Http1Method::Post) {
+                "POST"
+            } else {
+                "GET"
+            };
+            if Self::is_mail_json_route(&path, method_str) {
+                return Some(self.error_response(req, 401, "Unauthorized"));
+            }
+            return Some(self.mail_unauthorized_html_response(req));
+        }
+
         Some(self.error_response(req, 401, "Unauthorized"))
+    }
+
+    /// Check whether the request URI contains a `?token=<expected>` query parameter
+    /// matching the configured bearer token. Uses constant-time comparison.
+    fn has_expected_query_token(&self, req: &Http1Request) -> bool {
+        let Some(expected) = &self.config.http_bearer_token else {
+            return false;
+        };
+        let (_path, query_part) = split_path_query(&req.uri);
+        let query_str = query_part.as_deref().unwrap_or("");
+        for pair in query_str.split('&') {
+            if let Some(value) = pair.strip_prefix("token=") {
+                if constant_time_eq(value, expected) {
+                    return true;
+                }
+                if let Some(decoded) = percent_decode_query_component(value)
+                    && constant_time_eq(decoded.as_str(), expected)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Return a user-friendly HTML 401 page for `/mail` routes explaining how to
+    /// authenticate. Operators opening the health link in a browser need actionable
+    /// guidance rather than an opaque `{"detail":"Unauthorized"}` JSON blob.
+    fn mail_unauthorized_html_response(&self, req: &Http1Request) -> Http1Response {
+        let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>401 — Unauthorized</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:600px;margin:60px auto;padding:0 20px;color:#333}
+h1{color:#c0392b}code{background:#f4f4f4;padding:2px 6px;border-radius:3px}
+.steps{background:#f9f9f9;border-left:4px solid #3498db;padding:12px 16px;margin:16px 0}
+</style></head>
+<body>
+<h1>401 — Unauthorized</h1>
+<p>This Agent Mail web interface requires a valid bearer token.</p>
+<div class="steps">
+<h3>How to fix this</h3>
+<ol>
+<li>Set <code>AGENTMAIL_HTTP_BEARER_TOKEN</code> in your <code>.env</code> file
+(or environment) to match the server's configured token.</li>
+<li>Use the generated health link from the TUI — it embeds the token
+as <code>?token=…</code> in the URL automatically.</li>
+<li>If using <code>curl</code> or an API client, pass the token via header:<br>
+<code>Authorization: Bearer &lt;your-token&gt;</code></li>
+</ol>
+</div>
+<p><strong>Tip:</strong> If you're accessing from <code>localhost</code>,
+enable <code>AGENTMAIL_HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true</code>
+to skip auth for local requests.</p>
+</body></html>"#;
+        self.raw_response(
+            req,
+            401,
+            "text/html; charset=utf-8",
+            html.as_bytes().to_vec(),
+        )
     }
 
     async fn fetch_jwks(&self, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
@@ -5456,6 +5547,24 @@ fn extract_arg_string_vec(arguments: Option<&serde_json::Value>, key: &str) -> V
         .unwrap_or_default()
 }
 
+/// Truncate a markdown body to a short excerpt suitable for event previews.
+/// Collapses whitespace and limits to ~200 characters on a char boundary.
+fn truncate_body_excerpt(body: &str) -> String {
+    const MAX_EXCERPT: usize = 200;
+    // Collapse newlines/tabs to single spaces for compact preview.
+    let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= MAX_EXCERPT {
+        return collapsed;
+    }
+    let mut end = MAX_EXCERPT;
+    while end > 0 && !collapsed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = collapsed[..end].to_string();
+    result.push('…');
+    result
+}
+
 fn message_sent_event_from_payload(
     payload: &serde_json::Value,
     project: Option<&str>,
@@ -5482,7 +5591,20 @@ fn message_sent_event_from_payload(
         .filter(|s| !s.is_empty())
         .unwrap_or("unthreaded")
         .to_string();
-    let event = tui_events::MailEvent::message_sent(id, from, to, subject, thread_id, &project);
+    let body_excerpt = payload
+        .get("body_md")
+        .and_then(serde_json::Value::as_str)
+        .map(truncate_body_excerpt)
+        .unwrap_or_default();
+    let event = tui_events::MailEvent::message_sent(
+        id,
+        from,
+        to,
+        subject,
+        thread_id,
+        &project,
+        body_excerpt,
+    );
     Some((id, project, event))
 }
 
@@ -5519,13 +5641,19 @@ fn append_message_flow_events(
         return false;
     };
 
-    let (from, subject, thread_id) = match &sent_event {
+    let (from, subject, thread_id, body_excerpt) = match &sent_event {
         tui_events::MailEvent::MessageSent {
             from,
             subject,
             thread_id,
+            body_excerpt,
             ..
-        } => (from.clone(), subject.clone(), thread_id.clone()),
+        } => (
+            from.clone(),
+            subject.clone(),
+            thread_id.clone(),
+            body_excerpt.clone(),
+        ),
         _ => return false,
     };
 
@@ -5556,6 +5684,7 @@ fn append_message_flow_events(
             &subject,
             &thread_id,
             &project,
+            &body_excerpt,
         ));
         *recipient_budget = recipient_budget.saturating_sub(1);
     }
@@ -5671,6 +5800,11 @@ fn derive_fetch_inbox_domain_events(
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
             .unwrap_or("unthreaded");
+        let body_excerpt = message
+            .get("body_md")
+            .and_then(serde_json::Value::as_str)
+            .map(truncate_body_excerpt)
+            .unwrap_or_default();
         let mut to = Vec::new();
         if let Some(agent_name) = ctx.agent.as_deref() {
             to.push(agent_name.to_string());
@@ -5682,6 +5816,7 @@ fn derive_fetch_inbox_domain_events(
             subject,
             thread_id,
             project_value,
+            body_excerpt,
         ));
     }
     events
@@ -6507,9 +6642,63 @@ pub(crate) fn detect_tailscale_ip() -> Option<String> {
 pub(crate) fn build_remote_url(tailscale_ip: &str, port: u16, token: Option<&str>) -> String {
     let base = format!("http://{tailscale_ip}:{port}/mail");
     match token {
-        Some(t) => format!("{base}?token={t}"),
+        Some(t) => format!("{base}?token={}", percent_encode_query_component(t)),
         None => base,
     }
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else if b == b' ' {
+            out.push('+');
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[(b >> 4) as usize]));
+            out.push(char::from(HEX[(b & 0x0F) as usize]));
+        }
+    }
+    out
+}
+
+fn percent_decode_query_component(value: &str) -> Option<String> {
+    const fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(10 + (b - b'a')),
+            b'A'..=b'F' => Some(10 + (b - b'A')),
+            _ => None,
+        }
+    }
+
+    let mut decoded = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let hi = hex_val(bytes[i + 1])?;
+                let lo = hex_val(bytes[i + 2])?;
+                decoded.push((hi << 4) | lo);
+                i += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                i += 1;
+            }
+            b => {
+                decoded.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn detect_transport_mode(path: &str) -> &'static str {
@@ -15775,6 +15964,358 @@ mod tests {
         );
     }
 
+    // ── D3: query-parameter token auth for /mail ─────────────────
+
+    #[test]
+    fn mail_route_accepts_query_token_when_bearer_configured() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("test-secret-42".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // Request with correct ?token= query param should NOT get 401.
+        let req = make_request(Http1Method::Get, "/mail?token=test-secret-42", &[]);
+        let resp = block_on(state.handle(req));
+        assert_ne!(resp.status, 401, "/mail with correct ?token= must not 401");
+    }
+
+    #[test]
+    fn mail_route_rejects_wrong_query_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("test-secret-42".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/mail?token=wrong-token", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401, "/mail with wrong ?token= must 401");
+    }
+
+    #[test]
+    fn mail_route_rejects_missing_token_when_bearer_required() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("test-secret-42".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/mail", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401, "/mail without any token must 401");
+    }
+
+    #[test]
+    fn mail_subpath_accepts_query_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("abc123".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/mail/dashboard?token=abc123", &[]);
+        let resp = block_on(state.handle(req));
+        assert_ne!(
+            resp.status, 401,
+            "/mail/dashboard with correct token must not 401"
+        );
+    }
+
+    #[test]
+    fn mail_route_accepts_percent_encoded_query_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("a+b/c?d=e&f".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/mail?token=a%2Bb%2Fc%3Fd%3De%26f", &[]);
+        let resp = block_on(state.handle(req));
+        assert_ne!(
+            resp.status, 401,
+            "/mail with percent-encoded token must authenticate"
+        );
+    }
+
+    #[test]
+    fn build_remote_url_percent_encodes_token() {
+        let url = build_remote_url("100.64.0.1", 8765, Some("a+b/c?d=e&f"));
+        assert_eq!(
+            url,
+            "http://100.64.0.1:8765/mail?token=a%2Bb%2Fc%3Fd%3De%26f"
+        );
+    }
+
+    #[test]
+    fn mail_route_requires_jwt_when_jwt_only_enabled() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("jwt-only-secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/mail", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 401,
+            "/mail must require JWT when JWT auth is enabled without static bearer token"
+        );
+    }
+
+    #[test]
+    fn mail_route_accepts_valid_jwt_when_jwt_only_enabled() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("jwt-only-secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "mail-user", "role": "writer" });
+        let token = hs256_token(b"jwt-only-secret", &claims);
+        let auth = format!("Bearer {token}");
+        let req = make_request(
+            Http1Method::Get,
+            "/mail",
+            &[("Authorization", auth.as_str())],
+        );
+        let resp = block_on(state.handle(req));
+        assert_ne!(
+            resp.status, 401,
+            "/mail with valid JWT must authenticate successfully"
+        );
+    }
+
+    // ── D4: actionable HTML for unauthorized /mail ───────────────
+
+    #[test]
+    fn mail_unauthorized_returns_html_not_json() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/mail", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/html"),
+            "unauthorized /mail must return HTML, got: {content_type}"
+        );
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.contains("AGENTMAIL_HTTP_BEARER_TOKEN"),
+            "HTML must mention env var"
+        );
+        assert!(
+            body.contains("How to fix"),
+            "HTML must include remediation steps"
+        );
+    }
+
+    #[test]
+    fn non_mail_unauthorized_returns_json() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Post, "/mcp/", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("application/json"),
+            "unauthorized /mcp must return JSON, got: {content_type}"
+        );
+    }
+
+    #[test]
+    fn mcp_route_rejects_query_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Post, "/mcp/?token=secret", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 401,
+            "query token auth must be limited to /mail routes only"
+        );
+    }
+
+    #[test]
+    fn mail_api_unauthorized_returns_json() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/mail/api/messages", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("application/json"),
+            "unauthorized /mail/api/* must return JSON, got: {content_type}"
+        );
+    }
+
+    // ── E4: Health workflow regression tests ──────────────────────
+
+    #[test]
+    fn e4_health_endpoint_bypasses_all_auth() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // /health must never return 401, regardless of auth config.
+        let req = make_request(Http1Method::Get, "/health", &[]);
+        let resp = block_on(state.handle(req));
+        assert_ne!(
+            resp.status, 401,
+            "/health must bypass auth (got {}, expected non-401)",
+            resp.status
+        );
+    }
+
+    #[test]
+    fn e4_no_bearer_config_allows_all_routes() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: None,
+            http_jwt_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // Without any auth configured, /mail should be accessible.
+        let req = make_request(Http1Method::Get, "/mail", &[]);
+        let resp = block_on(state.handle(req));
+        assert_ne!(
+            resp.status, 401,
+            "/mail without auth config must not return 401 (got {})",
+            resp.status
+        );
+    }
+
+    #[test]
+    fn e4_html_remediation_contains_localhost_tip() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/mail", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.contains("localhost"),
+            "HTML remediation must mention localhost access tip"
+        );
+    }
+
+    #[test]
+    fn e4_mail_subpath_unauthorized_is_html() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // /mail/dashboard (browser route) must return HTML 401, not JSON.
+        let req = make_request(Http1Method::Get, "/mail/dashboard", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/html"),
+            "/mail/dashboard unauthorized must return HTML, got: {content_type}"
+        );
+    }
+
+    #[test]
+    fn e4_query_token_is_constant_time_safe() {
+        // Wrong token must still return 401 (not bypass via timing).
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("correct-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // Similar-prefix token must fail.
+        let req = make_request(Http1Method::Get, "/mail?token=correct-toke", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401, "partial token must not authenticate");
+
+        // Empty token must fail.
+        let req = make_request(Http1Method::Get, "/mail?token=", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401, "empty token must not authenticate");
+    }
+
+    #[test]
+    fn e4_bearer_header_and_query_token_both_accepted() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("dual-test-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // Bearer header auth.
+        let req = make_request(
+            Http1Method::Get,
+            "/mail",
+            &[("Authorization", "Bearer dual-test-token")],
+        );
+        let resp = block_on(state.handle(req));
+        assert_ne!(resp.status, 401, "Bearer header must authenticate");
+
+        // Query token auth.
+        let req = make_request(Http1Method::Get, "/mail?token=dual-test-token", &[]);
+        let resp = block_on(state.handle(req));
+        assert_ne!(resp.status, 401, "query token must authenticate");
+    }
+
     #[test]
     fn compat_lock_mcp_aliases_all_accepted() {
         let config = mcp_agent_mail_core::Config::default();
@@ -16232,8 +16773,7 @@ mod tests {
         // Request without any Authorization header from external IP
         let req = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(external_peer));
         // Bearer auth check (not RBAC) rejects non-localhost without auth
-        let resp = state
-            .check_bearer_auth(&req)
+        let resp = block_on(state.check_bearer_auth(&req))
             .expect("non-localhost should require bearer auth");
         write_jwt_artifact(
             "localhost_bypass_rejects_non_local_without_auth",

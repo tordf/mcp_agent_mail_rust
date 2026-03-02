@@ -16,13 +16,21 @@ use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEvent, KeyEventKind, Modifiers, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_screens::{HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_theme::TuiThemePalette;
 use crate::tui_widgets::fancy::SummaryFooter;
 
 const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
 const ARCHIVE_SPLIT_GAP_THRESHOLD: u16 = 70;
+
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, active: bool) {
     if area.is_empty() {
@@ -1062,6 +1070,34 @@ impl MailScreen for ArchiveBrowserScreen {
                     entry.expanded = *exp;
                 }
             }
+
+            let raw_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+            let rendered_count = raw_count; // All entries are rendered (filter applied during scan)
+            let filter = sanitize_diagnostic_value(&self.filter);
+            let filter = if filter.is_empty() {
+                "all".to_string()
+            } else {
+                filter
+            };
+            let cfg = state.config_snapshot();
+            let transport_mode = cfg.transport_mode().to_string();
+            state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+                screen: "archive_browser".to_string(),
+                scope: "archive_entries.scan".to_string(),
+                query_params: format!(
+                    "filter={filter};project={};filter_active={}",
+                    self.selected_project.as_deref().unwrap_or("none"),
+                    self.filter_active,
+                ),
+                raw_count,
+                rendered_count,
+                dropped_count: 0,
+                timestamp_micros: chrono::Utc::now().timestamp_micros(),
+                db_url: cfg.database_url,
+                storage_root: cfg.storage_root,
+                transport_mode,
+                auth_enabled: cfg.auth_enabled,
+            });
         }
 
         self.last_data_gen = current_gen;
@@ -1439,5 +1475,134 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────
+
+    #[test]
+    fn sanitize_diagnostic_value_normalizes_whitespace_and_separators() {
+        assert_eq!(sanitize_diagnostic_value("hello world"), "hello world");
+        assert_eq!(
+            sanitize_diagnostic_value("line1\nline2\rline3"),
+            "line1 line2 line3"
+        );
+        assert_eq!(
+            sanitize_diagnostic_value("a;b,c  d"),
+            "a b c d"
+        );
+        assert_eq!(sanitize_diagnostic_value("  spaces  "), "spaces");
+        assert_eq!(sanitize_diagnostic_value(""), "");
+    }
+
+    #[test]
+    fn content_type_from_path_toml_yaml_binary() {
+        use std::path::Path;
+        assert_eq!(ContentType::from_path(Path::new("config.toml")), ContentType::Toml);
+        assert_eq!(ContentType::from_path(Path::new("deploy.yml")), ContentType::Yaml);
+        assert_eq!(ContentType::from_path(Path::new("ci.yaml")), ContentType::Yaml);
+        assert_eq!(ContentType::from_path(Path::new("icon.png")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("photo.jpg")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("photo.jpeg")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("anim.gif")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("img.webp")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("data.sqlite3")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("store.db")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("data.sqlite")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("icon.ico")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("icon.bmp")), ContentType::Binary);
+        assert_eq!(ContentType::from_path(Path::new("no_ext")), ContentType::PlainText);
+        assert_eq!(ContentType::from_path(Path::new("script.sh")), ContentType::PlainText);
+    }
+
+    #[test]
+    fn archive_entry_display_size_empty_dir() {
+        let dir = ArchiveEntry {
+            name: "empty".into(),
+            rel_path: "empty".into(),
+            is_dir: true,
+            size: 0,
+            depth: 0,
+            expanded: false,
+            child_count: 0,
+        };
+        assert_eq!(dir.display_size(), "");
+    }
+
+    #[test]
+    fn archive_entry_display_size_dir_with_children() {
+        let dir = ArchiveEntry {
+            name: "src".into(),
+            rel_path: "src".into(),
+            is_dir: true,
+            size: 0,
+            depth: 0,
+            expanded: true,
+            child_count: 15,
+        };
+        assert_eq!(dir.display_size(), "15 items");
+    }
+
+    #[test]
+    fn archive_entry_display_size_file() {
+        let file = ArchiveEntry {
+            name: "main.rs".into(),
+            rel_path: "main.rs".into(),
+            is_dir: false,
+            size: 2048,
+            depth: 0,
+            expanded: false,
+            child_count: 0,
+        };
+        assert_eq!(file.display_size(), "2.0 KB");
+    }
+
+    #[test]
+    fn format_file_size_gb_range() {
+        assert_eq!(format_file_size(1_073_741_824), "1.00 GB");
+        assert_eq!(format_file_size(2_147_483_648), "2.00 GB");
+        assert_eq!(format_file_size(1_610_612_736), "1.50 GB");
+    }
+
+    #[test]
+    fn archive_entry_depth_indentation() {
+        let entry = ArchiveEntry {
+            name: "deep".into(),
+            rel_path: "a/b/c/deep".into(),
+            is_dir: false,
+            size: 100,
+            depth: 3,
+            expanded: false,
+            child_count: 0,
+        };
+        let prefix = entry.display_prefix();
+        assert_eq!(prefix, "        "); // 3*2 spaces + "  " (file icon)
+    }
+
+    #[test]
+    fn archive_entry_display_label_dir_has_slash() {
+        let dir = ArchiveEntry {
+            name: "lib".into(),
+            rel_path: "lib".into(),
+            is_dir: true,
+            size: 0,
+            depth: 0,
+            expanded: false,
+            child_count: 3,
+        };
+        assert_eq!(dir.display_label(), "lib/");
+    }
+
+    #[test]
+    fn archive_entry_display_label_file_no_slash() {
+        let file = ArchiveEntry {
+            name: "Cargo.toml".into(),
+            rel_path: "Cargo.toml".into(),
+            is_dir: false,
+            size: 512,
+            depth: 0,
+            expanded: false,
+            child_count: 0,
+        };
+        assert_eq!(file.display_label(), "Cargo.toml");
     }
 }

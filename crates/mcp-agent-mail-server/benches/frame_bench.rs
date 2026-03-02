@@ -116,6 +116,7 @@ fn populate_event_ring(state: &TuiSharedState, count: usize) {
                 format!("alert benchmark subject {seq_id}"),
                 format!("bench-thread-{}", idx % 64),
                 "bench-project",
+                "benchmark body excerpt",
             ),
             1 => MailEvent::tool_call_end(
                 "send_message",

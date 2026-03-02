@@ -24,7 +24,7 @@ use ftui_widgets::textarea::TextArea;
 use serde::Deserialize;
 
 use crate::tui_action_menu::{ActionEntry, reservations_actions, reservations_batch_actions};
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{DbStatSnapshot, MailEvent, ReservationSnapshot};
 use crate::tui_persist::{
     ScreenFilterPresetStore, console_persist_path_from_env_or_default,
@@ -1564,6 +1564,29 @@ impl MailScreen for ReservationsScreen {
             let (a, e, s, x) = self.summary_counts();
             self.prev_counts = (a as u64, e as u64, s as u64, x as u64);
             self.rebuild_sorted();
+
+            let raw_count = u64::try_from(self.reservations.len()).unwrap_or(u64::MAX);
+            let rendered_count = u64::try_from(self.sorted_keys.len()).unwrap_or(u64::MAX);
+            let dropped_count = raw_count.saturating_sub(rendered_count);
+            let cfg = state.config_snapshot();
+            let transport_mode = cfg.transport_mode().to_string();
+            state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+                screen: "reservations".to_string(),
+                scope: "file_reservations.list".to_string(),
+                query_params: format!(
+                    "show_released={};sort_col={};sort_asc={};active={};exclusive={};shared={};expired={}",
+                    self.show_released, self.sort_col, self.sort_asc,
+                    a, e, s, x,
+                ),
+                raw_count,
+                rendered_count,
+                dropped_count,
+                timestamp_micros: chrono::Utc::now().timestamp_micros(),
+                db_url: cfg.database_url,
+                storage_root: cfg.storage_root,
+                transport_mode,
+                auth_enabled: cfg.auth_enabled,
+            });
         }
         self.sync_focused_event();
 
@@ -3619,5 +3642,155 @@ mod tests {
         assert_eq!(screen.reservations.len(), 2);
         assert_eq!(screen.last_snapshot_micros, 42);
         assert!(!screen.sorted_keys.is_empty());
+    }
+
+    // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────
+
+    #[test]
+    fn reservation_create_field_next_without_custom_ttl() {
+        let f = ReservationCreateField::Paths;
+        assert_eq!(f.next(false), ReservationCreateField::Exclusive);
+        assert_eq!(
+            ReservationCreateField::Exclusive.next(false),
+            ReservationCreateField::Ttl
+        );
+        assert_eq!(
+            ReservationCreateField::Ttl.next(false),
+            ReservationCreateField::Reason
+        );
+        assert_eq!(
+            ReservationCreateField::Reason.next(false),
+            ReservationCreateField::Paths
+        );
+    }
+
+    #[test]
+    fn reservation_create_field_next_with_custom_ttl() {
+        assert_eq!(
+            ReservationCreateField::Ttl.next(true),
+            ReservationCreateField::CustomTtl
+        );
+        assert_eq!(
+            ReservationCreateField::CustomTtl.next(true),
+            ReservationCreateField::Reason
+        );
+    }
+
+    #[test]
+    fn reservation_create_field_prev_without_custom_ttl() {
+        assert_eq!(
+            ReservationCreateField::Paths.prev(false),
+            ReservationCreateField::Reason
+        );
+        assert_eq!(
+            ReservationCreateField::Exclusive.prev(false),
+            ReservationCreateField::Paths
+        );
+        assert_eq!(
+            ReservationCreateField::Ttl.prev(false),
+            ReservationCreateField::Exclusive
+        );
+        assert_eq!(
+            ReservationCreateField::Reason.prev(false),
+            ReservationCreateField::Ttl
+        );
+    }
+
+    #[test]
+    fn reservation_create_field_prev_with_custom_ttl() {
+        assert_eq!(
+            ReservationCreateField::Reason.prev(true),
+            ReservationCreateField::CustomTtl
+        );
+        assert_eq!(
+            ReservationCreateField::CustomTtl.prev(true),
+            ReservationCreateField::Ttl
+        );
+    }
+
+    #[test]
+    fn save_preset_field_next_cycles() {
+        assert_eq!(SavePresetField::Name.next(), SavePresetField::Description);
+        assert_eq!(SavePresetField::Description.next(), SavePresetField::Name);
+    }
+
+    #[test]
+    fn validation_errors_has_any() {
+        let empty = ReservationCreateValidationErrors::default();
+        assert!(!empty.has_any());
+
+        let with_paths = ReservationCreateValidationErrors {
+            paths: Some("err".into()),
+            ..Default::default()
+        };
+        assert!(with_paths.has_any());
+
+        let with_ttl = ReservationCreateValidationErrors {
+            ttl: Some("err".into()),
+            ..Default::default()
+        };
+        assert!(with_ttl.has_any());
+
+        let with_general = ReservationCreateValidationErrors {
+            general: Some("err".into()),
+            ..Default::default()
+        };
+        assert!(with_general.has_any());
+    }
+
+    #[test]
+    fn parse_custom_ttl_rejects_empty_input() {
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("").is_err());
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("  ").is_err());
+    }
+
+    #[test]
+    fn parse_custom_ttl_rejects_single_char() {
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("m").is_err());
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("5").is_err());
+    }
+
+    #[test]
+    fn parse_custom_ttl_rejects_invalid_unit() {
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("10s").is_err());
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("10d").is_err());
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("10x").is_err());
+    }
+
+    #[test]
+    fn parse_custom_ttl_rejects_zero_and_negative() {
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("0m").is_err());
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("-5h").is_err());
+    }
+
+    #[test]
+    fn parse_custom_ttl_rejects_non_numeric() {
+        assert!(ReservationsScreen::parse_custom_ttl_seconds("abch").is_err());
+    }
+
+    #[test]
+    fn format_ttl_boundary_values() {
+        assert_eq!(format_ttl(59), "59s left");
+        assert_eq!(format_ttl(60), "1m left");
+        assert_eq!(format_ttl(3599), "59m left");
+        assert_eq!(format_ttl(3600), "1h left");
+    }
+
+    #[test]
+    fn reservation_create_form_paths_skips_empty_lines() {
+        let mut form =
+            ReservationCreateFormState::new("proj".into(), "BlueLake".into());
+        form.paths_input.set_text("src/**\n\n  \ntests/**\n");
+        let paths = form.paths();
+        assert_eq!(paths, vec!["src/**", "tests/**"]);
+    }
+
+    #[test]
+    fn reservation_create_form_custom_ttl_enabled() {
+        let mut form =
+            ReservationCreateFormState::new("proj".into(), "BlueLake".into());
+        assert!(!form.custom_ttl_enabled());
+        form.ttl_idx = RESERVATION_TTL_CUSTOM_INDEX;
+        assert!(form.custom_ttl_enabled());
     }
 }

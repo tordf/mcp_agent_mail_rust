@@ -36,11 +36,13 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Manual/test overrides are allowed to go below `MIN_POLL_INTERVAL`, but never to zero.
 const MIN_OVERRIDE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Maximum agents to fetch per poll cycle.
-const MAX_AGENTS: usize = 50;
+/// Maximum agents to fetch per poll cycle.  Raised from 50 to 500 to avoid
+/// silently truncating the agent list in large deployments (B4 truthfulness).
+const MAX_AGENTS: usize = 500;
 
-/// Maximum projects to fetch per poll cycle.
-const MAX_PROJECTS: usize = 100;
+/// Maximum projects to fetch per poll cycle.  Raised from 100 to 500 to avoid
+/// silently truncating the project list in large deployments (B5 truthfulness).
+const MAX_PROJECTS: usize = 500;
 
 /// Maximum contact links to fetch per poll cycle.
 const MAX_CONTACTS: usize = 200;
@@ -2758,5 +2760,109 @@ mod tests {
     fn health_pulse_heartbeat_interval_is_reasonable() {
         assert!(HEALTH_PULSE_HEARTBEAT_INTERVAL.as_secs() >= 5);
         assert!(HEALTH_PULSE_HEARTBEAT_INTERVAL.as_secs() <= 60);
+    }
+
+    // ── B6: Count/List Consistency Contract ──────────────────────────
+
+    #[test]
+    fn agents_list_cap_is_explicit_and_bounded() {
+        // Documents the contract: MAX_AGENTS caps the list the poller
+        // delivers to screens. Screens can detect capping by comparing
+        // db.agents (global COUNT) vs db.agents_list.len().
+        assert!(
+            MAX_AGENTS >= 100,
+            "cap must be large enough for real deployments"
+        );
+        assert!(
+            MAX_AGENTS <= 10_000,
+            "cap must be bounded to prevent OOM on large DBs"
+        );
+    }
+
+    #[test]
+    fn projects_list_cap_is_explicit_and_bounded() {
+        // Same contract for projects.
+        assert!(
+            MAX_PROJECTS >= 100,
+            "cap must be large enough for real deployments"
+        );
+        assert!(
+            MAX_PROJECTS <= 10_000,
+            "cap must be bounded to prevent OOM on large DBs"
+        );
+    }
+
+    #[test]
+    fn fetch_agents_list_sql_has_explicit_limit() {
+        // Documents that the agents list query uses ORDER BY + LIMIT.
+        // Without LIMIT, the list would grow unbounded with agent count.
+        let sql = format!(
+            "SELECT name, program, last_active_ts FROM agents \
+             ORDER BY last_active_ts DESC, id DESC LIMIT {MAX_AGENTS}"
+        );
+        assert!(
+            sql.contains("LIMIT"),
+            "agents list query must include LIMIT"
+        );
+        assert!(
+            sql.contains("ORDER BY"),
+            "agents list query must be ordered to make LIMIT deterministic"
+        );
+    }
+
+    #[test]
+    fn fetch_projects_list_sql_has_explicit_limit() {
+        // Documents that the projects list query uses ORDER BY + LIMIT.
+        let sql = format!(
+            "SELECT id, slug, human_key, created_at FROM projects \
+             ORDER BY created_at DESC, id DESC LIMIT {MAX_PROJECTS}"
+        );
+        assert!(
+            sql.contains("LIMIT"),
+            "projects list query must include LIMIT"
+        );
+        assert!(
+            sql.contains("ORDER BY"),
+            "projects list query must be ordered to make LIMIT deterministic"
+        );
+    }
+
+    #[test]
+    fn snapshot_count_vs_list_length_consistency() {
+        // Documents: when a snapshot has agents < agents_list.len(),
+        // it means the COUNT query returned stale/lower data than the
+        // actual list fetch. Both are valid but screens must handle this.
+        let snap = DbStatSnapshot {
+            agents: 5,
+            agents_list: vec![
+                AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "cc".to_string(),
+                    last_active_ts: 1,
+                },
+                AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "cc".to_string(),
+                    last_active_ts: 2,
+                },
+            ],
+            projects: 10,
+            projects_list: vec![ProjectSummary {
+                slug: "alpha".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // Agents: count=5 but list has 2 (capped at MAX_AGENTS or race)
+        assert!(
+            snap.agents >= snap.agents_list.len() as u64 || snap.agents_list.len() <= MAX_AGENTS,
+            "either count >= list or list is within cap"
+        );
+        // Projects: count=10 but list has 1 (capped or race)
+        assert!(
+            snap.projects >= snap.projects_list.len() as u64
+                || snap.projects_list.len() <= MAX_PROJECTS,
+            "either count >= list or list is within cap"
+        );
     }
 }

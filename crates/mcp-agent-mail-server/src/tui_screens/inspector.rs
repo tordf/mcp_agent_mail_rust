@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 
 use super::DeepLinkTarget;
 use super::dashboard::format_event;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{MailEvent, MailEventKind};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -379,7 +380,13 @@ pub fn remediation_hints(event: &MailEvent) -> Vec<RemediationHint> {
 /// Render an inspector detail card for the given event into `area`.
 ///
 /// If `event` is `None`, renders an empty placeholder.
-pub fn render_inspector(frame: &mut Frame<'_>, area: Rect, event: Option<&MailEvent>) {
+/// When `state` is provided, a screen-level diagnostic snapshot is emitted.
+pub fn render_inspector(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    event: Option<&MailEvent>,
+    state: Option<&TuiSharedState>,
+) {
     let Some(event) = event else {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
@@ -430,6 +437,31 @@ pub fn render_inspector(frame: &mut Frame<'_>, area: Rect, event: Option<&MailEv
         "─".repeat(area.width.saturating_sub(2) as usize),
     );
     let full_text = format!("{header}\n{body}{hints_section}{links_section}");
+
+    // ── Screen diagnostic snapshot ──────────────────────────────
+    if let Some(state) = state {
+        let link_count = links.len();
+        let hint_count = hints.len();
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "inspector".to_string(),
+            scope: "inspector.event_detail".to_string(),
+            query_params: format!(
+                "kind={};seq={};links={link_count};hints={hint_count}",
+                kind_label(event.kind()),
+                event.seq(),
+            ),
+            raw_count: 1,
+            rendered_count: 1,
+            dropped_count: 0,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
+    }
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
@@ -713,7 +745,7 @@ mod tests {
     fn render_inspector_no_event() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(60, 20, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 60, 20), None);
+        render_inspector(&mut frame, Rect::new(0, 0, 60, 20), None, None);
     }
 
     #[test]
@@ -726,7 +758,7 @@ mod tests {
         );
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 30, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 80, 30), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 80, 30), Some(&event), None);
     }
 
     #[test]
@@ -743,7 +775,7 @@ mod tests {
         );
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 30, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 80, 30), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 80, 30), Some(&event), None);
     }
 
     #[test]
@@ -755,10 +787,11 @@ mod tests {
             "Hello",
             "thread-1",
             "my-project",
+            "",
         );
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 20, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 80, 20), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 80, 20), Some(&event), None);
     }
 
     #[test]
@@ -766,7 +799,7 @@ mod tests {
         let event = MailEvent::http_request("GET", "/mcp/", 200, 15, "10.0.0.1");
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(60, 15, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 60, 15), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 60, 15), Some(&event), None);
     }
 
     #[test]
@@ -780,7 +813,7 @@ mod tests {
         );
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 20, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 80, 20), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 80, 20), Some(&event), None);
     }
 
     #[test]
@@ -788,7 +821,7 @@ mod tests {
         let event = MailEvent::agent_registered("RedFox", "claude-code", "opus-4.6", "my-project");
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(60, 15, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 60, 15), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 60, 15), Some(&event), None);
     }
 
     #[test]
@@ -806,7 +839,7 @@ mod tests {
         });
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(60, 20, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 60, 20), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 60, 20), Some(&event), None);
     }
 
     #[test]
@@ -814,7 +847,7 @@ mod tests {
         let event = MailEvent::server_started("http://127.0.0.1:8765/mcp/", "db=mail.db pool=5");
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 15, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 80, 15), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 80, 15), Some(&event), None);
     }
 
     #[test]
@@ -822,7 +855,7 @@ mod tests {
         let event = MailEvent::server_shutdown();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(60, 10, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 60, 10), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 60, 10), Some(&event), None);
     }
 
     #[test]
@@ -916,7 +949,7 @@ mod tests {
         let event = MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1");
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(30, 5, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 30, 5), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 30, 5), Some(&event), None);
     }
 
     // ── Correlation link tests ────────────────────────────────────
@@ -993,6 +1026,7 @@ mod tests {
             "Hello",
             "thread-1",
             "my-project",
+            "",
         );
         let links = extract_links(&event);
         // project, from-agent, to-agent1, to-agent2, thread, message
@@ -1030,6 +1064,7 @@ mod tests {
             "Self-message",
             "t",
             "p",
+            "",
         );
         let links = extract_links(&event);
         let agent_links = links
@@ -1154,10 +1189,11 @@ mod tests {
             "Hello",
             "thread-1",
             "proj",
+            "",
         );
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 40, &mut pool);
-        render_inspector(&mut frame, Rect::new(0, 0, 80, 40), Some(&event));
+        render_inspector(&mut frame, Rect::new(0, 0, 80, 40), Some(&event), None);
         // If the frame renders without panic, the link section was included
     }
 
@@ -1239,6 +1275,7 @@ mod tests {
             "Hi",
             "thread1",
             "proj1",
+            "",
         );
         let actions = build_quick_actions(&event);
         let agent_action_count = actions
@@ -1373,6 +1410,7 @@ mod tests {
             "Test",
             "thread1",
             "proj1",
+            "",
         );
         let hints = remediation_hints(&event);
         assert!(hints.is_empty());
@@ -1389,6 +1427,7 @@ mod tests {
             "Hello",
             "thread-1",
             "my-project",
+            "",
         );
         let actions = build_quick_actions(&event);
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
@@ -1440,8 +1479,15 @@ mod tests {
     #[test]
     fn macro_actions_agent_dedup() {
         // Message with sender==recipient: agent macros should not duplicate.
-        let event =
-            MailEvent::message_sent(1, "RedFox", vec!["RedFox".to_string()], "Self", "t", "p");
+        let event = MailEvent::message_sent(
+            1,
+            "RedFox",
+            vec!["RedFox".to_string()],
+            "Self",
+            "t",
+            "p",
+            "",
+        );
         let actions = build_quick_actions(&event);
         let fetch_inbox_count = actions
             .iter()

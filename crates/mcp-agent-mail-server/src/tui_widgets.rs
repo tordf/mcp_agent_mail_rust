@@ -5229,6 +5229,7 @@ mod tests {
                 "[br-123] Start implementation",
                 "br-123",
                 "proj-a",
+                "",
             ),
             MailEvent::message_sent(
                 2,
@@ -5237,6 +5238,7 @@ mod tests {
                 "Re: [br-123] Progress",
                 "br-123",
                 "proj-a",
+                "",
             ),
             MailEvent::message_sent(
                 3,
@@ -5245,6 +5247,7 @@ mod tests {
                 "Ack",
                 "br-123",
                 "proj-a",
+                "",
             ),
         ];
 
@@ -5434,6 +5437,7 @@ mod tests {
             "diag \"quoted\" line\nnext | part",
             "br-14tc9",
             "diag-proj",
+            "",
         )];
         let thread_messages = vec![MermaidThreadMessage {
             from_agent: "Alpha".to_string(),
@@ -5503,6 +5507,7 @@ mod tests {
                 "[br-edpom] perf scenario",
                 "br-edpom",
                 "perf-proj",
+                "",
             ));
         }
 
@@ -5576,6 +5581,7 @@ mod tests {
                 "first",
                 "br-edpom",
                 "proj",
+                "",
             ),
             MailEvent::message_sent(
                 2,
@@ -5584,6 +5590,7 @@ mod tests {
                 "second",
                 "br-edpom",
                 "proj",
+                "",
             ),
             MailEvent::message_sent(
                 3,
@@ -5592,6 +5599,7 @@ mod tests {
                 "third",
                 "br-edpom",
                 "proj",
+                "",
             ),
         ];
 
@@ -7094,6 +7102,7 @@ mod tests {
             subject: "test".into(),
             thread_id: "t1".into(),
             project: "p1".into(),
+            body_excerpt: String::new(),
         }
     }
 

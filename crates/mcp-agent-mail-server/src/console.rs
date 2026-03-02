@@ -2806,7 +2806,7 @@ mod tests {
             "banner should contain tool panel state"
         );
         assert!(
-            joined.contains("Stats:"),
+            joined.contains("Database Statistics"),
             "banner should contain stats summary"
         );
         assert!(

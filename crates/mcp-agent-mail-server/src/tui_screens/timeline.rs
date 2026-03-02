@@ -23,7 +23,7 @@ use ftui_widgets::StatefulWidget;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
 
 use crate::tui_action_menu::{ActionEntry, ActionKind, timeline_actions, timeline_batch_actions};
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
 use crate::tui_layout::{DockLayout, DockPosition, DockPreset};
 use crate::tui_persist::{
@@ -1523,6 +1523,32 @@ impl MailScreen for TimelineScreen {
             self.refresh_commit_entries(tick_count, state);
             self.prune_selection_to_visible();
             self.sync_list_state();
+
+            let raw_count = u64::try_from(self.pane.entries.len()).unwrap_or(u64::MAX);
+            let rendered_count = u64::try_from(self.pane.filtered_len()).unwrap_or(u64::MAX);
+            let dropped_count = raw_count.saturating_sub(rendered_count);
+            let cfg = state.config_snapshot();
+            let transport_mode = cfg.transport_mode().to_string();
+            state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+                screen: "timeline".to_string(),
+                scope: "timeline.events".to_string(),
+                query_params: format!(
+                    "view_mode={:?};verbosity={:?};kind_filters={};source_filters={};commits={}",
+                    self.view_mode,
+                    self.pane.verbosity,
+                    self.pane.kind_filter.len(),
+                    self.pane.source_filter.len(),
+                    self.commit_entries.len(),
+                ),
+                raw_count,
+                rendered_count,
+                dropped_count,
+                timestamp_micros: chrono::Utc::now().timestamp_micros(),
+                db_url: cfg.database_url,
+                storage_root: cfg.storage_root,
+                transport_mode,
+                auth_enabled: cfg.auth_enabled,
+            });
         }
 
         // Flush debounced preference save (always — time-based).
@@ -1686,7 +1712,7 @@ impl MailScreen for TimelineScreen {
             } else {
                 combined_selected_event.as_ref()
             };
-            super::inspector::render_inspector(frame, dock_area, event_ref);
+            super::inspector::render_inspector(frame, dock_area, event_ref, Some(state));
         }
         match self.preset_dialog_mode {
             PresetDialogMode::Save => render_save_preset_dialog(
@@ -2709,6 +2735,7 @@ mod tests {
                 "hello",
                 "t",
                 "p",
+                "",
             ),
         );
         push_event_entry(
@@ -2721,6 +2748,7 @@ mod tests {
                 "re: hello",
                 "t",
                 "p",
+                "",
             ),
         );
         push_event_entry(
@@ -3352,7 +3380,7 @@ mod tests {
             timestamp_micros: 3_000_000,
             source: EventSource::Mail,
             severity: EventSeverity::Info,
-            raw: MailEvent::message_sent(1, "A", vec![], "s", "t", "p"),
+            raw: MailEvent::message_sent(1, "A", vec![], "s", "t", "p", ""),
         });
         pane.entries.push(TimelineEntry {
             display: EventEntry {
@@ -3723,7 +3751,7 @@ mod tests {
             timestamp_micros: 1_000_000,
             source: EventSource::Mail,
             severity: EventSeverity::Info,
-            raw: MailEvent::message_sent(1, "A", vec![], "s", "t", "p"),
+            raw: MailEvent::message_sent(1, "A", vec![], "s", "t", "p", ""),
         });
         pane.entries.push(TimelineEntry {
             display: EventEntry {
@@ -4008,7 +4036,7 @@ mod tests {
                 timestamp_micros: i_i64 * 1_000_000,
                 source: EventSource::Mail,
                 severity: EventSeverity::Info,
-                raw: MailEvent::message_sent(i_i64, "A", vec![], "s", "t", "p"),
+                raw: MailEvent::message_sent(i_i64, "A", vec![], "s", "t", "p", ""),
             });
         }
 
@@ -4075,7 +4103,7 @@ mod tests {
             timestamp_micros: 3_000_000,
             source: EventSource::Mail,
             severity: EventSeverity::Info,
-            raw: MailEvent::message_sent(1, "A", vec![], "s", "t", "p"),
+            raw: MailEvent::message_sent(1, "A", vec![], "s", "t", "p", ""),
         });
 
         // All verbosity, no filters: all 3 visible

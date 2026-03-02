@@ -1285,6 +1285,8 @@ pub struct MailAppModel {
     clipboard: Clipboard,
     /// Internal clipboard fallback when terminal clipboard is unavailable.
     internal_clipboard: Option<String>,
+    /// Whether the one-shot System Health URL shortcuts hint was shown.
+    system_health_url_hint_shown: bool,
     /// Last fully rendered frame snapshot used for screen export.
     last_export_snapshot: RefCell<Option<FrameExportSnapshot>>,
     /// One-shot flag requesting export snapshot refresh on next render.
@@ -1389,6 +1391,7 @@ impl MailAppModel {
             action_outcomes: Vec::new(),
             clipboard: Clipboard::auto(ftui::TerminalCapabilities::detect()),
             internal_clipboard: None,
+            system_health_url_hint_shown: false,
             last_export_snapshot: RefCell::new(None),
             export_snapshot_refresh_pending: Cell::new(false),
             quit_confirm_armed_at: None,
@@ -1583,6 +1586,14 @@ impl MailAppModel {
         self.restore_focus_for_screen(to);
         self.start_screen_transition(from, to);
         self.show_coach_hint_if_eligible(id);
+        if to == MailScreenId::SystemHealth && !self.system_health_url_hint_shown {
+            self.system_health_url_hint_shown = true;
+            self.notifications.notify(
+                Toast::new("System Health URL shortcuts: o=open, y=copy")
+                    .icon(ToastIcon::Info)
+                    .duration(Duration::from_secs(4)),
+            );
+        }
         // Force-tick the newly active screen so it shows fresh data
         // immediately (inactive screens tick at a reduced rate).
         if from != to {
@@ -1827,6 +1838,64 @@ impl MailAppModel {
                 .icon(icon)
                 .duration(Duration::from_secs(duration)),
         );
+    }
+
+    fn system_health_web_ui_url(&self) -> Result<String, &'static str> {
+        sanitize_system_health_url(&self.state.config_snapshot().web_ui_url)
+    }
+
+    fn copy_system_health_web_ui_url(&mut self) {
+        if let Ok(url) = self.system_health_web_ui_url() {
+            let result =
+                self.clipboard
+                    .set(&url, ClipboardSelection::Clipboard, &mut std::io::stdout());
+            self.internal_clipboard = Some(url);
+            let (message, icon, duration) = if result == Ok(()) {
+                ("System Health URL copied", ToastIcon::Info, 2)
+            } else {
+                ("System Health URL copied (internal)", ToastIcon::Warning, 3)
+            };
+            self.notifications.notify(
+                Toast::new(message)
+                    .icon(icon)
+                    .duration(Duration::from_secs(duration)),
+            );
+            return;
+        }
+
+        self.notifications.notify(
+            Toast::new("System Health URL unavailable or invalid")
+                .icon(ToastIcon::Warning)
+                .duration(Duration::from_secs(2)),
+        );
+    }
+
+    fn open_system_health_web_ui_url(&mut self) {
+        let Ok(url) = self.system_health_web_ui_url() else {
+            self.notifications.notify(
+                Toast::new("System Health URL unavailable or invalid")
+                    .icon(ToastIcon::Warning)
+                    .duration(Duration::from_secs(2)),
+            );
+            return;
+        };
+
+        match spawn_browser_for_url(&url) {
+            Ok(()) => {
+                self.notifications.notify(
+                    Toast::new("Opening System Health URL")
+                        .icon(ToastIcon::Info)
+                        .duration(Duration::from_secs(3)),
+                );
+            }
+            Err(error) => {
+                self.notifications.notify(
+                    Toast::new(format!("Failed to open URL: {error}"))
+                        .icon(ToastIcon::Error)
+                        .duration(Duration::from_secs(4)),
+                );
+            }
+        }
     }
 
     #[allow(clippy::missing_const_for_fn)]
@@ -3986,8 +4055,20 @@ impl Model for MailAppModel {
                             }
                             return Cmd::none();
                         }
+                        KeyCode::Char('o')
+                            if !text_mode
+                                && self.screen_manager.active_screen()
+                                    == MailScreenId::SystemHealth =>
+                        {
+                            self.open_system_health_web_ui_url();
+                            return Cmd::none();
+                        }
                         // Clipboard yank: y copies focused content
                         KeyCode::Char('y') if !text_mode => {
+                            if self.screen_manager.active_screen() == MailScreenId::SystemHealth {
+                                self.copy_system_health_web_ui_url();
+                                return Cmd::none();
+                            }
                             if let Some(screen) = self.screen_manager.active_screen_ref() {
                                 if let Some(content) = screen.copyable_content() {
                                     self.copy_to_clipboard(&content);
@@ -4333,7 +4414,13 @@ impl Model for MailAppModel {
             let sections = self
                 .keymap
                 .contextual_help(&screen_bindings, screen_label, screen_tip);
-            tui_chrome::render_help_overlay_sections(&sections, self.help_scroll, frame, area);
+            tui_chrome::render_help_overlay_sections(
+                &sections,
+                self.help_scroll,
+                effects_enabled,
+                frame,
+                area,
+            );
             help_render_us = help_started
                 .elapsed()
                 .as_micros()
@@ -4435,6 +4522,61 @@ impl Model for MailAppModel {
 
     fn as_screen_tick_dispatch(&mut self) -> Option<&mut dyn ScreenTickDispatch> {
         Some(self)
+    }
+}
+
+fn sanitize_system_health_url(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("missing");
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err("scheme");
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_ascii_control() || ch.is_whitespace())
+    {
+        return Err("chars");
+    }
+    Ok(trimmed.to_string())
+}
+
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+fn spawn_browser_for_url(url: &str) -> std::io::Result<()> {
+    #[allow(dead_code)] // only called in non-test cfg branches
+    fn map_status_to_result(status: std::process::ExitStatus) -> std::io::Result<()> {
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "browser launcher exited with status {status}"
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    {
+        let _ = url;
+        Ok(())
+    }
+    #[cfg(all(not(test), target_os = "windows"))]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(url)
+            .status()?;
+        map_status_to_result(status)
+    }
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        let status = std::process::Command::new("open").arg(url).status()?;
+        map_status_to_result(status)
+    }
+    #[cfg(all(not(test), not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let status = std::process::Command::new("xdg-open").arg(url).status()?;
+        map_status_to_result(status)
     }
 }
 
@@ -6544,6 +6686,12 @@ mod tests {
         MailAppModel::new(state)
     }
 
+    fn set_test_web_ui_url(model: &MailAppModel, web_ui_url: &str) {
+        let mut snapshot = model.state.config_snapshot();
+        snapshot.web_ui_url = web_ui_url.to_string();
+        model.state.update_config_snapshot(snapshot);
+    }
+
     fn frame_text(frame: &Frame<'_>) -> String {
         let mut text = String::new();
         for y in 0..frame.buffer.height() {
@@ -6691,6 +6839,7 @@ mod tests {
                 "subject",
                 "thread",
                 "project",
+                "",
             ));
         }
         let model = MailAppModel::with_config(state, &config);
@@ -8467,6 +8616,7 @@ mod tests {
             "Subject for dynamic palette entry",
             "thread-42",
             "proj-a",
+            "",
         )));
         assert!(model.state.push_event(MailEvent::message_sent(
             99,
@@ -8475,6 +8625,7 @@ mod tests {
             "Outgoing subject",
             "thread-99",
             "proj-a",
+            "",
         )));
 
         let actions = build_palette_actions(&model.state);
@@ -8539,6 +8690,7 @@ mod tests {
             "First subject",
             "thread-1",
             "proj-a",
+            "",
         )));
         assert!(model.state.push_event(MailEvent::message_received(
             2,
@@ -8547,6 +8699,7 @@ mod tests {
             "Second subject",
             "thread-1",
             "proj-a",
+            "",
         )));
 
         let mut out = Vec::new();
@@ -9659,7 +9812,8 @@ mod tests {
 
     #[test]
     fn toast_message_received_generates_info() {
-        let event = MailEvent::message_received(1, "BlueLake", vec![], "Hello world", "t1", "proj");
+        let event =
+            MailEvent::message_received(1, "BlueLake", vec![], "Hello world", "t1", "proj", "");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
         assert!(toast.is_some(), "MessageReceived should generate a toast");
     }
@@ -9667,7 +9821,8 @@ mod tests {
     #[test]
     fn toast_message_received_truncates_long_subject() {
         let long_subject = "A".repeat(60);
-        let event = MailEvent::message_received(1, "BlueLake", vec![], &long_subject, "t1", "proj");
+        let event =
+            MailEvent::message_received(1, "BlueLake", vec![], &long_subject, "t1", "proj", "");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
         // The message inside the toast should be truncated
         assert!(toast.content.message.len() < 60);
@@ -9678,7 +9833,7 @@ mod tests {
     fn toast_message_received_unicode_subject_never_panics() {
         let subject =
             "[review] Session 16 code review pass — 1 bug fixed, ~3,500 lines reviewed clean";
-        let event = MailEvent::message_received(1, "BlueLake", vec![], subject, "t1", "proj");
+        let event = MailEvent::message_received(1, "BlueLake", vec![], subject, "t1", "proj", "");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
         assert!(toast.content.message.starts_with("BlueLake: "));
         assert!(toast.content.message.contains('—'));
@@ -9694,7 +9849,7 @@ mod tests {
 
     #[test]
     fn toast_message_sent_still_works() {
-        let event = MailEvent::message_sent(1, "RedFox", vec![], "Test", "t1", "proj");
+        let event = MailEvent::message_sent(1, "RedFox", vec![], "Test", "t1", "proj", "");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info);
         assert!(
             toast.is_some(),
@@ -9829,7 +9984,7 @@ mod tests {
 
     #[test]
     fn toast_severity_filter_blocks_info_at_error_level() {
-        let event = MailEvent::message_received(1, "BlueLake", vec![], "Hello", "t1", "proj");
+        let event = MailEvent::message_received(1, "BlueLake", vec![], "Hello", "t1", "proj", "");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Error);
         assert!(
             toast.is_none(),
@@ -10177,7 +10332,7 @@ mod tests {
 
     #[test]
     fn toast_for_event_info_renders_info_color() {
-        let event = MailEvent::message_sent(1, "A", vec!["B".into()], "Hi", "t1", "proj");
+        let event = MailEvent::message_sent(1, "A", vec!["B".into()], "Hi", "t1", "proj", "");
         let toast = toast_for_event(&event, ToastSeverityThreshold::Info).unwrap();
         let fg = render_toast_border_fg(&toast);
         assert_eq!(fg, toast_color_info());
@@ -11821,6 +11976,176 @@ mod tests {
         // A toast notification should have been queued.
         model.notifications.tick(Duration::from_millis(16));
         assert!(model.notifications.visible_count() > 0);
+    }
+
+    #[test]
+    fn clipboard_yank_on_system_health_copies_web_ui_url() {
+        let mut model = test_model();
+        model.activate_screen(MailScreenId::SystemHealth);
+
+        let expected = model.state.config_snapshot().web_ui_url;
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'y',
+        )))));
+
+        assert!(matches!(cmd, Cmd::None));
+        assert_eq!(model.internal_clipboard.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn system_health_open_shortcut_emits_feedback_toast() {
+        let mut model = test_model();
+        model.activate_screen(MailScreenId::SystemHealth);
+        model.notifications.tick(Duration::from_millis(16));
+        let baseline = model.notifications.visible_count();
+
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'o',
+        )))));
+        assert!(matches!(cmd, Cmd::None));
+
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > baseline);
+    }
+
+    #[test]
+    fn system_health_copy_shortcut_does_not_echo_url_in_toast() {
+        let mut model = test_model();
+        set_test_web_ui_url(
+            &model,
+            "https://example.test/mail?token=sensitive-value#fragment",
+        );
+        model.activate_screen(MailScreenId::SystemHealth);
+        model.notifications.tick(Duration::from_millis(16));
+
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'y',
+        )))));
+        assert!(matches!(cmd, Cmd::None));
+
+        model.notifications.tick(Duration::from_millis(16));
+        let message = model
+            .notifications
+            .visible()
+            .last()
+            .expect("expected a copy feedback toast")
+            .content
+            .message
+            .clone();
+        // In test mode clipboard.set() returns Err (no clipboard), so the
+        // internal-only fallback message is produced.
+        assert!(
+            message == "System Health URL copied"
+                || message == "System Health URL copied (internal)",
+            "unexpected toast: {message}"
+        );
+        assert!(!message.contains("token="));
+    }
+
+    #[test]
+    fn system_health_open_shortcut_does_not_echo_url_in_toast() {
+        let mut model = test_model();
+        set_test_web_ui_url(
+            &model,
+            "https://example.test/mail?token=sensitive-value#fragment",
+        );
+        model.activate_screen(MailScreenId::SystemHealth);
+        model.notifications.tick(Duration::from_millis(16));
+
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'o',
+        )))));
+        assert!(matches!(cmd, Cmd::None));
+
+        model.notifications.tick(Duration::from_millis(16));
+        let message = model
+            .notifications
+            .visible()
+            .last()
+            .expect("expected an open feedback toast")
+            .content
+            .message
+            .clone();
+        assert_eq!(message, "Opening System Health URL");
+        assert!(!message.contains("token="));
+    }
+
+    #[test]
+    fn system_health_copy_shortcut_trims_valid_url() {
+        let mut model = test_model();
+        set_test_web_ui_url(&model, " https://example.test/mail ");
+        model.activate_screen(MailScreenId::SystemHealth);
+
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'y',
+        )))));
+        assert!(matches!(cmd, Cmd::None));
+        assert_eq!(
+            model.internal_clipboard.as_deref(),
+            Some("https://example.test/mail")
+        );
+    }
+
+    #[test]
+    fn system_health_copy_shortcut_rejects_invalid_url_with_feedback() {
+        let mut model = test_model();
+        set_test_web_ui_url(&model, "ftp://example.test/mail");
+        model.activate_screen(MailScreenId::SystemHealth);
+        model.notifications.tick(Duration::from_millis(16));
+        let baseline = model.notifications.visible_count();
+
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'y',
+        )))));
+        assert!(matches!(cmd, Cmd::None));
+        assert!(model.internal_clipboard.is_none());
+
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > baseline);
+    }
+
+    #[test]
+    fn system_health_open_shortcut_rejects_invalid_url_with_feedback() {
+        let mut model = test_model();
+        set_test_web_ui_url(&model, "ftp://example.test/mail");
+        model.activate_screen(MailScreenId::SystemHealth);
+        model.notifications.tick(Duration::from_millis(16));
+        let baseline = model.notifications.visible_count();
+
+        let cmd = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'o',
+        )))));
+        assert!(matches!(cmd, Cmd::None));
+
+        model.notifications.tick(Duration::from_millis(16));
+        assert!(model.notifications.visible_count() > baseline);
+    }
+
+    #[test]
+    fn system_health_shortcut_hint_is_one_shot() {
+        let mut model = test_model();
+        assert!(!model.system_health_url_hint_shown);
+
+        model.activate_screen(MailScreenId::SystemHealth);
+        assert!(model.system_health_url_hint_shown);
+
+        model.activate_screen(MailScreenId::Dashboard);
+        model.activate_screen(MailScreenId::SystemHealth);
+        assert!(model.system_health_url_hint_shown);
+    }
+
+    #[test]
+    fn sanitize_system_health_url_rejects_unsafe_inputs() {
+        assert!(sanitize_system_health_url("http://127.0.0.1:8765/mail").is_ok());
+        assert!(sanitize_system_health_url(" https://example.test/mail ").is_ok());
+        assert!(
+            sanitize_system_health_url("https://example.test/mail?token=abc%20123#ctx").is_ok()
+        );
+        assert!(sanitize_system_health_url("ftp://example.test/mail").is_err());
+        assert!(sanitize_system_health_url("http://bad url").is_err());
+        assert!(sanitize_system_health_url("http://bad\turl").is_err());
+        assert!(sanitize_system_health_url("http://bad\nurl").is_err());
+        assert!(sanitize_system_health_url("").is_err());
     }
 
     #[test]

@@ -25,7 +25,7 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::{Row, Value};
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -33,6 +33,14 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 // ──────────────────────────────────────────────────────────────────────
 
 const MAX_ENTRIES: usize = 200;
+
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 const MAX_TEXT_FILTER_IDS: usize = 600;
 const DEBOUNCE_TICKS: u8 = 1;
 
@@ -347,6 +355,7 @@ pub struct MailExplorerScreen {
     // DB/search state
     db_conn: Option<DbConn>,
     db_conn_attempted: bool,
+    db_context_unavailable: bool,
     last_error: Option<String>,
     debounce_remaining: u8,
     search_dirty: bool,
@@ -388,6 +397,7 @@ impl MailExplorerScreen {
             active_filter: FilterSlot::Direction,
             db_conn: None,
             db_conn_attempted: false,
+            db_context_unavailable: false,
             last_error: None,
             debounce_remaining: 0,
             search_dirty: true,
@@ -420,6 +430,7 @@ impl MailExplorerScreen {
                 &e.subject,
                 e.thread_id.as_deref().unwrap_or(""),
                 &e.project_slug,
+                &e.body_md,
             )
         });
     }
@@ -437,13 +448,22 @@ impl MailExplorerScreen {
         if let Ok(path) = cfg.sqlite_path() {
             self.db_conn = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path).ok();
         }
+        self.db_context_unavailable = self.db_conn.is_none();
     }
 
     fn execute_query(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let Some(conn) = self.db_conn.take() else {
+            self.entries.clear();
+            self.cursor = 0;
+            self.detail_scroll = 0;
+            self.search_dirty = false;
+            self.db_context_unavailable = true;
+            self.db_conn_attempted = false; // allow retry on next tick
+            self.emit_db_unavailable_diagnostic(state, "database connection unavailable");
             return;
         };
+        self.db_context_unavailable = false;
 
         let text_filter = self.search_input.value().trim().to_string();
         let text_match_ids = match Self::resolve_text_filter_message_ids(&text_filter) {
@@ -489,9 +509,41 @@ impl MailExplorerScreen {
         // Sort
         sort_entries(&mut all_entries, self.sort_mode);
 
+        // Track raw count before truncation for diagnostics
+        let raw_count = u64::try_from(all_entries.len()).unwrap_or(u64::MAX);
+
         // Truncate
         all_entries.truncate(MAX_ENTRIES);
         self.entries = all_entries;
+
+        let rendered_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        let dropped_count = raw_count.saturating_sub(rendered_count);
+        let agent_filter = sanitize_diagnostic_value(&self.agent_filter);
+        let agent_filter = if agent_filter.is_empty() {
+            "all".to_string()
+        } else {
+            agent_filter
+        };
+        let text_filter_diag = sanitize_diagnostic_value(&text_filter);
+
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "explorer".to_string(),
+            scope: "mailbox.explorer".to_string(),
+            query_params: format!(
+                "agent={agent_filter};direction={:?};sort={:?};ack={:?};group={:?};text_filter={text_filter_diag}",
+                self.direction, self.sort_mode, self.ack_filter, self.group_mode,
+            ),
+            raw_count,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
 
         // Clamp cursor
         if self.entries.is_empty() {
@@ -503,6 +555,26 @@ impl MailExplorerScreen {
         self.last_error = None;
         self.search_dirty = false;
         self.db_conn = Some(conn);
+    }
+
+    #[allow(clippy::unused_self)] // consistent signature across screens
+    fn emit_db_unavailable_diagnostic(&self, state: &TuiSharedState, reason: &str) {
+        let reason = sanitize_diagnostic_value(reason);
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "explorer".to_string(),
+            scope: "mailbox.explorer.db_unavailable".to_string(),
+            query_params: format!("filter=db_context_unavailable;reason={reason}"),
+            raw_count: 0,
+            rendered_count: 0,
+            dropped_count: 0,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
     }
 
     fn resolve_text_filter_message_ids(
@@ -548,8 +620,13 @@ impl MailExplorerScreen {
     fn refresh_pressure_board(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let Some(conn) = self.db_conn.take() else {
+            self.pressure_dirty = false;
+            self.db_context_unavailable = true;
+            self.db_conn_attempted = false; // allow retry on next tick
+            self.emit_db_unavailable_diagnostic(state, "database connection unavailable (pressure)");
             return;
         };
+        self.db_context_unavailable = false;
 
         let now = now_micros();
 
@@ -1456,20 +1533,25 @@ fn render_header(
 
     if inner.height >= 2 {
         let w = inner.width as usize;
-        let (hint, style) = screen.last_error.as_ref().map_or_else(
-            || {
-                (
-                    truncate_str(&stat_line, w),
-                    crate::tui_theme::text_meta(&tp),
-                )
-            },
-            |err| {
-                (
-                    truncate_str(&format!("ERR: {err}"), w),
-                    crate::tui_theme::text_error(&tp),
-                )
-            },
-        );
+        let (hint, style) = if screen.db_context_unavailable {
+            (
+                truncate_str(
+                    "Database context unavailable. Check DB URL/project scope and refresh.",
+                    w,
+                ),
+                crate::tui_theme::text_error(&tp),
+            )
+        } else if let Some(err) = screen.last_error.as_ref() {
+            (
+                truncate_str(&format!("ERR: {err}"), w),
+                crate::tui_theme::text_error(&tp),
+            )
+        } else {
+            (
+                truncate_str(&stat_line, w),
+                crate::tui_theme::text_meta(&tp),
+            )
+        };
 
         let hint_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
         Paragraph::new(hint).style(style).render(hint_area, frame);
@@ -2535,5 +2617,143 @@ mod tests {
         ));
         screen.update(&scroll_up, &state);
         assert_eq!(screen.cursor, 0, "scroll up should move cursor back");
+    }
+
+    // ── G4 body propagation audit tests ─────────────────────────────
+
+    #[test]
+    fn sync_focused_event_propagates_body_md() {
+        let mut screen = MailExplorerScreen::new();
+        let mut entry = test_entry(42, 1_000_000, Direction::Inbound);
+        entry.body_md = "Important deployment update with details".to_string();
+        screen.entries = vec![entry];
+        screen.cursor = 0;
+        screen.sync_focused_event();
+
+        let event = screen
+            .focused_synthetic
+            .expect("should have synthetic event");
+        match &event {
+            crate::tui_events::MailEvent::MessageSent { body_excerpt, .. } => {
+                assert_eq!(
+                    body_excerpt, "Important deployment update with details",
+                    "synthetic event must carry body_md from DisplayEntry"
+                );
+            }
+            other => panic!("expected MessageSent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_focused_event_empty_body_yields_empty_excerpt() {
+        let mut screen = MailExplorerScreen::new();
+        screen.entries = vec![stub_entry(1)];
+        screen.cursor = 0;
+        screen.sync_focused_event();
+
+        let event = screen
+            .focused_synthetic
+            .expect("should have synthetic event");
+        match &event {
+            crate::tui_events::MailEvent::MessageSent { body_excerpt, .. } => {
+                assert!(
+                    body_excerpt.is_empty(),
+                    "empty body_md should yield empty excerpt, not placeholder"
+                );
+            }
+            other => panic!("expected MessageSent, got {other:?}"),
+        }
+    }
+
+    // ── B8: DB context binding guardrail regression tests ─────────────
+
+    #[test]
+    fn b8_explorer_db_context_unavailable_starts_false() {
+        let screen = MailExplorerScreen::new();
+        assert!(
+            !screen.db_context_unavailable,
+            "fresh screen should not be marked as db_context_unavailable"
+        );
+    }
+
+    fn broken_db_config() -> mcp_agent_mail_core::Config {
+        mcp_agent_mail_core::Config {
+            database_url: "sqlite:////nonexistent/path/b8_test.sqlite3".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn b8_explorer_execute_query_without_conn_sets_unavailable() {
+        let config = broken_db_config();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+
+        screen.execute_query(&state);
+
+        assert!(
+            screen.db_context_unavailable,
+            "execute_query without DB connection should set db_context_unavailable"
+        );
+        assert!(
+            screen.entries.is_empty(),
+            "entries should be cleared on db unavailable"
+        );
+
+        // Verify diagnostic was emitted
+        let diags = state.screen_diagnostics_since(0);
+        let explorer_diag = diags
+            .iter()
+            .find(|(_, d)| d.screen == "explorer" && d.scope.contains("db_unavailable"));
+        assert!(
+            explorer_diag.is_some(),
+            "should emit db_unavailable diagnostic"
+        );
+    }
+
+    #[test]
+    fn b8_explorer_allows_retry_after_conn_failure() {
+        let config = broken_db_config();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+
+        screen.execute_query(&state);
+        assert!(screen.db_context_unavailable);
+
+        // db_conn_attempted should be reset to allow retry
+        assert!(
+            !screen.db_conn_attempted,
+            "db_conn_attempted should be reset after failure to allow retry"
+        );
+    }
+
+    #[test]
+    fn b8_explorer_banner_renders_when_unavailable() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+        screen.db_context_unavailable = true;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, ftui::layout::Rect::new(0, 0, 120, 30), &state);
+
+        let mut text = String::new();
+        for y in 0..frame.buffer.height() {
+            for x in 0..frame.buffer.width() {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    if let Some(ch) = cell.content.as_char() {
+                        text.push(ch);
+                    } else if !cell.is_continuation() {
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Database context unavailable"),
+            "should render degraded banner when db_context_unavailable is true"
+        );
     }
 }

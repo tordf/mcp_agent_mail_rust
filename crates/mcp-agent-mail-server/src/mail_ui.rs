@@ -47,7 +47,7 @@ pub fn dispatch(
         // Explicit projects list route (legacy Python: GET /mail/projects).
         "/projects" => render_projects_list(&cx, &pool),
         _ if sub.starts_with("/api/") => handle_api_route(sub, query, method, body, &cx, &pool),
-        _ if sub.starts_with("/archive/") => render_archive_route(sub, query, &cx, &pool),
+        _ if sub.starts_with("/archive/") => render_archive_route(sub, query, method, &cx, &pool),
         _ => dispatch_project_route(sub, method, body, &cx, &pool, query),
     }
 }
@@ -392,6 +392,312 @@ mod utility_tests {
         let body_overlap = "authenticate";
         let html_overlap = highlight_snippet(body_overlap, "auth thenticate", 100);
         assert_eq!(html_overlap, "<mark>authenticate</mark>");
+    }
+}
+
+#[cfg(test)]
+mod route_hardening_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_test_pool() -> DbPool {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("mail-ui-route-{nonce}.sqlite3"));
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..DbPoolConfig::default()
+        };
+        get_or_create_pool(&cfg).expect("test pool")
+    }
+
+    // F2: Malformed project slugs are rejected with 400 before DB access.
+    #[test]
+    fn dispatch_project_rejects_path_traversal_slug() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        let result = dispatch_project_route("/../../etc/passwd", "GET", "", &cx, &pool, "");
+        let (status, _msg) = result.expect_err("path traversal slug should be rejected");
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn dispatch_project_rejects_dot_dot_slug() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        let result = dispatch_project_route("/..", "GET", "", &cx, &pool, "");
+        let (status, _msg) = result.expect_err(".. slug should be rejected");
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn dispatch_project_rejects_special_chars_in_slug() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        for bad_slug in &["/foo bar", "/slug;drop", "/slug'inject", "/slug<xss>"] {
+            let result = dispatch_project_route(bad_slug, "GET", "", &cx, &pool, "");
+            let (status, _msg) =
+                result.expect_err(&format!("slug {bad_slug:?} should be rejected"));
+            assert_eq!(status, 400, "slug {bad_slug:?} should return 400");
+        }
+    }
+
+    #[test]
+    fn dispatch_project_accepts_valid_slug_format() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        // Valid slug format passes validation (may then 404 on project lookup).
+        let result = dispatch_project_route("/my-project_1", "GET", "", &cx, &pool, "");
+        // Should not be a 400 — either Ok or a different error from DB lookup.
+        match result {
+            Err((400, _)) => panic!("valid slug should not be rejected as 400"),
+            _ => {} // Ok(None), Ok(Some), or Err(404/500) are all acceptable
+        }
+    }
+
+    // F3: Unknown inbox sub-actions return Ok(None) → 404, not the inbox page.
+    #[test]
+    fn inbox_unknown_subaction_returns_none() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        let result = dispatch_project_route(
+            "/my-project/inbox/some-agent/unknown-action",
+            "GET",
+            "",
+            &cx,
+            &pool,
+            "",
+        );
+        // Ok(None) means 404 at the HTTP handler level.
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "unknown inbox sub-action should return None (404)"
+        );
+    }
+
+    #[test]
+    fn inbox_deep_subpath_returns_none() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        let result = dispatch_project_route(
+            "/my-project/inbox/agent/foo/bar/baz",
+            "GET",
+            "",
+            &cx,
+            &pool,
+            "",
+        );
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "deep inbox sub-path should return None (404)"
+        );
+    }
+}
+
+/// F4 regression test suite: comprehensive authorization + route hardening
+/// assertions to prevent regressions in slug validation, IDOR prevention,
+/// route dispatch strictness, and archive input sanitization.
+#[cfg(test)]
+mod auth_route_hardening_regression_suite {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_test_pool() -> DbPool {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("mail-ui-f4-{nonce}.sqlite3"));
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..DbPoolConfig::default()
+        };
+        get_or_create_pool(&cfg).expect("test pool")
+    }
+
+    // -- Slug validation regression (F2 scope) --
+
+    #[test]
+    fn regression_slug_url_encoded_traversal_rejected() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        // Slugs containing non-alphanumeric/hyphen/underscore chars → 400.
+        for slug in &["..%2F..%2Fetc", ".hidden", "slug with space"] {
+            let path = format!("/{slug}");
+            let result = dispatch_project_route(&path, "GET", "", &cx, &pool, "");
+            match result {
+                Err((400, _)) => {} // expected
+                other => panic!("slug {slug:?} should yield 400, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn regression_path_traversal_in_rest_yields_404_not_traversal() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        // "foo/../bar" → slug="foo" (valid), rest="../bar" (unknown route → 404).
+        // Path traversal in the rest segment can't escape because routes are
+        // matched by exact string, not filesystem paths.
+        let result = dispatch_project_route("/foo/../bar", "GET", "", &cx, &pool, "");
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "path traversal in rest segment yields 404, not a directory escape"
+        );
+    }
+
+    #[test]
+    fn regression_archive_browser_file_slug_validated() {
+        // archive_browser_file_project_slug must reject invalid slugs.
+        assert!(archive_browser_file_project_slug("/archive/browser/../../../etc/file").is_none());
+        assert!(archive_browser_file_project_slug("/archive/browser//file").is_none());
+        assert!(archive_browser_file_project_slug("/archive/browser/ok/file").is_some());
+    }
+
+    #[test]
+    fn regression_time_travel_rejects_bad_agent_name() {
+        // is_valid_archive_agent_name rejects path-traversal and special chars.
+        assert!(!is_valid_archive_agent_name(""));
+        assert!(!is_valid_archive_agent_name("../etc"));
+        assert!(!is_valid_archive_agent_name("agent;DROP"));
+        assert!(!is_valid_archive_agent_name("a b c"));
+        assert!(is_valid_archive_agent_name("BlueLake"));
+        assert!(is_valid_archive_agent_name("Agent42"));
+    }
+
+    #[test]
+    fn regression_time_travel_rejects_bad_timestamp() {
+        assert!(!is_valid_time_travel_timestamp(""));
+        assert!(!is_valid_time_travel_timestamp("not-a-date"));
+        assert!(!is_valid_time_travel_timestamp("2026/02/11T05:43"));
+        assert!(!is_valid_time_travel_timestamp("'; DROP TABLE messages;--"));
+        assert!(is_valid_time_travel_timestamp("2026-02-11T05:43"));
+    }
+
+    // -- Route dispatch strictness (F3 scope) --
+
+    #[test]
+    fn regression_inbox_post_to_nonexistent_action_is_method_not_allowed() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        // POST to an unknown inbox sub-action should be 405, not silently handled.
+        let result = dispatch_project_route(
+            "/my-project/inbox/some-agent/nonexistent",
+            "POST",
+            "",
+            &cx,
+            &pool,
+            "",
+        );
+        let (status, _) = result.expect_err("unknown POST inbox action should be rejected");
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn regression_archive_routes_reject_post_method() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        let result = render_archive_route("/archive/guide", "", "POST", &cx, &pool);
+        let (status, _) = result.expect_err("POST to archive should be 405");
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn regression_unknown_archive_subpath_returns_none() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        let result = render_archive_route("/archive/nonexistent", "", "GET", &cx, &pool);
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "unknown archive path should return None (404)"
+        );
+    }
+
+    // -- Aggregate: slug validation applies consistently across entry points --
+
+    #[test]
+    fn regression_all_slug_validators_agree_on_boundary_inputs() {
+        let boundary_inputs = vec![
+            ("valid-slug", true),
+            ("slug_with_underscore", true),
+            ("slug123", true),
+            ("", false),
+            (".", false),
+            ("..", false),
+            ("slug/path", false),
+            ("slug space", false),
+            ("slug;inject", false),
+            ("slug<xss>", false),
+            ("slug'quote", false),
+            ("slug\"double", false),
+            ("slug&param=val", false),
+            ("slug%00null", false),
+        ];
+
+        for (input, expected_valid) in &boundary_inputs {
+            assert_eq!(
+                is_valid_project_slug(input),
+                *expected_valid,
+                "is_valid_project_slug({input:?}) mismatch"
+            );
+        }
+    }
+
+    // -- Cross-project route scoping (F1 scope) --
+
+    #[test]
+    fn regression_message_route_format_requires_numeric_id() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        // message/{mid} where mid is not numeric → 404 (invalid parse returns None).
+        let result = dispatch_project_route("/my-project/message/abc", "GET", "", &cx, &pool, "");
+        // Non-numeric message IDs should gracefully fail (Ok(None) or Err(400/404)).
+        match result {
+            Ok(None) | Err((400, _)) | Err((404, _)) => {} // acceptable
+            other => panic!("non-numeric message id should fail gracefully, got {other:?}"),
+        }
+    }
+
+    // -- Method enforcement on known routes --
+
+    #[test]
+    fn regression_mark_read_only_accepts_post() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        // GET on mark-read should be 405.
+        let result = dispatch_project_route(
+            "/my-project/inbox/agent/mark-read",
+            "GET",
+            "",
+            &cx,
+            &pool,
+            "",
+        );
+        // GET on a POST-only action should return Ok(None) from the ("GET", _) arm.
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "GET on mark-read should not render anything (404)"
+        );
+    }
+
+    #[test]
+    fn regression_overseer_send_only_accepts_post() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        // GET /mail/{project}/overseer/send → should not render (only POST accepted).
+        let result = dispatch_project_route("/my-project/overseer/send", "GET", "", &cx, &pool, "");
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "GET on overseer/send should return None (404)"
+        );
     }
 }
 
@@ -834,10 +1140,12 @@ fn render_message(
     message_id: i64,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
-    let m = block_on_outcome(cx, queries::get_message(cx, pool, message_id))?;
-    let sender = block_on_outcome(cx, queries::get_agent_by_id(cx, pool, m.sender_id))?;
-
     let pid = p.id.unwrap_or(0);
+    let m = block_on_outcome(cx, queries::get_message(cx, pool, message_id))?;
+    if m.project_id != pid {
+        return Err((404, "Message not found".to_string()));
+    }
+    let sender = block_on_outcome(cx, queries::get_agent_by_id(cx, pool, m.sender_id))?;
     let recipients = block_on_outcome(
         cx,
         queries::list_message_recipient_names_for_messages(cx, pool, pid, &[message_id]),
@@ -861,6 +1169,98 @@ fn render_message(
             recipients,
         },
     )
+}
+
+#[cfg(test)]
+mod message_route_authorization_tests {
+    use super::*;
+    use asupersync::Outcome;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
+        match outcome {
+            Outcome::Ok(v) => v,
+            Outcome::Err(e) => panic!("db error: {e}"),
+            Outcome::Cancelled(_) => panic!("db operation cancelled"),
+            Outcome::Panicked(p) => panic!("db operation panicked: {}", p.message()),
+        }
+    }
+
+    fn make_test_pool() -> DbPool {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("mail-ui-idor-{nonce}.sqlite3"));
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..DbPoolConfig::default()
+        };
+        get_or_create_pool(&cfg).expect("test pool should initialize")
+    }
+
+    #[test]
+    fn project_message_route_blocks_cross_project_idor_access() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+
+        let project_a = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-idor-a-{nonce}"),
+        )));
+        let project_b = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-idor-b-{nonce}"),
+        )));
+        let project_a_id = project_a.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_a_id,
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+        )));
+        let sender_id = sender.id.unwrap_or(0);
+
+        let message = outcome_ok(block_on(queries::create_message(
+            &cx,
+            &pool,
+            project_a_id,
+            sender_id,
+            "Scoped subject",
+            "Scoped body",
+            Some("idor-thread"),
+            "normal",
+            false,
+            "[]",
+        )));
+        let message_id = message.id.expect("message id should be present");
+
+        let in_scope_route = format!("/{}/message/{message_id}", project_a.slug);
+        let in_scope_result = dispatch_project_route(&in_scope_route, "GET", "", &cx, &pool, "");
+        assert!(
+            matches!(in_scope_result, Ok(Some(_))),
+            "same-project route should render message: {in_scope_result:?}"
+        );
+
+        let cross_scope_route = format!("/{}/message/{message_id}", project_b.slug);
+        let cross_scope_result =
+            dispatch_project_route(&cross_scope_route, "GET", "", &cx, &pool, "");
+        let (status, detail) =
+            cross_scope_result.expect_err("cross-project tampering must be rejected");
+        assert_eq!(status, 404);
+        assert_eq!(detail, "Message not found");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,6 +1867,11 @@ fn dispatch_project_route(
         return Ok(None);
     }
 
+    // F2: Reject malformed project slugs early (before any DB/archive access).
+    if !is_valid_project_slug(project_slug) {
+        return Err((400, "Invalid project identifier".to_string()));
+    }
+
     match rest {
         "" => render_project(cx, pool, project_slug),
         "search" => render_search(cx, pool, project_slug, query),
@@ -1491,11 +1896,13 @@ fn dispatch_project_route(
                 ("POST", "mark-all-read") => {
                     handle_mark_all_read(cx, pool, project_slug, agent_name)
                 }
-                ("GET", _) => {
+                // F3: Only accept GET on the inbox root, not unknown sub-paths.
+                ("GET", "") => {
                     let limit = extract_query_int(query, "limit", 10000);
                     let page = extract_query_int(query, "page", 1);
                     render_inbox(cx, pool, project_slug, agent_name, limit, page)
                 }
+                ("GET", _) => Ok(None), // Unknown inbox sub-action → 404
                 _ => Err((405, "Method Not Allowed".to_string())),
             }
         }
@@ -1661,9 +2068,13 @@ fn get_project_archive(slug: &str) -> Result<storage::ProjectArchive, (u16, Stri
 fn render_archive_route(
     sub: &str,
     query: &str,
+    method: &str,
     cx: &Cx,
     pool: &DbPool,
 ) -> Result<Option<String>, (u16, String)> {
+    if method != "GET" {
+        return Err((405, "Method Not Allowed".to_string()));
+    }
     match sub {
         "/archive/guide" => render_archive_guide(cx, pool),
         "/archive/activity" => {
@@ -1677,7 +2088,7 @@ fn render_archive_route(
         "/archive/browser" => {
             let project = extract_query_str(query, "project");
             let path = extract_query_str(query, "path").unwrap_or_default();
-            render_archive_browser(project.as_deref(), &path)
+            render_archive_browser(cx, pool, project.as_deref(), &path)
         }
         "/archive/network" => {
             let project = extract_query_str(query, "project");
@@ -1852,12 +2263,17 @@ fn render_archive_timeline(
 }
 
 /// Resolve a project slug + `human_key`, defaulting to the first project.
+///
+/// F2: Validates slug format before DB lookup to reject malformed input early.
 fn resolve_project_slug(
     cx: &Cx,
     pool: &DbPool,
     project: Option<&str>,
 ) -> Result<(String, String), (u16, String)> {
     if let Some(slug) = project {
+        if !is_valid_project_slug(slug) {
+            return Err((400, "Invalid project identifier".to_string()));
+        }
         let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
         Ok((p.slug.clone(), p.human_key))
     } else {
@@ -1879,6 +2295,8 @@ struct ArchiveBrowserCtx {
 }
 
 fn render_archive_browser(
+    cx: &Cx,
+    pool: &DbPool,
     project: Option<&str>,
     path: &str,
 ) -> Result<Option<String>, (u16, String)> {
@@ -1886,6 +2304,11 @@ fn render_archive_browser(
         Some(s) if !s.is_empty() => s,
         _ => return render_error("Please select a project to browse"),
     };
+    if !is_valid_project_slug(slug) {
+        return Err((400, "Invalid project identifier".to_string()));
+    }
+    // Enforce project scope via DB lookup before touching archive paths.
+    let _ = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
 
     let archive = get_project_archive(slug)?;
     let tree = storage::get_archive_tree(&archive, path)

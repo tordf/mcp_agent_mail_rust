@@ -15,6 +15,8 @@ const REQUEST_SPARKLINE_CAPACITY: usize = 60;
 const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4096;
 /// Max console log entries in the ring buffer.
 const CONSOLE_LOG_CAPACITY: usize = 2000;
+/// Max retained screen diagnostics snapshots.
+const SCREEN_DIAGNOSTIC_CAPACITY: usize = 512;
 
 #[derive(Debug)]
 struct AtomicSparkline {
@@ -167,6 +169,100 @@ pub struct RequestCounters {
     pub latency_total_ms: u64,
 }
 
+/// Structured per-screen diagnostics used to trace DB/query/render mismatches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenDiagnosticSnapshot {
+    pub screen: String,
+    pub scope: String,
+    pub query_params: String,
+    pub raw_count: u64,
+    pub rendered_count: u64,
+    pub dropped_count: u64,
+    pub timestamp_micros: i64,
+    pub db_url: String,
+    pub storage_root: String,
+    pub transport_mode: String,
+    pub auth_enabled: bool,
+}
+
+impl ScreenDiagnosticSnapshot {
+    #[must_use]
+    pub fn to_log_line(&self) -> String {
+        format!(
+            "[screen_diag] screen={} scope={} raw={} rendered={} dropped={} params={} db={} storage={} transport={} auth={} ts={}",
+            self.screen,
+            self.scope,
+            self.raw_count,
+            self.rendered_count,
+            self.dropped_count,
+            self.query_params,
+            self.db_url,
+            self.storage_root,
+            self.transport_mode,
+            self.auth_enabled,
+            self.timestamp_micros
+        )
+    }
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn strict_truth_assertions_enabled(config: &ConfigSnapshot) -> bool {
+    config.tui_debug || cfg!(debug_assertions) || env_truthy("AM_TUI_STRICT_TRUTH_ASSERTIONS")
+}
+
+pub(crate) fn query_params_explain_empty_state(query_params: &str) -> bool {
+    query_params.split([';', ',']).any(|part| {
+        let Some((raw_key, raw_value)) = part.split_once('=') else {
+            return false;
+        };
+        let key = raw_key.trim().to_ascii_lowercase();
+        let value = raw_value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            return false;
+        }
+        let value_lc = value.to_ascii_lowercase();
+        match key.as_str() {
+            "filter" | "query" | "search" | "thread" | "thread_id" | "project" | "project_slug"
+            | "agent" | "agent_name" | "sender" | "recipient" | "importance" | "ack" | "status" => {
+                !matches!(value_lc.as_str(), "all" | "any" | "none" | "*" | "false")
+            }
+            "page" => value_lc.parse::<u64>().ok().is_some_and(|page| page > 1),
+            "offset" => value_lc
+                .parse::<u64>()
+                .ok()
+                .is_some_and(|offset| offset > 0),
+            _ => false,
+        }
+    })
+}
+
+fn assert_screen_truth(snapshot: &ScreenDiagnosticSnapshot) {
+    let has_raw_rows = snapshot.raw_count > 0;
+    let rendered_none = snapshot.rendered_count == 0;
+    let user_filter_active = query_params_explain_empty_state(&snapshot.query_params);
+    assert!(
+        !(has_raw_rows && rendered_none && !user_filter_active),
+        "[truth_assertion] screen={} scope={} raw_count={} rendered_count={} query_params={} \
+possible silent false-empty state",
+        snapshot.screen,
+        snapshot.scope,
+        snapshot.raw_count,
+        snapshot.rendered_count,
+        snapshot.query_params
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteTerminalEvent {
     Key { key: String, modifiers: u8 },
@@ -226,6 +322,9 @@ pub struct TuiSharedState {
     /// Console log ring buffer: `(seq, text)` pairs for tool call cards etc.
     console_log: Mutex<VecDeque<(u64, String)>>,
     console_log_seq: AtomicU64,
+    /// Per-screen diagnostics snapshots, keyed by insertion sequence.
+    screen_diagnostics: Mutex<VecDeque<(u64, ScreenDiagnosticSnapshot)>>,
+    screen_diagnostic_seq: AtomicU64,
     /// Generation counter bumped on each `update_db_stats` call.
     db_stats_gen: AtomicU64,
     /// Generation counter bumped on each `record_request` call.
@@ -263,6 +362,8 @@ impl TuiSharedState {
             server_control_tx: Mutex::new(None),
             console_log: Mutex::new(VecDeque::with_capacity(CONSOLE_LOG_CAPACITY)),
             console_log_seq: AtomicU64::new(0),
+            screen_diagnostics: Mutex::new(VecDeque::with_capacity(SCREEN_DIAGNOSTIC_CAPACITY)),
+            screen_diagnostic_seq: AtomicU64::new(0),
             db_stats_gen: AtomicU64::new(0),
             request_gen: AtomicU64::new(0),
         })
@@ -593,6 +694,39 @@ impl TuiSharedState {
         log.push_back((seq, text));
     }
 
+    /// Record a screen-level diagnostics snapshot.
+    ///
+    /// When TUI debug mode is enabled, a compact diagnostics line is also sent
+    /// to the console log stream so operators can inspect query→render flow.
+    pub fn push_screen_diagnostic(&self, snapshot: ScreenDiagnosticSnapshot) {
+        let config = self.config_snapshot();
+        if strict_truth_assertions_enabled(&config) {
+            assert_screen_truth(&snapshot);
+        }
+        let seq = self
+            .screen_diagnostic_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let mut diagnostics = self
+            .screen_diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if diagnostics.len() >= SCREEN_DIAGNOSTIC_CAPACITY {
+            let _ = diagnostics.pop_front();
+        }
+        let log_line = if config.tui_debug {
+            Some(snapshot.to_log_line())
+        } else {
+            None
+        };
+        diagnostics.push_back((seq, snapshot));
+        drop(diagnostics);
+
+        if let Some(line) = log_line {
+            self.push_console_log(line);
+        }
+    }
+
     /// Snapshot all data generation counters for dirty-state tracking.
     ///
     /// Screens store the returned value and later compare it against a fresh
@@ -616,6 +750,20 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         log.iter()
+            .filter(|(seq, _)| *seq > since_seq)
+            .cloned()
+            .collect()
+    }
+
+    /// Return screen diagnostics snapshots with sequence > `since_seq`.
+    #[must_use]
+    pub fn screen_diagnostics_since(&self, since_seq: u64) -> Vec<(u64, ScreenDiagnosticSnapshot)> {
+        let diagnostics = self
+            .screen_diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        diagnostics
+            .iter()
             .filter(|(seq, _)| *seq > since_seq)
             .cloned()
             .collect()
@@ -1305,6 +1453,161 @@ mod tests {
         assert!(future.is_empty());
     }
 
+    fn sample_screen_diag(screen: &str) -> ScreenDiagnosticSnapshot {
+        ScreenDiagnosticSnapshot {
+            screen: screen.to_string(),
+            scope: "db_stats.agents_list".to_string(),
+            query_params: "filter=red;sort=Active".to_string(),
+            raw_count: 100,
+            rendered_count: 12,
+            dropped_count: 88,
+            timestamp_micros: 42,
+            db_url: "sqlite:///tmp/am.db".to_string(),
+            storage_root: "/tmp/am".to_string(),
+            transport_mode: "mcp".to_string(),
+            auth_enabled: true,
+        }
+    }
+
+    #[test]
+    fn screen_diagnostics_round_trip() {
+        let state = TuiSharedState::new(&Config::default());
+        state.push_screen_diagnostic(sample_screen_diag("agents"));
+        state.push_screen_diagnostic(sample_screen_diag("projects"));
+
+        let rows = state.screen_diagnostics_since(0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1.screen, "agents");
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[1].1.screen, "projects");
+    }
+
+    #[test]
+    fn screen_diagnostics_log_when_debug_enabled() {
+        let config = Config {
+            tui_debug: true,
+            ..Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        state.push_screen_diagnostic(sample_screen_diag("agents"));
+
+        let logs = state.console_log_since(0);
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].1.contains("[screen_diag]"));
+        assert!(logs[0].1.contains("screen=agents"));
+    }
+
+    #[test]
+    fn screen_diagnostics_do_not_log_when_debug_disabled() {
+        let state = TuiSharedState::new(&Config::default());
+        state.push_screen_diagnostic(sample_screen_diag("agents"));
+        assert!(state.console_log_since(0).is_empty());
+    }
+
+    #[test]
+    fn screen_diagnostics_panic_on_silent_false_empty_without_filter() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut snapshot = sample_screen_diag("agents");
+        snapshot.query_params = r#"filter="";sort_col=name;sort_asc=true"#.to_string();
+        snapshot.raw_count = 5;
+        snapshot.rendered_count = 0;
+        snapshot.dropped_count = 5;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.push_screen_diagnostic(snapshot);
+        }));
+        assert!(result.is_err(), "expected truth assertion to panic");
+    }
+
+    #[test]
+    fn screen_diagnostics_allow_empty_when_filter_is_active() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut snapshot = sample_screen_diag("agents");
+        snapshot.query_params = r#"filter="urgent";sort_col=name;sort_asc=true"#.to_string();
+        snapshot.raw_count = 5;
+        snapshot.rendered_count = 0;
+        snapshot.dropped_count = 5;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.push_screen_diagnostic(snapshot);
+        }));
+        assert!(result.is_ok(), "active user filter should suppress panic");
+    }
+
+    #[test]
+    fn screen_diagnostics_allow_empty_with_structured_filter_context() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut snapshot = sample_screen_diag("dashboard");
+        snapshot.query_params =
+            "filter=query:incident|verbosity:verbose|types:MessageReceived".to_string();
+        snapshot.raw_count = 12;
+        snapshot.rendered_count = 0;
+        snapshot.dropped_count = 12;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.push_screen_diagnostic(snapshot);
+        }));
+        assert!(
+            result.is_ok(),
+            "structured non-empty filter context should suppress panic"
+        );
+    }
+
+    #[test]
+    fn screen_diagnostics_panic_when_filter_is_all() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut snapshot = sample_screen_diag("agents");
+        snapshot.query_params = "filter=all;sort_col=name;sort_asc=true".to_string();
+        snapshot.raw_count = 5;
+        snapshot.rendered_count = 0;
+        snapshot.dropped_count = 5;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.push_screen_diagnostic(snapshot);
+        }));
+        assert!(
+            result.is_err(),
+            "filter=all should not suppress truth assertion"
+        );
+    }
+
+    #[test]
+    fn screen_diagnostics_panic_for_messages_global_all_signature() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut snapshot = sample_screen_diag("messages");
+        snapshot.query_params = "raw=4;rendered=0;filter=all;mode=global;project=all;method=LocalCache;live_added=0;total_results=4".to_string();
+        snapshot.raw_count = 4;
+        snapshot.rendered_count = 0;
+        snapshot.dropped_count = 4;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.push_screen_diagnostic(snapshot);
+        }));
+        assert!(
+            result.is_err(),
+            "messages global/all signature should not suppress truth assertion"
+        );
+    }
+
+    #[test]
+    fn screen_diagnostics_allow_messages_local_project_filter_signature() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut snapshot = sample_screen_diag("messages");
+        snapshot.query_params = "raw=4;rendered=0;filter=project:alpha;mode=local;project=alpha;method=LocalCache;live_added=0;total_results=4".to_string();
+        snapshot.raw_count = 4;
+        snapshot.rendered_count = 0;
+        snapshot.dropped_count = 4;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.push_screen_diagnostic(snapshot);
+        }));
+        assert!(
+            result.is_ok(),
+            "messages project filter signature should suppress truth assertion"
+        );
+    }
+
     // ── Data generation / dirty-state tests ──────────────────────
 
     #[test]
@@ -1523,5 +1826,301 @@ mod tests {
         let stale = crate::tui_screens::DataGeneration::stale();
         let default = crate::tui_screens::DataGeneration::default();
         assert_ne!(stale, default, "stale must differ from default");
+    }
+
+    // ── E8: query_params_explain_empty_state invariants ──────────────
+
+    #[test]
+    fn e8_empty_query_params_not_user_filter() {
+        assert!(
+            !super::query_params_explain_empty_state(""),
+            "empty query_params must not explain empty state"
+        );
+    }
+
+    #[test]
+    fn e8_filter_all_not_user_filter() {
+        assert!(
+            !super::query_params_explain_empty_state("filter=all"),
+            "filter=all is not a user filter"
+        );
+        assert!(
+            !super::query_params_explain_empty_state("filter=any"),
+            "filter=any is not a user filter"
+        );
+        assert!(
+            !super::query_params_explain_empty_state("filter=none"),
+            "filter=none is not a user filter"
+        );
+        assert!(
+            !super::query_params_explain_empty_state("filter=*"),
+            "filter=* is not a user filter"
+        );
+    }
+
+    #[test]
+    fn e8_active_filter_is_user_filter() {
+        assert!(
+            super::query_params_explain_empty_state("filter=urgent"),
+            "filter=urgent should be recognized as user filter"
+        );
+        assert!(
+            super::query_params_explain_empty_state("query=something"),
+            "query=something should be recognized"
+        );
+        assert!(
+            super::query_params_explain_empty_state("project=my-proj"),
+            "project=my-proj should be recognized"
+        );
+        assert!(
+            super::query_params_explain_empty_state("agent=RedFox"),
+            "agent=RedFox should be recognized"
+        );
+    }
+
+    #[test]
+    fn e8_page_offset_user_filter() {
+        assert!(
+            super::query_params_explain_empty_state("page=2"),
+            "page=2 should explain empty state (pagination)"
+        );
+        assert!(
+            !super::query_params_explain_empty_state("page=1"),
+            "page=1 should not explain empty state"
+        );
+        assert!(
+            super::query_params_explain_empty_state("offset=50"),
+            "offset=50 should explain empty state"
+        );
+        assert!(
+            !super::query_params_explain_empty_state("offset=0"),
+            "offset=0 should not explain empty state"
+        );
+    }
+
+    #[test]
+    fn e8_case_insensitive_filter_keys() {
+        assert!(
+            super::query_params_explain_empty_state("Filter=urgent"),
+            "key matching should be case-insensitive"
+        );
+        assert!(
+            super::query_params_explain_empty_state("QUERY=test"),
+            "key matching should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn e8_semicolon_separated_params() {
+        assert!(
+            super::query_params_explain_empty_state("raw=0;filter=urgent;rendered=0"),
+            "semicolon-separated params should be parsed"
+        );
+        assert!(
+            !super::query_params_explain_empty_state("raw=0;filter=all;rendered=0"),
+            "filter=all among other params should not be a user filter"
+        );
+    }
+
+    #[test]
+    fn e8_empty_value_not_user_filter() {
+        assert!(
+            !super::query_params_explain_empty_state("filter="),
+            "empty filter value should not be user filter"
+        );
+        assert!(
+            !super::query_params_explain_empty_state("query="),
+            "empty query value should not be user filter"
+        );
+    }
+
+    #[test]
+    fn e8_unknown_keys_ignored() {
+        assert!(
+            !super::query_params_explain_empty_state("raw=20;rendered=0;method=Recent"),
+            "unknown keys should not explain empty state"
+        );
+    }
+
+    // ── E8: ScreenDiagnosticSnapshot invariants ─────────────────────
+
+    #[test]
+    fn e8_diagnostic_snapshot_dropped_count_invariant() {
+        let snap = ScreenDiagnosticSnapshot {
+            screen: "test".into(),
+            scope: "test.scope".into(),
+            query_params: "filter=all".into(),
+            raw_count: 20,
+            rendered_count: 15,
+            dropped_count: 5,
+            timestamp_micros: 1_704_067_200_000_000,
+            db_url: "sqlite:///test".into(),
+            storage_root: "/tmp".into(),
+            transport_mode: "stdio".into(),
+            auth_enabled: false,
+        };
+        assert_eq!(
+            snap.dropped_count,
+            snap.raw_count.saturating_sub(snap.rendered_count),
+            "dropped_count must equal raw_count - rendered_count"
+        );
+    }
+
+    #[test]
+    fn e8_diagnostic_to_log_line_contains_all_fields() {
+        let snap = ScreenDiagnosticSnapshot {
+            screen: "messages".into(),
+            scope: "message_search.results".into(),
+            query_params: "filter=urgent".into(),
+            raw_count: 10,
+            rendered_count: 8,
+            dropped_count: 2,
+            timestamp_micros: 1_704_067_200_000_000,
+            db_url: "sqlite:///test.db".into(),
+            storage_root: "/tmp/am".into(),
+            transport_mode: "http".into(),
+            auth_enabled: true,
+        };
+        let line = snap.to_log_line();
+        assert!(line.contains("messages"), "log line should contain screen name");
+        assert!(
+            line.contains("message_search.results"),
+            "log line should contain scope"
+        );
+        assert!(line.contains("raw=10"), "log line should contain raw count");
+        assert!(
+            line.contains("rendered=8"),
+            "log line should contain rendered count"
+        );
+    }
+
+    // ── E8: ConfigSnapshot context binding invariants ────────────────
+
+    #[test]
+    fn e8_config_snapshot_auth_matches_token_presence() {
+        let config_with_token = Config {
+            http_bearer_token: Some("secret".into()),
+            ..Default::default()
+        };
+        let snap = ConfigSnapshot::from_config(&config_with_token);
+        assert!(
+            snap.auth_enabled,
+            "auth_enabled must be true when bearer token is set"
+        );
+
+        let config_without_token = Config {
+            http_bearer_token: None,
+            ..Default::default()
+        };
+        let snap = ConfigSnapshot::from_config(&config_without_token);
+        assert!(
+            !snap.auth_enabled,
+            "auth_enabled must be false when bearer token is None"
+        );
+    }
+
+    #[test]
+    fn e8_config_snapshot_sanitizes_db_url() {
+        let config = Config {
+            database_url: "sqlite:///secret_path?token=abc".into(),
+            ..Default::default()
+        };
+        let snap = ConfigSnapshot::from_config(&config);
+        // raw_database_url should have the full URL
+        assert_eq!(snap.raw_database_url, config.database_url);
+        // sanitized database_url should not expose secrets in common cases
+        assert!(!snap.database_url.is_empty());
+    }
+
+    #[test]
+    fn e8_config_snapshot_transport_mode_derived() {
+        let config = Config::default();
+        let snap = ConfigSnapshot::from_config(&config);
+        let mode = snap.transport_mode();
+        // transport_mode is derived from http_path via TransportBase
+        assert!(
+            matches!(mode, "api" | "mcp" | "custom"),
+            "transport_mode should be api, mcp, or custom, got: {mode}"
+        );
+    }
+
+    // ── E8: assert_screen_truth invariants ───────────────────────────
+
+    #[test]
+    fn e8_truth_assertion_allows_both_zero() {
+        // raw=0, rendered=0 → OK (genuinely empty data)
+        let snap = ScreenDiagnosticSnapshot {
+            screen: "test".into(),
+            scope: "test".into(),
+            query_params: String::new(),
+            raw_count: 0,
+            rendered_count: 0,
+            dropped_count: 0,
+            timestamp_micros: 0,
+            db_url: String::new(),
+            storage_root: String::new(),
+            transport_mode: String::new(),
+            auth_enabled: false,
+        };
+        // Should not panic
+        super::assert_screen_truth(&snap);
+    }
+
+    #[test]
+    fn e8_truth_assertion_allows_raw_gt_zero_with_rendered() {
+        // raw=10, rendered=10 → OK (data shown)
+        let snap = ScreenDiagnosticSnapshot {
+            screen: "test".into(),
+            scope: "test".into(),
+            query_params: String::new(),
+            raw_count: 10,
+            rendered_count: 10,
+            dropped_count: 0,
+            timestamp_micros: 0,
+            db_url: String::new(),
+            storage_root: String::new(),
+            transport_mode: String::new(),
+            auth_enabled: false,
+        };
+        super::assert_screen_truth(&snap);
+    }
+
+    #[test]
+    fn e8_truth_assertion_allows_empty_rendered_with_user_filter() {
+        // raw=10, rendered=0, filter=urgent → OK (user filter explains empty)
+        let snap = ScreenDiagnosticSnapshot {
+            screen: "test".into(),
+            scope: "test".into(),
+            query_params: "filter=urgent".into(),
+            raw_count: 10,
+            rendered_count: 0,
+            dropped_count: 10,
+            timestamp_micros: 0,
+            db_url: String::new(),
+            storage_root: String::new(),
+            transport_mode: String::new(),
+            auth_enabled: false,
+        };
+        super::assert_screen_truth(&snap);
+    }
+
+    #[test]
+    #[should_panic(expected = "truth_assertion")]
+    fn e8_truth_assertion_catches_false_empty() {
+        // raw=10, rendered=0, no filter → PANIC (false-empty state)
+        let snap = ScreenDiagnosticSnapshot {
+            screen: "test".into(),
+            scope: "test".into(),
+            query_params: "filter=all".into(),
+            raw_count: 10,
+            rendered_count: 0,
+            dropped_count: 10,
+            timestamp_micros: 0,
+            db_url: String::new(),
+            storage_root: String::new(),
+            transport_mode: String::new(),
+            auth_enabled: false,
+        };
+        super::assert_screen_truth(&snap);
     }
 }

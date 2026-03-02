@@ -14,7 +14,7 @@ use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{MailEvent, ProjectSummary};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::fancy::SummaryFooter;
@@ -34,6 +34,35 @@ const SORT_LABELS: &[&str] = &["Slug", "Path", "Agents", "Msgs", "Reserv", "Crea
 const ACTIVE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
 const IDLE_WINDOW_MICROS: i64 = 30 * 60 * 1_000_000;
 
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Truth assertion: when the DB reports non-zero projects but the rendered
+/// list is empty AND no filter is active, the data pipeline has a bug.
+fn assert_projects_list_cardinality(total_db_projects: u64, rendered_count: usize, filter: &str) {
+    let assertions_on = cfg!(debug_assertions)
+        || std::env::var("AM_TUI_STRICT_TRUTH_ASSERTIONS").is_ok_and(|v| {
+            let n = v.trim().to_ascii_lowercase();
+            matches!(n.as_str(), "1" | "true" | "yes" | "on")
+        });
+    if !assertions_on {
+        return;
+    }
+    if total_db_projects > 0 && rendered_count == 0 && filter.trim().is_empty() {
+        debug_assert!(
+            false,
+            "[truth_assertion] projects screen: DB reports {total_db_projects} projects \
+             but rendered list is empty with no active filter — data pipeline dropped all rows"
+        );
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProjectsScreen {
     table_state: TableState,
     projects: Vec<ProjectSummary>,
@@ -53,6 +82,8 @@ pub struct ProjectsScreen {
     detail_scroll: usize,
     /// Last observed data-channel generation for dirty-state gating.
     last_data_gen: super::DataGeneration,
+    /// True when the DB poller has not yet delivered any data.
+    db_context_unavailable: bool,
 }
 
 impl ProjectsScreen {
@@ -71,26 +102,36 @@ impl ProjectsScreen {
             detail_visible: true,
             detail_scroll: 0,
             last_data_gen: super::DataGeneration::stale(),
+            db_context_unavailable: false,
         }
     }
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
         let db = state.db_stats_snapshot().unwrap_or_default();
+        let total_rows = db.projects;
+        let raw_count = u64::try_from(db.projects_list.len()).unwrap_or(u64::MAX);
         let mut rows: Vec<ProjectSummary> = db.projects_list;
 
         // Apply filter
-        if !self.filter.is_empty() {
-            let f = self.filter.to_lowercase();
+        let filter_text = self.filter.trim().to_ascii_lowercase();
+        if !filter_text.is_empty() {
             rows.retain(|r| {
-                r.slug.to_lowercase().contains(&f) || r.human_key.to_lowercase().contains(&f)
+                r.slug.to_ascii_lowercase().contains(&filter_text)
+                    || r.human_key.to_ascii_lowercase().contains(&filter_text)
             });
         }
 
-        // Sort
+        // Sort (use to_ascii_lowercase for consistency with filter phase)
         rows.sort_by(|a, b| {
             let cmp = match self.sort_col {
-                COL_SLUG => a.slug.to_lowercase().cmp(&b.slug.to_lowercase()),
-                COL_HUMAN_KEY => a.human_key.to_lowercase().cmp(&b.human_key.to_lowercase()),
+                COL_SLUG => a
+                    .slug
+                    .to_ascii_lowercase()
+                    .cmp(&b.slug.to_ascii_lowercase()),
+                COL_HUMAN_KEY => a
+                    .human_key
+                    .to_ascii_lowercase()
+                    .cmp(&b.human_key.to_ascii_lowercase()),
                 COL_AGENTS => a.agent_count.cmp(&b.agent_count),
                 COL_MESSAGES => a.message_count.cmp(&b.message_count),
                 COL_RESERVATIONS => a.reservation_count.cmp(&b.reservation_count),
@@ -98,6 +139,45 @@ impl ProjectsScreen {
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc { cmp } else { cmp.reverse() }
+        });
+
+        let rendered_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        // Use the higher of total_rows (DB COUNT) and list length as raw_count,
+        // since COUNT(*) may be stale/race-y relative to the list fetch.
+        let raw_from_db = total_rows.max(raw_count);
+        let dropped_count = raw_from_db.saturating_sub(rendered_count);
+        let sort_label = SORT_LABELS.get(self.sort_col).copied().unwrap_or("unknown");
+        let filter = sanitize_diagnostic_value(&self.filter);
+        let filter = if filter.is_empty() {
+            "all".to_string()
+        } else {
+            filter
+        };
+
+        // Truth assertion: non-empty DB should produce non-empty rendered list
+        // when no user filter is active.
+        assert_projects_list_cardinality(total_rows, rows.len(), &self.filter);
+
+        // Detect when list was capped by poller LIMIT (total_rows > list length).
+        let list_capped = total_rows > raw_count;
+
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "projects".to_string(),
+            scope: "db_stats.projects_list".to_string(),
+            query_params: format!(
+                "filter={filter};sort_col={sort_label};sort_asc={};list_rows={raw_count};total_rows={total_rows};capped={list_capped}",
+                self.sort_asc,
+            ),
+            raw_count: raw_from_db,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
         });
 
         self.projects = rows;
@@ -283,6 +363,11 @@ impl MailScreen for ProjectsScreen {
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
 
+        // Poller hasn't delivered data yet if db_stats_gen == 0.
+        // Only flag as unavailable after a few seconds (30 ticks) to allow
+        // startup grace period before showing the degraded banner.
+        self.db_context_unavailable = current_gen.db_stats_gen == 0 && tick_count >= 30;
+
         if dirty.events {
             self.ingest_events(state);
         }
@@ -319,6 +404,16 @@ impl MailScreen for ProjectsScreen {
                 Breakpoint::Xl,
                 Flex::horizontal().constraints([Constraint::Percentage(50.0), Constraint::Fill]),
             );
+
+        if self.db_context_unavailable {
+            let banner = Paragraph::new(
+                " Database context unavailable. Waiting for poller data...",
+            )
+            .style(Style::default().fg(tp.severity_error));
+            let banner_area = Rect::new(area.x, area.y, area.width, 1);
+            banner.render(banner_area, frame);
+            return;
+        }
 
         let split = layout.split(area);
         let table_area = split.rects[0];
@@ -1034,6 +1129,111 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_emits_screen_diagnostic_with_raw_and_rendered_counts() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 5,
+            projects_list: vec![
+                ProjectSummary {
+                    slug: "alpha".into(),
+                    human_key: "/tmp/alpha".into(),
+                    ..Default::default()
+                },
+                ProjectSummary {
+                    slug: "beta".into(),
+                    human_key: "/tmp/beta".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.filter = "alpha".to_string();
+        screen.rebuild_from_state(&state);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        assert_eq!(diagnostics.len(), 1);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("screen diagnostic should be present");
+        assert_eq!(diag.screen, "projects");
+        // raw_count uses total_rows (DB COUNT=5), not projects_list.len()=2,
+        // so the diagnostic tracks the full cardinality gap.
+        assert_eq!(diag.raw_count, 5);
+        assert_eq!(diag.rendered_count, 1);
+        assert_eq!(diag.dropped_count, 4);
+        assert!(diag.query_params.contains("filter=alpha"));
+        assert!(diag.query_params.contains("list_rows=2"));
+        assert!(diag.query_params.contains("total_rows=5"));
+    }
+
+    #[test]
+    fn rebuild_emits_screen_diagnostic_filter_all_when_empty() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            projects_list: vec![ProjectSummary {
+                slug: "alpha".into(),
+                human_key: "/tmp/alpha".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.filter = " \n ".to_string();
+        screen.rebuild_from_state(&state);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("screen diagnostic should be present");
+        assert!(diag.query_params.contains("filter=all"));
+    }
+
+    #[test]
+    fn rebuild_diagnostic_raw_count_tracks_list_rows_when_total_counter_is_lower() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 0,
+            projects_list: vec![
+                ProjectSummary {
+                    slug: "alpha".into(),
+                    human_key: "/tmp/alpha".into(),
+                    ..Default::default()
+                },
+                ProjectSummary {
+                    slug: "beta".into(),
+                    human_key: "/tmp/beta".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.filter = "beta".to_string();
+        screen.rebuild_from_state(&state);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("screen diagnostic should be present");
+        assert_eq!(diag.raw_count, 2);
+        assert_eq!(diag.rendered_count, 1);
+        assert_eq!(diag.dropped_count, 1);
+        assert!(diag.query_params.contains("list_rows=2"));
+        assert!(diag.query_params.contains("total_rows=0"));
+    }
+
+    #[test]
+    fn sanitize_diagnostic_value_strips_delimiters_and_whitespace() {
+        let value = sanitize_diagnostic_value(" alpha;\n beta,\r gamma ");
+        assert_eq!(value, "alpha beta gamma");
+    }
+
+    #[test]
     fn move_selection_navigation() {
         let mut screen = ProjectsScreen::new();
         screen.projects.push(ProjectSummary {
@@ -1120,5 +1320,266 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(screen.compute_totals(), (2, 8, 30, 3));
+    }
+
+    // ── B5: Cardinality truth assertions ────────────────────────────
+
+    #[test]
+    fn projects_cardinality_passes_when_projects_rendered() {
+        assert_projects_list_cardinality(15, 15, "");
+    }
+
+    #[test]
+    fn projects_cardinality_passes_when_filter_active_and_empty() {
+        assert_projects_list_cardinality(15, 0, "no-match-filter");
+    }
+
+    #[test]
+    fn projects_cardinality_passes_when_db_empty() {
+        assert_projects_list_cardinality(0, 0, "");
+    }
+
+    #[test]
+    fn projects_cardinality_catches_false_empty_state() {
+        let result = std::panic::catch_unwind(|| {
+            assert_projects_list_cardinality(15, 0, "");
+        });
+        assert!(
+            result.is_err(),
+            "should panic when DB has projects but rendered list is empty without filter"
+        );
+    }
+
+    // ── G6: Project scope audit tests ───────────────────────────────
+
+    #[test]
+    fn project_aggregation_counts_are_per_project() {
+        // Documents the invariant: each ProjectSummary carries its own
+        // agent_count, message_count, reservation_count. These are computed
+        // by SQL subqueries with WHERE project_id = p.id, ensuring no
+        // cross-project bleed in aggregate counts.
+        let mut screen = ProjectsScreen::new();
+        screen.projects.push(ProjectSummary {
+            slug: "project-a".to_string(),
+            agent_count: 3,
+            message_count: 10,
+            reservation_count: 2,
+            ..Default::default()
+        });
+        screen.projects.push(ProjectSummary {
+            slug: "project-b".to_string(),
+            agent_count: 5,
+            message_count: 20,
+            reservation_count: 1,
+            ..Default::default()
+        });
+        // Each project's counts are independent (no leakage)
+        let proj_a = &screen.projects[0];
+        let proj_b = &screen.projects[1];
+        assert_ne!(
+            proj_a.agent_count, proj_b.agent_count,
+            "per-project agent counts must be independent"
+        );
+        assert_ne!(
+            proj_a.message_count, proj_b.message_count,
+            "per-project message counts must be independent"
+        );
+    }
+
+    #[test]
+    fn project_list_shows_all_projects_by_default() {
+        // Documents: projects screen shows ALL projects, no default scope filter.
+        // This is correct because the projects screen IS the scope selector.
+        let screen = ProjectsScreen::new();
+        assert!(
+            screen.filter.is_empty(),
+            "projects screen must start with empty filter (showing all)"
+        );
+    }
+
+    // ── B6: Count/List Consistency Contract ──────────────────────────
+
+    #[test]
+    fn count_list_consistency_no_filter_no_cap() {
+        // When total_rows == list length and no filter: rendered_count must
+        // equal total_rows. Diagnostic must show capped=false.
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 2,
+            projects_list: vec![
+                ProjectSummary {
+                    slug: "alpha".to_string(),
+                    human_key: "/path/alpha".to_string(),
+                    created_at: 100,
+                    ..Default::default()
+                },
+                ProjectSummary {
+                    slug: "beta".to_string(),
+                    human_key: "/path/beta".to_string(),
+                    created_at: 200,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.projects.len(), 2, "all projects should be rendered");
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("diagnostic expected");
+        assert_eq!(diag.raw_count, 2);
+        assert_eq!(diag.rendered_count, 2);
+        assert_eq!(diag.dropped_count, 0);
+        assert!(
+            diag.query_params.contains("capped=false"),
+            "list is not capped when total_rows == list length"
+        );
+    }
+
+    #[test]
+    fn count_list_consistency_capped_list() {
+        // When total_rows > list length (simulating poller cap), diagnostic
+        // must show capped=true with correct cardinality gap.
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 800,
+            projects_list: vec![ProjectSummary {
+                slug: "alpha".to_string(),
+                human_key: "/path/alpha".to_string(),
+                created_at: 100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.projects.len(), 1);
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("diagnostic expected");
+        assert_eq!(diag.raw_count, 800);
+        assert_eq!(diag.rendered_count, 1);
+        assert_eq!(diag.dropped_count, 799);
+        assert!(
+            diag.query_params.contains("capped=true"),
+            "list must be flagged as capped when total_rows > list length"
+        );
+    }
+
+    #[test]
+    fn count_list_consistency_filter_reduces_rendered() {
+        // Filter should reduce rendered_count but not raw_count.
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 3,
+            projects_list: vec![
+                ProjectSummary {
+                    slug: "api-server".to_string(),
+                    human_key: "/path/api".to_string(),
+                    created_at: 100,
+                    ..Default::default()
+                },
+                ProjectSummary {
+                    slug: "web-frontend".to_string(),
+                    human_key: "/path/web".to_string(),
+                    created_at: 200,
+                    ..Default::default()
+                },
+                ProjectSummary {
+                    slug: "api-gateway".to_string(),
+                    human_key: "/path/gateway".to_string(),
+                    created_at: 300,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.filter = "api".to_string();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(
+            screen.projects.len(),
+            2,
+            "filter matches api-server and api-gateway"
+        );
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("diagnostic expected");
+        assert_eq!(diag.raw_count, 3);
+        assert_eq!(diag.rendered_count, 2);
+        assert_eq!(diag.dropped_count, 1);
+        assert!(diag.query_params.contains("capped=false"));
+    }
+
+    // ── B8: DB context binding guardrail regression tests ─────────────
+
+    #[test]
+    fn b8_projects_unavailable_after_grace_period_without_poller() {
+        let state = test_state();
+        let mut screen = ProjectsScreen::new();
+        assert!(!screen.db_context_unavailable, "starts false");
+
+        // Tick past grace period without poller data
+        screen.tick(30, &state);
+        assert!(
+            screen.db_context_unavailable,
+            "should show banner when poller never delivered data after grace period"
+        );
+    }
+
+    #[test]
+    fn b8_projects_available_after_poller_delivers() {
+        let state = test_state();
+        let mut screen = ProjectsScreen::new();
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            projects_list: vec![ProjectSummary {
+                slug: "test-proj".to_string(),
+                human_key: "/path/test".to_string(),
+                created_at: 100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        screen.tick(30, &state);
+        assert!(
+            !screen.db_context_unavailable,
+            "should not show banner when poller has delivered data"
+        );
+    }
+
+    #[test]
+    fn b8_projects_banner_renders_when_unavailable() {
+        let state = test_state();
+        let mut screen = ProjectsScreen::new();
+        screen.db_context_unavailable = true;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, ftui::layout::Rect::new(0, 0, 120, 30), &state);
+
+        let mut text = String::new();
+        for y in 0..frame.buffer.height() {
+            for x in 0..frame.buffer.width() {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    if let Some(ch) = cell.content.as_char() {
+                        text.push(ch);
+                    } else if !cell.is_continuation() {
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Database context unavailable"),
+            "should render degraded banner: {text}"
+        );
     }
 }

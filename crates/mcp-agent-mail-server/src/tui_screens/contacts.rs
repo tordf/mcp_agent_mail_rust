@@ -21,7 +21,7 @@ use ftui_runtime::program::Cmd;
 use ftui::PackedRgba;
 
 use crate::tui_action_menu::{ActionEntry, contacts_actions};
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{ContactSummary, MailEvent};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::fancy::SummaryFooter;
@@ -38,6 +38,14 @@ const COL_UPDATED: usize = 4;
 const SORT_LABELS: &[&str] = &["From", "To", "Status", "Reason", "Updated"];
 const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
 const GRAPH_EVENTS_WINDOW: usize = 512;
+
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 const GRAPH_MIN_WIDTH: u16 = 60;
 const GRAPH_MIN_HEIGHT: u16 = 10;
 
@@ -149,6 +157,8 @@ pub struct ContactsScreen {
     detail_scroll: usize,
     /// Last observed data generation for dirty-state tracking.
     last_data_gen: super::DataGeneration,
+    /// True when the DB poller has not yet delivered any data.
+    db_context_unavailable: bool,
 }
 
 impl ContactsScreen {
@@ -172,11 +182,13 @@ impl ContactsScreen {
             detail_visible: true,
             detail_scroll: 0,
             last_data_gen: super::DataGeneration::stale(),
+            db_context_unavailable: false,
         }
     }
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
         let db = state.db_stats_snapshot().unwrap_or_default();
+        let total_rows = u64::try_from(db.contacts_list.len()).unwrap_or(u64::MAX);
         let mut rows: Vec<ContactSummary> = db.contacts_list;
 
         // Apply status filter
@@ -208,6 +220,36 @@ impl ContactsScreen {
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc { cmp } else { cmp.reverse() }
+        });
+
+        let rendered_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        let dropped_count = total_rows.saturating_sub(rendered_count);
+        let sort_label = SORT_LABELS.get(self.sort_col).copied().unwrap_or("unknown");
+        let filter = sanitize_diagnostic_value(&self.filter);
+        let filter = if filter.is_empty() {
+            "all".to_string()
+        } else {
+            filter
+        };
+
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "contacts".to_string(),
+            scope: "db_stats.contacts_list".to_string(),
+            query_params: format!(
+                "filter={filter};status_filter={};sort_col={sort_label};sort_asc={};total_rows={total_rows}",
+                self.status_filter.label(),
+                self.sort_asc,
+            ),
+            raw_count: total_rows,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
         });
 
         self.contacts = rows;
@@ -441,9 +483,15 @@ impl MailScreen for ContactsScreen {
     }
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        let current_gen = state.data_generation();
+
+        // Poller hasn't delivered data yet if db_stats_gen == 0.
+        // Only flag as unavailable after a few seconds (30 ticks) to allow
+        // startup grace period before showing the degraded banner.
+        self.db_context_unavailable = current_gen.db_stats_gen == 0 && tick_count >= 30;
+
         // Rebuild every 5 seconds, but only when DB stats actually changed.
         if tick_count.is_multiple_of(50) {
-            let current_gen = state.data_generation();
             let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
             if dirty.db_stats {
                 self.prev_contact_counts = self.contact_counts();
@@ -464,6 +512,17 @@ impl MailScreen for ContactsScreen {
         let inner = outer_block.inner(area);
         outer_block.render(area, frame);
         let area = inner;
+
+        if self.db_context_unavailable {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let banner = Paragraph::new(
+                " Database context unavailable. Waiting for poller data...",
+            )
+            .style(Style::default().fg(tp.severity_error));
+            let banner_area = Rect::new(area.x, area.y, area.width, 1);
+            banner.render(banner_area, frame);
+            return;
+        }
 
         let is_table_mode = self.view_mode == ViewMode::Table && !self.show_mermaid_panel;
 
@@ -1792,8 +1851,9 @@ mod tests {
                 "s",
                 "t",
                 "p",
+                "",
             ),
-            MailEvent::message_received(2, "Beta", vec!["Alpha".to_string()], "s", "t", "p"),
+            MailEvent::message_received(2, "Beta", vec!["Alpha".to_string()], "s", "t", "p", ""),
         ];
         let metrics = build_graph_flow_metrics(&contacts, &events);
         assert_eq!(metrics.edge_weight("Alpha", "Beta"), 1);
@@ -1828,6 +1888,7 @@ mod tests {
             "subject",
             "thread",
             "project",
+            "",
         ));
         screen.rebuild_from_state(&state);
         assert!(
@@ -1850,6 +1911,7 @@ mod tests {
             "subject",
             "thread",
             "project",
+            "",
         ));
         screen.rebuild_from_state(&state);
         screen.graph_selected_idx = 0;
@@ -1910,5 +1972,76 @@ mod tests {
             let r = truncate_str(s, max);
             assert!(r.chars().count() <= max.max(3), "max={max}");
         }
+    }
+
+    // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────
+
+    #[test]
+    fn status_filter_next_full_cycle() {
+        let f = StatusFilter::All;
+        let f = f.next();
+        assert_eq!(f, StatusFilter::Pending);
+        let f = f.next();
+        assert_eq!(f, StatusFilter::Approved);
+        let f = f.next();
+        assert_eq!(f, StatusFilter::Blocked);
+        let f = f.next();
+        assert_eq!(f, StatusFilter::All);
+    }
+
+    #[test]
+    fn status_filter_labels() {
+        assert_eq!(StatusFilter::All.label(), "All");
+        assert_eq!(StatusFilter::Pending.label(), "Pending");
+        assert_eq!(StatusFilter::Approved.label(), "Approved");
+        assert_eq!(StatusFilter::Blocked.label(), "Blocked");
+    }
+
+    #[test]
+    fn graph_flow_metrics_empty() {
+        let m = GraphFlowMetrics::default();
+        assert_eq!(m.max_node_total(), 0);
+        assert_eq!(m.max_edge_weight(), 0);
+        assert_eq!(m.node_total("nonexistent"), 0);
+        assert_eq!(m.edge_weight("a", "b"), 0);
+    }
+
+    #[test]
+    fn graph_flow_metrics_max_calculations() {
+        let mut m = GraphFlowMetrics::default();
+        m.node_sent.insert("alpha".into(), 10);
+        m.node_received.insert("alpha".into(), 5);
+        m.node_sent.insert("beta".into(), 3);
+        m.node_received.insert("beta".into(), 20);
+        m.edge_volume
+            .insert(("alpha".into(), "beta".into()), 8);
+        m.edge_volume
+            .insert(("beta".into(), "alpha".into()), 12);
+
+        assert_eq!(m.node_total("alpha"), 15);
+        assert_eq!(m.node_total("beta"), 23);
+        assert_eq!(m.max_node_total(), 23);
+        assert_eq!(m.max_edge_weight(), 12);
+        assert_eq!(m.edge_weight("alpha", "beta"), 8);
+        assert_eq!(m.edge_weight("beta", "alpha"), 12);
+    }
+
+    #[test]
+    fn sanitize_diagnostic_value_strips_separators() {
+        assert_eq!(sanitize_diagnostic_value("a\nb;c,d\re"), "a b c d e");
+        assert_eq!(sanitize_diagnostic_value("   "), "");
+    }
+
+    #[test]
+    fn view_mode_is_table_by_default() {
+        let screen = ContactsScreen::new();
+        assert_eq!(screen.view_mode, ViewMode::Table);
+    }
+
+    #[test]
+    fn status_filter_matches_case_sensitive() {
+        assert!(!StatusFilter::Pending.matches("Pending"));
+        assert!(!StatusFilter::Approved.matches("APPROVED"));
+        assert!(!StatusFilter::Blocked.matches("BLOCKED"));
     }
 }

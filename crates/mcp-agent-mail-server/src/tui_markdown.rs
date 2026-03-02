@@ -59,6 +59,114 @@ pub fn render_body_streaming(body: &str, theme: &MarkdownTheme) -> Text<'static>
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Canonical Message-Body Rendering Contract (C1 / br-2k3qx.3.1)
+// ──────────────────────────────────────────────────────────────────────
+//
+// All TUI surfaces that display message body content MUST use these
+// functions to ensure consistent markdown detection, JSON wrapping,
+// empty-body handling, sanitization, and truth-assertion semantics.
+
+/// Maximum body preview length (characters) for list views and dashboards.
+pub const BODY_PREVIEW_MAX_CHARS: usize = 200;
+
+/// Render a message body through the canonical pipeline:
+/// 1. Empty → returns `None` (caller decides placeholder)
+/// 2. JSON auto-detection → wraps in json code fence
+/// 3. Sanitize → strip scripts/style, limit URL schemes
+/// 4. Markdown auto-detect → full GFM or plain text rendering
+///
+/// Returns `None` when the body is empty/whitespace-only. The caller
+/// should render a placeholder like "(empty body)" in hint style.
+#[must_use]
+pub fn render_message_body(body_md: &str, theme: &MarkdownTheme) -> Option<Text<'static>> {
+    if body_md.trim().is_empty() {
+        return None;
+    }
+    let prepared = prepare_body_for_render(body_md);
+    Some(render_body(&prepared, theme))
+}
+
+/// Render a truncated plain-text preview of a message body.
+///
+/// Useful for list views, dashboard previews, and table cells where
+/// full markdown rendering is too expensive or visually noisy.
+/// Returns `None` when the body is empty/whitespace-only.
+#[must_use]
+pub fn render_message_body_preview(body_md: &str, max_chars: usize) -> Option<String> {
+    if body_md.trim().is_empty() {
+        return None;
+    }
+    // Strip markdown syntax for preview: render then extract plain text.
+    let theme = MarkdownTheme::default();
+    let rendered = render_body(body_md, &theme);
+    let plain = rendered
+        .lines()
+        .iter()
+        .map(|line| {
+            line.spans()
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(truncate_str(&trimmed, max_chars))
+}
+
+/// Render a message body as a blockquote preview (dashboard style).
+///
+/// Wraps the body excerpt in `> ` blockquote markers before rendering,
+/// suitable for "recent message" preview cards.
+/// Returns `None` when the body is empty/whitespace-only.
+#[must_use]
+pub fn render_message_body_blockquote(
+    body_excerpt: &str,
+    theme: &MarkdownTheme,
+) -> Option<Text<'static>> {
+    if body_excerpt.trim().is_empty() {
+        return None;
+    }
+    let quoted = format!("> {}", body_excerpt.replace('\n', "\n> "));
+    Some(render_body(&quoted, theme))
+}
+
+/// Detect if a body string looks like raw JSON (object or array).
+///
+/// Returns `true` when the trimmed body starts with `{` or `[` and is
+/// NOT already wrapped in a code fence. Used to auto-wrap JSON payloads
+/// in json code fences for syntax highlighting.
+#[must_use]
+pub fn looks_like_json(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    (trimmed.starts_with('{') || trimmed.starts_with('[')) && !trimmed.starts_with("```")
+}
+
+/// Prepare body for rendering: apply JSON auto-wrapping if needed.
+///
+/// This is the shared pre-processing step before `render_body()`.
+#[must_use]
+fn prepare_body_for_render(body_md: &str) -> String {
+    if looks_like_json(body_md) {
+        format!("```json\n{}\n```", body_md.trim_end())
+    } else {
+        body_md.to_string()
+    }
+}
+
+/// Truncate a string to at most `max_chars` characters, appending "..."
+/// if truncation occurred.
+#[must_use]
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{truncated}...")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
@@ -614,6 +722,74 @@ Thanks!";
                 min_height: 3,
                 required_fragments: &["parent", "child", "grandchild"],
             },
+            // C5: Additional fidelity snapshots for full GFM coverage.
+            Case {
+                scenario_id: "gfm_table",
+                markdown: "| Col A | Col B |\n|-------|-------|\n| val1  | val2  |",
+                min_height: 2,
+                required_fragments: &["Col A", "Col B", "val1", "val2"],
+            },
+            Case {
+                scenario_id: "link_inline",
+                markdown: "Visit [Docs](https://example.com) for details.",
+                min_height: 1,
+                required_fragments: &["Visit", "Docs", "details"],
+            },
+            Case {
+                scenario_id: "blockquote_nested",
+                markdown: "> outer\n>> inner\n\nafter",
+                min_height: 2,
+                required_fragments: &["outer", "inner", "after"],
+            },
+            Case {
+                scenario_id: "task_list",
+                markdown: "- [x] done\n- [ ] pending\n- [x] also done",
+                min_height: 3,
+                required_fragments: &["done", "pending", "also done"],
+            },
+            Case {
+                scenario_id: "italic_and_bold",
+                markdown: "*italic* and **bold** and ***both***",
+                min_height: 1,
+                required_fragments: &["italic", "bold", "both"],
+            },
+            Case {
+                scenario_id: "inline_code",
+                markdown: "Run `cargo test` to verify the build.",
+                min_height: 1,
+                required_fragments: &["Run", "cargo test", "verify"],
+            },
+            Case {
+                scenario_id: "ordered_list",
+                markdown: "1. first\n2. second\n3. third",
+                min_height: 3,
+                required_fragments: &["first", "second", "third"],
+            },
+            Case {
+                scenario_id: "strikethrough",
+                markdown: "~~removed~~ kept",
+                min_height: 1,
+                required_fragments: &["removed", "kept"],
+            },
+            Case {
+                scenario_id: "thematic_break",
+                markdown: "above\n\n---\n\nbelow",
+                min_height: 2,
+                required_fragments: &["above", "below"],
+            },
+            Case {
+                scenario_id: "mixed_realistic_message",
+                markdown: "## Status Update\n\n**Build passed.** See the [report](https://ci.example.com).\n\n- Test coverage: 95%\n- Lint: clean\n\n```\ncargo test --all\n```\n\n> Review notes: LGTM",
+                min_height: 5,
+                required_fragments: &[
+                    "Status Update",
+                    "Build passed",
+                    "report",
+                    "coverage",
+                    "cargo test",
+                    "LGTM",
+                ],
+            },
         ];
 
         for case in cases {
@@ -700,5 +876,492 @@ Thanks!";
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // ── Canonical Message-Body Contract Tests (C1 / br-2k3qx.3.1) ──
+
+    #[test]
+    fn render_message_body_returns_none_for_empty() {
+        assert!(render_message_body("", &theme()).is_none());
+        assert!(render_message_body("   ", &theme()).is_none());
+        assert!(render_message_body("\n\n", &theme()).is_none());
+    }
+
+    #[test]
+    fn render_message_body_renders_plain_text() {
+        let result = render_message_body("Hello, world!", &theme());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        let rendered = text_to_string(&text);
+        assert!(rendered.contains("Hello, world!"));
+    }
+
+    #[test]
+    fn render_message_body_renders_markdown() {
+        let result = render_message_body("# Title\n\n**bold** text", &theme());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.height() >= 2);
+        let rendered = text_to_string(&text);
+        assert!(rendered.contains("Title"));
+        assert!(rendered.contains("bold"));
+    }
+
+    #[test]
+    fn render_message_body_auto_wraps_json() {
+        let json_body = r#"{"status":"ok","count":42}"#;
+        let result = render_message_body(json_body, &theme());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        let rendered = text_to_string(&text);
+        assert!(
+            rendered.contains("status"),
+            "JSON body should be rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_message_body_auto_wraps_json_array() {
+        let json_body = r#"[{"id":1},{"id":2}]"#;
+        let result = render_message_body(json_body, &theme());
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn render_message_body_does_not_double_wrap_fenced_json() {
+        let fenced = "```json\n{\"ok\":true}\n```";
+        let result = render_message_body(fenced, &theme());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        let rendered = text_to_string(&text);
+        assert!(rendered.contains("ok"));
+    }
+
+    #[test]
+    fn render_message_body_preview_returns_none_for_empty() {
+        assert!(render_message_body_preview("", 200).is_none());
+        assert!(render_message_body_preview("  \n  ", 200).is_none());
+    }
+
+    #[test]
+    fn render_message_body_preview_truncates_long_body() {
+        let long_body = "word ".repeat(100);
+        let preview = render_message_body_preview(&long_body, 50).unwrap();
+        assert!(preview.len() <= 50, "preview should be at most 50 chars");
+        assert!(
+            preview.ends_with("..."),
+            "truncated preview should end with ..."
+        );
+    }
+
+    #[test]
+    fn render_message_body_preview_preserves_short_body() {
+        let short = "Hello there!";
+        let preview = render_message_body_preview(short, 200).unwrap();
+        assert_eq!(preview, "Hello there!");
+    }
+
+    #[test]
+    fn render_message_body_preview_strips_markdown() {
+        let md = "# Title\n\n**bold** text";
+        let preview = render_message_body_preview(md, 200).unwrap();
+        // Preview should be plain text, not raw markdown
+        assert!(!preview.contains('#'));
+        assert!(!preview.contains("**"));
+        assert!(preview.contains("Title"));
+        assert!(preview.contains("bold"));
+    }
+
+    #[test]
+    fn render_message_body_blockquote_returns_none_for_empty() {
+        assert!(render_message_body_blockquote("", &theme()).is_none());
+        assert!(render_message_body_blockquote("   ", &theme()).is_none());
+    }
+
+    #[test]
+    fn render_message_body_blockquote_wraps_content() {
+        let body = "Hello\nWorld";
+        let result = render_message_body_blockquote(body, &theme());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.height() >= 1);
+    }
+
+    #[test]
+    fn looks_like_json_detects_objects() {
+        assert!(looks_like_json(r#"{"key":"value"}"#));
+        assert!(looks_like_json(r#"  {"key":"value"}"#));
+    }
+
+    #[test]
+    fn looks_like_json_detects_arrays() {
+        assert!(looks_like_json("[1,2,3]"));
+        assert!(looks_like_json("  [1,2,3]"));
+    }
+
+    #[test]
+    fn looks_like_json_rejects_non_json() {
+        assert!(!looks_like_json("# heading"));
+        assert!(!looks_like_json("plain text"));
+        assert!(!looks_like_json("- list item"));
+    }
+
+    #[test]
+    fn looks_like_json_rejects_already_fenced() {
+        assert!(!looks_like_json("```json\n{}\n```"));
+    }
+
+    #[test]
+    fn truncate_str_preserves_short_strings() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_truncates_long_strings() {
+        let result = truncate_str("hello world foo bar", 10);
+        assert!(result.len() <= 10);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn render_message_body_sanitizes_hostile_content() {
+        let hostile = "<script>alert('xss')</script>Safe content";
+        let result = render_message_body(hostile, &theme());
+        assert!(result.is_some());
+        let rendered = text_to_string(&result.unwrap());
+        assert!(!rendered.to_lowercase().contains("script"));
+        assert!(rendered.contains("Safe content"));
+    }
+
+    #[test]
+    fn render_message_body_handles_large_body() {
+        let large = "x\n".repeat(5000);
+        let result = render_message_body(&large, &theme());
+        assert!(result.is_some());
+        assert!(result.unwrap().height() >= 1000);
+    }
+
+    #[test]
+    fn body_preview_max_chars_constant() {
+        assert_eq!(BODY_PREVIEW_MAX_CHARS, 200);
+    }
+
+    // ── C5: Markdown fidelity regression fixtures ─────────────────
+
+    /// Verify render_message_body preserves GFM table structure.
+    #[test]
+    fn c5_message_body_table_fidelity() {
+        let md = "| Agent | Status |\n|-------|--------|\n| Blue  | Ready  |\n| Red   | Busy   |";
+        let result = render_message_body(md, &theme());
+        assert!(result.is_some(), "table body must render");
+        let text = text_to_string(&result.unwrap());
+        assert!(text.contains("Blue"), "table cell content preserved");
+        assert!(text.contains("Ready"), "table cell content preserved");
+        assert!(text.contains("Red"), "table cell content preserved");
+    }
+
+    /// Verify render_message_body preserves links and their text.
+    #[test]
+    fn c5_message_body_link_fidelity() {
+        let md = "See the [deployment guide](https://example.com/deploy) for steps.";
+        let result = render_message_body(md, &theme());
+        assert!(result.is_some());
+        let text = text_to_string(&result.unwrap());
+        assert!(text.contains("deployment guide"), "link text preserved");
+        assert!(text.contains("steps"), "surrounding text preserved");
+    }
+
+    /// Verify render_message_body preserves blockquote content.
+    #[test]
+    fn c5_message_body_blockquote_fidelity() {
+        let md = "> Important: the migration is scheduled for midnight.";
+        let result = render_message_body(md, &theme());
+        assert!(result.is_some());
+        let text = text_to_string(&result.unwrap());
+        assert!(text.contains("Important"), "blockquote content preserved");
+        assert!(text.contains("midnight"), "blockquote content preserved");
+    }
+
+    /// Verify render_message_body preserves task list items.
+    #[test]
+    fn c5_message_body_task_list_fidelity() {
+        let md = "- [x] Tests pass\n- [ ] Deploy to staging\n- [ ] Monitor metrics";
+        let result = render_message_body(md, &theme());
+        assert!(result.is_some());
+        let text = text_to_string(&result.unwrap());
+        assert!(text.contains("Tests pass"), "checked task preserved");
+        assert!(
+            text.contains("Deploy to staging"),
+            "unchecked task preserved"
+        );
+        assert!(text.contains("Monitor metrics"), "unchecked task preserved");
+    }
+
+    /// Verify render_message_body_preview strips markdown but keeps content.
+    #[test]
+    fn c5_preview_strips_formatting_preserves_content() {
+        let md = "## Update\n\n**Build** is `green`. See [CI](https://ci.example.com).";
+        let preview = render_message_body_preview(md, 200);
+        assert!(preview.is_some());
+        let text = preview.unwrap();
+        assert!(text.contains("Update"), "heading text preserved in preview");
+        assert!(text.contains("Build"), "bold text preserved in preview");
+        assert!(text.contains("green"), "code text preserved in preview");
+        assert!(
+            !text.contains("**"),
+            "markdown syntax stripped from preview"
+        );
+        assert!(!text.contains("##"), "heading syntax stripped from preview");
+    }
+
+    /// Verify render_message_body_blockquote wraps multi-line content correctly.
+    #[test]
+    fn c5_blockquote_multiline_fidelity() {
+        let body = "Line one\nLine two\nLine three";
+        let result = render_message_body_blockquote(body, &theme());
+        assert!(result.is_some());
+        let text = text_to_string(&result.unwrap());
+        assert!(text.contains("Line one"), "first line in blockquote");
+        assert!(text.contains("Line three"), "last line in blockquote");
+    }
+
+    /// Verify sanitization strips script but preserves surrounding content
+    /// through the full render_message_body pipeline.
+    #[test]
+    fn c5_sanitization_preserves_surrounding_content() {
+        let md = "Before\n\n<script>evil()</script>\n\nMiddle\n\n<img onerror=x src=y>\n\nAfter";
+        let result = render_message_body(md, &theme());
+        assert!(result.is_some());
+        let text = text_to_string(&result.unwrap());
+        assert!(
+            text.contains("Before"),
+            "content before hostile tag preserved"
+        );
+        assert!(
+            text.contains("Middle"),
+            "content between hostile tags preserved"
+        );
+        assert!(
+            text.contains("After"),
+            "content after hostile tag preserved"
+        );
+        assert!(!text.contains("evil"), "script content removed");
+        assert!(!text.contains("onerror"), "event handler removed");
+    }
+
+    /// Deterministic rendering: same input always produces identical output.
+    #[test]
+    fn c5_deterministic_rendering_contract() {
+        let md = "## Report\n\n- item 1\n- item 2\n\n```\ncode\n```\n\n> quote";
+        let t = theme();
+        let r1 = render_message_body(md, &t).unwrap();
+        let r2 = render_message_body(md, &t).unwrap();
+        let s1 = canonical_text(&r1);
+        let s2 = canonical_text(&r2);
+        assert_eq!(s1, s2, "same input must produce identical output");
+    }
+
+    // ── C5: Canonical Pipeline Regression Matrix (br-2k3qx.3.5) ──
+
+    /// Comprehensive regression matrix exercising `render_message_body()` (the
+    /// canonical pipeline with JSON detection) across all GFM element types.
+    #[test]
+    fn c5_canonical_pipeline_regression_matrix() {
+        struct Case {
+            id: &'static str,
+            body_md: &'static str,
+            min_height: usize,
+            must_contain: &'static [&'static str],
+            must_not_contain: &'static [&'static str],
+        }
+
+        let t = theme();
+        let cases = [
+            Case {
+                id: "heading_h1",
+                body_md: "# Main Title",
+                min_height: 1,
+                must_contain: &["Main Title"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "bold_italic_mixed",
+                body_md: "Normal **bold** *italic* ***both*** `code`",
+                min_height: 1,
+                must_contain: &["Normal", "bold", "italic", "both", "code"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "unordered_list",
+                body_md: "- apple\n- banana\n- cherry",
+                min_height: 3,
+                must_contain: &["apple", "banana", "cherry"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "ordered_list",
+                body_md: "1. first\n2. second\n3. third",
+                min_height: 3,
+                must_contain: &["first", "second", "third"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "gfm_table",
+                body_md: "| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |",
+                min_height: 2,
+                must_contain: &["Name", "Age", "Alice", "Bob"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "code_fence_rust",
+                body_md: "```rust\nfn main() {\n    println!(\"hello\");\n}\n```",
+                min_height: 1,
+                must_contain: &["fn main", "println"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "link_inline",
+                body_md: "See [docs](https://example.com) for info.",
+                min_height: 1,
+                must_contain: &["See", "docs", "info"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "blockquote",
+                body_md: "> Important note\n> Second line",
+                min_height: 1,
+                must_contain: &["Important note"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "task_list",
+                body_md: "- [x] completed\n- [ ] pending",
+                min_height: 2,
+                must_contain: &["completed", "pending"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "strikethrough",
+                body_md: "~~old~~ new",
+                min_height: 1,
+                must_contain: &["old", "new"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "json_auto_wrapped",
+                body_md: "{\"status\":\"ok\",\"count\":42}",
+                min_height: 1,
+                must_contain: &["status", "ok", "count"],
+                must_not_contain: &[],
+            },
+            Case {
+                id: "sanitized_html",
+                body_md: "Safe <script>alert('xss')</script> text",
+                min_height: 1,
+                must_contain: &["Safe", "text"],
+                must_not_contain: &["alert", "script"],
+            },
+            Case {
+                id: "mixed_agent_message",
+                body_md: "## Build Report\n\n**Status:** passing\n\n- Tests: 42/42\n- Coverage: 95%\n\n```\ncargo test --all\n```\n\n> LGTM — ready to merge",
+                min_height: 5,
+                must_contain: &[
+                    "Build Report",
+                    "passing",
+                    "42/42",
+                    "Coverage",
+                    "cargo test",
+                    "LGTM",
+                ],
+                must_not_contain: &[],
+            },
+        ];
+
+        for case in cases {
+            let result = render_message_body(case.body_md, &t);
+            assert!(
+                result.is_some(),
+                "C5 {}: render_message_body returned None for non-empty input",
+                case.id
+            );
+            let text = result.unwrap();
+            assert!(
+                text.height() >= case.min_height,
+                "C5 {}: expected height >= {}, got {}",
+                case.id,
+                case.min_height,
+                text.height()
+            );
+            let plain = canonical_text(&text);
+            for frag in case.must_contain {
+                assert!(
+                    plain.contains(frag),
+                    "C5 {}: missing required fragment {:?} in: {}",
+                    case.id,
+                    frag,
+                    plain
+                );
+            }
+            for frag in case.must_not_contain {
+                assert!(
+                    !plain.contains(frag),
+                    "C5 {}: found prohibited fragment {:?} in: {}",
+                    case.id,
+                    frag,
+                    plain
+                );
+            }
+            // Determinism check
+            let r2 = render_message_body(case.body_md, &t).unwrap();
+            assert_eq!(
+                canonical_text(&text),
+                canonical_text(&r2),
+                "C5 {}: rendering must be deterministic",
+                case.id
+            );
+        }
+    }
+
+    /// Preview regression: canonical previews preserve text content and truncate.
+    #[test]
+    fn c5_preview_regression_fixtures() {
+        let cases = [
+            ("**bold** text", "bold text"),
+            ("# Heading\n\nParagraph", "Heading Paragraph"),
+            ("- item\n- item2", "item item2"),
+            ("> quoted text", "quoted text"),
+        ];
+        for (input, expected_contains) in cases {
+            let preview = render_message_body_preview(input, 200);
+            assert!(preview.is_some(), "preview should not be None for: {input}");
+            let p = preview.unwrap();
+            for word in expected_contains.split_whitespace() {
+                assert!(
+                    p.contains(word),
+                    "preview missing {word:?} for input {input:?}, got: {p}"
+                );
+            }
+        }
+    }
+
+    /// Blockquote regression: canonical blockquote renders body excerpt correctly.
+    #[test]
+    fn c5_blockquote_regression_fixtures() {
+        let t = theme();
+        // Normal text blockquote
+        let result = render_message_body_blockquote("Hello from agent", &t);
+        assert!(result.is_some());
+        let plain = canonical_text(&result.unwrap());
+        assert!(plain.contains("Hello from agent"));
+
+        // JSON body in blockquote gets auto-detected
+        let result = render_message_body_blockquote("{\"key\":\"value\"}", &t);
+        assert!(result.is_some());
+        let plain = canonical_text(&result.unwrap());
+        assert!(plain.contains("key"));
+
+        // Empty body produces no blockquote
+        assert!(render_message_body_blockquote("", &t).is_none());
+        assert!(render_message_body_blockquote("   ", &t).is_none());
     }
 }

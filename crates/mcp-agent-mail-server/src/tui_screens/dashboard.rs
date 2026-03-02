@@ -20,7 +20,7 @@ use ftui_extras::charts::{LineChart, Series};
 use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{
     AgentSummary, ContactSummary, DbStatSnapshot, EventLogEntry, EventSeverity, MailEvent,
     MailEventKind, ProjectSummary, ReservationSnapshot, VerbosityTier, format_event_timestamp,
@@ -280,6 +280,8 @@ pub struct DashboardScreen {
     last_db_reservations: u64,
     /// Whether DB-delta baseline has been initialized.
     db_delta_baseline_ready: bool,
+    /// Last emitted screen-diagnostic signature for deduplicating repeated frames.
+    last_diagnostic_signature: RefCell<Option<String>>,
     /// Last observed data generation for dirty-state tracking.
     last_data_gen: super::DataGeneration,
 }
@@ -298,6 +300,8 @@ struct RecentMessagePreview {
     subject: String,
     thread_id: String,
     project: String,
+    /// Truncated body excerpt (first ~200 chars) for inline preview.
+    body_excerpt: String,
 }
 
 impl RecentMessagePreview {
@@ -310,6 +314,7 @@ impl RecentMessagePreview {
                 subject,
                 thread_id,
                 project,
+                body_excerpt,
                 ..
             } => Some(Self {
                 timestamp_micros: *timestamp_micros,
@@ -320,6 +325,7 @@ impl RecentMessagePreview {
                 subject: subject.clone(),
                 thread_id: thread_id.clone(),
                 project: project.clone(),
+                body_excerpt: body_excerpt.clone(),
             }),
             MailEvent::MessageReceived {
                 timestamp_micros,
@@ -328,6 +334,7 @@ impl RecentMessagePreview {
                 subject,
                 thread_id,
                 project,
+                body_excerpt,
                 ..
             } => Some(Self {
                 timestamp_micros: *timestamp_micros,
@@ -338,6 +345,7 @@ impl RecentMessagePreview {
                 subject: subject.clone(),
                 thread_id: thread_id.clone(),
                 project: project.clone(),
+                body_excerpt: body_excerpt.clone(),
             }),
             _ => None,
         }
@@ -361,7 +369,7 @@ impl RecentMessagePreview {
         };
 
         format!(
-            "### {} Message · {}\n\n**{}**\n\n- **From:** `{}`\n- **To:** `{}`\n- **Thread:** `{}`\n- **Project:** `{}`\n\n_Preview is derived from event metadata; open Messages/Threads for full body._",
+            "### {} Message · {}\n\n**{}**\n\n- **From:** `{}`\n- **To:** `{}`\n- **Thread:** `{}`\n- **Project:** `{}`",
             self.direction, self.timestamp, subject, self.from, self.to, thread, project
         )
     }
@@ -439,6 +447,7 @@ impl DashboardScreen {
             last_db_messages: 0,
             last_db_reservations: 0,
             db_delta_baseline_ready: false,
+            last_diagnostic_signature: RefCell::new(None),
             last_data_gen: super::DataGeneration::stale(),
         }
     }
@@ -483,6 +492,7 @@ impl DashboardScreen {
                         &summary,
                         "db-snapshot",
                         "all-projects",
+                        "",
                     );
                     if let Some(preview) = RecentMessagePreview::from_event(&synthetic) {
                         self.recent_message_preview = Some(preview);
@@ -533,6 +543,7 @@ impl DashboardScreen {
                 &summary,
                 "db-snapshot",
                 "all-projects",
+                "",
             );
             if let Some(preview) = RecentMessagePreview::from_event(&synthetic) {
                 self.recent_message_preview = Some(preview);
@@ -623,6 +634,67 @@ impl DashboardScreen {
 
     fn quick_query(&self) -> &str {
         self.quick_query_input.value().trim()
+    }
+
+    fn emit_screen_diagnostic(&self, state: &TuiSharedState, rendered_count: usize) {
+        let raw_count = u64::try_from(self.event_log.len()).unwrap_or(u64::MAX);
+        let rendered_count = u64::try_from(rendered_count).unwrap_or(u64::MAX);
+        let dropped_count = raw_count.saturating_sub(rendered_count);
+        let query = sanitize_diagnostic_value(self.quick_query());
+        let type_filters = type_filter_signature(&self.type_filter);
+        let user_filter = {
+            let mut active_filters: Vec<String> = Vec::new();
+            if !query.is_empty() {
+                active_filters.push(format!("query:{query}"));
+            }
+            if self.quick_filter != DashboardQuickFilter::All {
+                active_filters.push(format!(
+                    "quick:{}",
+                    self.quick_filter.label().to_ascii_lowercase()
+                ));
+            }
+            if self.verbosity != VerbosityTier::Verbose {
+                active_filters.push(format!(
+                    "verbosity:{}",
+                    self.verbosity.label().to_ascii_lowercase()
+                ));
+            }
+            if type_filters != "none" {
+                active_filters.push(format!("types:{type_filters}"));
+            }
+            if active_filters.is_empty() {
+                "all".to_string()
+            } else {
+                active_filters.join("|")
+            }
+        };
+        let signature = format!(
+            "raw={raw_count};rendered={rendered_count};query={query};filter={user_filter};quick_filter={:?};verbosity={:?};type_filters={type_filters};auto_follow={};scroll_offset={};last_seq={}",
+            self.quick_filter, self.verbosity, self.auto_follow, self.scroll_offset, self.last_seq
+        );
+        {
+            let mut last = self.last_diagnostic_signature.borrow_mut();
+            if last.as_ref().is_some_and(|prev| prev == &signature) {
+                return;
+            }
+            *last = Some(signature.clone());
+        }
+
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "dashboard".to_string(),
+            scope: "event_log.visible_entries".to_string(),
+            query_params: signature,
+            raw_count,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
     }
 
     fn begin_query_edit(&mut self) {
@@ -1098,6 +1170,8 @@ impl MailScreen for DashboardScreen {
         if dirty.events {
             // Ingest new events from ring buffer.
             self.ingest_events(state);
+        }
+        if dirty.events || dirty.db_stats {
             // Synthesize dashboard-friendly deltas from polled DB counters so
             // message/reservation movement remains visible even when no matching
             // domain events were emitted into the ring buffer.
@@ -1186,6 +1260,7 @@ impl MailScreen for DashboardScreen {
         let density = DensityHint::from_terminal_class(tc);
         let effects_enabled = state.config_snapshot().tui_effects;
         let visible_entries = self.visible_entries();
+        self.emit_screen_diagnostic(state, visible_entries.len());
         let quick_query = self.quick_query();
         let preview = if self.quick_filter.includes_messages() {
             self.recent_message_preview
@@ -1453,6 +1528,31 @@ fn parse_query_terms(raw: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(str::to_ascii_lowercase)
         .collect()
+}
+
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if matches!(ch, ';' | ',' | '\n' | '\r') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn type_filter_signature(type_filter: &HashSet<MailEventKind>) -> String {
+    if type_filter.is_empty() {
+        return "none".to_string();
+    }
+    let mut names: Vec<String> = type_filter.iter().map(|kind| format!("{kind:?}")).collect();
+    names.sort_unstable();
+    names.join("|")
 }
 
 fn text_matches_query_terms(haystack: &str, query_terms: &[String]) -> bool {
@@ -1912,8 +2012,8 @@ fn render_lines_with_columns(
 /// Render the dashboard title with optional gradient effect.
 ///
 /// Uses [`StyledText`] with [`TextEffect::HorizontalGradient`] to produce
-/// a smooth color transition from `status_accent` to `severity_ok` across
-/// the title text when effects are enabled. The title is centered within
+/// a smooth color transition from the theme accent to secondary text color
+/// across the title text when effects are enabled. The title is centered within
 /// the given area.
 fn render_gradient_title(frame: &mut Frame<'_>, area: Rect, effects_enabled: bool) {
     use ftui::text::{Line, Span};
@@ -1930,7 +2030,7 @@ fn render_gradient_title(frame: &mut Frame<'_>, area: Rect, effects_enabled: boo
     let title_area = Rect::new(area.x + x_offset, area.y, text_len, 1);
 
     if effects_enabled {
-        let gradient = ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.severity_ok)]);
+        let gradient = ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.text_secondary)]);
         StyledText::new(title_text)
             .effect(TextEffect::HorizontalGradient { gradient })
             .base_color(tp.status_accent)
@@ -5156,7 +5256,16 @@ fn render_recent_message_preview_panel(
         || Text::from("No message traffic yet. Recent sent/received metadata appears here."),
         |preview| {
             let theme = crate::tui_theme::markdown_theme();
-            crate::tui_markdown::render_body(&preview.to_markdown(), &theme)
+            let mut text = crate::tui_markdown::render_body(&preview.to_markdown(), &theme);
+            if let Some(body_text) =
+                crate::tui_markdown::render_message_body_blockquote(&preview.body_excerpt, &theme)
+            {
+                text.push_line(Line::raw(""));
+                for line in body_text.lines() {
+                    text.push_line(line.clone());
+                }
+            }
+            text
         },
     );
 
@@ -5688,6 +5797,133 @@ mod tests {
     }
 
     #[test]
+    fn type_filter_signature_is_sorted_and_stable() {
+        let mut filters = HashSet::new();
+        filters.insert(MailEventKind::ReservationReleased);
+        filters.insert(MailEventKind::MessageSent);
+        assert_eq!(type_filter_signature(&HashSet::new()), "none");
+        assert_eq!(
+            type_filter_signature(&filters),
+            "MessageSent|ReservationReleased"
+        );
+    }
+
+    #[test]
+    fn sanitize_diagnostic_value_strips_delimiters_and_normalizes_whitespace() {
+        let value = sanitize_diagnostic_value(" alpha;\n beta,\r gamma ");
+        assert_eq!(value, "alpha beta gamma");
+    }
+
+    #[test]
+    fn emit_screen_diagnostic_records_and_dedupes_repeated_frames() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = DashboardScreen::new();
+        let event = MailEvent::message_received(
+            1,
+            "alice",
+            vec!["bob".to_string()],
+            "Subject",
+            "thread-1",
+            "project-a",
+            "",
+        );
+        screen.push_event_entry(format_event(&event));
+        screen.last_seq = 1;
+
+        screen.emit_screen_diagnostic(&state, 1);
+        let diagnostics = state.screen_diagnostics_since(0);
+        assert_eq!(diagnostics.len(), 1);
+        let (_, first) = diagnostics.last().expect("dashboard diagnostic");
+        assert_eq!(first.screen, "dashboard");
+        assert_eq!(first.raw_count, 1);
+        assert_eq!(first.rendered_count, 1);
+        assert_eq!(first.dropped_count, 0);
+        assert!(first.query_params.contains("filter=all"));
+        assert!(first.query_params.contains("quick_filter=All"));
+
+        screen.emit_screen_diagnostic(&state, 1);
+        assert_eq!(state.screen_diagnostics_since(0).len(), 1);
+
+        screen.quick_query_input.set_value("alice");
+        screen.emit_screen_diagnostic(&state, 1);
+        assert_eq!(state.screen_diagnostics_since(0).len(), 2);
+    }
+
+    #[test]
+    fn emit_screen_diagnostic_marks_non_default_quick_filter_as_user_filter() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = DashboardScreen::new();
+        let event = MailEvent::tool_call_end(
+            "search_messages",
+            13,
+            Some("ok".to_string()),
+            1,
+            2.5,
+            vec![("messages".to_string(), 1)],
+            Some("project-a".to_string()),
+            Some("agent-a".to_string()),
+        );
+        screen.push_event_entry(format_event(&event));
+        screen.apply_quick_filter(DashboardQuickFilter::Tools);
+
+        screen.emit_screen_diagnostic(&state, 1);
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("dashboard diagnostic");
+        assert!(diag.query_params.contains("quick_filter=Tools"));
+        assert!(diag.query_params.contains("filter=quick:tools"));
+    }
+
+    #[test]
+    fn emit_screen_diagnostic_marks_non_default_verbosity_as_user_filter() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = DashboardScreen::new();
+        let event = MailEvent::message_received(
+            1,
+            "alice",
+            vec!["bob".to_string()],
+            "Subject",
+            "thread-1",
+            "project-a",
+            "",
+        );
+        screen.push_event_entry(format_event(&event));
+        screen.verbosity = VerbosityTier::Minimal;
+
+        screen.emit_screen_diagnostic(&state, 0);
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("dashboard diagnostic");
+        assert!(diag.query_params.contains("verbosity=Minimal"));
+        assert!(diag.query_params.contains("filter=verbosity:minimal"));
+    }
+
+    #[test]
+    fn emit_screen_diagnostic_combines_multiple_active_filter_contexts() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = DashboardScreen::new();
+        let event = MailEvent::message_received(
+            1,
+            "alice",
+            vec!["bob".to_string()],
+            "Subject",
+            "thread-1",
+            "project-a",
+            "",
+        );
+        screen.push_event_entry(format_event(&event));
+        screen.apply_quick_filter(DashboardQuickFilter::Messages);
+        screen.verbosity = VerbosityTier::Minimal;
+        screen.quick_query_input.set_value("alice");
+
+        screen.emit_screen_diagnostic(&state, 0);
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("dashboard diagnostic");
+        assert!(
+            diag.query_params
+                .contains("filter=query:alice|quick:messages|verbosity:minimal")
+        );
+    }
+
+    #[test]
     fn dashboard_shimmer_progress_expires_after_window() {
         let now = 1_700_000_000_000_000_i64;
         assert!(shimmer_progress_for_timestamp(now, now).is_some());
@@ -5753,6 +5989,7 @@ mod tests {
             "Hello world",
             "thread-1",
             "test-project",
+            "",
         );
         let entry = format_event(&event);
         assert!(entry.summary.contains("GoldFox"));
@@ -6064,6 +6301,7 @@ mod tests {
             "Initial update",
             "br-3vwi.6.5",
             "test-project",
+            "Working on the initial update for the feature",
         ));
         screen.ingest_events(&state);
         let first = screen
@@ -6074,6 +6312,10 @@ mod tests {
         assert_eq!(first.from, "GoldFox");
         assert_eq!(first.to, "SilverWolf, RedPine");
         assert_eq!(first.thread_id, "br-3vwi.6.5");
+        assert_eq!(
+            first.body_excerpt,
+            "Working on the initial update for the feature"
+        );
 
         let _ = state.push_event(MailEvent::message_received(
             2,
@@ -6082,6 +6324,7 @@ mod tests {
             "Ack received",
             "br-3vwi.6.5",
             "test-project",
+            "Acknowledged your message",
         ));
         screen.ingest_events(&state);
         let second = screen
@@ -6092,6 +6335,58 @@ mod tests {
         assert_eq!(second.from, "TealBasin");
         assert_eq!(second.to, "GoldFox");
         assert_eq!(second.subject, "Ack received");
+        assert_eq!(second.body_excerpt, "Acknowledged your message");
+    }
+
+    #[test]
+    fn recent_message_preview_body_rendered_via_canonical_blockquote() {
+        let preview = RecentMessagePreview {
+            timestamp_micros: 1_000_000,
+            direction: "Inbound",
+            timestamp: "12:00".to_string(),
+            from: "TestAgent".to_string(),
+            to: "OtherAgent".to_string(),
+            subject: "Test subject".to_string(),
+            thread_id: "t-1".to_string(),
+            project: "proj".to_string(),
+            body_excerpt: "Hello, this is the body content".to_string(),
+        };
+        // Body is no longer in to_markdown(); it's rendered separately via
+        // render_message_body_blockquote() in render_recent_message_preview_panel.
+        let md = preview.to_markdown();
+        assert!(
+            !md.contains("Hello, this is the body content"),
+            "body should not be in metadata markdown (rendered separately), got: {md}"
+        );
+        // Verify the canonical blockquote renders the body
+        let theme = crate::tui_theme::markdown_theme();
+        let blockquote =
+            crate::tui_markdown::render_message_body_blockquote(&preview.body_excerpt, &theme);
+        assert!(
+            blockquote.is_some(),
+            "non-empty body should produce blockquote via canonical renderer"
+        );
+    }
+
+    #[test]
+    fn recent_message_preview_empty_body_produces_no_blockquote() {
+        let preview = RecentMessagePreview {
+            timestamp_micros: 1_000_000,
+            direction: "Outbound",
+            timestamp: "12:00".to_string(),
+            from: "TestAgent".to_string(),
+            to: "OtherAgent".to_string(),
+            subject: "Test subject".to_string(),
+            thread_id: "t-1".to_string(),
+            project: "proj".to_string(),
+            body_excerpt: String::new(),
+        };
+        let theme = crate::tui_theme::markdown_theme();
+        assert!(
+            crate::tui_markdown::render_message_body_blockquote(&preview.body_excerpt, &theme)
+                .is_none(),
+            "empty body should not produce blockquote via canonical renderer"
+        );
     }
 
     #[test]
@@ -6105,6 +6400,7 @@ mod tests {
             subject: "Status update".to_string(),
             thread_id: "br-3vwi.6.5".to_string(),
             project: "data-projects-mcp-agent-mail-rust".to_string(),
+            body_excerpt: "Shipped diagnostics updates".to_string(),
         };
 
         let md = preview.to_markdown();
@@ -6135,6 +6431,7 @@ mod tests {
             subject: "S".to_string(),
             thread_id: "t".to_string(),
             project: "p".to_string(),
+            body_excerpt: "body".to_string(),
         };
         assert!(stale.is_stale());
     }
@@ -7273,6 +7570,7 @@ mod tests {
             "Hello",
             "t",
             "p",
+            "",
         );
         let entry = format_event(&event);
         // 3 recipients -> should use "+N" format
@@ -7332,6 +7630,7 @@ mod tests {
             "Status update",
             "thread-1",
             "proj",
+            "",
         );
         let entry = format_event(&event);
         assert!(entry.summary.contains("#99"));
@@ -7749,5 +8048,71 @@ mod tests {
         let (start, end) = event_log_window_bounds(1_000, 300, 10);
         assert_eq!(end, 700);
         assert_eq!(start, 660);
+    }
+
+    // ── E2: Body Rendering Regression (br-2k3qx.5.2) ──
+
+    /// E2: Verify dashboard preview renders actual body content, not placeholders.
+    #[test]
+    fn e2_dashboard_preview_renders_real_body_not_placeholder() {
+        let theme = crate::tui_theme::markdown_theme();
+        let bodies = [
+            "Fixed the race condition in the worker pool",
+            "## Status\n\n- All tests passing\n- Coverage at 95%",
+            "{\"build\":\"ok\",\"tests\":42}",
+        ];
+        let placeholders = ["(empty body)", "(empty)", "no body", "message body unavailable"];
+
+        for body in bodies {
+            let blockquote = crate::tui_markdown::render_message_body_blockquote(body, &theme);
+            assert!(
+                blockquote.is_some(),
+                "E2: non-empty body {body:?} must produce blockquote"
+            );
+            let rendered = blockquote.unwrap();
+            let plain: String = rendered
+                .lines()
+                .iter()
+                .flat_map(|l| l.spans().iter().map(|s| s.content.to_string()))
+                .collect();
+            for placeholder in &placeholders {
+                assert!(
+                    !plain.to_ascii_lowercase().contains(placeholder),
+                    "E2: rendered body must not contain placeholder {placeholder:?}, got: {plain}"
+                );
+            }
+        }
+    }
+
+    /// E2: Verify that message events with body content produce non-empty previews.
+    #[test]
+    fn e2_dashboard_event_body_binding_not_empty() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "TestAgent",
+            vec!["TargetAgent".to_string()],
+            "Test subject",
+            "thread-1",
+            "test-project",
+            "This is the actual message body with real content",
+        ));
+        screen.ingest_events(&state);
+
+        let preview = screen
+            .recent_message_preview
+            .as_ref()
+            .expect("preview should exist after message event");
+        assert!(
+            !preview.body_excerpt.trim().is_empty(),
+            "E2: body_excerpt must not be empty when event contains body"
+        );
+        assert_eq!(
+            preview.body_excerpt,
+            "This is the actual message body with real content"
+        );
     }
 }

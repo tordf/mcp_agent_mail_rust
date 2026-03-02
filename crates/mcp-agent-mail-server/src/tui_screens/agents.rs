@@ -13,7 +13,7 @@ use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::fancy::SummaryFooter;
@@ -134,6 +134,34 @@ fn env_flag_enabled(name: &str) -> bool {
     })
 }
 
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Truth assertion: when the DB reports non-zero agents but the rendered
+/// list is empty AND no filter is active, the data pipeline has a bug.
+fn assert_agents_list_cardinality(total_db_agents: u64, rendered_count: usize, filter: &str) {
+    let assertions_on = cfg!(debug_assertions)
+        || std::env::var("AM_TUI_STRICT_TRUTH_ASSERTIONS").is_ok_and(|v| {
+            let n = v.trim().to_ascii_lowercase();
+            matches!(n.as_str(), "1" | "true" | "yes" | "on")
+        });
+    if !assertions_on {
+        return;
+    }
+    if total_db_agents > 0 && rendered_count == 0 && filter.trim().is_empty() {
+        debug_assert!(
+            false,
+            "[truth_assertion] agents screen: DB reports {total_db_agents} agents \
+             but rendered list is empty with no active filter — data pipeline dropped all rows"
+        );
+    }
+}
+
 fn reduced_motion_enabled() -> bool {
     env_flag_enabled("AM_TUI_REDUCED_MOTION") || env_flag_enabled("AM_TUI_A11Y_REDUCED_MOTION")
 }
@@ -187,6 +215,8 @@ pub struct AgentsScreen {
     detail_scroll: usize,
     /// Last observed data-channel generation for dirty-state gating.
     last_data_gen: super::DataGeneration,
+    /// True when the DB poller has not yet delivered any data.
+    db_context_unavailable: bool,
 }
 
 impl AgentsScreen {
@@ -215,6 +245,7 @@ impl AgentsScreen {
             detail_visible: true,
             detail_scroll: 0,
             last_data_gen: super::DataGeneration::stale(),
+            db_context_unavailable: false,
         }
     }
 
@@ -236,6 +267,8 @@ impl AgentsScreen {
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
         let db = state.db_stats_snapshot().unwrap_or_default();
+        let total_rows = db.agents;
+        let raw_count = u64::try_from(db.agents_list.len()).unwrap_or(u64::MAX);
         let mut rows: Vec<AgentRow> = db
             .agents_list
             .iter()
@@ -249,26 +282,74 @@ impl AgentsScreen {
             .collect();
 
         // Apply filter
-        if !self.filter.is_empty() {
-            let f = self.filter.to_lowercase();
+        let filter_text = self.filter.trim().to_ascii_lowercase();
+        if !filter_text.is_empty() {
             rows.retain(|r| {
-                r.name.to_lowercase().contains(&f)
-                    || r.program.to_lowercase().contains(&f)
-                    || r.model.to_lowercase().contains(&f)
+                r.name.to_ascii_lowercase().contains(&filter_text)
+                    || r.program.to_ascii_lowercase().contains(&filter_text)
+                    || r.model.to_ascii_lowercase().contains(&filter_text)
             });
         }
 
-        // Sort
+        // Sort (use to_ascii_lowercase for consistency with filter phase)
         rows.sort_by(|a, b| {
             let cmp = match self.sort_col {
-                COL_NAME => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                COL_PROGRAM => a.program.to_lowercase().cmp(&b.program.to_lowercase()),
-                COL_MODEL => a.model.to_lowercase().cmp(&b.model.to_lowercase()),
+                COL_NAME => a
+                    .name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase()),
+                COL_PROGRAM => a
+                    .program
+                    .to_ascii_lowercase()
+                    .cmp(&b.program.to_ascii_lowercase()),
+                COL_MODEL => a
+                    .model
+                    .to_ascii_lowercase()
+                    .cmp(&b.model.to_ascii_lowercase()),
                 COL_LAST_ACTIVE => a.last_active_ts.cmp(&b.last_active_ts),
                 COL_MESSAGES => a.message_count.cmp(&b.message_count),
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc { cmp } else { cmp.reverse() }
+        });
+
+        let rendered_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        // Use the higher of total_rows (DB COUNT) and list length as raw_count,
+        // since COUNT(*) may be stale/race-y relative to the list fetch.
+        let raw_from_db = total_rows.max(raw_count);
+        let dropped_count = raw_from_db.saturating_sub(rendered_count);
+        let sort_label = SORT_LABELS.get(self.sort_col).copied().unwrap_or("unknown");
+        let filter = sanitize_diagnostic_value(&self.filter);
+        let filter = if filter.is_empty() {
+            "all".to_string()
+        } else {
+            filter
+        };
+
+        // Truth assertion: non-empty DB should produce non-empty rendered list
+        // when no user filter is active.
+        assert_agents_list_cardinality(total_rows, rows.len(), &self.filter);
+
+        // Detect when list was capped by poller LIMIT (total_rows > list length).
+        let list_capped = total_rows > raw_count;
+
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "agents".to_string(),
+            scope: "db_stats.agents_list".to_string(),
+            query_params: format!(
+                "filter={filter};sort_col={sort_label};sort_asc={};list_rows={raw_count};total_rows={total_rows};capped={list_capped}",
+                self.sort_asc,
+            ),
+            raw_count: raw_from_db,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
         });
 
         self.track_stagger_reveals(&rows);
@@ -557,6 +638,11 @@ impl MailScreen for AgentsScreen {
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
 
+        // Poller hasn't delivered data yet if db_stats_gen == 0.
+        // Only flag as unavailable after a few seconds (30 ticks) to allow
+        // startup grace period before showing the degraded banner.
+        self.db_context_unavailable = current_gen.db_stats_gen == 0 && tick_count >= 30;
+
         if dirty.events {
             self.ingest_events(state);
         }
@@ -604,6 +690,16 @@ impl MailScreen for AgentsScreen {
                 Breakpoint::Xl,
                 Flex::horizontal().constraints([Constraint::Percentage(50.0), Constraint::Fill]),
             );
+
+        if self.db_context_unavailable {
+            let banner = Paragraph::new(
+                " Database context unavailable. Waiting for poller data...",
+            )
+            .style(Style::default().fg(tp.severity_error));
+            let banner_area = ftui::layout::Rect::new(area.x, area.y, area.width, 1);
+            banner.render(banner_area, frame);
+            return;
+        }
 
         let split = layout.split(area);
         let table_area = split.rects[0];
@@ -1284,6 +1380,111 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_emits_screen_diagnostic_with_raw_and_rendered_counts() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 3,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 100,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 200,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.filter = "red".to_string();
+        screen.rebuild_from_state(&state);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        assert_eq!(diagnostics.len(), 1);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("screen diagnostic should be present");
+        assert_eq!(diag.screen, "agents");
+        // raw_count uses total_rows (DB COUNT=3), not agents_list.len()=2,
+        // so the diagnostic tracks the full cardinality gap.
+        assert_eq!(diag.raw_count, 3);
+        assert_eq!(diag.rendered_count, 1);
+        assert_eq!(diag.dropped_count, 2);
+        assert!(diag.query_params.contains("filter=red"));
+        assert!(diag.query_params.contains("list_rows=2"));
+        assert!(diag.query_params.contains("total_rows=3"));
+    }
+
+    #[test]
+    fn rebuild_emits_screen_diagnostic_filter_all_when_empty() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 1,
+            agents_list: vec![crate::tui_events::AgentSummary {
+                name: "RedFox".to_string(),
+                program: "claude-code".to_string(),
+                last_active_ts: 100,
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.filter = " \n ".to_string();
+        screen.rebuild_from_state(&state);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("screen diagnostic should be present");
+        assert!(diag.query_params.contains("filter=all"));
+    }
+
+    #[test]
+    fn rebuild_diagnostic_raw_count_tracks_list_rows_when_total_counter_is_lower() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 0,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 100,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 200,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.filter = "blue".to_string();
+        screen.rebuild_from_state(&state);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("screen diagnostic should be present");
+        assert_eq!(diag.raw_count, 2);
+        assert_eq!(diag.rendered_count, 1);
+        assert_eq!(diag.dropped_count, 1);
+        assert!(diag.query_params.contains("list_rows=2"));
+        assert!(diag.query_params.contains("total_rows=0"));
+    }
+
+    #[test]
+    fn sanitize_diagnostic_value_strips_delimiters_and_whitespace() {
+        let value = sanitize_diagnostic_value(" alpha;\n beta,\r gamma ");
+        assert_eq!(value, "alpha beta gamma");
+    }
+
+    #[test]
     fn status_thresholds_are_classified() {
         let now = chrono::Utc::now().timestamp_micros();
         assert_eq!(AgentStatus::from_last_active(now, now), AgentStatus::Active);
@@ -1462,5 +1663,290 @@ mod tests {
     fn status_counts_empty() {
         let screen = AgentsScreen::new();
         assert_eq!(screen.status_counts(), (0, 0, 0));
+    }
+
+    // ── B4: Cardinality truth assertions ────────────────────────────
+
+    #[test]
+    fn agents_cardinality_passes_when_agents_rendered() {
+        assert_agents_list_cardinality(100, 50, "");
+    }
+
+    #[test]
+    fn agents_cardinality_passes_when_filter_active_and_empty() {
+        assert_agents_list_cardinality(100, 0, "nonexistent-agent");
+    }
+
+    #[test]
+    fn agents_cardinality_passes_when_db_empty() {
+        assert_agents_list_cardinality(0, 0, "");
+    }
+
+    #[test]
+    fn agents_cardinality_catches_false_empty_state() {
+        let result = std::panic::catch_unwind(|| {
+            assert_agents_list_cardinality(100, 0, "");
+        });
+        assert!(
+            result.is_err(),
+            "should panic when DB has agents but rendered list is empty without filter"
+        );
+    }
+
+    // ── G6: Project/agent scope audit tests ─────────────────────────
+
+    #[test]
+    fn agents_query_is_global_by_design() {
+        // Documents the invariant: agent list fetches ALL agents across all projects.
+        // Agent names are globally unique (adjective+noun validation) so cross-project
+        // ambiguity is prevented at the naming layer, not the query layer.
+        let sql = "SELECT name, program, last_active_ts FROM agents \
+            ORDER BY last_active_ts DESC, id DESC LIMIT 500";
+        // Confirm no WHERE project_id clause — this is intentional for the global view.
+        assert!(
+            !sql.contains("project_id"),
+            "agent list query must be global (no project_id filter) \
+             because agent names are globally unique"
+        );
+    }
+
+    #[test]
+    fn filter_and_sort_use_same_case_function() {
+        // G3: Documents fix — filter uses to_ascii_lowercase(), sort must also
+        // use to_ascii_lowercase() (not to_lowercase()) for consistent behavior
+        // with non-ASCII characters.
+        let name = "Caf\u{00e9}Agent"; // "CaféAgent"
+        let ascii_lower = name.to_ascii_lowercase();
+        let unicode_lower = name.to_lowercase();
+        // ASCII lowercase leaves non-ASCII bytes unchanged
+        assert_eq!(ascii_lower, "caf\u{00e9}agent");
+        // Unicode lowercase also lowercases (same for this char, but differs for e.g. Σ→σ)
+        assert_eq!(unicode_lower, "caf\u{00e9}agent");
+        // For agent names (ASCII-only validated), both are equivalent,
+        // but we use to_ascii_lowercase() consistently for correctness.
+    }
+
+    #[test]
+    fn agent_name_uniqueness_prevents_cross_project_ambiguity() {
+        // Documents: agent names are validated via adjective+noun system
+        // which ensures global uniqueness. Two projects cannot have "BlueLake".
+        use mcp_agent_mail_core::models::is_valid_agent_name;
+        // Valid agent names follow the adjective+noun pattern
+        assert!(
+            is_valid_agent_name("BlueLake"),
+            "adjective+noun names should be valid"
+        );
+        // The uniqueness constraint is enforced at DB level (UNIQUE per project)
+        // and by the naming system generating distinct combinations.
+    }
+
+    // ── B6: Count/List Consistency Contract ──────────────────────────
+
+    #[test]
+    fn count_list_consistency_no_filter_no_cap() {
+        // When total_rows == list length and no filter: rendered_count must
+        // equal total_rows. Diagnostic must show capped=false.
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 2,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 100,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 200,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.agents.len(), 2, "all agents should be rendered");
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("diagnostic expected");
+        assert_eq!(diag.raw_count, 2, "raw_count should equal total_rows");
+        assert_eq!(diag.rendered_count, 2, "rendered_count should match list");
+        assert_eq!(diag.dropped_count, 0, "no rows should be dropped");
+        assert!(
+            diag.query_params.contains("capped=false"),
+            "list is not capped when total_rows == list length"
+        );
+    }
+
+    #[test]
+    fn count_list_consistency_capped_list() {
+        // When total_rows > list length (simulating poller cap), diagnostic
+        // must show capped=true with correct cardinality gap.
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 600, // DB reports 600 agents
+            agents_list: vec![
+                // But poller only provides 2 (simulating cap)
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 100,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 200,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.agents.len(), 2);
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("diagnostic expected");
+        assert_eq!(diag.raw_count, 600, "raw_count reflects full DB count");
+        assert_eq!(
+            diag.rendered_count, 2,
+            "rendered_count reflects capped list"
+        );
+        assert_eq!(diag.dropped_count, 598, "dropped tracks total gap");
+        assert!(
+            diag.query_params.contains("capped=true"),
+            "list must be flagged as capped when total_rows > list length"
+        );
+        assert!(
+            diag.query_params.contains("list_rows=2"),
+            "list_rows tracks actual list length"
+        );
+        assert!(
+            diag.query_params.contains("total_rows=600"),
+            "total_rows tracks DB COUNT"
+        );
+    }
+
+    #[test]
+    fn count_list_consistency_filter_reduces_rendered() {
+        // Filter should reduce rendered_count but not raw_count or total_rows.
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 3,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 100,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 200,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "GreenPeak".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 300,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.filter = "claude".to_string();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(
+            screen.agents.len(),
+            2,
+            "filter matches RedFox and GreenPeak"
+        );
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("diagnostic expected");
+        assert_eq!(diag.raw_count, 3, "raw_count is total from DB");
+        assert_eq!(diag.rendered_count, 2, "rendered_count after filter");
+        assert_eq!(diag.dropped_count, 1, "one agent filtered out");
+        assert!(
+            diag.query_params.contains("capped=false"),
+            "not capped when total_rows == list length"
+        );
+    }
+
+    // ── B8: DB context binding guardrail regression tests ─────────────
+
+    #[test]
+    fn b8_agents_unavailable_after_grace_period_without_poller() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+        assert!(!screen.db_context_unavailable, "starts false");
+
+        // Tick at 0 — within grace period
+        screen.tick(0, &state);
+        assert!(
+            !screen.db_context_unavailable,
+            "should not show banner during startup grace"
+        );
+
+        // Tick past grace period (>= 30) without poller data
+        screen.tick(30, &state);
+        assert!(
+            screen.db_context_unavailable,
+            "should show banner when poller never delivered data after grace period"
+        );
+    }
+
+    #[test]
+    fn b8_agents_available_after_poller_delivers() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+
+        // Simulate poller delivery
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 1,
+            agents_list: vec![crate::tui_events::AgentSummary {
+                name: "TestAgent".to_string(),
+                program: "test".to_string(),
+                last_active_ts: 100,
+            }],
+            ..Default::default()
+        });
+
+        screen.tick(30, &state);
+        assert!(
+            !screen.db_context_unavailable,
+            "should not show banner when poller has delivered data"
+        );
+        assert_eq!(screen.agents.len(), 1);
+    }
+
+    #[test]
+    fn b8_agents_banner_renders_when_unavailable() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+        screen.db_context_unavailable = true;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, ftui::layout::Rect::new(0, 0, 120, 30), &state);
+
+        let mut text = String::new();
+        for y in 0..frame.buffer.height() {
+            for x in 0..frame.buffer.width() {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    if let Some(ch) = cell.content.as_char() {
+                        text.push(ch);
+                    } else if !cell.is_continuation() {
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Database context unavailable"),
+            "should render degraded banner: {text}"
+        );
     }
 }

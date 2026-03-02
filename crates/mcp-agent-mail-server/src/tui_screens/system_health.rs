@@ -30,7 +30,9 @@ use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::Config;
 
-use crate::tui_bridge::{ConfigSnapshot, TuiSharedState};
+use crate::tui_bridge::{
+    ConfigSnapshot, ScreenDiagnosticSnapshot, TuiSharedState, query_params_explain_empty_state,
+};
 use crate::tui_widgets::{
     AnomalyCard, AnomalySeverity, MetricTile, MetricTrend, ReservationGauge, WidgetState,
 };
@@ -42,6 +44,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
 const WORKER_SLEEP: Duration = Duration::from_millis(500);
 const MAX_READ_BYTES: usize = 8 * 1024;
+const SCREEN_DIAGNOSTIC_PREVIEW_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Level {
@@ -101,6 +104,35 @@ fn format_http_status(status: u16) -> String {
         500 => "500 Internal Error".to_string(),
         _ => status.to_string(),
     }
+}
+
+fn screen_diag_level(diag: &ScreenDiagnosticSnapshot) -> Level {
+    let active_user_filter = query_params_explain_empty_state(&diag.query_params);
+    if diag.raw_count > 0 && diag.rendered_count == 0 && !active_user_filter {
+        Level::Fail
+    } else if diag.raw_count != diag.rendered_count || diag.dropped_count > 0 {
+        Level::Warn
+    } else {
+        Level::Ok
+    }
+}
+
+fn format_diag_timestamp_micros(timestamp_micros: i64) -> String {
+    DateTime::<Utc>::from_timestamp_micros(timestamp_micros)
+        .map_or_else(|| timestamp_micros.to_string(), |ts| ts.to_rfc3339())
+}
+
+fn recent_system_health_diagnostics(
+    state: &TuiSharedState,
+    limit: usize,
+) -> Vec<(u64, ScreenDiagnosticSnapshot)> {
+    state
+        .screen_diagnostics_since(0)
+        .into_iter()
+        .filter(|(_, diag)| diag.screen == "system_health")
+        .rev()
+        .take(limit)
+        .collect()
 }
 
 /// Width classes for adaptive dashboard layout.
@@ -439,12 +471,48 @@ impl SystemHealthScreen {
             }
         }
 
+        let recent_diagnostics =
+            recent_system_health_diagnostics(state, SCREEN_DIAGNOSTIC_PREVIEW_LIMIT);
+        if !recent_diagnostics.is_empty() {
+            lines.push(Line::raw(String::new()));
+            lines.push(Line::from_spans([Span::styled(
+                "\u{2500}\u{2500} Screen Diagnostics \u{2500}\u{2500}",
+                section_style,
+            )]));
+            for (seq, diag) in recent_diagnostics {
+                let level = screen_diag_level(&diag);
+                let parity = if diag.raw_count == diag.rendered_count {
+                    "match"
+                } else {
+                    "mismatch"
+                };
+                let checked_at = format_diag_timestamp_micros(diag.timestamp_micros);
+                lines.push(level_styled_line(
+                    level,
+                    &tp,
+                    format!("#{} {} ({parity})", seq, diag.scope),
+                    format!(
+                        "raw={} rendered={} dropped={} checked={checked_at}",
+                        diag.raw_count, diag.rendered_count, diag.dropped_count
+                    ),
+                ));
+                lines.push(Line::from_spans([
+                    Span::styled("       Params: ", accent_style),
+                    Span::styled(diag.query_params, hint_style),
+                ]));
+            }
+        }
+
         lines.push(Line::raw(String::new()));
         lines.push(Line::from_spans([
             Span::styled("r", action_key_style),
             Span::styled(" Refresh  ", hint_style),
             Span::styled("v", action_key_style),
-            Span::styled(" Dashboard", hint_style),
+            Span::styled(" Dashboard  ", hint_style),
+            Span::styled("o", action_key_style),
+            Span::styled(" Open URL  ", hint_style),
+            Span::styled("y", action_key_style),
+            Span::styled(" Copy URL", hint_style),
         ]));
 
         let block = Block::default()
@@ -1128,7 +1196,7 @@ impl MailScreen for SystemHealthScreen {
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("Server status, connection pool, and WAL/cache diagnostics.")
+        Some("Server status, connection pool, WAL/cache diagnostics. Use o=open URL, y=copy URL.")
     }
 
     fn title(&self) -> &'static str {
@@ -1254,6 +1322,7 @@ fn diagnostics_worker_loop(
                 tailscale_checked_at = now;
             }
             let snap = run_diagnostics(state, cached_tailscale_ip.as_deref());
+            emit_screen_diagnostic(state, &snap);
             if let Ok(mut guard) = snapshot.lock() {
                 *guard = snap;
             }
@@ -1261,6 +1330,43 @@ fn diagnostics_worker_loop(
         }
         thread::sleep(WORKER_SLEEP);
     }
+}
+
+fn emit_screen_diagnostic(state: &TuiSharedState, snap: &DiagnosticsSnapshot) {
+    let cfg = state.config_snapshot();
+    let transport_mode = cfg.transport_mode().to_string();
+    let raw_count = u64::try_from(snap.path_probes.len()).unwrap_or(u64::MAX);
+    let rendered_count = u64::try_from(snap.lines.len()).unwrap_or(u64::MAX);
+    let dropped_count = raw_count.saturating_sub(rendered_count);
+    let failing_paths = snap
+        .path_probes
+        .iter()
+        .filter(|probe| probe.status.is_some_and(|status| status >= 400))
+        .count();
+    let checked_at_micros = snap
+        .checked_at
+        .map_or_else(|| Utc::now().timestamp_micros(), |ts| ts.timestamp_micros());
+
+    state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+        screen: "system_health".to_string(),
+        scope: "http_probe.tools_list".to_string(),
+        query_params: format!(
+            "configured_path={};path_probes={};failing_paths={failing_paths};token_present={};token_len={};tcp_error={}",
+            snap.configured_path,
+            snap.path_probes.len(),
+            snap.token_present,
+            snap.token_len,
+            snap.tcp_error.as_deref().unwrap_or("none")
+        ),
+        raw_count,
+        rendered_count,
+        dropped_count,
+        timestamp_micros: checked_at_micros,
+        db_url: cfg.database_url,
+        storage_root: cfg.storage_root,
+        transport_mode,
+        auth_enabled: cfg.auth_enabled,
+    });
 }
 
 fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> DiagnosticsSnapshot {
@@ -1753,6 +1859,154 @@ mod tests {
     #[test]
     fn normalize_path_root() {
         assert_eq!(normalize_path("/"), "/");
+    }
+
+    #[test]
+    fn emit_screen_diagnostic_records_probe_and_render_counts() {
+        let state = test_state();
+        let snap = DiagnosticsSnapshot {
+            checked_at: Some(Utc::now()),
+            configured_path: "/mcp/".to_string(),
+            token_present: true,
+            token_len: 12,
+            tcp_error: Some("timeout".to_string()),
+            path_probes: vec![
+                PathProbe {
+                    status: Some(200),
+                    ..Default::default()
+                },
+                PathProbe {
+                    status: Some(401),
+                    ..Default::default()
+                },
+            ],
+            lines: vec![ProbeLine {
+                level: Level::Warn,
+                name: "auth-check",
+                detail: "bearer token rejected".to_string(),
+                remediation: Some("verify token".to_string()),
+            }],
+            ..Default::default()
+        };
+
+        emit_screen_diagnostic(&state, &snap);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        assert_eq!(diagnostics.len(), 1);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("system health diagnostic should be recorded");
+        assert_eq!(diag.screen, "system_health");
+        assert_eq!(diag.raw_count, 2);
+        assert_eq!(diag.rendered_count, 1);
+        assert_eq!(diag.dropped_count, 1);
+        assert!(diag.query_params.contains("configured_path=/mcp/"));
+        assert!(diag.query_params.contains("failing_paths=1"));
+    }
+
+    #[test]
+    fn screen_diag_level_flags_mismatches() {
+        let base = ScreenDiagnosticSnapshot {
+            screen: "system_health".to_string(),
+            scope: "http_probe.tools_list".to_string(),
+            query_params: "configured_path=/mcp/".to_string(),
+            raw_count: 2,
+            rendered_count: 2,
+            dropped_count: 0,
+            timestamp_micros: Utc::now().timestamp_micros(),
+            db_url: "sqlite:///tmp/test.db".to_string(),
+            storage_root: "/tmp/am".to_string(),
+            transport_mode: "mcp".to_string(),
+            auth_enabled: true,
+        };
+        let ok = ScreenDiagnosticSnapshot {
+            raw_count: 2,
+            rendered_count: 2,
+            dropped_count: 0,
+            ..base.clone()
+        };
+        let warn = ScreenDiagnosticSnapshot {
+            raw_count: 3,
+            rendered_count: 2,
+            dropped_count: 1,
+            ..base.clone()
+        };
+        let fail = ScreenDiagnosticSnapshot {
+            raw_count: 4,
+            rendered_count: 0,
+            dropped_count: 4,
+            ..base
+        };
+        let filtered_empty = ScreenDiagnosticSnapshot {
+            query_params:
+                "raw=4;rendered=0;filter=query:incident|project:alpha;mode=local;project=alpha"
+                    .to_string(),
+            raw_count: 4,
+            rendered_count: 0,
+            dropped_count: 4,
+            ..ok.clone()
+        };
+
+        assert_eq!(screen_diag_level(&ok), Level::Ok);
+        assert_eq!(screen_diag_level(&warn), Level::Warn);
+        assert_eq!(screen_diag_level(&fail), Level::Fail);
+        assert_eq!(screen_diag_level(&filtered_empty), Level::Warn);
+    }
+
+    #[test]
+    fn recent_system_health_diagnostics_filters_and_limits() {
+        let state = test_state();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "agents".to_string(),
+            scope: "list".to_string(),
+            query_params: "page=1".to_string(),
+            raw_count: 1,
+            rendered_count: 1,
+            dropped_count: 0,
+            timestamp_micros: Utc::now().timestamp_micros(),
+            db_url: "sqlite:///tmp/test.db".to_string(),
+            storage_root: "/tmp/am".to_string(),
+            transport_mode: "mcp".to_string(),
+            auth_enabled: true,
+        });
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "system_health".to_string(),
+            scope: "http_probe.tools_list".to_string(),
+            query_params: "configured_path=/mcp/".to_string(),
+            raw_count: 2,
+            rendered_count: 2,
+            dropped_count: 0,
+            timestamp_micros: Utc::now().timestamp_micros(),
+            db_url: "sqlite:///tmp/test.db".to_string(),
+            storage_root: "/tmp/am".to_string(),
+            transport_mode: "mcp".to_string(),
+            auth_enabled: true,
+        });
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "system_health".to_string(),
+            scope: "http_probe.tools_list".to_string(),
+            query_params: "configured_path=/api/".to_string(),
+            raw_count: 3,
+            rendered_count: 2,
+            dropped_count: 1,
+            timestamp_micros: Utc::now().timestamp_micros(),
+            db_url: "sqlite:///tmp/test.db".to_string(),
+            storage_root: "/tmp/am".to_string(),
+            transport_mode: "mcp".to_string(),
+            auth_enabled: true,
+        });
+
+        let diagnostics = recent_system_health_diagnostics(&state, 2);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].1.screen, "system_health");
+        assert_eq!(diagnostics[1].1.screen, "system_health");
+        assert!(diagnostics[0].0 > diagnostics[1].0);
+        assert!(
+            diagnostics[0]
+                .1
+                .query_params
+                .contains("configured_path=/api/")
+        );
     }
 
     #[test]
@@ -2493,6 +2747,27 @@ mod tests {
         let bindings = screen.keybindings();
         assert!(bindings.iter().any(|b| b.key == "r"));
         assert!(bindings.iter().any(|b| b.key == "v"));
+    }
+
+    #[test]
+    fn text_view_footer_mentions_url_shortcuts() {
+        let state = test_state();
+        let mut screen = test_screen(DiagnosticsSnapshot::default());
+        screen.view_mode = ViewMode::Text;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(90, 24, &mut pool);
+        screen.render_text_view(&mut frame, Rect::new(0, 0, 90, 24), &state);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Open URL"),
+            "expected footer to include Open URL shortcut, got:\n{text}"
+        );
+        assert!(
+            text.contains("Copy URL"),
+            "expected footer to include Copy URL shortcut, got:\n{text}"
+        );
     }
 
     #[test]

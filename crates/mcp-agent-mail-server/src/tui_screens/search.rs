@@ -38,7 +38,7 @@ use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 use mcp_agent_mail_db::{DbConn, QueryAssistance, parse_query_assistance};
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_layout::{DockLayout, DockPosition};
 use crate::tui_markdown;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -46,6 +46,14 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 // ──────────────────────────────────────────────────────────────────────
 // Constants
 // ──────────────────────────────────────────────────────────────────────
+
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Max results to display.
 const MAX_RESULTS: usize = 200;
@@ -1105,6 +1113,7 @@ pub struct SearchCockpitScreen {
     // Search state
     db_conn: Option<DbConn>,
     db_conn_attempted: bool,
+    db_context_unavailable: bool,
     last_query: String,
     last_error: Option<String>,
     query_assistance: Option<QueryAssistance>,
@@ -1182,6 +1191,7 @@ impl SearchCockpitScreen {
             query_lab_visible: false,
             db_conn: None,
             db_conn_attempted: false,
+            db_context_unavailable: false,
             last_query: String::new(),
             last_error: None,
             query_assistance: None,
@@ -1293,6 +1303,7 @@ impl SearchCockpitScreen {
                         &entry.title,
                         entry.thread_id.as_deref().unwrap_or(""),
                         "", // project slug not directly available
+                        entry.full_body.as_deref().unwrap_or(&entry.body_preview),
                     ))
                 }
                 DocKind::Agent => Some(crate::tui_events::MailEvent::agent_registered(
@@ -1323,6 +1334,7 @@ impl SearchCockpitScreen {
                 self.ensure_recipes_loaded();
             }
         }
+        self.db_context_unavailable = self.db_conn.is_none();
     }
 
     /// Build a `SearchQuery` from the current facet state.
@@ -1363,6 +1375,7 @@ impl SearchCockpitScreen {
     }
 
     /// Execute the search using sync DB connection.
+    #[allow(clippy::too_many_lines)]
     fn execute_search(&mut self, state: &TuiSharedState) {
         let started = Instant::now();
         let raw = self.query_input.value().trim().to_string();
@@ -1400,8 +1413,17 @@ impl SearchCockpitScreen {
 
         self.ensure_db_conn(state);
         let Some(conn) = self.db_conn.take() else {
+            self.results.clear();
+            self.result_rows.clear();
+            self.cursor = 0;
+            self.total_sql_rows = 0;
+            self.search_dirty = false;
+            self.db_context_unavailable = true;
+            self.db_conn_attempted = false; // allow retry on next tick
+            self.emit_db_unavailable_diagnostic(state, "database connection unavailable");
             return;
         };
+        self.db_context_unavailable = false;
 
         if self.doc_kind_filter == DocKindFilter::All {
             // Run all three kinds and merge
@@ -1445,7 +1467,55 @@ impl SearchCockpitScreen {
         self.search_dirty = false;
         let elapsed_ms = started.elapsed().as_millis();
         self.last_search_ms = Some(u32::try_from(elapsed_ms).unwrap_or(u32::MAX));
+
+        let raw_count = u64::try_from(self.total_sql_rows).unwrap_or(u64::MAX);
+        let rendered_count = u64::try_from(self.results.len()).unwrap_or(u64::MAX);
+        let dropped_count = raw_count.saturating_sub(rendered_count);
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "search".to_string(),
+            scope: "search_cockpit.results".to_string(),
+            query_params: format!(
+                "doc_kind={};importance={};ack={};sort={};field_scope={};search_mode={};elapsed_ms={elapsed_ms}",
+                self.doc_kind_filter.label(),
+                self.importance_filter.label(),
+                self.ack_filter.label(),
+                self.sort_direction.label(),
+                self.field_scope.label(),
+                self.search_mode.label(),
+            ),
+            raw_count,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
+
         self.record_history();
+    }
+
+    #[allow(clippy::unused_self)] // consistent signature across screens
+    fn emit_db_unavailable_diagnostic(&self, state: &TuiSharedState, reason: &str) {
+        let reason = sanitize_diagnostic_value(reason);
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "search".to_string(),
+            scope: "search_cockpit.db_unavailable".to_string(),
+            query_params: format!("filter=db_context_unavailable;reason={reason}"),
+            raw_count: 0,
+            rendered_count: 0,
+            dropped_count: 0,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
     }
 
     /// Build zero-result recovery guidance from current TUI facet state.
@@ -3475,13 +3545,19 @@ fn render_query_bar(
     // Optional hint line when the query bar has extra height.
     if content_inner.height >= 2 {
         let w = content_inner.width as usize;
-        let (hint, style) = screen.last_error.as_ref().map_or_else(
-            || {
-                screen
-                    .last_diagnostics
-                    .as_ref()
-                    .filter(|diag| diag.degraded)
-                    .map_or_else(
+        let (hint, style) = if screen.db_context_unavailable {
+            (
+                "Database context unavailable. Check DB URL/project scope and refresh.".to_string(),
+                Style::default().fg(ERROR_FG()),
+            )
+        } else if let Some(err) = screen.last_error.as_ref() {
+            (format!("ERR: {err}"), Style::default().fg(ERROR_FG()))
+        } else {
+            screen
+                .last_diagnostics
+                .as_ref()
+                .filter(|diag| diag.degraded)
+                .map_or_else(
                         || {
                             screen.assistance_hint_line().map_or_else(
                                 || {
@@ -3524,9 +3600,7 @@ fn render_query_bar(
                             )
                         },
                     )
-            },
-            |err| (format!("ERR: {err}"), Style::default().fg(ERROR_FG())),
-        );
+        };
 
         let hint_area = Rect::new(content_inner.x, content_inner.y + 1, content_inner.width, 1);
         Paragraph::new(truncate_display_width(&hint, w))
@@ -6350,5 +6424,133 @@ mod tests {
         let screen = SearchCockpitScreen::new();
         assert!(!screen.query_help_visible);
         assert!(!screen.query_lab_visible);
+    }
+
+    // ── G4 body propagation audit tests ─────────────────────────────
+
+    #[test]
+    fn sync_focused_event_propagates_full_body_for_message() {
+        let mut screen = SearchCockpitScreen::new();
+        let entry = make_msg_entry();
+        let expected_body = entry.full_body.clone().unwrap();
+        screen.results = vec![entry];
+        screen.cursor = 0;
+        screen.sync_focused_event();
+
+        let event = screen
+            .focused_synthetic
+            .expect("should have synthetic event");
+        match &event {
+            crate::tui_events::MailEvent::MessageSent { body_excerpt, .. } => {
+                assert_eq!(
+                    body_excerpt, &expected_body,
+                    "synthetic event must carry full_body from search result"
+                );
+            }
+            other => panic!("expected MessageSent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_focused_event_falls_back_to_body_preview_when_no_full_body() {
+        let mut screen = SearchCockpitScreen::new();
+        let mut entry = make_msg_entry();
+        entry.full_body = None;
+        entry.body_preview = "short preview text".to_string();
+        screen.results = vec![entry];
+        screen.cursor = 0;
+        screen.sync_focused_event();
+
+        let event = screen
+            .focused_synthetic
+            .expect("should have synthetic event");
+        match &event {
+            crate::tui_events::MailEvent::MessageSent { body_excerpt, .. } => {
+                assert_eq!(
+                    body_excerpt, "short preview text",
+                    "when full_body is None, should fall back to body_preview"
+                );
+            }
+            other => panic!("expected MessageSent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_focused_event_agent_doc_kind_has_no_body_path() {
+        let mut screen = SearchCockpitScreen::new();
+        let entry = make_agent_entry();
+        screen.results = vec![entry];
+        screen.cursor = 0;
+        screen.sync_focused_event();
+
+        // Agent entries produce AgentRegistered events, not MessageSent
+        let event = screen
+            .focused_synthetic
+            .expect("should have synthetic event");
+        match &event {
+            crate::tui_events::MailEvent::AgentRegistered { .. } => {
+                // Agent events don't carry body content — correct
+            }
+            other => panic!("expected AgentRegistered for agent doc kind, got {other:?}"),
+        }
+    }
+
+    // ── B8: DB context binding guardrail regression tests ─────────────
+
+    #[test]
+    fn b8_search_db_context_unavailable_starts_false() {
+        let screen = SearchCockpitScreen::new();
+        assert!(
+            !screen.db_context_unavailable,
+            "fresh screen should not be marked as db_context_unavailable"
+        );
+    }
+
+    fn broken_db_state() -> std::sync::Arc<crate::tui_bridge::TuiSharedState> {
+        crate::tui_bridge::TuiSharedState::new(&mcp_agent_mail_core::Config {
+            database_url: "sqlite:////nonexistent/path/b8_test.sqlite3".to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn b8_search_run_search_without_conn_sets_unavailable() {
+        let state = broken_db_state();
+        let mut screen = SearchCockpitScreen::new();
+
+        screen.execute_search(&state);
+
+        assert!(
+            screen.db_context_unavailable,
+            "run_search without DB connection should set db_context_unavailable"
+        );
+        assert!(
+            screen.results.is_empty(),
+            "results should be cleared on db unavailable"
+        );
+
+        // Verify diagnostic was emitted
+        let diags = state.screen_diagnostics_since(0);
+        let search_diag = diags
+            .iter()
+            .find(|(_, d)| d.screen == "search" && d.scope.contains("db_unavailable"));
+        assert!(
+            search_diag.is_some(),
+            "should emit db_unavailable diagnostic"
+        );
+    }
+
+    #[test]
+    fn b8_search_allows_retry_after_conn_failure() {
+        let state = broken_db_state();
+        let mut screen = SearchCockpitScreen::new();
+
+        screen.execute_search(&state);
+        assert!(screen.db_context_unavailable);
+
+        assert!(
+            !screen.db_conn_attempted,
+            "db_conn_attempted should be reset after failure to allow retry"
+        );
     }
 }
