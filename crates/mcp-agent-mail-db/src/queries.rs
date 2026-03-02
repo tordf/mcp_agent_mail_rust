@@ -992,7 +992,9 @@ pub async fn register_agent(
     // Keep behavior consistent with insert path: omitted task_description clears
     // to empty string instead of preserving stale content.
     normalize_sets.push("task_description = ?");
-    normalize_base_params.push(Value::Text(task_description.unwrap_or_default().to_string()));
+    normalize_base_params.push(Value::Text(
+        task_description.unwrap_or_default().to_string(),
+    ));
     if let Some(ap) = attachments_policy {
         normalize_sets.push("attachments_policy = ?");
         normalize_base_params.push(Value::Text(ap.to_string()));
@@ -4521,17 +4523,14 @@ pub async fn request_contact(
     let tracked = tracked(&*conn);
     try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
-    // Atomic upsert: INSERT OR IGNORE + UPDATE to avoid TOCTOU race under
-    // concurrent send_message auto-handshake (multiple agents requesting
-    // contact for the same pair simultaneously).
-    let upsert_sql = "INSERT INTO agent_links \
+    // FrankenConnection does not consistently support `ON CONFLICT ... DO UPDATE`.
+    // Keep this path portable by doing insert-then-refresh on uniqueness conflict
+    // inside one transaction.
+    let insert_sql = "INSERT INTO agent_links \
         (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) \
-        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?) \
-        ON CONFLICT(a_project_id, a_agent_id, b_project_id, b_agent_id) DO UPDATE SET \
-            status = 'pending', reason = excluded.reason, updated_ts = excluded.updated_ts, \
-            expires_ts = excluded.expires_ts";
+        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)";
 
-    let upsert_params: Vec<Value> = vec![
+    let insert_params: Vec<Value> = vec![
         Value::BigInt(from_project_id),
         Value::BigInt(from_agent_id),
         Value::BigInt(to_project_id),
@@ -4541,12 +4540,60 @@ pub async fn request_contact(
         Value::BigInt(now),
         expires.map_or(Value::Null, Value::BigInt),
     ];
+    let is_contact_pair_unique_violation = |err: &DbError| match err {
+        DbError::Sqlite(msg) => {
+            let msg = msg.to_ascii_lowercase();
+            msg.contains("unique constraint failed")
+                && (msg.contains("agent_links.a_project_id")
+                    || msg.contains("agent_links.a_agent_id")
+                    || msg.contains("agent_links.b_project_id")
+                    || msg.contains("agent_links.b_agent_id")
+                    || msg.contains("idx_agent_links_pair_unique"))
+        }
+        _ => false,
+    };
 
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, upsert_sql, &upsert_params).await)
-    );
+    match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await) {
+        Outcome::Ok(_) => {}
+        Outcome::Err(e) => {
+            if is_contact_pair_unique_violation(&e) {
+                let refresh_sql = "UPDATE agent_links \
+                    SET status = 'pending', reason = ?, updated_ts = ?, expires_ts = ? \
+                    WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ?";
+                let refresh_params = vec![
+                    Value::Text(reason.to_string()),
+                    Value::BigInt(now),
+                    expires.map_or(Value::Null, Value::BigInt),
+                    Value::BigInt(from_project_id),
+                    Value::BigInt(from_agent_id),
+                    Value::BigInt(to_project_id),
+                    Value::BigInt(to_agent_id),
+                ];
+                let updated_rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, refresh_sql, &refresh_params).await)
+                );
+                if updated_rows == 0 {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(
+                        "agent_links conflict refresh updated zero rows".to_string(),
+                    ));
+                }
+            } else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+        }
+        Outcome::Cancelled(r) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(r);
+        }
+        Outcome::Panicked(p) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Panicked(p);
+        }
+    }
 
     // Fetch the upserted row using explicit columns to avoid SELECT * decoding issues.
     let fetch_sql = format!(
@@ -4568,7 +4615,7 @@ pub async fn request_contact(
     );
     let Some(row) = rows.first() else {
         rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::not_found("AgentLink", "upserted row"));
+        return Outcome::Err(DbError::not_found("AgentLink", "inserted/refreshed row"));
     };
     let decoded = match decode_agent_link_row(row) {
         Ok(link) => link,
@@ -6711,6 +6758,119 @@ mod tests {
                 .expect("cache entry should be refreshed");
             assert_eq!(cached.contact_policy, "contacts_only");
             assert_eq!(cached.attachments_policy, "inline");
+        });
+    }
+
+    #[test]
+    fn request_contact_refreshes_existing_pair_without_on_conflict_do_update() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("request_contact_refresh_pair.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project_a = ensure_project(&cx, &pool, &format!("/tmp/am-contact-a-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project A");
+            let project_b = ensure_project(&cx, &pool, &format!("/tmp/am-contact-b-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project B");
+            let project_a_id = project_a.id.expect("project A id");
+            let project_b_id = project_b.id.expect("project B id");
+
+            let from = register_agent(
+                &cx,
+                &pool,
+                project_a_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let to = register_agent(
+                &cx,
+                &pool,
+                project_b_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let from_id = from.id.expect("sender id");
+            let to_id = to.id.expect("recipient id");
+
+            let first = request_contact(
+                &cx,
+                &pool,
+                project_a_id,
+                from_id,
+                project_b_id,
+                to_id,
+                "initial",
+                3_600,
+            )
+            .await
+            .into_result()
+            .expect("initial request_contact");
+            let first_id = first.id.expect("first link id");
+
+            let refreshed = request_contact(
+                &cx,
+                &pool,
+                project_a_id,
+                from_id,
+                project_b_id,
+                to_id,
+                "refreshed",
+                120,
+            )
+            .await
+            .into_result()
+            .expect("second request_contact should refresh existing row");
+
+            assert_eq!(refreshed.id, Some(first_id));
+            assert_eq!(refreshed.status, "pending");
+            assert_eq!(refreshed.reason, "refreshed");
+            assert!(refreshed.expires_ts.is_some(), "refresh should set TTL");
+
+            let (outgoing, incoming) = list_contacts(&cx, &pool, project_a_id, from_id)
+                .await
+                .into_result()
+                .expect("list contacts");
+            assert_eq!(outgoing.len(), 1, "should keep exactly one outgoing link");
+            assert!(incoming.is_empty(), "sender should not have incoming links");
+            assert_eq!(outgoing[0].id, Some(first_id));
+            assert_eq!(outgoing[0].reason, "refreshed");
+
+            let (to_outgoing, to_incoming) = list_contacts(&cx, &pool, project_b_id, to_id)
+                .await
+                .into_result()
+                .expect("list recipient contacts");
+            assert!(
+                to_outgoing.is_empty(),
+                "recipient should not have outgoing links"
+            );
+            assert_eq!(
+                to_incoming.len(),
+                1,
+                "recipient should see one incoming link"
+            );
+            assert_eq!(to_incoming[0].id, Some(first_id));
+            assert_eq!(to_incoming[0].reason, "refreshed");
         });
     }
 

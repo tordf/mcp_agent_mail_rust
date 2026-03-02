@@ -2311,11 +2311,9 @@ fn coalescer_commit_with_retry(
         let repo = Repository::open(repo_root)?;
         let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
 
-        write_lock_owner(repo_root);
         let commit_start = std::time::Instant::now();
-        match commit_paths(&repo, config, message, &refs) {
+        match run_with_lock_owner(repo_root, || commit_paths(&repo, config, message, &refs)) {
             Ok(()) => {
-                remove_lock_owner(repo_root);
                 sm.git_commit_latency_us
                     .record(commit_start.elapsed().as_micros() as u64);
                 if index_lock_retries > 0 {
@@ -2330,10 +2328,10 @@ fn coalescer_commit_with_retry(
                     if try_clean_stale_git_lock(repo_root, 30.0) {
                         let repo2 = Repository::open(repo_root)?;
                         let refs2: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
-                        write_lock_owner(repo_root);
                         let start2 = std::time::Instant::now();
-                        let result = commit_paths(&repo2, config, message, &refs2);
-                        remove_lock_owner(repo_root);
+                        let result = run_with_lock_owner(repo_root, || {
+                            commit_paths(&repo2, config, message, &refs2)
+                        });
                         sm.git_commit_latency_us
                             .record(start2.elapsed().as_micros() as u64);
                         sm.git_index_lock_retries_total.add(index_lock_retries);
@@ -2389,11 +2387,9 @@ fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &
     for attempt in 0..=MAX_RETRIES {
         let repo = Repository::open(repo_root)?;
 
-        write_lock_owner(repo_root);
         let commit_start = std::time::Instant::now();
-        match commit_all(&repo, config, message) {
+        match run_with_lock_owner(repo_root, || commit_all(&repo, config, message)) {
             Ok(()) => {
-                remove_lock_owner(repo_root);
                 sm.git_commit_latency_us
                     .record(commit_start.elapsed().as_micros() as u64);
                 if index_lock_retries > 0 {
@@ -2406,10 +2402,9 @@ fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &
                 if attempt >= MAX_RETRIES {
                     if try_clean_stale_git_lock(repo_root, 30.0) {
                         let repo2 = Repository::open(repo_root)?;
-                        write_lock_owner(repo_root);
                         let start2 = std::time::Instant::now();
-                        let result = commit_all(&repo2, config, message);
-                        remove_lock_owner(repo_root);
+                        let result =
+                            run_with_lock_owner(repo_root, || commit_all(&repo2, config, message));
                         sm.git_commit_latency_us
                             .record(start2.elapsed().as_micros() as u64);
                         sm.git_index_lock_retries_total.add(index_lock_retries);
@@ -2563,6 +2558,17 @@ fn write_lock_owner(repo_root: &Path) {
 fn remove_lock_owner(repo_root: &Path) {
     let owner_path = repo_root.join(".git").join("index.lock.owner");
     let _ = fs::remove_file(&owner_path);
+}
+
+/// Run a commit attempt while ensuring the owner sidecar is cleaned up.
+///
+/// The owner file is advisory metadata for a single attempt and should never
+/// survive an attempt outcome.
+fn run_with_lock_owner<T>(repo_root: &Path, op: impl FnOnce() -> Result<T>) -> Result<T> {
+    write_lock_owner(repo_root);
+    let result = op();
+    remove_lock_owner(repo_root);
+    result
 }
 
 /// Check if a process with the given PID is still alive.
@@ -2889,11 +2895,11 @@ pub fn commit_paths_with_retry(
 
     for attempt in 0..MAX_INDEX_LOCK_RETRIES + 2 {
         let repo = Repository::open(repo_root)?;
-        write_lock_owner(repo_root);
         let commit_start = std::time::Instant::now();
-        match commit_paths(&repo, config, message, rel_paths) {
+        match run_with_lock_owner(repo_root, || {
+            commit_paths(&repo, config, message, rel_paths)
+        }) {
             Ok(()) => {
-                remove_lock_owner(repo_root);
                 sm.git_commit_latency_us
                     .record(commit_start.elapsed().as_micros() as u64);
                 if index_lock_retries > 0 {
@@ -2984,6 +2990,19 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
 
     fn maybe_cleanup_lock(path: &Path, result: &mut HealResult) {
         if path.extension().is_none_or(|e| e != "lock") {
+            return;
+        }
+        // Never remove Git's index lock via generic flock heuristics.
+        // Git index.lock is existence-based and can be active even when no
+        // advisory file lock is held.
+        if path
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("index.lock"))
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == std::ffi::OsStr::new(".git"))
+        {
             return;
         }
 
@@ -6430,7 +6449,7 @@ pub fn check_archive_consistency(
 
     for msg in messages {
         // Build the expected canonical path:
-        // {storage_root}/projects/{slug}/messages/{YYYY}/{MM}/{iso}__{slug}__{id}.md
+        // {storage_root}/projects/{slug}/archive/messages/{YYYY}/{MM}/{iso}__{slug}__{id}.md
         let project_dir = storage_root.join("projects").join(&msg.project_slug);
 
         // Parse the ISO timestamp to extract year/month
@@ -6454,7 +6473,7 @@ pub fn check_archive_consistency(
             &iso_filename
         };
 
-        let messages_dir = project_dir.join("messages").join(&year).join(&month);
+        let messages_dir = project_dir.join("archive").join("messages").join(&year).join(&month);
 
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
         // We check both the computed path and do a directory scan fallback
@@ -7858,6 +7877,28 @@ mod tests {
         let result = heal_archive_locks(&config).unwrap();
         assert_eq!(result.metadata_removed.len(), 1);
         assert!(!meta_path.exists());
+    }
+
+    #[test]
+    fn test_heal_archive_locks_never_removes_git_index_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive_root(&config).unwrap();
+
+        let git_dir = tmp.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let index_lock = git_dir.join("index.lock");
+        fs::write(&index_lock, "active git lock").unwrap();
+
+        let result = heal_archive_locks(&config).unwrap();
+        assert!(index_lock.exists(), "git index.lock must be preserved");
+        assert!(
+            !result
+                .locks_removed
+                .iter()
+                .any(|path| path.ends_with(".git/index.lock")),
+            "healer must not report index.lock removal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -9881,6 +9922,24 @@ mod tests {
         // Remove owner file
         remove_lock_owner(&archive.repo_root);
         assert!(!owner_path.exists(), "owner file should be removed");
+    }
+
+    #[test]
+    fn run_with_lock_owner_cleans_up_on_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "owner-cleanup-error").unwrap();
+        let owner_path = archive.repo_root.join(".git/index.lock.owner");
+        let expected = StorageError::LockContention {
+            message: "synthetic failure".to_string(),
+        };
+
+        let result: Result<()> = run_with_lock_owner(&archive.repo_root, || Err(expected));
+        assert!(result.is_err(), "operation should fail");
+        assert!(
+            !owner_path.exists(),
+            "owner sidecar must be removed even when operation fails"
+        );
     }
 
     #[test]

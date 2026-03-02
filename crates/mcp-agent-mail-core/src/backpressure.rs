@@ -178,7 +178,7 @@ impl HealthSignals {
     #[must_use]
     pub const fn classify(&self) -> HealthLevel {
         // Red: any critical subsystem breached
-        if self.pool_acquire_p95_us > red::POOL_ACQUIRE_P95_US
+        if self.pool_acquire_p95_us >= red::POOL_ACQUIRE_P95_US
             || self.pool_utilization_pct >= red::POOL_UTIL_PCT
             || self.pool_over_80_for_s >= red::OVER_80_DURATION_S
             || self.wbq_depth_pct >= red::WBQ_DEPTH_PCT
@@ -190,7 +190,7 @@ impl HealthSignals {
         }
 
         // Yellow: any elevated subsystem
-        if self.pool_acquire_p95_us > yellow::POOL_ACQUIRE_P95_US
+        if self.pool_acquire_p95_us >= yellow::POOL_ACQUIRE_P95_US
             || self.pool_utilization_pct >= yellow::POOL_UTIL_PCT
             || self.pool_over_80_for_s >= yellow::OVER_80_DURATION_S
             || self.wbq_depth_pct >= yellow::WBQ_DEPTH_PCT
@@ -257,8 +257,10 @@ pub fn refresh_health_level() -> (HealthLevel, bool) {
     let prev = CURRENT_LEVEL.swap(new as u8, Ordering::Relaxed);
     let changed = prev != new as u8;
     if changed {
-        // Saturating add — wraps at 255, which is fine for observability.
-        LEVEL_TRANSITIONS.fetch_add(1, Ordering::Relaxed);
+        // Saturating increment for observability (clamped at 255).
+        let _ = LEVEL_TRANSITIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_add(1))
+        });
     }
     (new, changed)
 }
@@ -483,20 +485,18 @@ mod tests {
     }
 
     #[test]
-    fn boundary_just_below_yellow_is_green() {
+    fn boundary_at_yellow_is_yellow() {
         let mut s = default_signals();
-        // At the threshold (not above) → green for pool_acquire
+        // At threshold we now classify as yellow.
         s.pool_acquire_p95_us = yellow::POOL_ACQUIRE_P95_US;
-        assert_eq!(s.classify(), HealthLevel::Green);
+        assert_eq!(s.classify(), HealthLevel::Yellow);
     }
 
     #[test]
-    fn boundary_just_below_red_is_yellow() {
+    fn boundary_at_red_is_red() {
         let mut s = default_signals();
         s.pool_acquire_p95_us = red::POOL_ACQUIRE_P95_US;
-        // Exactly at the threshold → not "above" → yellow (below red)
-        // But it IS above yellow threshold, so yellow
-        assert_eq!(s.classify(), HealthLevel::Yellow);
+        assert_eq!(s.classify(), HealthLevel::Red);
     }
 
     #[test]

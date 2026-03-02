@@ -2222,9 +2222,7 @@ effective_free_bytes={free}"
                 .await,
             )
             .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "contact enforcement: list_thread_messages failed (fail-open): {e}"
-                );
+                tracing::warn!("contact enforcement: list_thread_messages failed (fail-open): {e}");
                 mcp_agent_mail_core::global_metrics()
                     .tools
                     .contact_enforcement_bypass_total

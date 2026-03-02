@@ -187,15 +187,15 @@ pub fn cache_metrics() -> &'static CacheMetrics {
 
 /// In-memory read cache for projects, agents, and inbox stats.
 pub struct ReadCache {
-    projects_by_slug: OrderedRwLock<S3FifoCache<String, CacheEntry<ProjectRow>>>,
-    projects_by_human_key: OrderedRwLock<S3FifoCache<String, CacheEntry<ProjectRow>>>,
+    projects_by_slug: OrderedRwLock<S3FifoCache<(u64, String), CacheEntry<ProjectRow>>>,
+    projects_by_human_key: OrderedRwLock<S3FifoCache<(u64, String), CacheEntry<ProjectRow>>>,
     agents_by_key: OrderedRwLock<S3FifoCache<(u64, i64, InternedStr), CacheEntry<AgentRow>>>,
     agents_by_id: OrderedRwLock<S3FifoCache<(u64, i64), CacheEntry<AgentRow>>>,
     /// Cached inbox aggregate counters keyed by `(db_scope, agent_id)` (30s TTL).
     inbox_stats: OrderedRwLock<S3FifoCache<(u64, i64), CacheEntry<InboxStatsRow>>>,
-    /// Sharded deferred touch queue (16 shards, keyed by `agent_id % 16`).
-    /// Each shard maps `agent_id` → latest requested timestamp (micros).
-    deferred_touch_shards: [OrderedMutex<HashMap<i64, i64>>; NUM_TOUCH_SHARDS],
+    /// Sharded deferred touch queue (16 shards, keyed by `(scope, agent_id) % 16`).
+    /// Each shard maps `(scope_fp, agent_id)` → latest requested timestamp (micros).
+    deferred_touch_shards: [OrderedMutex<HashMap<(u64, i64), i64>>; NUM_TOUCH_SHARDS],
     /// Last time we flushed the deferred touches.
     last_touch_flush: OrderedMutex<Instant>,
     /// Atomic flag: true if any shard MAY have pending entries.
@@ -249,8 +249,15 @@ impl ReadCache {
     /// Look up a project by slug. Returns `None` if not cached or expired.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_project(&self, slug: &str) -> Option<ProjectRow> {
+        self.get_project_scoped("", slug)
+    }
+
+    /// Look up a project by slug in a specific DB scope.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn get_project_scoped(&self, scope: &str, slug: &str) -> Option<ProjectRow> {
+        let key = (scope_fingerprint(scope), slug.to_owned());
         let mut cache = self.projects_by_slug.write();
-        let Some(entry) = cache.get_mut(slug) else {
+        let Some(entry) = cache.get_mut(&key) else {
             CACHE_METRICS.record_project_miss();
             return None;
         };
@@ -264,7 +271,7 @@ impl ReadCache {
                 0.9,
                 "s3fifo_v1",
             );
-            cache.remove(slug);
+            cache.remove(&key);
             CACHE_METRICS.record_project_miss();
             return None;
         }
@@ -277,13 +284,24 @@ impl ReadCache {
     /// Look up a project by `human_key`.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_project_by_human_key(&self, human_key: &str) -> Option<ProjectRow> {
+        self.get_project_by_human_key_scoped("", human_key)
+    }
+
+    /// Look up a project by `human_key` in a specific DB scope.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn get_project_by_human_key_scoped(
+        &self,
+        scope: &str,
+        human_key: &str,
+    ) -> Option<ProjectRow> {
+        let key = (scope_fingerprint(scope), human_key.to_owned());
         let mut cache = self.projects_by_human_key.write();
-        let Some(entry) = cache.get_mut(human_key) else {
+        let Some(entry) = cache.get_mut(&key) else {
             CACHE_METRICS.record_project_miss();
             return None;
         };
         if entry.is_expired(PROJECT_TTL) {
-            cache.remove(human_key);
+            cache.remove(&key);
             CACHE_METRICS.record_project_miss();
             return None;
         }
@@ -296,13 +314,25 @@ impl ReadCache {
     /// Cache a project (write-through after DB mutation).
     /// Indexes by both `slug` and `human_key`.
     pub fn put_project(&self, project: &ProjectRow) {
+        self.put_project_scoped("", project);
+    }
+
+    /// Cache a project (write-through after DB mutation) in a specific DB scope.
+    pub fn put_project_scoped(&self, scope: &str, project: &ProjectRow) {
+        let scope_fp = scope_fingerprint(scope);
         {
             let mut cache = self.projects_by_slug.write();
-            cache.insert(project.slug.clone(), CacheEntry::new(project.clone()));
+            cache.insert(
+                (scope_fp, project.slug.clone()),
+                CacheEntry::new(project.clone()),
+            );
         }
         {
             let mut cache = self.projects_by_human_key.write();
-            cache.insert(project.human_key.clone(), CacheEntry::new(project.clone()));
+            cache.insert(
+                (scope_fp, project.human_key.clone()),
+                CacheEntry::new(project.clone()),
+            );
         }
     }
 
@@ -415,16 +445,28 @@ impl ReadCache {
 
     /// Bulk-insert projects into the cache (cache warming on startup).
     pub fn warm_projects(&self, projects: &[ProjectRow]) {
+        self.warm_projects_scoped("", projects);
+    }
+
+    /// Bulk-insert projects into the cache (cache warming on startup) in a DB scope.
+    pub fn warm_projects_scoped(&self, scope: &str, projects: &[ProjectRow]) {
+        let scope_fp = scope_fingerprint(scope);
         {
             let mut cache = self.projects_by_slug.write();
             for project in projects {
-                cache.insert(project.slug.clone(), CacheEntry::new(project.clone()));
+                cache.insert(
+                    (scope_fp, project.slug.clone()),
+                    CacheEntry::new(project.clone()),
+                );
             }
         }
         {
             let mut cache = self.projects_by_human_key.write();
             for project in projects {
-                cache.insert(project.human_key.clone(), CacheEntry::new(project.clone()));
+                cache.insert(
+                    (scope_fp, project.human_key.clone()),
+                    CacheEntry::new(project.clone()),
+                );
             }
         }
     }
@@ -508,12 +550,20 @@ impl ReadCache {
     /// different shards never contend.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn enqueue_touch(&self, agent_id: i64, ts_micros: i64) -> bool {
-        let shard_idx = (agent_id as u64 as usize) % NUM_TOUCH_SHARDS;
+        self.enqueue_touch_scoped("", agent_id, ts_micros)
+    }
+
+    /// Enqueue a deferred `touch_agent` update in a specific DB scope.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn enqueue_touch_scoped(&self, scope: &str, agent_id: i64, ts_micros: i64) -> bool {
+        let scope_fp = scope_fingerprint(scope);
+        let shard_idx = ((scope_fp ^ agent_id as u64) as usize) % NUM_TOUCH_SHARDS;
+        let key = (scope_fp, agent_id);
         {
             let mut shard = self.deferred_touch_shards[shard_idx].lock();
             // Keep only the latest timestamp per agent
             shard
-                .entry(agent_id)
+                .entry(key)
                 .and_modify(|existing| {
                     if ts_micros > *existing {
                         *existing = ts_micros;
@@ -532,6 +582,13 @@ impl ReadCache {
     /// Drain all pending touch entries from all shards and reset the flush clock.
     /// Returns the merged map of `agent_id` → latest timestamp.
     pub fn drain_touches(&self) -> HashMap<i64, i64> {
+        self.drain_touches_scoped("")
+    }
+
+    /// Drain pending touch entries for a specific DB scope and reset the flush clock.
+    /// Returns the merged map of `agent_id` → latest timestamp for this scope.
+    pub fn drain_touches_scoped(&self, scope: &str) -> HashMap<i64, i64> {
+        let scope_fp = scope_fingerprint(scope);
         // Clear the pending flag BEFORE draining all shards.
         // If a concurrent enqueue happens after we clear the flag but before we lock
         // its shard, we will drain the new item.
@@ -540,10 +597,32 @@ impl ReadCache {
         self.has_pending.store(false, Ordering::Release);
 
         let mut merged = HashMap::new();
+        let mut has_remaining = false;
         for shard in &self.deferred_touch_shards {
             let mut s = shard.lock();
-            merged.extend(s.drain());
+            let scoped_keys: Vec<(u64, i64)> = s
+                .keys()
+                .copied()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .collect();
+            for key in scoped_keys {
+                if let Some(ts) = s.remove(&key) {
+                    let aid = key.1;
+                    merged
+                        .entry(aid)
+                        .and_modify(|existing| {
+                            if ts > *existing {
+                                *existing = ts;
+                            }
+                        })
+                        .or_insert(ts);
+                }
+            }
+            if !s.is_empty() {
+                has_remaining = true;
+            }
         }
+        self.has_pending.store(has_remaining, Ordering::Release);
 
         let mut last = self.last_touch_flush.lock();
         *last = Instant::now();
@@ -1481,7 +1560,7 @@ mod tests {
 
         // Verify the entry has extended effective TTL
         let mut by_slug = cache.projects_by_slug.write();
-        let slug_key = "hot-proj".to_owned();
+        let slug_key = (scope_fingerprint(""), "hot-proj".to_owned());
         if let Some(entry) = by_slug.get(&slug_key) {
             let effective = entry.effective_ttl(PROJECT_TTL);
             assert!(

@@ -2168,7 +2168,9 @@ dependencies = [
  "fsqlite-btree",
  "fsqlite-error",
  "fsqlite-ext-fts5",
+ "fsqlite-ext-icu",
  "fsqlite-ext-json",
+ "fsqlite-ext-misc",
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-observability 0.1.1",
@@ -2203,6 +2205,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsqlite-ext-icu"
+version = "0.1.1"
+dependencies = [
+ "fsqlite-error",
+ "fsqlite-func",
+ "fsqlite-types",
+ "tracing",
+]
+
+[[package]]
 name = "fsqlite-ext-json"
 version = "0.1.1"
 dependencies = [
@@ -2211,6 +2223,16 @@ dependencies = [
  "fsqlite-types",
  "json5",
  "serde_json",
+]
+
+[[package]]
+name = "fsqlite-ext-misc"
+version = "0.1.1"
+dependencies = [
+ "fsqlite-error",
+ "fsqlite-func",
+ "fsqlite-types",
+ "tracing",
 ]
 
 [[package]]
@@ -2687,10 +2709,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "139ef39800118c7683f2fd3c98c1b23c09ae076556b435f8e9064ae108aaeeec"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4556,7 +4580,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "criterion",
@@ -4582,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4593,6 +4617,7 @@ dependencies = [
  "ftui-runtime",
  "glob",
  "hex",
+ "json5",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
  "mcp-agent-mail-guard",
@@ -4617,7 +4642,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asupersync",
  "clap",
@@ -4639,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -4662,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4704,7 +4729,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "git2",
@@ -4719,7 +4744,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -4748,7 +4773,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4787,7 +4812,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "atty",
  "base64 0.22.1",
@@ -4809,7 +4834,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4834,7 +4859,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4858,7 +4883,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",

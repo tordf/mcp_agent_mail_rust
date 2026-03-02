@@ -78,12 +78,30 @@ impl Model2VecEmbedder {
 
         // Fall back to agent-mail-specific paths
         let candidates = Self::agent_mail_model_paths(model_name);
+        let mut first_load_error: Option<SearchError> = None;
         for candidate in &candidates {
-            if candidate.exists()
-                && let Ok(embedder) = Self::load_from_dir(candidate, model_name)
-            {
-                return Ok(embedder);
+            if !candidate.exists() {
+                continue;
             }
+
+            match Self::load_from_dir(candidate, model_name) {
+                Ok(embedder) => return Ok(embedder),
+                Err(err) => {
+                    tracing::debug!(
+                        model = model_name,
+                        path = %candidate.display(),
+                        error = %err,
+                        "Model2Vec candidate exists but failed to load"
+                    );
+                    if first_load_error.is_none() {
+                        first_load_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_load_error {
+            return Err(err);
         }
 
         Err(SearchError::ModeUnavailable(format!(

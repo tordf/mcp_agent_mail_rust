@@ -243,8 +243,9 @@ pub fn diversify<S: BuildHasher>(
             }
         }
 
-        // Track if this was a demotion (placed out of original order)
-        if idx_to_take != position {
+        // Count true demotions only: an item originally earlier in the list
+        // was pushed to a later position by diversity reordering.
+        if idx_to_take < position {
             demotions += 1;
         }
 
@@ -403,6 +404,28 @@ mod tests {
             thread_a_in_top3 <= 2,
             "Expected at most 2 thread-A docs in top 3, got {thread_a_in_top3}"
         );
+    }
+
+    #[test]
+    fn promotions_do_not_increment_demotion_counter() {
+        let hits = vec![make_hit(1, 0.030), make_hit(2, 0.030), make_hit(3, 0.029)];
+        let mut meta = HashMap::new();
+        meta.insert(1, make_meta(Some("thread-A"), Some("alice")));
+        meta.insert(2, make_meta(Some("thread-A"), Some("alice")));
+        meta.insert(3, make_meta(Some("thread-B"), Some("bob")));
+
+        let config = DiversityConfig {
+            enabled: true,
+            max_per_thread: 1,
+            max_per_sender: 100,
+            score_tolerance: 0.01,
+            window_size: 3,
+        };
+
+        let result = diversify(hits, &meta, &config);
+        let order: Vec<i64> = result.hits.iter().map(|hit| hit.doc_id).collect();
+        assert_eq!(order, vec![1, 3, 2]);
+        assert_eq!(result.demotions, 1);
     }
 
     // ── Sender diversity ──────────────────────────────────────────────

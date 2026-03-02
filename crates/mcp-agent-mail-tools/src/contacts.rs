@@ -258,19 +258,28 @@ pub async fn request_contact(
         Some(t) if t > 0 => t.max(60),
         _ => 604_800, // 7 days default
     };
-    let link_row = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::request_contact(
-            ctx.cx(),
-            &pool,
-            project_id,
-            from_row.id.unwrap_or(0),
-            target_project_id,
-            to_row.id.unwrap_or(0),
-            reason.as_deref().unwrap_or(""),
-            ttl,
-        )
-        .await,
-    )?;
+    let link_out = mcp_agent_mail_db::queries::request_contact(
+        ctx.cx(),
+        &pool,
+        project_id,
+        from_row.id.unwrap_or(0),
+        target_project_id,
+        to_row.id.unwrap_or(0),
+        reason.as_deref().unwrap_or(""),
+        ttl,
+    )
+    .await;
+    if let Outcome::Err(ref err) = link_out {
+        tracing::error!(
+            from_agent = %from_agent,
+            from_project_id = project_id,
+            to_agent = %target_agent_name,
+            to_project_id = target_project_id,
+            error = %err,
+            "request_contact query failed"
+        );
+    }
+    let link_row = db_outcome_to_mcp_result(link_out)?;
 
     // Send an intro mail (ack_required) so the recipient sees the request in their inbox.
     let subject = format!("Contact request from {from_agent}");
@@ -278,22 +287,33 @@ pub async fn request_contact(
 
     let to_id = to_row.id.unwrap_or(0);
     let recipients: &[(i64, &str)] = &[(to_id, "to")];
-    let message = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::create_message_with_recipients(
-            ctx.cx(),
-            &pool,
-            target_project_id,
-            from_row.id.unwrap_or(0),
-            &subject,
-            &body_md,
-            None,
-            "normal",
-            true,
-            "[]",
-            recipients,
-        )
-        .await,
-    )?;
+    let message_out = mcp_agent_mail_db::queries::create_message_with_recipients(
+        ctx.cx(),
+        &pool,
+        target_project_id,
+        from_row.id.unwrap_or(0),
+        &subject,
+        &body_md,
+        None,
+        "normal",
+        true,
+        "[]",
+        recipients,
+    )
+    .await;
+    if let Outcome::Err(ref err) = message_out {
+        tracing::error!(
+            from_agent = %from_agent,
+            from_project_id = project_id,
+            to_agent = %target_agent_name,
+            to_project_id = target_project_id,
+            sender_id = from_row.id.unwrap_or(0),
+            recipient_id = to_id,
+            error = %err,
+            "request_contact intro-message insert failed"
+        );
+    }
+    let message = db_outcome_to_mcp_result(message_out)?;
     enqueue_message_semantic_index(
         target_project_id,
         message.id.unwrap_or(0),
@@ -396,19 +416,29 @@ pub async fn respond_contact(
         Some(t) if t > 0 => t.max(60),
         _ => 2_592_000, // 30 days default
     };
-    let (updated, link_row) = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::respond_contact(
-            ctx.cx(),
-            &pool,
-            source_project_id,
-            from_row.id.unwrap_or(0),
-            project_id,
-            to_row.id.unwrap_or(0),
+    let respond_out = mcp_agent_mail_db::queries::respond_contact(
+        ctx.cx(),
+        &pool,
+        source_project_id,
+        from_row.id.unwrap_or(0),
+        project_id,
+        to_row.id.unwrap_or(0),
+        accept,
+        ttl,
+    )
+    .await;
+    if let Outcome::Err(ref err) = respond_out {
+        tracing::error!(
+            from_agent = %from_agent,
+            from_project_id = source_project_id,
+            to_agent = %to_agent,
+            to_project_id = project_id,
             accept,
-            ttl,
-        )
-        .await,
-    )?;
+            error = %err,
+            "respond_contact query failed"
+        );
+    }
+    let (updated, link_row) = db_outcome_to_mcp_result(respond_out)?;
 
     let response = RespondContactResponse {
         from: from_agent,

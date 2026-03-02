@@ -588,11 +588,13 @@ async fn canonicalize_message_results(
 
 /// Serialized bootstrap state for Tantivy bridge initialization in non-server surfaces.
 ///
-/// Keyed by SQLite path to avoid cross-database contamination in test and
+/// Keyed by `SQLite` path to avoid cross-database contamination in test and
 /// multi-project local contexts that share one process.
 static LEXICAL_BRIDGE_BOOTSTRAP_STATE: OnceLock<Mutex<HashMap<String, Result<(), String>>>> =
     OnceLock::new();
 static LEXICAL_BRIDGE_BACKFILL_STATE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static LEXICAL_BRIDGE_ACTIVE_DB_KEY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LEXICAL_BRIDGE_INIT_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn lexical_bootstrap_state() -> &'static Mutex<HashMap<String, Result<(), String>>> {
     LEXICAL_BRIDGE_BOOTSTRAP_STATE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -600,6 +602,14 @@ fn lexical_bootstrap_state() -> &'static Mutex<HashMap<String, Result<(), String
 
 fn lexical_backfill_state() -> &'static Mutex<HashSet<String>> {
     LEXICAL_BRIDGE_BACKFILL_STATE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn lexical_active_db_key() -> &'static Mutex<Option<String>> {
+    LEXICAL_BRIDGE_ACTIVE_DB_KEY.get_or_init(|| Mutex::new(None))
+}
+
+fn lexical_init_guard() -> &'static Mutex<()> {
+    LEXICAL_BRIDGE_INIT_GUARD.get_or_init(|| Mutex::new(()))
 }
 
 fn map_bridge_bootstrap_error(err: &str) -> DbError {
@@ -629,11 +639,10 @@ fn has_run_lexical_backfill(sqlite_key: &str) -> Result<bool, DbError> {
 }
 
 fn mark_lexical_backfill_ran(sqlite_key: &str) -> Result<(), DbError> {
-    let backfill_state = lexical_backfill_state();
-    let mut state = backfill_state
+    lexical_backfill_state()
         .lock()
-        .map_err(|_| DbError::Sqlite("search backfill state lock poisoned".to_string()))?;
-    state.insert(sqlite_key.to_string());
+        .map_err(|_| DbError::Sqlite("search backfill state lock poisoned".to_string()))?
+        .insert(sqlite_key.to_string());
     Ok(())
 }
 
@@ -647,33 +656,63 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
 
 fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     let sqlite_key = pool.sqlite_path().to_string();
+    let _guard = lexical_init_guard()
+        .lock()
+        .map_err(|_| DbError::Sqlite("search bootstrap init guard lock poisoned".to_string()))?;
+
     let state_lock = lexical_bootstrap_state();
+    let cached_state = state_lock
+        .lock()
+        .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
+        .get(&sqlite_key)
+        .cloned();
+    let active_key = lexical_active_db_key()
+        .lock()
+        .map_err(|_| DbError::Sqlite("search active DB key lock poisoned".to_string()))?
+        .clone();
+
+    // Fast path: the current DB is already the active bridge source and the
+    // per-DB backfill marker is present.
+    if matches!(cached_state, Some(Ok(())))
+        && active_key.as_deref() == Some(sqlite_key.as_str())
+        && has_run_lexical_backfill(&sqlite_key)?
     {
-        let state = state_lock
-            .lock()
-            .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?;
-        if let Some(result) = state.get(&sqlite_key) {
-            return result
-                .clone()
-                .map_err(|err| map_bridge_bootstrap_error(&err));
-        }
+        return Ok(());
     }
 
     let config = mcp_agent_mail_core::Config::get();
     let index_dir = config.storage_root.join("search_index");
-    let result = (|| {
+    let result: Result<(), String> = (|| {
         if crate::search_v3::get_bridge().is_none() {
             crate::search_v3::init_bridge(&index_dir)?;
+        }
+
+        // The lexical bridge is process-global. Re-run backfill whenever a
+        // different DB becomes active so lexical results cannot drift across DB
+        // boundaries in multi-pool workflows.
+        let should_backfill = active_key.as_deref() != Some(sqlite_key.as_str())
+            || !has_run_lexical_backfill(&sqlite_key).map_err(|err| err.to_string())?;
+        if should_backfill {
             run_lexical_backfill_for_pool(pool).map_err(|err| err.to_string())?;
         }
         Ok(())
     })();
 
-    {
-        let mut state = state_lock
+    if result.is_ok() {
+        state_lock
             .lock()
-            .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?;
-        state.insert(sqlite_key, result.clone());
+            .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
+            .insert(sqlite_key.clone(), Ok(()));
+        *lexical_active_db_key()
+            .lock()
+            .map_err(|_| DbError::Sqlite("search active DB key lock poisoned".to_string()))? =
+            Some(sqlite_key);
+    } else {
+        // Do not permanently cache failures; allow retry on next query.
+        state_lock
+            .lock()
+            .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
+            .remove(&sqlite_key);
     }
 
     result.map_err(|err| map_bridge_bootstrap_error(&err))
@@ -806,7 +845,16 @@ impl SemanticBridge {
     /// Create a semantic bridge with default configuration (384-dim for `MiniLM`).
     #[must_use]
     pub fn default_config() -> Self {
-        Self::new(VectorIndexConfig::default())
+        let ctx = get_two_tier_context();
+        let mut config = VectorIndexConfig::default();
+        config.dimension = ctx.fast_info().map_or_else(
+            || {
+                ctx.quality_info()
+                    .map_or(config.dimension, |info| info.dimension)
+            },
+            |info| info.dimension,
+        );
+        Self::new(config)
     }
 
     /// Get a reference to the vector index (for reads).
@@ -2857,13 +2905,13 @@ pub async fn execute_search(
     // ── Cache lookup ──────────────────────────────────────────────────
     let cache = global_search_cache();
     let cache_key = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
         let filter = query.to_search_filter();
         let engine_mode = options
             .search_engine
             .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
         let mode = engine_to_search_mode(engine_mode);
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
         let mut discriminator_hasher = DefaultHasher::new();
         cache_scope_discriminator(query).hash(&mut discriminator_hasher);
         pool.sqlite_path().hash(&mut discriminator_hasher);
@@ -3012,27 +3060,25 @@ pub async fn execute_search(
     if engine == SearchEngine::Lexical {
         let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
         if let Some(mut raw_results) = try_tantivy_search(query) {
-            if raw_results.is_empty() {
-                if !explicit_lexical {
-                    let sqlite_key = pool.sqlite_path().to_string();
-                    let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
-                        Ok(v) => v,
-                        Err(err) => return Outcome::Err(err),
-                    };
-                    if !backfill_ran {
-                        if let Err(err) = run_lexical_backfill_for_pool(pool) {
-                            let latency_us =
-                                u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-                            record_legacy_error_metrics(
-                                "search_service_lexical_backfill",
-                                latency_us,
-                                options.track_telemetry,
-                            );
-                            return Outcome::Err(err);
-                        }
-                        if let Some(rerun_results) = try_tantivy_search(query) {
-                            raw_results = rerun_results;
-                        }
+            if raw_results.is_empty() && !explicit_lexical {
+                let sqlite_key = pool.sqlite_path().to_string();
+                let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
+                    Ok(v) => v,
+                    Err(err) => return Outcome::Err(err),
+                };
+                if !backfill_ran {
+                    if let Err(err) = run_lexical_backfill_for_pool(pool) {
+                        let latency_us =
+                            u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+                        record_legacy_error_metrics(
+                            "search_service_lexical_backfill",
+                            latency_us,
+                            options.track_telemetry,
+                        );
+                        return Outcome::Err(err);
+                    }
+                    if let Some(rerun_results) = try_tantivy_search(query) {
+                        raw_results = rerun_results;
                     }
                 }
             }
@@ -4435,6 +4481,24 @@ mod tests {
         let query = SearchQuery::messages("auto-init semantic bridge", 1);
         let _ = try_two_tier_search(&query, query.effective_limit());
         assert!(get_two_tier_bridge().is_some());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_bridge_default_dimension_matches_auto_init_context() {
+        let ctx = get_two_tier_context();
+        let expected_dimension = ctx.fast_info().map_or_else(
+            || {
+                ctx.quality_info().map_or_else(
+                    || VectorIndexConfig::default().dimension,
+                    |info| info.dimension,
+                )
+            },
+            |info| info.dimension,
+        );
+
+        let bridge = SemanticBridge::default_config();
+        assert_eq!(bridge.index().config().dimension, expected_dimension);
     }
 
     #[cfg(feature = "hybrid")]

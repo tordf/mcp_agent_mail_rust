@@ -854,7 +854,12 @@ impl DbPool {
         }
 
         // Checkpoint WAL so the backup is self-contained.
-        let _ = self.wal_checkpoint();
+        if let Err(e) = self.wal_checkpoint() {
+            return Err(DbError::Sqlite(format!(
+                "proactive backup aborted: WAL checkpoint failed for {}: {e}",
+                primary.display()
+            )));
+        }
 
         std::fs::copy(primary, &bak_path).map_err(|e| {
             DbError::Sqlite(format!(

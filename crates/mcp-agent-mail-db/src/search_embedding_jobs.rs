@@ -332,13 +332,6 @@ impl EmbeddingQueue {
     pub fn enqueue(&self, request: EmbeddingRequest) -> bool {
         let mut state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
 
-        // Check backpressure
-        let total_pending = state.queue.len() + state.retry_queue.len();
-        if total_pending >= self.config.backpressure_threshold {
-            state.stats.total_dropped += 1;
-            return false;
-        }
-
         // Check dedup
         let key = request.dedup_key();
         if state.dedup.contains(&key) {
@@ -366,6 +359,13 @@ impl EmbeddingQueue {
             }
             // Stale dedup key; clear and continue with enqueue.
             state.dedup.remove(&key);
+        }
+
+        // Check backpressure for new requests only.
+        let total_pending = state.queue.len() + state.retry_queue.len();
+        if total_pending >= self.config.backpressure_threshold {
+            state.stats.total_dropped += 1;
+            return false;
         }
 
         // Add to queue
@@ -1674,6 +1674,31 @@ mod tests {
         let batch = queue.drain_batch(10);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].body, "new body");
+    }
+
+    #[test]
+    fn queue_backpressure_allows_dedup_replacement() {
+        let config = EmbeddingJobConfig {
+            backpressure_threshold: 1,
+            ..Default::default()
+        };
+        let queue = EmbeddingQueue::with_config(config);
+
+        let mut initial = make_request(7);
+        initial.body = "old".to_owned();
+        assert!(queue.enqueue(initial));
+
+        let mut replacement = make_request(7);
+        replacement.body = "new".to_owned();
+        assert!(queue.enqueue(replacement));
+
+        let stats = queue.stats();
+        assert_eq!(stats.total_deduped, 1);
+        assert_eq!(stats.total_dropped, 0);
+
+        let batch = queue.drain_batch(10);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].body, "new");
     }
 
     // ── JobMetrics extended ──

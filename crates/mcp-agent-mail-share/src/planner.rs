@@ -288,8 +288,8 @@ fn generate_github_pages_plan(
             output_dir.display()
         ),
         command: Some(format!(
-            "cp -r {}/* {}",
-            quote_path(bundle_path),
+            "cp -a {} {}",
+            quote_path(&bundle_path.join(".")),
             quote_path(&output_dir)
         )),
         optional: false,
@@ -432,7 +432,7 @@ fn generate_cloudflare_pages_plan(
         description: format!("Deploy to Cloudflare Pages project: {project}"),
         command: Some(format!(
             "wrangler pages deploy {} --project-name {}",
-            quote_path(bundle_path),
+            quote_path(&output_dir),
             quote_str(project)
         )),
         optional: false,
@@ -497,7 +497,7 @@ fn generate_netlify_plan(
         description: format!("Deploy to Netlify site: {site}"),
         command: Some(format!(
             "netlify deploy --dir {} --prod",
-            quote_path(bundle_path)
+            quote_path(&output_dir)
         )),
         optional: false,
         requires_confirm: true,
@@ -804,6 +804,16 @@ mod tests {
         assert!(!plan.steps.is_empty());
         assert!(plan.steps.iter().any(|s| s.id == "create_nojekyll"));
         assert!(plan.steps.iter().any(|s| s.id == "create_headers"));
+        let copy_step = plan.steps.iter().find(|s| s.id == "copy_bundle").unwrap();
+        let expected_output = bundle.path().join("docs");
+        assert_eq!(
+            copy_step.command,
+            Some(format!(
+                "cp -a {} {}",
+                quote_path(&bundle.path().join(".")),
+                quote_path(&expected_output)
+            ))
+        );
     }
 
     #[test]
@@ -819,6 +829,34 @@ mod tests {
         let plan = generate_cloudflare_pages_plan(&inputs, &env, bundle.path()).unwrap();
         assert!(plan.steps.iter().any(|s| s.id == "wrangler_deploy"));
         assert!(plan.expected_url.as_ref().unwrap().contains("my-project"));
+    }
+
+    #[test]
+    fn cloudflare_plan_deploy_uses_output_dir() {
+        let bundle = tempfile::tempdir().unwrap();
+        let output_dir = bundle.path().join("public-dist");
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::CloudflarePages),
+            cloudflare_project: Some("my-project".to_string()),
+            output_dir: Some(output_dir.clone()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let plan = generate_cloudflare_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        let deploy_step = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "wrangler_deploy")
+            .unwrap();
+        assert_eq!(
+            deploy_step.command,
+            Some(format!(
+                "wrangler pages deploy {} --project-name {}",
+                quote_path(&output_dir),
+                quote_str("my-project")
+            ))
+        );
     }
 
     #[test]
@@ -971,6 +1009,33 @@ mod tests {
         assert_eq!(
             plan.expected_url,
             Some("https://my-site.netlify.app".to_string())
+        );
+    }
+
+    #[test]
+    fn netlify_plan_deploy_uses_output_dir() {
+        let bundle = tempfile::tempdir().unwrap();
+        let output_dir = bundle.path().join("netlify-out");
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::Netlify),
+            netlify_site: Some("my-site".to_string()),
+            output_dir: Some(output_dir.clone()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let plan = generate_netlify_plan(&inputs, &env, bundle.path()).unwrap();
+        let deploy_step = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "netlify_deploy")
+            .unwrap();
+        assert_eq!(
+            deploy_step.command,
+            Some(format!(
+                "netlify deploy --dir {} --prod",
+                quote_path(&output_dir)
+            ))
         );
     }
 

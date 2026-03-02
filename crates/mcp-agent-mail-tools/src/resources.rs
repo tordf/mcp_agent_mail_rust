@@ -41,6 +41,29 @@ fn parse_bool_param(v: &str) -> bool {
     )
 }
 
+/// Maximum number of rows a resource endpoint will return.
+const RESOURCE_LIMIT_MAX: usize = 10_000;
+/// Default number of rows when no `limit` query parameter is supplied.
+const RESOURCE_LIMIT_DEFAULT: usize = 20;
+
+/// Parse the `limit` query parameter from a resource URI.
+///
+/// Returns [`RESOURCE_LIMIT_DEFAULT`] when the key is absent, unparseable,
+/// zero, or negative.  Positive values are clamped to
+/// `[1, RESOURCE_LIMIT_MAX]`.
+fn parse_resource_limit(query: &HashMap<String, String>) -> usize {
+    query
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .map_or(RESOURCE_LIMIT_DEFAULT, |v| {
+            if v <= 0 {
+                RESOURCE_LIMIT_DEFAULT
+            } else {
+                usize::try_from(v).map_or(RESOURCE_LIMIT_MAX, |u| u.min(RESOURCE_LIMIT_MAX))
+            }
+        })
+}
+
 fn parse_query(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&') {
@@ -1165,7 +1188,7 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
 
     let response = ToolMetricsResponse {
         generated_at: None,
-        health_level: mcp_agent_mail_core::cached_health_level().to_string(),
+        health_level: mcp_agent_mail_core::compute_health_level().to_string(),
         tools,
     };
 
@@ -1200,7 +1223,7 @@ pub struct ToolingMetricsCoreResponse {
 pub fn tooling_metrics_core(_ctx: &McpContext) -> McpResult<String> {
     let response = ToolingMetricsCoreResponse {
         generated_at: None,
-        health_level: mcp_agent_mail_core::cached_health_level().to_string(),
+        health_level: mcp_agent_mail_core::compute_health_level().to_string(),
         metrics: mcp_agent_mail_core::global_metrics().snapshot(),
         lock_contention: mcp_agent_mail_core::lock_contention_snapshot(),
     };
@@ -2042,16 +2065,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         .get("urgent_only")
         .is_some_and(|v| parse_bool_param(v));
     let since_ts: Option<i64> = query.get("since_ts").and_then(|v| iso_to_micros(v));
-    let limit = query
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .map_or(20, |v| {
-            if v == 0 {
-                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-            } else {
-                v
-            }
-        });
+    let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2257,16 +2271,7 @@ pub struct MailboxResponseFull {
 pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let limit: usize = query
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| {
-            if v == 0 {
-                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-            } else {
-                v
-            }
-        });
+    let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2356,16 +2361,7 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let limit: usize = query
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| {
-            if v == 0 {
-                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-            } else {
-                v
-            }
-        });
+    let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2498,16 +2494,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let limit: usize = query
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| {
-            if v == 0 {
-                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-            } else {
-                v
-            }
-        });
+    let limit = parse_resource_limit(&query);
     let include_bodies = query
         .get("include_bodies")
         .is_some_and(|v| parse_bool_param(v));
@@ -2721,16 +2708,7 @@ pub struct ViewResponse {
 pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let limit: usize = query
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| {
-            if v == 0 {
-                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-            } else {
-                v
-            }
-        });
+    let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2816,16 +2794,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
 pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let limit: usize = query
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| {
-            if v == 0 {
-                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-            } else {
-                v
-            }
-        });
+    let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2949,16 +2918,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
         .get("ttl_seconds")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3600);
-    let limit: usize = query
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| {
-            if v == 0 {
-                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-            } else {
-                v
-            }
-        });
+    let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -3056,16 +3016,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
 pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let limit: usize = query
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .map_or(20, |v: usize| {
-            if v == 0 {
-                usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-            } else {
-                v
-            }
-        });
+    let limit = parse_resource_limit(&query);
     let ttl_minutes: u64 = query
         .get("ttl_minutes")
         .and_then(|v| v.parse().ok())
@@ -4702,11 +4653,72 @@ mod query_param_tests {
     }
 
     #[test]
-    fn inbox_limit_zero_means_no_limit() {
-        let input = "RedFox?project=/data/proj&limit=0";
-        let (_agent, query) = split_param_and_query(input);
-        let limit: usize = query.get("limit").unwrap().parse().unwrap();
-        assert_eq!(limit, 0);
+    fn parse_resource_limit_defaults_to_20() {
+        let query = HashMap::new();
+        assert_eq!(parse_resource_limit(&query), 20);
+    }
+
+    #[test]
+    fn parse_resource_limit_valid_value() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "50".to_string());
+        assert_eq!(parse_resource_limit(&query), 50);
+    }
+
+    #[test]
+    fn parse_resource_limit_zero_returns_default() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "0".to_string());
+        assert_eq!(parse_resource_limit(&query), RESOURCE_LIMIT_DEFAULT);
+    }
+
+    #[test]
+    fn parse_resource_limit_negative_returns_default() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "-5".to_string());
+        assert_eq!(parse_resource_limit(&query), RESOURCE_LIMIT_DEFAULT);
+    }
+
+    #[test]
+    fn parse_resource_limit_clamped_to_max() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "999999".to_string());
+        assert_eq!(parse_resource_limit(&query), RESOURCE_LIMIT_MAX);
+    }
+
+    #[test]
+    fn parse_resource_limit_unparseable_returns_default() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "abc".to_string());
+        assert_eq!(parse_resource_limit(&query), RESOURCE_LIMIT_DEFAULT);
+    }
+
+    #[test]
+    fn parse_resource_limit_one_is_valid() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "1".to_string());
+        assert_eq!(parse_resource_limit(&query), 1);
+    }
+
+    #[test]
+    fn parse_resource_limit_at_max_boundary() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "10000".to_string());
+        assert_eq!(parse_resource_limit(&query), 10_000);
+    }
+
+    #[test]
+    fn parse_resource_limit_just_above_max() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "10001".to_string());
+        assert_eq!(parse_resource_limit(&query), RESOURCE_LIMIT_MAX);
+    }
+
+    #[test]
+    fn parse_resource_limit_extreme_positive_clamped_to_max() {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), i64::MAX.to_string());
+        assert_eq!(parse_resource_limit(&query), RESOURCE_LIMIT_MAX);
     }
 
     #[test]

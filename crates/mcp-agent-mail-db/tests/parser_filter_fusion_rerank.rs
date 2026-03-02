@@ -230,9 +230,8 @@ fn filter_date_range_both_none_not_counted() {
         }),
         ..Default::default()
     };
-    // A date range with both bounds None is technically set but meaningless
-    // active_filter_count should still count it as 1 (the field is Some)
-    assert_eq!(active_filter_count(&filter), 1);
+    assert_eq!(active_filter_count(&filter), 0);
+    assert!(!has_active_filters(&filter));
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -113,8 +113,8 @@ impl DbError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Sqlite(msg) | Self::Pool(msg) | Self::ResourceBusy(msg) => is_lock_error(msg),
-            Self::PoolExhausted { .. } => true,
+            Self::Sqlite(msg) | Self::Pool(msg) => is_lock_error(msg),
+            Self::ResourceBusy(_) | Self::PoolExhausted { .. } => true,
             _ => false,
         }
     }

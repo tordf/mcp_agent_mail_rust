@@ -377,14 +377,14 @@ fn health_classification_matrix() {
             },
             HealthLevel::Red,
         ),
-        // Boundary: at-threshold pool latency (not above) → Green
+        // Boundary: at-threshold pool latency counts as Yellow.
         (
             "pool_latency_at_yellow_boundary",
             HealthSignals {
                 pool_acquire_p95_us: backpressure::yellow::POOL_ACQUIRE_P95_US,
                 ..default_signals()
             },
-            HealthLevel::Green,
+            HealthLevel::Yellow,
         ),
     ];
 

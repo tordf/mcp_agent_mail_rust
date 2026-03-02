@@ -13,7 +13,7 @@
 #[cfg(feature = "tantivy-engine")]
 use tantivy::Term;
 #[cfg(feature = "tantivy-engine")]
-use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 #[cfg(feature = "tantivy-engine")]
 use tantivy::schema::{Field, IndexRecordOption};
 
@@ -88,15 +88,20 @@ pub fn compile_filters(filter: &SearchFilter, handles: &FieldHandles) -> Compile
 
     // Project ID filter
     if let Some(project_id) = filter.project_id {
-        #[allow(clippy::cast_sign_loss)]
-        let uid = project_id as u64;
-        clauses.push((
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_u64(handles.project_id, uid),
-                IndexRecordOption::Basic,
-            )),
-        ));
+        if project_id < 0 {
+            // Negative IDs are invalid in persisted project rows; force empty result set.
+            clauses.push((Occur::MustNot, Box::new(AllQuery)));
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            let uid = project_id as u64;
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(handles.project_id, uid),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
     }
 
     // Thread ID filter (exact match on STRING field)
@@ -213,7 +218,7 @@ pub fn has_active_filters(filter: &SearchFilter) -> bool {
         || filter.project_id.is_some()
         || filter.thread_id.is_some()
         || filter.doc_kind.is_some()
-        || filter.date_range.is_some()
+        || has_active_date_range_bounds(filter)
         || filter
             .importance
             .as_ref()
@@ -236,7 +241,7 @@ pub fn active_filter_count(filter: &SearchFilter) -> usize {
     if filter.doc_kind.is_some() {
         count += 1;
     }
-    if filter.date_range.is_some() {
+    if has_active_date_range_bounds(filter) {
         count += 1;
     }
     if filter
@@ -247,6 +252,13 @@ pub fn active_filter_count(filter: &SearchFilter) -> usize {
         count += 1;
     }
     count
+}
+
+fn has_active_date_range_bounds(filter: &SearchFilter) -> bool {
+    filter
+        .date_range
+        .as_ref()
+        .is_some_and(|range| range.start.is_some() || range.end.is_some())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -362,6 +374,18 @@ mod tests {
     }
 
     #[test]
+    fn has_active_filters_date_range_without_bounds_is_inactive() {
+        let filter = SearchFilter {
+            date_range: Some(DateRange {
+                start: None,
+                end: None,
+            }),
+            ..SearchFilter::default()
+        };
+        assert!(!has_active_filters(&filter));
+    }
+
+    #[test]
     fn has_active_filters_importance_high() {
         let filter = SearchFilter {
             importance: Some(ImportanceFilter::High),
@@ -436,6 +460,18 @@ mod tests {
             ..SearchFilter::default()
         };
         assert_eq!(active_filter_count(&filter), 1);
+    }
+
+    #[test]
+    fn active_filter_count_date_range_without_bounds_not_counted() {
+        let filter = SearchFilter {
+            date_range: Some(DateRange {
+                start: None,
+                end: None,
+            }),
+            ..SearchFilter::default()
+        };
+        assert_eq!(active_filter_count(&filter), 0);
     }
 
     #[test]
@@ -559,6 +595,17 @@ mod tests {
             };
             let ids = search_with_filter(&index, &handles, &filter);
             assert_eq!(ids, vec![3]);
+        }
+
+        #[test]
+        fn filter_by_negative_project_id_returns_empty() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                project_id: Some(-1),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert!(ids.is_empty());
         }
 
         #[test]

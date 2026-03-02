@@ -318,8 +318,8 @@ impl TwoTierContext {
     /// Create a frankensearch `EmbedderStack` from the auto-detected embedders.
     ///
     /// This uses `SyncEmbedderAdapter` to bridge search-core's sync embedders
-    /// to frankensearch's async `Embedder` trait. Returns `None` if no embedders
-    /// are available.
+    /// to frankensearch's async `Embedder` trait. Returns `None` if the fast
+    /// embedder is unavailable (quality-only mode cannot build a two-tier stack).
     ///
     /// This is the primary integration point for consumers migrating to
     /// frankensearch — use this stack with `frankensearch::IndexBuilder` or
@@ -345,7 +345,7 @@ impl TwoTierContext {
 
     /// Create a searcher for the given index.
     ///
-    /// Returns `None` if no embedders are available.
+    /// Returns `None` if the fast embedder is unavailable.
     #[must_use]
     pub fn create_searcher<'a>(&self, index: &'a TwoTierIndex) -> Option<TwoTierSearcher<'a>> {
         let fast_embedder: Option<Arc<dyn TwoTierEmbedder>> = match get_fast_embedder() {
