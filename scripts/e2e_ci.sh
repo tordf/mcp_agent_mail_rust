@@ -34,6 +34,7 @@ mkdir -p "${WORK}"
 # Case 1: am ci --help lists expected flags
 # ===========================================================================
 e2e_case_banner "am ci --help lists expected flags"
+e2e_mark_case_start "case01_am_ci_help_lists_expected_flags"
 
 set +e
 HELP_OUT="$(am ci --help 2>&1)"
@@ -52,6 +53,7 @@ done
 # Case 2: am ci --quick runs and produces output
 # ===========================================================================
 e2e_case_banner "am ci --quick produces JSON report"
+e2e_mark_case_start "case02_am_ci_quick_produces_json_report"
 
 REPORT_FILE="${WORK}/quick_report.json"
 set +e
@@ -73,6 +75,7 @@ fi
 # Case 3: Report schema matches am_ci_gate_report.v1
 # ===========================================================================
 e2e_case_banner "Report schema matches v1"
+e2e_mark_case_start "case03_report_schema_matches_v1"
 
 if [ -f "$REPORT_FILE" ]; then
     SCHEMA_VERSION="$(jq -r '.schema_version // empty' "$REPORT_FILE" 2>/dev/null || echo "")"
@@ -99,6 +102,7 @@ fi
 # Case 4: Quick mode skips E2E gates
 # ===========================================================================
 e2e_case_banner "Quick mode skips E2E gates"
+e2e_mark_case_start "case04_quick_mode_skips_e2e_gates"
 
 if [ -f "$REPORT_FILE" ]; then
     # Check if any gate with skip_in_quick=true has status=skip
@@ -117,6 +121,7 @@ fi
 # Case 5: Decision field present
 # ===========================================================================
 e2e_case_banner "Decision field present in report"
+e2e_mark_case_start "case05_decision_field_present_in_report"
 
 if [ -f "$REPORT_FILE" ]; then
     DECISION="$(jq -r '.decision // empty' "$REPORT_FILE" 2>/dev/null || echo "")"
@@ -133,6 +138,7 @@ fi
 # Case 6: --parallel flag produces valid report
 # ===========================================================================
 e2e_case_banner "am ci --quick --parallel produces valid report"
+e2e_mark_case_start "case06_am_ci_quick_parallel_produces_valid_report"
 
 PARALLEL_REPORT="${WORK}/parallel_report.json"
 set +e
@@ -160,6 +166,7 @@ fi
 # Case 7: NDJSON sidecar file created
 # ===========================================================================
 e2e_case_banner "NDJSON sidecar file created"
+e2e_mark_case_start "case07_ndjson_sidecar_file_created"
 
 NDJSON_SIDECAR="${PARALLEL_REPORT%.json}.gates.ndjson"
 if [ -f "$NDJSON_SIDECAR" ]; then
@@ -188,6 +195,7 @@ fi
 # Case 8: Custom report path with --report
 # ===========================================================================
 e2e_case_banner "Custom report path with --report"
+e2e_mark_case_start "case08_custom_report_path_with_report"
 
 CUSTOM_PATH="${WORK}/custom/nested/report.json"
 mkdir -p "$(dirname "$CUSTOM_PATH")"
@@ -207,6 +215,7 @@ fi
 # Case 9: Quick mode decision is no-go
 # ===========================================================================
 e2e_case_banner "Quick mode decision semantics"
+e2e_mark_case_start "case09_quick_mode_decision_semantics"
 
 if [ -f "$REPORT_FILE" ]; then
     DECISION="$(jq -r '.decision // empty' "$REPORT_FILE" 2>/dev/null || echo "")"
@@ -232,6 +241,7 @@ fi
 # Case 10: Verify gates array populated
 # ===========================================================================
 e2e_case_banner "Gates array populated in report"
+e2e_mark_case_start "case10_gates_array_populated_in_report"
 
 if [ -f "$REPORT_FILE" ]; then
     GATE_COUNT="$(jq '.gates | length' "$REPORT_FILE" 2>/dev/null || echo "0")"

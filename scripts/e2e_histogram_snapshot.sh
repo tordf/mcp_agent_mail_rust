@@ -33,6 +33,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
 
 # ── Case 1: Concurrent recording benchmark ──────────────────────────────
 e2e_case_banner "concurrent_recording_benchmark"
+e2e_mark_case_start "case01_concurrentrecordingbenchmark"
 set +e
 BENCH_OUT="$(cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_recording -- --nocapture 2>&1)"
 BENCH_RC=$?
@@ -50,6 +51,7 @@ fi
 
 # ── Case 2: Concurrent read/write invariant check ───────────────────────
 e2e_case_banner "concurrent_read_write_invariant_check"
+e2e_mark_case_start "case02_concurrentreadwriteinvariantcheck"
 set +e
 RW_OUT="$(cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_read_write -- --nocapture 2>&1)"
 RW_RC=$?
@@ -66,6 +68,7 @@ fi
 
 # ── Case 3: Quantile stability under bimodal load ────────────────────────
 e2e_case_banner "quantile_stability_bimodal_load"
+e2e_mark_case_start "case03_quantilestabilitybimodalload"
 set +e
 QUANT_OUT="$(cargo test -p mcp-agent-mail-core histogram_snapshot_quantile_stability_under_load -- --nocapture 2>&1)"
 QUANT_RC=$?
@@ -75,6 +78,7 @@ e2e_assert_exit_code "quantile stability exits 0" "0" "$QUANT_RC"
 
 # ── Case 4: Invariant summary ───────────────────────────────────────────
 e2e_case_banner "invariant_summary_validation"
+e2e_mark_case_start "case04_invariantsummaryvalidation"
 
 INVARIANT_REPORT="Histogram Snapshot Invariant Report
 ====================================

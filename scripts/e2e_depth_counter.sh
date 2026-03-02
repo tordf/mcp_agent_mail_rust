@@ -34,6 +34,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
 
 # ── Case 1: Interleaved increment/decrement (32 threads) ────────────────
 e2e_case_banner "interleaved_inc_dec_32_threads"
+e2e_mark_case_start "case01_interleavedincdec32threads"
 set +e
 OUT1="$(cargo test -p mcp-agent-mail-storage depth_counter_stress_interleaved_inc_dec_32_threads -- --nocapture 2>&1)"
 RC1=$?
@@ -46,6 +47,7 @@ e2e_pass "32 threads completed (logged ${THREAD_COUNT})"
 
 # ── Case 2: Burst drain never wraps ─────────────────────────────────────
 e2e_case_banner "burst_drain_never_wraps"
+e2e_mark_case_start "case02_burstdrainneverwraps"
 set +e
 OUT2="$(cargo test -p mcp-agent-mail-storage depth_counter_stress_burst_drain_never_wraps -- --nocapture 2>&1)"
 RC2=$?
@@ -61,6 +63,7 @@ fi
 
 # ── Case 3: Rapid increment then bulk drain ──────────────────────────────
 e2e_case_banner "rapid_inc_then_bulk_drain"
+e2e_mark_case_start "case03_rapidincthenbulkdrain"
 set +e
 OUT3="$(cargo test -p mcp-agent-mail-storage depth_counter_stress_rapid_inc_then_bulk_drain -- --nocapture 2>&1)"
 RC3=$?
@@ -76,6 +79,7 @@ fi
 
 # ── Case 4: Contention profile (producers + drainers) ────────────────────
 e2e_case_banner "contention_profile_no_anomaly"
+e2e_mark_case_start "case04_contentionprofilenoanomaly"
 set +e
 OUT4="$(cargo test -p mcp-agent-mail-storage depth_counter_stress_contention_profile_no_anomaly -- --nocapture 2>&1)"
 RC4=$?
@@ -91,6 +95,7 @@ fi
 
 # ── Case 5: Pressure report ──────────────────────────────────────────────
 e2e_case_banner "pressure_report_generation"
+e2e_mark_case_start "case05_pressurereportgeneration"
 
 PRESSURE_REPORT="Coalescer Depth Counter Pressure Report
 ========================================

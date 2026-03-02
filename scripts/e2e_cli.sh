@@ -43,6 +43,7 @@ mkdir -p "${CLI_STORAGE_ROOT}"
 # Case 1: Top-level --help contains expected subcommands
 # ===========================================================================
 e2e_case_banner "am --help lists expected subcommands"
+e2e_mark_case_start "case01_am_help_lists_expected_subcommands"
 
 HELP_OUT="$(am --help 2>&1)" || true
 e2e_save_artifact "case_01_help.txt" "$HELP_OUT"
@@ -61,6 +62,7 @@ done
 # Case 2: --version outputs something
 # ===========================================================================
 e2e_case_banner "am --version exits 0 and produces output"
+e2e_mark_case_start "case02_am_version_exits_0_and_produces_output"
 
 set +e
 VERSION_OUT="$(am --version 2>&1)"
@@ -80,6 +82,7 @@ fi
 # Case 3: mcp-agent-mail --help lists server-only subcommands
 # ===========================================================================
 e2e_case_banner "mcp-agent-mail --help lists expected subcommands"
+e2e_mark_case_start "case03_mcpagentmail_help_lists_expected_subcommands"
 
 MCP_HELP="$(mcp-agent-mail --help 2>&1)" || true
 e2e_save_artifact "case_03_mcp_help.txt" "$MCP_HELP"
@@ -94,6 +97,7 @@ e2e_assert_contains "mcp help points to am CLI" "$MCP_HELP" "am --help"
 # Case 4: Per-subcommand --help exits 0 and produces output
 # ===========================================================================
 e2e_case_banner "Subcommand --help exits 0"
+e2e_mark_case_start "case04_subcommand_help_exits_0"
 
 AM_SUBCMDS=(
     share archive guard file_reservations acks config
@@ -117,6 +121,7 @@ done
 # Case 5: Bad arguments produce exit code 2 (clap error)
 # ===========================================================================
 e2e_case_banner "Bad arguments exit with code 2"
+e2e_mark_case_start "case05_bad_arguments_exit_with_code_2"
 
 set +e
 am --no-such-flag 2>/dev/null; BAD_FLAG_RC=$?
@@ -132,6 +137,7 @@ e2e_assert_exit_code "am list-acks (missing required)" "2" "$MISSING_REQ_RC"
 # Case 6: migrate on fresh DB exits 0
 # ===========================================================================
 e2e_case_banner "migrate on fresh DB exits 0"
+e2e_mark_case_start "case06_migrate_on_fresh_db_exits_0"
 
 set +e
 MIGRATE_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" am migrate 2>&1)"
@@ -145,6 +151,7 @@ e2e_assert_exit_code "am migrate" "0" "$MIGRATE_RC"
 # Case 7: list-projects --json on fresh DB produces valid JSON
 # ===========================================================================
 e2e_case_banner "list-projects --json produces valid JSON"
+e2e_mark_case_start "case07_listprojects_json_produces_valid_json"
 
 set +e
 LP_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" am list-projects --json 2>&1)"
@@ -166,6 +173,7 @@ fi
 # Case 8: config show-port exits 0
 # ===========================================================================
 e2e_case_banner "config show-port exits 0"
+e2e_mark_case_start "case08_config_showport_exits_0"
 
 set +e
 SP_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" am config show-port 2>&1)"
@@ -179,6 +187,7 @@ e2e_assert_exit_code "am config show-port" "0" "$SP_RC"
 # Case 9: config set-port + show-port roundtrip
 # ===========================================================================
 e2e_case_banner "config set-port + show-port roundtrip"
+e2e_mark_case_start "case09_config_setport_showport_roundtrip"
 
 # Use a temp .env file so we don't clobber project's .env
 WORK_ENV="${WORK}/.env"
@@ -202,6 +211,7 @@ fi
 # Case 10: amctl env exits 0 and produces output
 # ===========================================================================
 e2e_case_banner "amctl env exits 0"
+e2e_mark_case_start "case10_amctl_env_exits_0"
 
 set +e
 AMCTL_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" am amctl env 2>&1)"
@@ -220,6 +230,7 @@ fi
 # Case 11: mail status on fresh DB
 # ===========================================================================
 e2e_case_banner "mail status on fresh DB exits 0"
+e2e_mark_case_start "case11_mail_status_on_fresh_db_exits_0"
 
 set +e
 MAIL_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" am mail status /tmp/test_project 2>&1)"
@@ -233,6 +244,7 @@ e2e_assert_exit_code "am mail status" "0" "$MAIL_RC"
 # Case 12: acks pending/overdue on fresh DB
 # ===========================================================================
 e2e_case_banner "acks pending/overdue on fresh DB"
+e2e_mark_case_start "case12_acks_pendingoverdue_on_fresh_db"
 
 set +e
 ACKS_PEND="$(DATABASE_URL="sqlite:////${CLI_DB}" am acks pending /tmp/test TestAgent 2>&1)"
@@ -250,6 +262,7 @@ e2e_assert_exit_code "am acks overdue" "0" "$ACKS_O_RC"
 # Case 13: file_reservations list/active/soon on fresh DB
 # ===========================================================================
 e2e_case_banner "file_reservations subcommands on fresh DB"
+e2e_mark_case_start "case13_filereservations_subcommands_on_fresh_db"
 
 set +e
 FR_LIST="$(DATABASE_URL="sqlite:////${CLI_DB}" am file_reservations list /tmp/test 2>&1)"
@@ -271,6 +284,7 @@ e2e_assert_exit_code "am file_reservations soon" "0" "$FR_S_RC"
 # Case 14: guard status in temp git repo
 # ===========================================================================
 e2e_case_banner "guard status in temp git repo"
+e2e_mark_case_start "case14_guard_status_in_temp_git_repo"
 
 GUARD_REPO="${WORK}/guard_repo"
 mkdir -p "$GUARD_REPO"
@@ -295,6 +309,7 @@ fi
 # Case 15: share subcommand --help texts
 # ===========================================================================
 e2e_case_banner "share subcommands --help"
+e2e_mark_case_start "case15_share_subcommands_help"
 
 SHARE_SUBS=(export update preview verify decrypt wizard)
 for sub in "${SHARE_SUBS[@]}"; do
@@ -310,6 +325,7 @@ done
 # Case 16: doctor subcommands --help
 # ===========================================================================
 e2e_case_banner "doctor subcommands --help"
+e2e_mark_case_start "case16_doctor_subcommands_help"
 
 DOC_SUBS=(check repair backups restore)
 for sub in "${DOC_SUBS[@]}"; do
@@ -325,6 +341,7 @@ done
 # Case 17: products subcommands --help
 # ===========================================================================
 e2e_case_banner "products subcommands --help"
+e2e_mark_case_start "case17_products_subcommands_help"
 
 PROD_SUBS=(ensure link status search inbox summarize-thread)
 for sub in "${PROD_SUBS[@]}"; do
@@ -340,6 +357,7 @@ done
 # Case 18: projects subcommands --help
 # ===========================================================================
 e2e_case_banner "projects subcommands --help"
+e2e_mark_case_start "case18_projects_subcommands_help"
 
 PROJ_SUBS=(mark-identity discovery-init adopt)
 for sub in "${PROJ_SUBS[@]}"; do
@@ -355,6 +373,7 @@ done
 # Case 19: docs insert-blurbs --help
 # ===========================================================================
 e2e_case_banner "docs insert-blurbs --help"
+e2e_mark_case_start "case19_docs_insertblurbs_help"
 
 set +e
 DOCS_HELP="$(am docs insert-blurbs --help 2>&1)"
@@ -368,6 +387,7 @@ e2e_assert_exit_code "am docs insert-blurbs --help" "0" "$DOCS_RC"
 # Case 20: mcp-agent-mail serve --help exits 0
 # ===========================================================================
 e2e_case_banner "mcp-agent-mail serve --help"
+e2e_mark_case_start "case20_mcpagentmail_serve_help"
 
 set +e
 SERVE_HELP="$(mcp-agent-mail serve --help 2>&1)"
@@ -383,6 +403,7 @@ e2e_assert_contains "serve help shows --port" "$SERVE_HELP" "--port"
 # Case 21: Legacy CLI inventory roots are present in top-level help
 # ===========================================================================
 e2e_case_banner "legacy inventory command roots in am --help"
+e2e_mark_case_start "case21_legacy_inventory_command_roots_in_am_help"
 
 INVENTORY_PATH="${E2E_PROJECT_ROOT}/crates/mcp-agent-mail-conformance/tests/conformance/fixtures/cli/legacy_cli_inventory.json"
 e2e_assert_file_exists "legacy CLI inventory fixture exists" "$INVENTORY_PATH"
@@ -409,6 +430,7 @@ fi
 # Case 22: JSON mode parseability + shape checks
 # ===========================================================================
 e2e_case_banner "JSON mode parseability + shape checks"
+e2e_mark_case_start "case22_json_mode_parseability_shape_checks"
 
 check_json_case() {
     local label="$1"
@@ -469,6 +491,7 @@ check_json_case "doctor check --json" "case_22_doctor_check_json" "doctor" \
 # Case 23: list-acks success path (non-JSON human output)
 # ===========================================================================
 e2e_case_banner "list-acks success path"
+e2e_mark_case_start "case23_listacks_success_path"
 
 set +e
 LIST_ACKS_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" am list-acks --project /tmp/e2e_cli_project --agent TestAgent 2>&1)"
@@ -483,6 +506,7 @@ e2e_assert_contains "list-acks empty-state message" "$LIST_ACKS_OUT" "No ack-req
 # Case 24: share wizard native validation error path
 # ===========================================================================
 e2e_case_banner "share wizard non-interactive validation error path"
+e2e_mark_case_start "case24_share_wizard_noninteractive_validation_error_path"
 
 WIZARD_CWD="$(e2e_mktemp "e2e_cli_wizard")"
 WIZARD_BUNDLE="${WORK}/wizard_bundle_ok"
@@ -501,6 +525,7 @@ e2e_assert_contains "wizard reports native missing required option code" "$WIZAR
 # Case 25: bind failure returns non-zero when port is already in use
 # ===========================================================================
 e2e_case_banner "mcp-agent-mail bind failure (port already in use)"
+e2e_mark_case_start "case25_mcpagentmail_bind_failure_port_already_in_use"
 
 BIND_PORT="$(
 python3 - <<'PY'
@@ -547,6 +572,7 @@ e2e_stop_server 2>/dev/null || true
 # Case 26: coverage additions (docs/am-run/archive/products error semantics)
 # ===========================================================================
 e2e_case_banner "coverage additions: docs/am-run/archive/products semantics"
+e2e_mark_case_start "case26_coverage_additions_docsamrunarchiveproducts_semant"
 
 DOCS_SCAN_DIR="$(e2e_mktemp "e2e_cli_docs")"
 cat > "${DOCS_SCAN_DIR}/README.md" <<'EOF'
