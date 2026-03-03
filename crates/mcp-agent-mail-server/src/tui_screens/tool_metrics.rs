@@ -1404,11 +1404,10 @@ impl MailScreen for ToolMetricsScreen {
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
 
-        if self.tool_map.is_empty()
-            || (dirty.db_stats
-                && tick_count.wrapping_sub(self.last_persisted_hydrate_tick)
-                    >= PERSISTED_HYDRATE_INTERVAL_TICKS)
-        {
+        let hydrate_due = self.last_persisted_hydrate_tick == 0
+            || tick_count.wrapping_sub(self.last_persisted_hydrate_tick)
+                >= PERSISTED_HYDRATE_INTERVAL_TICKS;
+        if hydrate_due && (self.tool_map.is_empty() || dirty.db_stats) {
             self.hydrate_from_persisted_metrics(state);
             self.last_persisted_hydrate_tick = tick_count;
         }

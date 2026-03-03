@@ -603,7 +603,7 @@ impl ThreadExplorerScreen {
 
     /// Ensure we have a DB connection, opening one if needed.
     fn ensure_db_conn(&mut self, state: &TuiSharedState) {
-        if self.db_conn.is_some() {
+        if self.db_conn.is_some() || self.db_conn_attempted {
             return;
         }
         self.db_conn_attempted = true;
@@ -625,6 +625,8 @@ impl ThreadExplorerScreen {
             self.threads.clear();
             self.cursor = 0;
             self.list_dirty = false;
+            self.last_refresh = Some(Instant::now());
+            self.db_conn_attempted = false;
             self.db_context_unavailable = true;
             self.emit_thread_list_db_unavailable_diagnostic(
                 state,

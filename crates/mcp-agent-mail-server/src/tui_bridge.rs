@@ -384,11 +384,16 @@ impl TuiSharedState {
 
         // Give important events a few non-blocking retries, then drop instead of
         // risking transport stalls while the UI thread is rendering.
+        let mut backoff = std::time::Duration::from_millis(2);
         for _ in 0..3 {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(backoff);
             if self.events.try_push(event.clone()).is_some() {
                 return true;
             }
+            backoff = backoff
+                .checked_mul(2)
+                .unwrap_or_else(|| std::time::Duration::from_millis(8))
+                .min(std::time::Duration::from_millis(8));
         }
 
         false
@@ -2008,7 +2013,10 @@ mod tests {
             auth_enabled: true,
         };
         let line = snap.to_log_line();
-        assert!(line.contains("messages"), "log line should contain screen name");
+        assert!(
+            line.contains("messages"),
+            "log line should contain screen name"
+        );
         assert!(
             line.contains("message_search.results"),
             "log line should contain scope"

@@ -98,10 +98,7 @@ fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
 fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
     let counters = state.request_counters();
     let ring = state.event_ring_stats();
-    let mut events = state.events_since(since);
-    if events.len() > limit {
-        events.truncate(limit);
-    }
+    let events = state.events_since_limited(since, limit);
     let to_seq = events.last().map_or(since, MailEvent::seq);
 
     json!({

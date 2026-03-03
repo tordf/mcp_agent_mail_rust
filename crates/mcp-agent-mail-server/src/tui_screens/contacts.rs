@@ -512,10 +512,9 @@ impl MailScreen for ContactsScreen {
 
         if self.db_context_unavailable {
             let tp = crate::tui_theme::TuiThemePalette::current();
-            let banner = Paragraph::new(
-                " Database context unavailable. Waiting for poller data...",
-            )
-            .style(Style::default().fg(tp.severity_error));
+            let banner =
+                Paragraph::new(" Database context unavailable. Waiting for poller data...")
+                    .style(Style::default().fg(tp.severity_error));
             let banner_area = Rect::new(area.x, area.y, area.width, 1);
             banner.render(banner_area, frame);
             return;
@@ -599,20 +598,15 @@ impl MailScreen for ContactsScreen {
         let content_area = Rect::new(main_area.x, y, main_area.width, table_h);
         y += table_h;
 
-        let graph_mode_active = self.view_mode == ViewMode::Graph || self.show_mermaid_panel;
-        let recent_events = if graph_mode_active {
-            state.recent_events(GRAPH_EVENTS_WINDOW)
-        } else {
-            Vec::new()
-        };
-        let metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
-
         if self.show_mermaid_panel {
+            let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
             self.render_mermaid_panel(frame, content_area, &recent_events);
         } else if self.view_mode == ViewMode::Graph
             && content_area.width >= GRAPH_MIN_WIDTH
             && content_area.height >= GRAPH_MIN_HEIGHT
         {
+            let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
+            let metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
             self.render_graph(frame, content_area, &metrics);
         } else {
             self.render_table(frame, content_area);
@@ -629,9 +623,9 @@ impl MailScreen for ContactsScreen {
             let detail_area = split.rects[1];
             if split.breakpoint >= Breakpoint::Xl {
                 // On Xl: show graph visualization in the side panel
-                let graph_events = state.recent_events(GRAPH_EVENTS_WINDOW);
-                let graph_metrics = build_graph_flow_metrics(&self.contacts, &graph_events);
                 if detail_area.width >= GRAPH_MIN_WIDTH && detail_area.height >= GRAPH_MIN_HEIGHT {
+                    let graph_events = state.recent_events(GRAPH_EVENTS_WINDOW);
+                    let graph_metrics = build_graph_flow_metrics(&self.contacts, &graph_events);
                     self.render_graph(frame, detail_area, &graph_metrics);
                 } else {
                     self.render_contact_detail_panel(frame, detail_area);
@@ -2010,10 +2004,8 @@ mod tests {
         m.node_received.insert("alpha".into(), 5);
         m.node_sent.insert("beta".into(), 3);
         m.node_received.insert("beta".into(), 20);
-        m.edge_volume
-            .insert(("alpha".into(), "beta".into()), 8);
-        m.edge_volume
-            .insert(("beta".into(), "alpha".into()), 12);
+        m.edge_volume.insert(("alpha".into(), "beta".into()), 8);
+        m.edge_volume.insert(("beta".into(), "alpha".into()), 12);
 
         assert_eq!(m.node_total("alpha"), 15);
         assert_eq!(m.node_total("beta"), 23);

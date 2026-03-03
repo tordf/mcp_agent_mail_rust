@@ -102,7 +102,7 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
 use mcp_agent_mail_core::config::{ConsoleSplitMode, ConsoleUiAnchor};
 use mcp_agent_mail_db::{
-    DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
+    DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
 };
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, ConfigEnvironmentQueryResource,
@@ -2048,7 +2048,7 @@ fn runtime_output_mode(config: &mcp_agent_mail_core::Config) -> RuntimeOutputMod
     }
 }
 
-const JWKS_CACHE_TTL: Duration = Duration::from_mins(1);
+const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
 const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
@@ -2540,13 +2540,14 @@ impl StartupDashboard {
         let handle = std::thread::Builder::new()
             .name("mcp-agent-mail-dashboard".to_string())
             .spawn(move || {
+                let mut db_conn = dashboard_open_connection(&this.database_url);
                 while !this.stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(1200));
                     if this.stop.load(Ordering::Relaxed) {
                         break;
                     }
                     this.sparkline.sample();
-                    this.refresh_db_stats();
+                    this.refresh_db_stats_cached(&mut db_conn);
                     this.render_now();
                 }
             });
@@ -3198,6 +3199,10 @@ impl StartupDashboard {
 
     fn refresh_db_stats(&self) {
         *lock_mutex(&self.db_stats) = fetch_dashboard_db_stats(&self.database_url);
+    }
+
+    fn refresh_db_stats_cached(&self, conn: &mut Option<DbConn>) {
+        *lock_mutex(&self.db_stats) = fetch_dashboard_db_stats_cached(&self.database_url, conn);
     }
 
     fn snapshot(&self) -> DashboardSnapshot {
@@ -3992,6 +3997,8 @@ struct HttpState {
     jwks_refreshing: AtomicBool,
     /// Optional web root for SPA static file serving.
     web_root: Option<static_files::WebRoot>,
+    /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
+    ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
 }
 
 impl HttpState {
@@ -4025,6 +4032,7 @@ impl HttpState {
             } else {
                 RateLimitRedisState::Disabled
             };
+        let ws_state_fallback = tui_bridge::TuiSharedState::new(&config);
         Self {
             router,
             server_info,
@@ -4038,6 +4046,7 @@ impl HttpState {
             jwks_cache: Mutex::new(None),
             jwks_refreshing: AtomicBool::new(false),
             web_root,
+            ws_state_fallback,
         }
     }
 
@@ -4347,10 +4356,7 @@ impl HttpState {
             let (_path_part, query_part) = split_path_query(&req.uri);
             let query = query_part.as_deref();
             let payload = tui_state_handle().map_or_else(
-                || {
-                    let fallback = tui_bridge::TuiSharedState::new(&self.config);
-                    tui_ws_state::poll_payload(&fallback, query)
-                },
+                || tui_ws_state::poll_payload(&self.ws_state_fallback, query),
                 |state| tui_ws_state::poll_payload(&state, query),
             );
             return Some(self.json_response(req, 200, &payload));
@@ -11899,7 +11905,7 @@ mod tests {
         {
             let mut cache = state.jwks_cache.lock().unwrap();
             *cache = Some(JwksCacheEntry {
-                fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
+                fetched_at: Instant::now().checked_sub(Duration::from_secs(120)).unwrap(),
                 jwks: Arc::clone(&jwks),
             });
         }
@@ -11938,7 +11944,7 @@ mod tests {
             {
                 let mut cache = state.jwks_cache.lock().unwrap();
                 *cache = Some(JwksCacheEntry {
-                    fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
+                    fetched_at: Instant::now().checked_sub(Duration::from_secs(120)).unwrap(),
                     jwks: Arc::clone(&old_jwks),
                 });
             }
@@ -15367,7 +15373,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *cache = Some(JwksCacheEntry {
             // 2 minutes in the past — well beyond the 60s TTL.
-            fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
+            fetched_at: Instant::now().checked_sub(Duration::from_secs(120)).unwrap(),
             jwks: Arc::new(jwks.clone()),
         });
     }

@@ -1404,7 +1404,11 @@ pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<(), D
 /// Immediately flush all pending deferred touch updates to the DB.
 /// Call this on server shutdown or when precise `last_active_ts` is needed.
 pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
-    let pending = crate::cache::read_cache().drain_touches();
+    let read_cache = crate::cache::read_cache();
+    if !read_cache.has_pending_touches() {
+        return Outcome::Ok(());
+    }
+    let pending = read_cache.drain_touches();
     if pending.is_empty() {
         return Outcome::Ok(());
     }
