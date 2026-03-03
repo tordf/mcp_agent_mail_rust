@@ -1955,9 +1955,12 @@ impl MessageBrowserScreen {
             return;
         }
         let row = usize::from(y.saturating_sub(inner_top));
-        let (start, end) = viewport_range(self.results.len(), list_height, self.cursor);
+        if row >= list_height {
+            return;
+        }
+        let start = self.list_state.borrow().scroll_offset();
         let idx = start.saturating_add(row);
-        if idx < end {
+        if idx < self.results.len() {
             self.cursor = idx;
             self.detail_scroll.set(0);
         }
@@ -1977,9 +1980,12 @@ impl MessageBrowserScreen {
             return None;
         }
         let row = usize::from(y.saturating_sub(inner_top));
-        let (start, end) = viewport_range(self.results.len(), list_height, self.cursor);
+        if row >= list_height {
+            return None;
+        }
+        let start = self.list_state.borrow().scroll_offset();
         let idx = start.saturating_add(row);
-        (idx < end).then_some(idx)
+        (idx < self.results.len()).then_some(idx)
     }
 
     fn thread_id_for_result_index(&self, idx: usize) -> Option<String> {

@@ -2245,9 +2245,12 @@ impl SearchCockpitScreen {
             return;
         }
         let row = usize::from(y.saturating_sub(inner_top));
-        let (start, end) = viewport_range(self.results.len(), list_height, self.cursor);
+        if row >= list_height {
+            return;
+        }
+        let start = self.list_state.borrow().scroll_offset();
         let idx = start.saturating_add(row);
-        if idx < end {
+        if idx < self.results.len() {
             self.cursor = idx;
             self.detail_scroll.set(0);
         }
