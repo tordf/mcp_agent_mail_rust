@@ -454,7 +454,7 @@ impl DashboardScreen {
 
     /// Ingest new events from the ring buffer.
     fn ingest_events(&mut self, state: &TuiSharedState) {
-        let new_events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
+        let new_events = state.tick_events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &new_events {
             self.last_seq = event.seq().max(self.last_seq);
             if let Some(preview) = RecentMessagePreview::from_event(event) {

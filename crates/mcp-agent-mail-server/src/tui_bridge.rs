@@ -303,6 +303,13 @@ pub struct KeyboardMoveSnapshot {
     pub source_project_slug: String,
 }
 
+#[derive(Debug, Clone)]
+struct TickEventBatch {
+    from_seq: u64,
+    to_seq: u64,
+    events: Arc<Vec<MailEvent>>,
+}
+
 #[derive(Debug)]
 pub struct TuiSharedState {
     events: EventRingBuffer,
@@ -323,6 +330,9 @@ pub struct TuiSharedState {
     message_drag: Mutex<Option<MessageDragSnapshot>>,
     keyboard_move: Mutex<Option<KeyboardMoveSnapshot>>,
     server_control_tx: Mutex<Option<Sender<ServerControlMsg>>>,
+    /// Per-tick shared event batch prepared by the TUI event loop so screens
+    /// can ingest recent events without each re-locking/re-scanning the ring.
+    tick_event_batch: Mutex<Option<TickEventBatch>>,
     /// Console log ring buffer: `(seq, text)` pairs for tool call cards etc.
     console_log: Mutex<VecDeque<(u64, String)>>,
     console_log_seq: AtomicU64,
@@ -364,6 +374,7 @@ impl TuiSharedState {
             message_drag: Mutex::new(None),
             keyboard_move: Mutex::new(None),
             server_control_tx: Mutex::new(None),
+            tick_event_batch: Mutex::new(None),
             console_log: Mutex::new(VecDeque::with_capacity(CONSOLE_LOG_CAPACITY)),
             console_log_seq: AtomicU64::new(0),
             screen_diagnostics: Mutex::new(VecDeque::with_capacity(SCREEN_DIAGNOSTIC_CAPACITY)),
@@ -420,6 +431,54 @@ impl TuiSharedState {
 
     #[must_use]
     pub fn events_since_limited(&self, seq: u64, limit: usize) -> Vec<MailEvent> {
+        self.events.events_since_seq_limited(seq, limit)
+    }
+
+    /// Publish a per-tick shared event batch. Returns the highest sequence seen.
+    ///
+    /// Screens can consume this via [`Self::tick_events_since_limited`] to avoid
+    /// repeated lock/scan work against the ring buffer during the same tick.
+    pub fn publish_tick_event_batch(&self, from_seq: u64, events: Vec<MailEvent>) -> u64 {
+        let to_seq = events.last().map_or(from_seq, MailEvent::seq);
+        let batch = TickEventBatch {
+            from_seq,
+            to_seq,
+            events: Arc::new(events),
+        };
+        let mut guard = self
+            .tick_event_batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(batch);
+        to_seq
+    }
+
+    /// Read events since `seq` using the shared per-tick batch when possible.
+    ///
+    /// Falls back to direct ring-buffer scan when the requested sequence is not
+    /// covered by the published batch (for correctness under concurrent pushes).
+    #[must_use]
+    pub fn tick_events_since_limited(&self, seq: u64, limit: usize) -> Vec<MailEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let guard = self
+            .tick_event_batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(batch) = guard.as_ref()
+            && seq >= batch.from_seq
+            && seq < batch.to_seq
+        {
+            return batch
+                .events
+                .iter()
+                .filter(|event| event.seq() > seq)
+                .take(limit)
+                .cloned()
+                .collect();
+        }
+        drop(guard);
         self.events.events_since_seq_limited(seq, limit)
     }
 
@@ -893,6 +952,41 @@ mod tests {
         let limited = state.events_since_limited(0, 1);
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].kind(), MailEventKind::HttpRequest);
+    }
+
+    #[test]
+    fn tick_event_batch_returns_shared_subset_when_seq_is_covered() {
+        let config = Config::default();
+        let state = TuiSharedState::with_event_capacity(&config, 16);
+        assert!(state.push_event(MailEvent::http_request("GET", "/a", 200, 1, "127.0.0.1")));
+        assert!(state.push_event(MailEvent::http_request("GET", "/b", 200, 1, "127.0.0.1")));
+        assert!(state.push_event(MailEvent::http_request("GET", "/c", 200, 1, "127.0.0.1")));
+
+        let from_seq = 1;
+        let batch = state.events_since_limited(from_seq, 8);
+        let to_seq = state.publish_tick_event_batch(from_seq, batch);
+        assert_eq!(to_seq, 3);
+
+        let covered = state.tick_events_since_limited(1, 8);
+        let seqs: Vec<u64> = covered.iter().map(MailEvent::seq).collect();
+        assert_eq!(seqs, vec![2, 3]);
+    }
+
+    #[test]
+    fn tick_event_batch_falls_back_when_seq_not_covered() {
+        let config = Config::default();
+        let state = TuiSharedState::with_event_capacity(&config, 16);
+        assert!(state.push_event(MailEvent::http_request("GET", "/a", 200, 1, "127.0.0.1")));
+        assert!(state.push_event(MailEvent::http_request("GET", "/b", 200, 1, "127.0.0.1")));
+
+        // Publish empty shared batch (from seq already at tail).
+        let to_seq = state.publish_tick_event_batch(2, Vec::new());
+        assert_eq!(to_seq, 2);
+
+        // Request older history; must fall back to ring scan.
+        let events = state.tick_events_since_limited(0, 8);
+        let seqs: Vec<u64> = events.iter().map(MailEvent::seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
     }
 
     #[test]

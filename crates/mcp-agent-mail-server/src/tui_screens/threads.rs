@@ -409,6 +409,15 @@ enum Focus {
     DetailPanel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadLayoutPhase {
+    Wide,
+    Stacked,
+    CompactList,
+    CompactDetail,
+    CompactMermaid,
+}
+
 #[derive(Debug, Clone)]
 enum MessageDragState {
     Idle,
@@ -518,6 +527,10 @@ pub struct ThreadExplorerScreen {
     last_list_area: Cell<Rect>,
     /// Last rendered thread detail panel area (for mouse hit testing).
     last_detail_area: Cell<Rect>,
+    /// Last rendered content area (for transition-only stale artifact cleanup).
+    last_content_area: Cell<Rect>,
+    /// Last resolved layout phase.
+    last_layout_phase: Cell<Option<ThreadLayoutPhase>>,
     /// Whether the detail panel is visible on wide screens (user toggle).
     detail_visible: bool,
     /// Last emitted list-level diagnostic signature for dedupe.
@@ -564,6 +577,8 @@ impl ThreadExplorerScreen {
             message_drag: MessageDragState::Idle,
             last_list_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_content_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            last_layout_phase: Cell::new(None),
             detail_visible: true,
             last_list_diagnostic_signature: None,
             last_detail_diagnostic_signature: None,
@@ -1643,10 +1658,9 @@ impl MailScreen for ThreadExplorerScreen {
             return;
         }
 
-        let tp = crate::tui_theme::TuiThemePalette::current();
-        // Hard-clear the full screen area before drawing filter/list/detail panes.
-        // This prevents stale border glyphs from previous layouts leaking through.
-        clear_rect(frame, area, tp.bg_deep);
+        // Avoid unconditional full-screen wipes here: filter/list/detail panes
+        // repaint their own bounds, which keeps steady-state redraw cost lower
+        // and reduces visible flashing during rapid tab traversal.
 
         // Filter bar (always visible: hint when collapsed, input when active)
         let has_filter = !self.filter_text.is_empty();
@@ -1663,20 +1677,8 @@ impl MailScreen for ThreadExplorerScreen {
         );
 
         let content_area = Rect::new(area.x, area.y + filter_height, area.width, content_height);
-        // Always repaint content background so mode switches never leave stray borders.
-        clear_rect(frame, content_area, tp.bg_deep);
-        let drop_visual = match &self.message_drag {
-            MessageDragState::Active(active) => Some(ThreadDropVisual {
-                source_thread_id: active.source_thread_id.as_str(),
-                hovered_thread_id: active.hovered_thread_id.as_deref(),
-                invalid_hover: active.invalid_hover,
-            }),
-            _ => None,
-        };
-        let keyboard_move = state.keyboard_move_snapshot();
 
-        // ResponsiveLayout: Md+ uses side-by-side split with breakpoint-based ratios.
-        // Below Md (< 90): fall through to height-based stacked/compact fallback.
+        // Compute responsive layout split early so layout_phase can reference it.
         let rl_layout = if self.detail_visible {
             ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
                 .at(
@@ -1698,6 +1700,40 @@ impl MailScreen for ThreadExplorerScreen {
             ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
         };
         let rl_split = rl_layout.split(content_area);
+
+        let layout_phase = if rl_split.rects.len() >= 2 && self.detail_visible {
+            ThreadLayoutPhase::Wide
+        } else if content_area.height >= THREAD_STACKED_MIN_HEIGHT && self.detail_visible {
+            ThreadLayoutPhase::Stacked
+        } else if self.show_mermaid_panel {
+            ThreadLayoutPhase::CompactMermaid
+        } else {
+            match self.focus {
+                Focus::ThreadList => ThreadLayoutPhase::CompactList,
+                Focus::DetailPanel => ThreadLayoutPhase::CompactDetail,
+            }
+        };
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let prev_content_area = self.last_content_area.get();
+        let prev_layout_phase = self.last_layout_phase.get();
+        if prev_content_area.width > 0
+            && prev_content_area.height > 0
+            && prev_content_area != content_area
+        {
+            clear_rect(frame, prev_content_area, tp.bg_deep);
+        }
+        if prev_layout_phase.is_some() && prev_layout_phase != Some(layout_phase) {
+            clear_rect(frame, content_area, tp.bg_deep);
+        }
+        let drop_visual = match &self.message_drag {
+            MessageDragState::Active(active) => Some(ThreadDropVisual {
+                source_thread_id: active.source_thread_id.as_str(),
+                hovered_thread_id: active.hovered_thread_id.as_deref(),
+                invalid_hover: active.invalid_hover,
+            }),
+            _ => None,
+        };
+        let keyboard_move = state.keyboard_move_snapshot();
 
         if rl_split.rects.len() >= 2 && self.detail_visible {
             // Wide: side-by-side list + detail
@@ -1916,6 +1952,8 @@ impl MailScreen for ThreadExplorerScreen {
                 render_compact_focus_hint(frame, hint_area, self.focus, self.show_mermaid_panel);
             }
         }
+        self.last_content_area.set(content_area);
+        self.last_layout_phase.set(Some(layout_phase));
     }
 
     fn keybindings(&self) -> Vec<HelpEntry> {
@@ -4714,6 +4752,37 @@ mod tests {
         );
         assert_eq!(list.width, detail.width);
         assert!(detail.y > list.y);
+    }
+
+    #[test]
+    fn transition_wide_to_narrow_does_not_leave_splitter_knob_artifacts() {
+        let screen = ThreadExplorerScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+
+        // First render in wide mode (side-by-side) to paint a splitter.
+        screen.view(&mut frame, Rect::new(0, 0, 80, 20), &state);
+        let list = screen.last_list_area.get();
+        let splitter_x = list.x.saturating_add(list.width).saturating_sub(1);
+        let splitter_y = list.y.saturating_add(list.height.saturating_sub(1) / 2);
+
+        // Then render narrow/compact on the same frame; stale splitter glyphs
+        // should be overwritten by pane rendering.
+        screen.view(&mut frame, Rect::new(0, 0, 40, 10), &state);
+        let ch = frame
+            .buffer
+            .get(splitter_x, splitter_y)
+            .and_then(|cell| cell.content.as_char())
+            .unwrap_or(' ');
+        assert_ne!(
+            ch, '·',
+            "splitter knob leaked after layout transition at ({splitter_x},{splitter_y})"
+        );
+        assert!(
+            !matches!(ch as u32, 0x2500..=0x257F),
+            "box-drawing artifact leaked after layout transition at ({splitter_x},{splitter_y})"
+        );
     }
 
     #[test]

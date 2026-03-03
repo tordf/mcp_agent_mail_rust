@@ -1191,8 +1191,8 @@ pub struct SearchCockpitScreen {
     results: Vec<ResultEntry>,
     result_rows: Vec<SearchResultRow>,
     cursor: usize,
-    detail_scroll: usize,
-    detail_view_mode: DetailViewMode,
+    detail_scroll: Cell<usize>,
+    detail_view_mode: Cell<DetailViewMode>,
     total_sql_rows: usize,
 
     // Focus
@@ -1255,7 +1255,7 @@ pub struct SearchCockpitScreen {
     /// Last-seen data generation snapshot for dirty-state gating.
     last_data_gen: super::DataGeneration,
     /// Per-selection collapsible JSON tree interaction state.
-    json_tree_state: crate::tui_markdown::JsonTreeViewState,
+    json_tree_state: RefCell<crate::tui_markdown::JsonTreeViewState>,
     /// On-disk path for persisted screen filter presets.
     filter_presets_path: PathBuf,
     /// Preset store loaded from `filter_presets_path`.
@@ -1297,8 +1297,8 @@ impl SearchCockpitScreen {
             results: Vec::new(),
             result_rows: Vec::new(),
             cursor: 0,
-            detail_scroll: 0,
-            detail_view_mode: DetailViewMode::Markdown,
+            detail_scroll: Cell::new(0),
+            detail_view_mode: Cell::new(DetailViewMode::Markdown),
             total_sql_rows: 0,
             focus: Focus::ResultList,
             active_facet: FacetSlot::DocKind,
@@ -1333,7 +1333,7 @@ impl SearchCockpitScreen {
             rendered_markdown_cache: RefCell::new(HashMap::new()),
             rendered_detail_cache: RefCell::new(HashMap::new()),
             last_data_gen: super::DataGeneration::stale(),
-            json_tree_state: crate::tui_markdown::JsonTreeViewState::default(),
+            json_tree_state: RefCell::new(crate::tui_markdown::JsonTreeViewState::default()),
             filter_presets_path,
             filter_presets,
             preset_dialog_mode: PresetDialogMode::None,
@@ -1355,7 +1355,7 @@ impl SearchCockpitScreen {
     }
 
     fn toggle_detail_view_mode(&mut self) {
-        match self.detail_view_mode {
+        match self.detail_view_mode.get() {
             DetailViewMode::Markdown => {
                 let Some(entry) = self.results.get(self.cursor) else {
                     return;
@@ -1363,97 +1363,95 @@ impl SearchCockpitScreen {
                 let Some(body) = entry.full_body.as_deref() else {
                     return;
                 };
-                if self.json_tree_state.sync_body(body) {
-                    self.detail_view_mode = DetailViewMode::JsonTree;
-                    self.detail_scroll = 0;
+                if self.json_tree_state.borrow_mut().sync_body(body) {
+                    self.detail_view_mode.set(DetailViewMode::JsonTree);
+                    self.detail_scroll.set(0);
                 }
             }
             DetailViewMode::JsonTree => {
-                self.detail_view_mode = DetailViewMode::Markdown;
-                self.detail_scroll = 0;
+                self.detail_view_mode.set(DetailViewMode::Markdown);
+                self.detail_scroll.set(0);
             }
         }
     }
 
-    fn sync_json_tree_scroll(&mut self, row_count: usize) {
+    fn sync_json_tree_scroll(&self, row_count: usize) {
         let area = self.last_detail_area.get();
         let visible_rows = usize::from(area.height.saturating_sub(4)).max(1);
         if row_count <= visible_rows {
-            self.detail_scroll = 0;
+            self.detail_scroll.set(0);
             return;
         }
-        let cursor = self.json_tree_state.cursor();
-        if cursor < self.detail_scroll {
-            self.detail_scroll = cursor;
-        } else if cursor >= self.detail_scroll.saturating_add(visible_rows) {
-            self.detail_scroll = cursor
+        let cursor = self.json_tree_state.borrow().cursor();
+        if cursor < self.detail_scroll.get() {
+            self.detail_scroll.set(cursor);
+        } else if cursor >= self.detail_scroll.get().saturating_add(visible_rows) {
+            self.detail_scroll.set(cursor
                 .saturating_add(1)
                 .saturating_sub(visible_rows)
-                .min(row_count.saturating_sub(visible_rows));
+                .min(row_count.saturating_sub(visible_rows)));
         } else {
-            self.detail_scroll = self
-                .detail_scroll
-                .min(row_count.saturating_sub(visible_rows));
+            self.detail_scroll.set(self.detail_scroll.get().min(row_count.saturating_sub(visible_rows)));
         }
     }
 
     fn handle_json_tree_navigation(&mut self, key: &ftui::KeyEvent) -> bool {
-        if self.detail_view_mode != DetailViewMode::JsonTree {
+        if self.detail_view_mode.get() != DetailViewMode::JsonTree {
             return false;
         }
 
         let Some(entry) = self.results.get(self.cursor) else {
-            self.detail_view_mode = DetailViewMode::Markdown;
-            self.detail_scroll = 0;
+            self.detail_view_mode.set(DetailViewMode::Markdown);
+            self.detail_scroll.set(0);
             return false;
         };
         let Some(body) = entry.full_body.as_deref() else {
-            self.detail_view_mode = DetailViewMode::Markdown;
-            self.detail_scroll = 0;
+            self.detail_view_mode.set(DetailViewMode::Markdown);
+            self.detail_scroll.set(0);
             return false;
         };
-        if !self.json_tree_state.sync_body(body) {
-            self.detail_view_mode = DetailViewMode::Markdown;
-            self.detail_scroll = 0;
+        if !self.json_tree_state.borrow_mut().sync_body(body) {
+            self.detail_view_mode.set(DetailViewMode::Markdown);
+            self.detail_scroll.set(0);
             return false;
         }
 
         let mut handled = true;
         match key.code {
             KeyCode::Char('J') => self.toggle_detail_view_mode(),
-            KeyCode::Char('j') | KeyCode::Down => self.json_tree_state.move_cursor_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.json_tree_state.move_cursor_by(-1),
-            KeyCode::Char('d') | KeyCode::PageDown => self.json_tree_state.move_cursor_by(8),
-            KeyCode::Char('u') | KeyCode::PageUp => self.json_tree_state.move_cursor_by(-8),
-            KeyCode::Home => self.json_tree_state.move_cursor_by(isize::MIN),
-            KeyCode::End | KeyCode::Char('G') => self.json_tree_state.move_cursor_by(isize::MAX),
+            KeyCode::Char('j') | KeyCode::Down => self.json_tree_state.borrow_mut().move_cursor_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.json_tree_state.borrow_mut().move_cursor_by(-1),
+            KeyCode::Char('d') | KeyCode::PageDown => self.json_tree_state.borrow_mut().move_cursor_by(8),
+            KeyCode::Char('u') | KeyCode::PageUp => self.json_tree_state.borrow_mut().move_cursor_by(-8),
+            KeyCode::Home => self.json_tree_state.borrow_mut().move_cursor_by(isize::MIN),
+            KeyCode::End | KeyCode::Char('G') => self.json_tree_state.borrow_mut().move_cursor_by(isize::MAX),
             KeyCode::Enter | KeyCode::Char(' ') => {
-                let _ = self.json_tree_state.toggle_selected();
+                let _ = self.json_tree_state.borrow_mut().toggle_selected();
             }
             KeyCode::Left => {
-                let rows = self.json_tree_state.rows();
-                if let Some(row) = rows.get(self.json_tree_state.cursor())
+                let rows = self.json_tree_state.borrow().rows();
+                if let Some(row) = rows.get(self.json_tree_state.borrow().cursor())
                     && row.expandable
                     && row.expanded
                 {
-                    let _ = self.json_tree_state.toggle_selected();
+                    let _ = self.json_tree_state.borrow_mut().toggle_selected();
                 }
             }
             KeyCode::Right => {
-                let rows = self.json_tree_state.rows();
-                if let Some(row) = rows.get(self.json_tree_state.cursor())
+                let rows = self.json_tree_state.borrow().rows();
+                if let Some(row) = rows.get(self.json_tree_state.borrow().cursor())
                     && row.expandable
                     && !row.expanded
                 {
-                    let _ = self.json_tree_state.toggle_selected();
+                    let _ = self.json_tree_state.borrow_mut().toggle_selected();
                 }
             }
             _ => handled = false,
         }
 
-        if handled && self.detail_view_mode == DetailViewMode::JsonTree {
-            self.json_tree_state.clamp_cursor();
-            self.sync_json_tree_scroll(self.json_tree_state.rows().len());
+        if handled && self.detail_view_mode.get() == DetailViewMode::JsonTree {
+            self.json_tree_state.borrow_mut().clamp_cursor();
+            self.sync_json_tree_scroll(self.json_tree_state.borrow().rows().len());
         }
         handled
     }
@@ -1579,7 +1577,7 @@ impl SearchCockpitScreen {
             .map(ToOwned::to_owned);
         self.search_dirty = true;
         self.debounce_remaining = 0;
-        self.detail_scroll = 0;
+        self.detail_scroll.set(0);
         self.cursor = 0;
     }
 
@@ -1852,7 +1850,7 @@ impl SearchCockpitScreen {
             self.total_sql_rows = 0;
             self.guidance = None;
             self.cursor = 0;
-            self.detail_scroll = 0;
+            self.detail_scroll.set(0);
             self.search_dirty = false;
             self.last_search_ms = None;
             return;
@@ -1922,7 +1920,7 @@ impl SearchCockpitScreen {
         } else {
             self.cursor = self.cursor.min(self.results.len() - 1);
         }
-        self.detail_scroll = 0;
+        self.detail_scroll.set(0);
         self.rebuild_result_rows();
         self.search_dirty = false;
         let elapsed_ms = started.elapsed().as_millis();
@@ -2229,7 +2227,7 @@ impl SearchCockpitScreen {
         let idx = start.saturating_add(row);
         if idx < end {
             self.cursor = idx;
-            self.detail_scroll = 0;
+            self.detail_scroll.set(0);
         }
     }
 
@@ -2293,14 +2291,14 @@ impl SearchCockpitScreen {
     fn scroll_detail_by(&mut self, delta: isize) {
         let max = self.detail_max_scroll();
         if delta.is_negative() {
-            self.detail_scroll = self
-                .detail_scroll
+            self.detail_scroll.set(self
+                .detail_scroll.get()
                 .saturating_sub(delta.unsigned_abs())
-                .min(max);
+                .min(max));
         } else {
             #[allow(clippy::cast_sign_loss)]
             let add = delta as usize;
-            self.detail_scroll = self.detail_scroll.saturating_add(add).min(max);
+            self.detail_scroll.set(self.detail_scroll.get().saturating_add(add).min(max));
         }
     }
 
@@ -2679,7 +2677,7 @@ impl MailScreen for SearchCockpitScreen {
                             && !self.results.is_empty()
                         {
                             self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                             return Cmd::None;
                         }
                     }
@@ -2700,7 +2698,7 @@ impl MailScreen for SearchCockpitScreen {
                         }
                         if point_in_rect(self.last_results_area.get(), mouse.x, mouse.y) {
                             self.cursor = self.cursor.saturating_sub(1);
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                             return Cmd::None;
                         }
                     }
@@ -2834,38 +2832,38 @@ impl MailScreen for SearchCockpitScreen {
                     KeyCode::Char('j') | KeyCode::Down => {
                         if !self.results.is_empty() {
                             self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.cursor = self.cursor.saturating_sub(1);
-                        self.detail_scroll = 0;
+                        self.detail_scroll.set(0);
                     }
                     KeyCode::Char('G') | KeyCode::End => {
                         if !self.results.is_empty() {
                             self.cursor = self.results.len() - 1;
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                         }
                     }
                     KeyCode::Char('g') | KeyCode::Home => {
                         self.cursor = 0;
-                        self.detail_scroll = 0;
+                        self.detail_scroll.set(0);
                     }
                     KeyCode::Char('d') | KeyCode::PageDown => {
                         if !self.results.is_empty() {
                             self.cursor = (self.cursor + 20).min(self.results.len() - 1);
-                            self.detail_scroll = 0;
+                            self.detail_scroll.set(0);
                         }
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
                         self.cursor = self.cursor.saturating_sub(20);
-                        self.detail_scroll = 0;
+                        self.detail_scroll.set(0);
                     }
                     KeyCode::Char('J') => {
-                        let previous_mode = self.detail_view_mode;
+                        let previous_mode = self.detail_view_mode.get();
                         self.toggle_detail_view_mode();
                         if previous_mode == DetailViewMode::Markdown
-                            && self.detail_view_mode == DetailViewMode::Markdown
+                            && self.detail_view_mode.get() == DetailViewMode::Markdown
                         {
                             self.scroll_detail_by(1);
                         }
@@ -2988,9 +2986,9 @@ impl MailScreen for SearchCockpitScreen {
             return;
         }
 
-        // Always paint the whole area before pane rendering.
-        let tp = crate::tui_theme::TuiThemePalette::current();
-        fill_rect(frame, area, tp.bg_deep);
+        // Avoid unconditional full-screen wipes here: query/results/detail
+        // panes render their own backgrounds, which lowers steady-state
+        // overdraw and flashing while tabbing between screens.
 
         // Layout: query bar (3-4h) + body
         let query_h: u16 = if area.height >= 20 {
@@ -3189,33 +3187,33 @@ impl MailScreen for SearchCockpitScreen {
         if let Some(detail_area) = detail_area {
             let selected_entry = self.results.get(self.cursor);
             let mut json_rows: Option<Vec<crate::tui_markdown::JsonTreeRow>> = None;
-            if self.detail_view_mode == DetailViewMode::JsonTree {
+            if self.detail_view_mode.get() == DetailViewMode::JsonTree {
                 if let Some(entry) = selected_entry {
                     if let Some(body) = entry.full_body.as_deref() {
-                        if self.json_tree_state.sync_body(body) {
-                            self.json_tree_state.clamp_cursor();
-                            let rows = self.json_tree_state.rows();
+                        if self.json_tree_state.borrow_mut().sync_body(body) {
+                            self.json_tree_state.borrow_mut().clamp_cursor();
+                            let rows = self.json_tree_state.borrow().rows();
                             self.sync_json_tree_scroll(rows.len());
                             json_rows = Some(rows);
                         } else {
-                            self.detail_view_mode = DetailViewMode::Markdown;
-                            self.detail_scroll = 0;
+                            self.detail_view_mode.set(DetailViewMode::Markdown);
+                            self.detail_scroll.set(0);
                         }
                     } else {
-                        self.detail_view_mode = DetailViewMode::Markdown;
-                        self.detail_scroll = 0;
+                        self.detail_view_mode.set(DetailViewMode::Markdown);
+                        self.detail_scroll.set(0);
                     }
                 } else {
-                    self.detail_view_mode = DetailViewMode::Markdown;
-                    self.detail_scroll = 0;
+                    self.detail_view_mode.set(DetailViewMode::Markdown);
+                    self.detail_scroll.set(0);
                 }
             }
-            let rendered_body_override = if self.detail_view_mode == DetailViewMode::JsonTree {
+            let rendered_body_override = if self.detail_view_mode.get() == DetailViewMode::JsonTree {
                 None
             } else {
                 selected_entry.and_then(|entry| self.cached_rendered_markdown(entry))
             };
-            let rendered_detail_override = if self.detail_view_mode == DetailViewMode::JsonTree {
+            let rendered_detail_override = if self.detail_view_mode.get() == DetailViewMode::JsonTree {
                 None
             } else {
                 selected_entry.map(|entry| self.cached_rendered_detail(entry))
@@ -3224,15 +3222,15 @@ impl MailScreen for SearchCockpitScreen {
                 frame,
                 detail_area,
                 selected_entry,
-                self.detail_scroll,
+                self.detail_scroll.get(),
                 &self.highlight_terms,
                 self.last_diagnostics.as_ref(),
                 rendered_body_override.as_deref(),
                 rendered_detail_override.as_deref(),
                 matches!(self.focus, Focus::ResultList),
-                self.detail_view_mode,
+                self.detail_view_mode.get(),
                 json_rows.as_deref(),
-                self.json_tree_state.cursor(),
+                self.json_tree_state.borrow().cursor(),
             );
         }
 
@@ -6516,6 +6514,9 @@ mod tests {
             None,
             None,
             true,
+            DetailViewMode::Markdown,
+            None,
+            0,
         );
         let text = buffer_to_text(&frame.buffer);
         // Should contain the body header
@@ -6549,6 +6550,9 @@ mod tests {
             None,
             None,
             true,
+            DetailViewMode::Markdown,
+            None,
+            0,
         );
         let text = buffer_to_text(&frame.buffer);
         assert!(
@@ -6571,12 +6575,89 @@ mod tests {
             None,
             None,
             true,
+            DetailViewMode::Markdown,
+            None,
+            0,
         );
         let text = buffer_to_text(&frame.buffer);
         assert!(
             text.contains("Select a result"),
             "should show selection prompt, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn detail_json_tree_toggle_and_expand_collapse() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.last_detail_area.set(Rect::new(0, 0, 80, 12));
+        let mut entry = make_msg_entry();
+        entry.full_body = Some(r#"{"a":{"b":1},"list":[1,2]}"#.to_string());
+        entry.rendered_body = None;
+        screen.results = vec![entry];
+        screen.focus = Focus::ResultList;
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
+        assert_eq!(screen.detail_view_mode.get(), DetailViewMode::JsonTree);
+        assert!(screen.json_tree_state.borrow().is_available());
+        assert!(screen.json_tree_state.borrow().rows().len() > 1);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert_eq!(screen.json_tree_state.borrow().rows().len(), 1);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert!(screen.json_tree_state.borrow().rows().len() > 1);
+
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
+        assert_eq!(screen.detail_view_mode.get(), DetailViewMode::Markdown);
+    }
+
+    #[test]
+    fn save_and_apply_named_preset_roundtrip() {
+        let mut screen = SearchCockpitScreen::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        screen.filter_presets_path = temp.path().join("search-presets.json");
+
+        screen.query_input.set_value("urgent triage");
+        screen.scope_mode = ScopeMode::Project;
+        screen.doc_kind_filter = DocKindFilter::Projects;
+        screen.importance_filter = ImportanceFilter::Urgent;
+        screen.ack_filter = AckFilter::Required;
+        screen.sort_direction = SortDirection::Relevance;
+        screen.field_scope = FieldScope::BodyOnly;
+        screen.search_mode = SearchModeFilter::Hybrid;
+        screen.explain_toggle = ExplainToggle::On;
+        screen.thread_filter = Some("br-2bbt".to_string());
+
+        assert!(screen.save_named_preset(
+            "triage",
+            Some("search triage defaults".to_string())
+        ));
+        assert_eq!(screen.preset_names(), vec!["triage".to_string()]);
+
+        screen.query_input.clear();
+        screen.scope_mode = ScopeMode::Global;
+        screen.doc_kind_filter = DocKindFilter::Messages;
+        screen.importance_filter = ImportanceFilter::Any;
+        screen.ack_filter = AckFilter::Any;
+        screen.sort_direction = SortDirection::NewestFirst;
+        screen.field_scope = FieldScope::SubjectAndBody;
+        screen.search_mode = SearchModeFilter::Auto;
+        screen.explain_toggle = ExplainToggle::Off;
+        screen.thread_filter = None;
+
+        assert!(screen.apply_named_preset("triage"));
+        assert_eq!(screen.query_input.value(), "urgent triage");
+        assert_eq!(screen.scope_mode, ScopeMode::Project);
+        assert_eq!(screen.doc_kind_filter, DocKindFilter::Projects);
+        assert_eq!(screen.importance_filter, ImportanceFilter::Urgent);
+        assert_eq!(screen.ack_filter, AckFilter::Required);
+        assert_eq!(screen.sort_direction, SortDirection::Relevance);
+        assert_eq!(screen.field_scope, FieldScope::BodyOnly);
+        assert_eq!(screen.search_mode, SearchModeFilter::Hybrid);
+        assert_eq!(screen.explain_toggle, ExplainToggle::On);
+        assert_eq!(screen.thread_filter.as_deref(), Some("br-2bbt"));
+        assert!(screen.search_dirty);
     }
 
     #[test]
@@ -6908,6 +6989,9 @@ mod tests {
             None,
             None,
             true,
+            DetailViewMode::Markdown,
+            None,
+            0,
         );
         let text = buffer_to_text(&frame.buffer);
         // Should show "Message" not "Message" from Debug format
@@ -6936,6 +7020,9 @@ mod tests {
             None,
             None,
             true,
+            DetailViewMode::Markdown,
+            None,
+            0,
         );
         let text = buffer_to_text(&frame.buffer);
         assert!(text.contains("Title:"), "detail text: {text}");
@@ -7129,6 +7216,17 @@ mod tests {
     }
 }
 
+fn preset_modal_rect(area: Rect, width: u16, height: u16) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let width = width.clamp(24, area.width.saturating_sub(2));
+    let height = height.clamp(6, area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
 fn render_save_preset_dialog(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -7142,7 +7240,7 @@ fn render_save_preset_dialog(
     let overlay = preset_modal_rect(area, 64, 9);
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
-        .title("Save Message Preset")
+        .title("Save Search Preset")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border))
         .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay));
@@ -7186,7 +7284,7 @@ fn render_load_preset_dialog(frame: &mut Frame<'_>, area: Rect, names: &[String]
     let overlay = preset_modal_rect(area, 64, 12);
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()
-        .title("Load Message Preset")
+        .title("Load Search Preset")
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(tp.panel_border))
         .style(Style::default().fg(tp.text_primary).bg(tp.bg_overlay));
@@ -7201,7 +7299,7 @@ fn render_load_preset_dialog(frame: &mut Frame<'_>, area: Rect, names: &[String]
     ))];
     if names.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No saved presets for Messages.",
+            "No saved presets for Search.",
             crate::tui_theme::text_warning(&tp),
         )));
     } else {
@@ -7219,4 +7317,3 @@ fn render_load_preset_dialog(frame: &mut Frame<'_>, area: Rect, names: &[String]
     }
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
 }
-

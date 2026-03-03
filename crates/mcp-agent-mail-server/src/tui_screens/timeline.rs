@@ -448,7 +448,7 @@ impl TimelinePane {
 
     /// Ingest new events from the shared state ring buffer.
     pub fn ingest(&mut self, state: &TuiSharedState) {
-        let new_events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
+        let new_events = state.tick_events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &new_events {
             self.last_seq = event.seq().max(self.last_seq);
             self.total_ingested += 1;

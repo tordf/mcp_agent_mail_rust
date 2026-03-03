@@ -91,6 +91,8 @@ const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 2;
 /// Safety-net cadence for full-frame contrast scans when no explicit repaint
 /// trigger (theme/resize/screen change) requests one.
 const CONTRAST_GUARD_SAFETY_SCAN_TICK_DIVISOR: u64 = 20;
+/// Max events published into the per-tick shared batch consumed by screens.
+const SHARED_TICK_EVENT_BATCH_LIMIT: usize = 512;
 
 /// Nearby (adjacent) inactive screens tick every Nth frame.
 const NEARBY_SCREEN_TICK_DIVISOR: u64 = 3;
@@ -1235,6 +1237,8 @@ pub struct MailAppModel {
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
+    /// Global cursor for per-tick shared event ingestion batch.
+    tick_event_batch_last_seq: u64,
     /// Last terminal dimensions dispatched to screens. Duplicate resize events
     /// are suppressed to avoid redundant invalidation/repaint churn.
     last_dispatched_resize: Option<(u16, u16)>,
@@ -1374,6 +1378,7 @@ impl MailAppModel {
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
             tick_count: 0,
+            tick_event_batch_last_seq: 0,
             last_dispatched_resize: None,
             accessibility: crate::tui_persist::AccessibilitySettings::default(),
             macro_engine: MacroEngine::new(),
@@ -1558,6 +1563,15 @@ impl MailAppModel {
         }
         self.last_dispatched_resize = Some((width, height));
         true
+    }
+
+    fn publish_shared_tick_event_batch(&mut self) {
+        let from_seq = self.tick_event_batch_last_seq;
+        let events = self
+            .state
+            .events_since_limited(from_seq, SHARED_TICK_EVENT_BATCH_LIMIT);
+        let to_seq = self.state.publish_tick_event_batch(from_seq, events);
+        self.tick_event_batch_last_seq = to_seq;
     }
 
     fn handle_help_overlay_mouse(&mut self, event: &Event) -> bool {
@@ -2455,7 +2469,7 @@ impl MailAppModel {
         self.contrast_guard_pending.set(true);
     }
 
-    fn should_run_contrast_guard_pass(&self) -> bool {
+    const fn should_run_contrast_guard_pass(&self) -> bool {
         if self.contrast_guard_pending.get() {
             return true;
         }
@@ -3669,6 +3683,7 @@ impl Model for MailAppModel {
             MailMsg::Terminal(Event::Tick) => {
                 self.tick_count = self.tick_count.wrapping_add(1);
                 let tick_count = self.tick_count;
+                self.publish_shared_tick_event_batch();
                 let active = self.screen_manager.active_screen();
                 let urgent_bypass = urgent_poller_bypass_active(&self.state);
                 // Always tick the active screen.
@@ -11088,6 +11103,30 @@ mod tests {
                 .contains_key(&MailScreenId::Messages),
             "message screen should be accelerated by urgent bypass cadence"
         );
+    }
+
+    #[test]
+    fn tick_publishes_shared_event_batch_and_advances_global_cursor() {
+        let mut model = test_model();
+        assert_eq!(model.tick_event_batch_last_seq, 0);
+
+        assert!(
+            model
+                .state
+                .push_event(MailEvent::http_request("GET", "/a", 200, 1, "127.0.0.1"))
+        );
+        assert!(
+            model
+                .state
+                .push_event(MailEvent::http_request("GET", "/b", 200, 1, "127.0.0.1"))
+        );
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert_eq!(model.tick_event_batch_last_seq, 2);
+
+        let shared = model.state.tick_events_since_limited(1, 8);
+        let seqs: Vec<u64> = shared.iter().map(MailEvent::seq).collect();
+        assert_eq!(seqs, vec![2]);
     }
 
     #[test]

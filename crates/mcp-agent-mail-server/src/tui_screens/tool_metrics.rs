@@ -426,7 +426,7 @@ impl ToolMetricsScreen {
     }
 
     fn ingest_events(&mut self, state: &TuiSharedState) {
-        let events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
+        let events = state.tick_events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &events {
             self.last_seq = event.seq().max(self.last_seq);
             if let MailEvent::ToolCallEnd {

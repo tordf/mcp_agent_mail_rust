@@ -8,10 +8,10 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 
-use ftui::PackedRgba;
-use ftui::text::{Line, Span};
 use ammonia::Builder;
+use ftui::PackedRgba;
 use ftui::text::Text;
+use ftui::text::{Line, Span};
 pub use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown};
 
 /// Sanitizer for hostile inline HTML embedded in markdown message bodies.
@@ -215,7 +215,14 @@ impl JsonTreeViewState {
             return Vec::new();
         };
         let mut out = Vec::new();
-        flatten_json_rows(value, None, "$".to_string(), 0, &self.expanded_paths, &mut out);
+        flatten_json_rows(
+            value,
+            None,
+            "$".to_string(),
+            0,
+            &self.expanded_paths,
+            &mut out,
+        );
         out
     }
 
@@ -237,7 +244,10 @@ impl JsonTreeViewState {
         } else {
             #[allow(clippy::cast_sign_loss)]
             let step = delta as usize;
-            self.cursor = self.cursor.saturating_add(step).min(rows_len.saturating_sub(1));
+            self.cursor = self
+                .cursor
+                .saturating_add(step)
+                .min(rows_len.saturating_sub(1));
         }
     }
 
@@ -285,6 +295,7 @@ const JSON_BOOL_FG: PackedRgba = PackedRgba::rgb(188, 63, 188);
 const JSON_NULL_FG: PackedRgba = PackedRgba::rgb(120, 120, 120);
 const JSON_PUNCT_FG: PackedRgba = PackedRgba::rgb(180, 180, 190);
 
+#[allow(clippy::needless_pass_by_value)]
 fn flatten_json_rows(
     value: &serde_json::Value,
     key_label: Option<String>,
@@ -300,7 +311,14 @@ fn flatten_json_rows(
     };
     let expanded = !expandable || expanded_paths.contains(path.as_str());
     let value_preview = format_json_value_preview(value);
-    let line = build_json_tree_line(depth, key_label.as_deref(), value, &value_preview, expandable, expanded);
+    let line = build_json_tree_line(
+        depth,
+        key_label.as_deref(),
+        value,
+        &value_preview,
+        expandable,
+        expanded,
+    );
     out.push(JsonTreeRow {
         path: path.clone(),
         expandable,

@@ -403,7 +403,7 @@ impl ReservationsScreen {
 
     fn ingest_events(&mut self, state: &TuiSharedState) -> bool {
         let mut changed = false;
-        let events = state.events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
+        let events = state.tick_events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &events {
             self.last_seq = event.seq().max(self.last_seq);
             match event {

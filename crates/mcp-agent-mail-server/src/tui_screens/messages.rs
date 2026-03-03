@@ -2210,21 +2210,24 @@ impl MessageBrowserScreen {
         total_lines.saturating_sub(visible_height)
     }
 
-    fn scroll_detail_by(&mut self, delta: isize) {
+    fn scroll_detail_by(&self, delta: isize) {
         let max = self.detail_max_scroll();
         if delta.is_negative() {
-            self.detail_scroll.set(self
-                .detail_scroll.get()
-                .saturating_sub(delta.unsigned_abs())
-                .min(max));
+            self.detail_scroll.set(
+                self.detail_scroll
+                    .get()
+                    .saturating_sub(delta.unsigned_abs())
+                    .min(max),
+            );
         } else {
             #[allow(clippy::cast_sign_loss)]
             let add = delta as usize;
-            self.detail_scroll.set(self.detail_scroll.get().saturating_add(add).min(max));
+            self.detail_scroll
+                .set(self.detail_scroll.get().saturating_add(add).min(max));
         }
     }
 
-    fn toggle_detail_view_mode(&mut self) {
+    fn toggle_detail_view_mode(&self) {
         match self.detail_view_mode.get() {
             DetailViewMode::Markdown => {
                 let Some(entry) = self.results.get(self.cursor) else {
@@ -2253,18 +2256,22 @@ impl MessageBrowserScreen {
         if cursor < self.detail_scroll.get() {
             self.detail_scroll.set(cursor);
         } else if cursor >= self.detail_scroll.get().saturating_add(visible_rows) {
-            self.detail_scroll.set(cursor
-                .saturating_add(1)
-                .saturating_sub(visible_rows)
-                .min(row_count.saturating_sub(visible_rows)));
+            self.detail_scroll.set(
+                cursor
+                    .saturating_add(1)
+                    .saturating_sub(visible_rows)
+                    .min(row_count.saturating_sub(visible_rows)),
+            );
         } else {
-            self.detail_scroll.set(self
-                .detail_scroll.get()
-                .min(row_count.saturating_sub(visible_rows)));
+            self.detail_scroll.set(
+                self.detail_scroll
+                    .get()
+                    .min(row_count.saturating_sub(visible_rows)),
+            );
         }
     }
 
-    fn handle_json_tree_navigation(&mut self, key: &ftui::KeyEvent) -> bool {
+    fn handle_json_tree_navigation(&self, key: &ftui::KeyEvent) -> bool {
         if self.detail_view_mode.get() != DetailViewMode::JsonTree {
             return false;
         }
@@ -2703,151 +2710,151 @@ impl MailScreen for MessageBrowserScreen {
                         return Cmd::None;
                     }
                     match key.code {
-                    KeyCode::Escape if state.keyboard_move_snapshot().is_some() => {
-                        state.clear_keyboard_move_snapshot();
-                        return Cmd::None;
-                    }
-                    // Enter search mode
-                    KeyCode::Char('/') | KeyCode::Tab => {
-                        self.focus = Focus::SearchBar;
-                        self.search_input.set_focused(true);
-                        return Cmd::None;
-                    }
-                    // Cursor navigation
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if !self.results.is_empty() {
-                            self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                        KeyCode::Escape if state.keyboard_move_snapshot().is_some() => {
+                            state.clear_keyboard_move_snapshot();
+                            return Cmd::None;
+                        }
+                        // Enter search mode
+                        KeyCode::Char('/') | KeyCode::Tab => {
+                            self.focus = Focus::SearchBar;
+                            self.search_input.set_focused(true);
+                            return Cmd::None;
+                        }
+                        // Cursor navigation
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !self.results.is_empty() {
+                                self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                                self.detail_scroll.set(0);
+                                self.extend_visual_selection_to_cursor();
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            self.cursor = self.cursor.saturating_sub(1);
                             self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                         }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.cursor = self.cursor.saturating_sub(1);
-                        self.detail_scroll.set(0);
-                        self.extend_visual_selection_to_cursor();
-                    }
-                    KeyCode::Char('G') | KeyCode::End => {
-                        if !self.results.is_empty() {
-                            self.cursor = self.results.len() - 1;
+                        KeyCode::Char('G') | KeyCode::End => {
+                            if !self.results.is_empty() {
+                                self.cursor = self.results.len() - 1;
+                                self.detail_scroll.set(0);
+                                self.extend_visual_selection_to_cursor();
+                            }
+                        }
+                        KeyCode::Home => {
+                            self.cursor = 0;
                             self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                         }
-                    }
-                    KeyCode::Home => {
-                        self.cursor = 0;
-                        self.detail_scroll.set(0);
-                        self.extend_visual_selection_to_cursor();
-                    }
-                    // Toggle inbox mode (Local/Global)
-                    KeyCode::Char('g') => {
-                        self.toggle_inbox_mode();
-                        return Cmd::None;
-                    }
-                    // Page navigation
-                    KeyCode::Char('d') | KeyCode::PageDown => {
-                        if !self.results.is_empty() {
-                            self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                        // Toggle inbox mode (Local/Global)
+                        KeyCode::Char('g') => {
+                            self.toggle_inbox_mode();
+                            return Cmd::None;
+                        }
+                        // Page navigation
+                        KeyCode::Char('d') | KeyCode::PageDown => {
+                            if !self.results.is_empty() {
+                                self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                                self.detail_scroll.set(0);
+                                self.extend_visual_selection_to_cursor();
+                            }
+                        }
+                        KeyCode::Char('u') | KeyCode::PageUp => {
+                            self.cursor = self.cursor.saturating_sub(20);
                             self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                         }
-                    }
-                    KeyCode::Char('u') | KeyCode::PageUp => {
-                        self.cursor = self.cursor.saturating_sub(20);
-                        self.detail_scroll.set(0);
-                        self.extend_visual_selection_to_cursor();
-                    }
-                    // Multi-select controls
-                    KeyCode::Char(' ') => {
-                        self.toggle_selection_for_cursor();
-                        return Cmd::None;
-                    }
-                    KeyCode::Char('v') if !key.modifiers.contains(Modifiers::CTRL) => {
-                        let enabled = self.selected_message_ids.toggle_visual_mode();
-                        if enabled {
-                            self.extend_visual_selection_to_cursor();
+                        // Multi-select controls
+                        KeyCode::Char(' ') => {
+                            self.toggle_selection_for_cursor();
+                            return Cmd::None;
                         }
-                        return Cmd::None;
-                    }
-                    KeyCode::Char('A') => {
-                        self.select_all_visible_messages();
-                        return Cmd::None;
-                    }
-                    KeyCode::Char('C') if !key.modifiers.contains(Modifiers::CTRL) => {
-                        self.clear_message_selection();
-                        return Cmd::None;
-                    }
-                    // Detail scroll
-                    KeyCode::Char('J') => {
-                        let previous_mode = self.detail_view_mode.get();
-                        self.toggle_detail_view_mode();
-                        if previous_mode == DetailViewMode::Markdown
-                            && self.detail_view_mode.get() == DetailViewMode::Markdown
-                        {
-                            self.scroll_detail_by(1);
+                        KeyCode::Char('v') if !key.modifiers.contains(Modifiers::CTRL) => {
+                            let enabled = self.selected_message_ids.toggle_visual_mode();
+                            if enabled {
+                                self.extend_visual_selection_to_cursor();
+                            }
+                            return Cmd::None;
                         }
-                    }
-                    KeyCode::Char('K') => self.scroll_detail_by(-1),
-                    // Split layout controls
-                    KeyCode::Char('i') => self.dock.toggle_visible(),
-                    KeyCode::Char(']') => self.dock.grow_dock(),
-                    KeyCode::Char('[') => self.dock.shrink_dock(),
-                    KeyCode::Char('}') => self.dock.cycle_position(),
-                    KeyCode::Char('{') => self.dock.cycle_position_prev(),
-                    // Deep-link: jump to timeline at message timestamp
-                    KeyCode::Enter => {
-                        if let Some(entry) = self.results.get(self.cursor) {
-                            return Cmd::msg(MailScreenMsg::DeepLink(
-                                DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
-                            ));
+                        KeyCode::Char('A') => {
+                            self.select_all_visible_messages();
+                            return Cmd::None;
                         }
-                    }
-                    // Cycle query presets
-                    KeyCode::Char('p') => {
-                        self.apply_preset(self.preset_index + 1);
-                    }
-                    KeyCode::Char('P') => {
-                        let idx = if self.preset_index == 0 {
-                            QUERY_PRESETS.len() - 1
-                        } else {
-                            self.preset_index - 1
-                        };
-                        self.apply_preset(idx);
-                    }
-                    // Compose message modal
-                    KeyCode::Char('c') if !key.modifiers.contains(Modifiers::CTRL) => {
-                        self.open_compose_modal(Some(state), None);
-                        return Cmd::None;
-                    }
-                    // Quick reply modal
-                    KeyCode::Char('r') if !key.modifiers.contains(Modifiers::CTRL) => {
-                        if let Some(entry) = self.results.get(self.cursor).cloned()
-                            && let Err(err) = self.open_quick_reply_modal_for_entry(&entry)
-                        {
-                            return Cmd::msg(MailScreenMsg::ActionExecute(
-                                "quick_reply_result:error".to_string(),
-                                err,
-                            ));
+                        KeyCode::Char('C') if !key.modifiers.contains(Modifiers::CTRL) => {
+                            self.clear_message_selection();
+                            return Cmd::None;
                         }
-                        return Cmd::None;
+                        // Detail scroll
+                        KeyCode::Char('J') => {
+                            let previous_mode = self.detail_view_mode.get();
+                            self.toggle_detail_view_mode();
+                            if previous_mode == DetailViewMode::Markdown
+                                && self.detail_view_mode.get() == DetailViewMode::Markdown
+                            {
+                                self.scroll_detail_by(1);
+                            }
+                        }
+                        KeyCode::Char('K') => self.scroll_detail_by(-1),
+                        // Split layout controls
+                        KeyCode::Char('i') => self.dock.toggle_visible(),
+                        KeyCode::Char(']') => self.dock.grow_dock(),
+                        KeyCode::Char('[') => self.dock.shrink_dock(),
+                        KeyCode::Char('}') => self.dock.cycle_position(),
+                        KeyCode::Char('{') => self.dock.cycle_position_prev(),
+                        // Deep-link: jump to timeline at message timestamp
+                        KeyCode::Enter => {
+                            if let Some(entry) = self.results.get(self.cursor) {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::TimelineAtTime(entry.timestamp_micros),
+                                ));
+                            }
+                        }
+                        // Cycle query presets
+                        KeyCode::Char('p') => {
+                            self.apply_preset(self.preset_index + 1);
+                        }
+                        KeyCode::Char('P') => {
+                            let idx = if self.preset_index == 0 {
+                                QUERY_PRESETS.len() - 1
+                            } else {
+                                self.preset_index - 1
+                            };
+                            self.apply_preset(idx);
+                        }
+                        // Compose message modal
+                        KeyCode::Char('c') if !key.modifiers.contains(Modifiers::CTRL) => {
+                            self.open_compose_modal(Some(state), None);
+                            return Cmd::None;
+                        }
+                        // Quick reply modal
+                        KeyCode::Char('r') if !key.modifiers.contains(Modifiers::CTRL) => {
+                            if let Some(entry) = self.results.get(self.cursor).cloned()
+                                && let Err(err) = self.open_quick_reply_modal_for_entry(&entry)
+                            {
+                                return Cmd::msg(MailScreenMsg::ActionExecute(
+                                    "quick_reply_result:error".to_string(),
+                                    err,
+                                ));
+                            }
+                            return Cmd::None;
+                        }
+                        // Mark selected message for keyboard move.
+                        KeyCode::Char('m') if key.modifiers.contains(Modifiers::CTRL) => {
+                            self.mark_selected_result_for_keyboard_move(state);
+                            return Cmd::None;
+                        }
+                        // Drop marked message onto current selected thread context.
+                        KeyCode::Char('v') if key.modifiers.contains(Modifiers::CTRL) => {
+                            return self.execute_keyboard_move_to_selected_context(state);
+                        }
+                        // Clear search
+                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                            self.search_input.clear();
+                            self.search_dirty = true;
+                            self.debounce_remaining = 0;
+                            self.preset_index = 0;
+                        }
+                        _ => {}
                     }
-                    // Mark selected message for keyboard move.
-                    KeyCode::Char('m') if key.modifiers.contains(Modifiers::CTRL) => {
-                        self.mark_selected_result_for_keyboard_move(state);
-                        return Cmd::None;
-                    }
-                    // Drop marked message onto current selected thread context.
-                    KeyCode::Char('v') if key.modifiers.contains(Modifiers::CTRL) => {
-                        return self.execute_keyboard_move_to_selected_context(state);
-                    }
-                    // Clear search
-                    KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
-                        self.search_input.clear();
-                        self.search_dirty = true;
-                        self.debounce_remaining = 0;
-                        self.preset_index = 0;
-                    }
-                    _ => {}
-                }
                 }
             },
             _ => {}
@@ -4103,6 +4110,22 @@ fn estimate_message_detail_lines(entry: &MessageEntry, width: u16) -> usize {
     count
 }
 
+fn estimate_wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
+    let wrap_width = width.max(1);
+    lines
+        .iter()
+        .map(|line| {
+            let len = line.width();
+            if len == 0 {
+                1
+            } else {
+                len.div_ceil(wrap_width)
+            }
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
 fn stable_hash<T: Hash>(value: T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
@@ -4110,6 +4133,7 @@ fn stable_hash<T: Hash>(value: T) -> u64 {
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_arguments)]
 fn render_detail_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4124,22 +4148,21 @@ fn render_detail_panel(
     let detail_title = entry.map_or_else(
         || "Detail".to_string(),
         |msg| {
-            let viewport = usize::from(area.height.saturating_sub(2)).max(1);
-            let width = if area.width == 0 { 80 } else { area.width };
-            let total = estimate_message_detail_lines(msg, width);
-            let max_scroll = total.saturating_sub(viewport);
-            let clamped = scroll.min(max_scroll);
             let importance = match msg.importance.as_str() {
                 "urgent" => "!!",
                 "high" => "!",
                 _ => "\u{00b7}",
             };
-            let view_suffix = if detail_view_mode == DetailViewMode::JsonTree {
-                " | JSON Tree"
+            if detail_view_mode == DetailViewMode::JsonTree {
+                format!("Detail {importance} | JSON Tree")
             } else {
-                ""
-            };
-            format!("Detail {importance} [{clamped}/{max_scroll}]{view_suffix}")
+                let viewport = usize::from(area.height.saturating_sub(2)).max(1);
+                let width = if area.width == 0 { 80 } else { area.width };
+                let total = estimate_message_detail_lines(msg, width);
+                let max_scroll = total.saturating_sub(viewport);
+                let clamped = scroll.min(max_scroll);
+                format!("Detail {importance} [{clamped}/{max_scroll}]")
+            }
         },
     );
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -4250,14 +4273,22 @@ fn render_detail_panel(
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 let selected = idx == json_cursor;
                 spans.push(Span::styled(
-                    if selected { "▸ ".to_string() } else { "  ".to_string() },
-                    if selected { selected_style } else { marker_style },
+                    if selected {
+                        "▸ ".to_string()
+                    } else {
+                        "  ".to_string()
+                    },
+                    if selected {
+                        selected_style
+                    } else {
+                        marker_style
+                    },
                 ));
                 spans.extend(row.line.spans().iter().cloned());
                 combined_lines.push(Line::from_spans(spans));
             }
         }
-        combined_lines.len().max(1)
+        estimate_wrapped_line_count(&combined_lines, usize::from(content_inner.width))
     } else {
         let body_text = {
             let width = content_inner.width;
@@ -5349,7 +5380,7 @@ mod tests {
     fn new_screen_defaults() {
         let screen = MessageBrowserScreen::new();
         assert_eq!(screen.cursor, 0);
-        assert_eq!(screen.detail_scroll, 0);
+        assert_eq!(screen.detail_scroll.get(), 0);
         assert!(matches!(screen.focus, Focus::ResultList));
         assert!(screen.results.is_empty());
         assert!(screen.search_dirty);
@@ -5503,15 +5534,15 @@ mod tests {
 
         let j_upper = Event::Key(ftui::KeyEvent::new(KeyCode::Char('J')));
         screen.update(&j_upper, &state);
-        assert_eq!(screen.detail_scroll, 1);
+        assert_eq!(screen.detail_scroll.get(), 1);
 
         let k_upper = Event::Key(ftui::KeyEvent::new(KeyCode::Char('K')));
         screen.update(&k_upper, &state);
-        assert_eq!(screen.detail_scroll, 0);
+        assert_eq!(screen.detail_scroll.get(), 0);
 
         // Can't go below 0
         screen.update(&k_upper, &state);
-        assert_eq!(screen.detail_scroll, 0);
+        assert_eq!(screen.detail_scroll.get(), 0);
     }
 
     #[test]
@@ -5535,24 +5566,24 @@ mod tests {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
-        assert_eq!(screen.detail_view_mode, DetailViewMode::JsonTree);
-        assert!(screen.json_tree_state.is_available());
+        assert_eq!(screen.detail_view_mode.get(), DetailViewMode::JsonTree);
+        assert!(screen.json_tree_state.borrow().is_available());
 
-        let expanded_rows = screen.json_tree_state.rows().len();
+        let expanded_rows = screen.json_tree_state.borrow().rows().len();
         assert!(expanded_rows > 1, "root should be expanded initially");
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
-        let collapsed_rows = screen.json_tree_state.rows().len();
+        let collapsed_rows = screen.json_tree_state.borrow().rows().len();
         assert_eq!(collapsed_rows, 1, "enter collapses selected root node");
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
         assert!(
-            screen.json_tree_state.rows().len() > 1,
+            screen.json_tree_state.borrow().rows().len() > 1,
             "enter toggles root back to expanded"
         );
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
-        assert_eq!(screen.detail_view_mode, DetailViewMode::Markdown);
+        assert_eq!(screen.detail_view_mode.get(), DetailViewMode::Markdown);
     }
 
     // ── consumes_text_input ─────────────────────────────────────────
@@ -6308,6 +6339,12 @@ mod tests {
             None,
             0,
         );
+    }
+
+    #[test]
+    fn estimate_wrapped_line_count_accounts_for_soft_wrap() {
+        let lines = vec![Line::raw("123456789"), Line::raw("x")];
+        assert_eq!(estimate_wrapped_line_count(&lines, 4), 4);
     }
 
     #[test]
