@@ -271,6 +271,35 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
 SQL
 
 # ===========================================================================
+# Case 0: Direct Rust migrate path handles legacy fixture without corruption
+# ===========================================================================
+e2e_case_banner "am migrate handles legacy sqlite fixture directly"
+DIRECT_DB="${WORK}/direct_migrate.sqlite3"
+cp -p "${PYTHON_DB}" "${DIRECT_DB}"
+set +e
+DIRECT_MIGRATE_OUT="$(
+    HOME="${TEST_HOME}" \
+    PATH="${PATH_BASE}" \
+    AM_INTERFACE_MODE=cli \
+    DATABASE_URL="sqlite:///${DIRECT_DB}" \
+    "${AM_BIN}" migrate --force 2>&1
+)"
+DIRECT_MIGRATE_RC=$?
+DIRECT_INTEGRITY="$(sqlite3 "${DIRECT_DB}" "PRAGMA integrity_check;" 2>/dev/null)"
+DIRECT_PROJECT_TYPE="$(sqlite3 "${DIRECT_DB}" "SELECT typeof(created_at) FROM projects WHERE id=1;" 2>/dev/null)"
+DIRECT_MESSAGE_TYPE="$(sqlite3 "${DIRECT_DB}" "SELECT typeof(created_ts) FROM messages WHERE id=1;" 2>/dev/null)"
+DIRECT_RES_TYPE="$(sqlite3 "${DIRECT_DB}" "SELECT typeof(created_ts) FROM file_reservations WHERE id=1;" 2>/dev/null)"
+DIRECT_SUBJECT="$(sqlite3 "${DIRECT_DB}" "SELECT subject FROM messages WHERE id=1;" 2>/dev/null)"
+set -e
+e2e_save_artifact "case_00_direct_migrate_output.txt" "${DIRECT_MIGRATE_OUT}"
+e2e_assert_exit_code "direct am migrate exits cleanly" "0" "${DIRECT_MIGRATE_RC}"
+e2e_assert_eq "direct am migrate integrity_check is ok" "ok" "${DIRECT_INTEGRITY}"
+e2e_assert_eq "direct am migrate projects.created_at type" "integer" "${DIRECT_PROJECT_TYPE}"
+e2e_assert_eq "direct am migrate messages.created_ts type" "integer" "${DIRECT_MESSAGE_TYPE}"
+e2e_assert_eq "direct am migrate file_reservations.created_ts type" "integer" "${DIRECT_RES_TYPE}"
+e2e_assert_eq "direct am migrate preserves message subject" "Legacy migration message" "${DIRECT_SUBJECT}"
+
+# ===========================================================================
 # Case 1: Run installer takeover flow
 # ===========================================================================
 e2e_case_banner "install.sh migrates over existing Python setup"

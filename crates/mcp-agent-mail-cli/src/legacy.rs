@@ -863,15 +863,20 @@ fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
 
     let conn = DbConn::open_file(path.display().to_string())
         .map_err(|e| CliError::Other(format!("cannot open sqlite DB {}: {e}", path.display())))?;
-    conn.execute_raw(schema::PRAGMA_SETTINGS_SQL)
-        .map_err(|e| CliError::Other(format!("failed to apply PRAGMAs: {e}")))?;
+    conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
+        .map_err(|e| CliError::Other(format!("failed to apply base init PRAGMAs: {e}")))?;
 
     let cx = asupersync::Cx::for_request();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
     match rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await }) {
-        asupersync::Outcome::Ok(ids) => Ok(ids),
+        asupersync::Outcome::Ok(ids) => {
+            schema::enforce_runtime_fts_cleanup(&conn)
+                .map_err(|e| CliError::Other(format!("runtime FTS cleanup failed: {e}")))?;
+            let _ = conn.execute_raw("PRAGMA journal_mode = WAL;");
+            Ok(ids)
+        }
         asupersync::Outcome::Err(e) => Err(CliError::Other(format!("migration failed: {e}"))),
         asupersync::Outcome::Cancelled(r) => {
             Err(CliError::Other(format!("migration cancelled: {r:?}")))

@@ -2305,8 +2305,38 @@ impl SearchCockpitScreen {
         } else {
             area.width.saturating_sub(2).max(1)
         };
-        let detail_text = self.cached_rendered_detail(entry);
-        let total = estimate_wrapped_text_lines(detail_text.as_ref(), usize::from(width));
+        let total = if self.detail_view_mode.get() == DetailViewMode::JsonTree {
+            let tree_snapshot = entry.full_body.as_deref().and_then(|body| {
+                let mut tree = self.json_tree_state.borrow_mut();
+                if tree.sync_body(body) {
+                    tree.clamp_cursor();
+                    Some((tree.rows(), tree.cursor()))
+                } else {
+                    None
+                }
+            });
+
+            if let Some((rows, cursor)) = tree_snapshot {
+                let tp = crate::tui_theme::TuiThemePalette::current();
+                let detail_text = compose_detail_text(
+                    entry,
+                    &self.highlight_terms,
+                    self.last_diagnostics.as_ref(),
+                    None,
+                    &tp,
+                    DetailViewMode::JsonTree,
+                    Some(rows.as_slice()),
+                    cursor,
+                );
+                estimate_wrapped_text_lines(&detail_text, usize::from(width))
+            } else {
+                let detail_text = self.cached_rendered_detail(entry);
+                estimate_wrapped_text_lines(detail_text.as_ref(), usize::from(width))
+            }
+        } else {
+            let detail_text = self.cached_rendered_detail(entry);
+            estimate_wrapped_text_lines(detail_text.as_ref(), usize::from(width))
+        };
         total.saturating_sub(visible)
     }
 
@@ -5447,6 +5477,7 @@ const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
 // ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use ftui_harness::buffer_to_text;

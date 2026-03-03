@@ -2547,11 +2547,11 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     #[allow(clippy::option_if_let_else)]
     let (sql, params): (String, Vec<Value>) = if let Some(ts) = since_ts {
         (
-            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-             m.importance, m.ack_required, m.created_ts, m.attachments \
-             FROM messages m \
-             WHERE m.sender_id = ? AND m.project_id = ? AND m.created_ts > ? \
-             ORDER BY m.created_ts DESC LIMIT ?"
+            "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
+             importance, ack_required, created_ts, attachments \
+             FROM messages \
+             WHERE sender_id = ? AND project_id = ? AND created_ts > ? \
+             ORDER BY created_ts DESC LIMIT ?"
                 .to_string(),
             vec![
                 Value::BigInt(agent_id),
@@ -2562,11 +2562,11 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         )
     } else {
         (
-            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-             m.importance, m.ack_required, m.created_ts, m.attachments \
-             FROM messages m \
-             WHERE m.sender_id = ? AND m.project_id = ? \
-             ORDER BY m.created_ts DESC LIMIT ?"
+            "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
+             importance, ack_required, created_ts, attachments \
+             FROM messages \
+             WHERE sender_id = ? AND project_id = ? \
+             ORDER BY created_ts DESC LIMIT ?"
                 .to_string(),
             vec![
                 Value::BigInt(agent_id),
