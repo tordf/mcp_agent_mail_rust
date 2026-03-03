@@ -1923,7 +1923,7 @@ fn dispatch_compose_envelope(
                 &envelope.subject,
                 thread_str,
                 "default",
-                truncate_body_excerpt(&envelope.body_md),
+                envelope.body_md.clone(),
             ));
 
             tracing::info!(
@@ -4702,7 +4702,11 @@ to skip auth for local requests.</p>
             return Err(());
         };
         let auth = auth.trim();
-        let Some(token) = auth.strip_prefix("Bearer ").map(str::trim) else {
+        let Some(token) = auth
+            .get(..7)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+            .map(|_| auth[7..].trim())
+        else {
             return Err(());
         };
         if token.is_empty() {
@@ -5568,21 +5572,20 @@ fn extract_arg_string_vec(arguments: Option<&serde_json::Value>, key: &str) -> V
         .unwrap_or_default()
 }
 
-/// Truncate a markdown body to a short excerpt suitable for event previews.
-/// Collapses whitespace and limits to ~200 characters on a char boundary.
-fn truncate_body_excerpt(body: &str) -> String {
-    const MAX_EXCERPT: usize = 200;
-    // Collapse newlines/tabs to single spaces for compact preview.
-    let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.len() <= MAX_EXCERPT {
-        return collapsed;
+/// Truncate a markdown body to a safe limit suitable for the event ring buffer.
+/// Collapses 50MB bodies to 32KB to prevent memory exhaustion, while still
+/// providing enough content for the full-screen dashboard preview.
+fn truncate_body_md(body: &str) -> String {
+    const MAX_EXCERPT: usize = 32_000;
+    if body.len() <= MAX_EXCERPT {
+        return body.to_string();
     }
     let mut end = MAX_EXCERPT;
-    while end > 0 && !collapsed.is_char_boundary(end) {
+    while end > 0 && !body.is_char_boundary(end) {
         end -= 1;
     }
-    let mut result = collapsed[..end].to_string();
-    result.push('…');
+    let mut result = body[..end].to_string();
+    result.push_str("\n\n... (message truncated for preview, open Messages/Threads for full body)");
     result
 }
 
@@ -5612,10 +5615,10 @@ fn message_sent_event_from_payload(
         .filter(|s| !s.is_empty())
         .unwrap_or("unthreaded")
         .to_string();
-    let body_excerpt = payload
+    let body_md = payload
         .get("body_md")
         .and_then(serde_json::Value::as_str)
-        .map(truncate_body_excerpt)
+        .map(truncate_body_md)
         .unwrap_or_default();
     let event = tui_events::MailEvent::message_sent(
         id,
@@ -5624,7 +5627,7 @@ fn message_sent_event_from_payload(
         subject,
         thread_id,
         &project,
-        body_excerpt,
+        body_md,
     );
     Some((id, project, event))
 }
@@ -5662,18 +5665,18 @@ fn append_message_flow_events(
         return false;
     };
 
-    let (from, subject, thread_id, body_excerpt) = match &sent_event {
+    let (from, subject, thread_id, body_md) = match &sent_event {
         tui_events::MailEvent::MessageSent {
             from,
             subject,
             thread_id,
-            body_excerpt,
+            body_md,
             ..
         } => (
             from.clone(),
             subject.clone(),
             thread_id.clone(),
-            body_excerpt.clone(),
+            body_md.clone(),
         ),
         _ => return false,
     };
@@ -5705,7 +5708,7 @@ fn append_message_flow_events(
             &subject,
             &thread_id,
             &project,
-            &body_excerpt,
+            &body_md,
         ));
         *recipient_budget = recipient_budget.saturating_sub(1);
     }
@@ -5821,10 +5824,10 @@ fn derive_fetch_inbox_domain_events(
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
             .unwrap_or("unthreaded");
-        let body_excerpt = message
+        let body_md = message
             .get("body_md")
             .and_then(serde_json::Value::as_str)
-            .map(truncate_body_excerpt)
+            .map(truncate_body_md)
             .unwrap_or_default();
         let mut to = Vec::new();
         if let Some(agent_name) = ctx.agent.as_deref() {
@@ -5837,7 +5840,7 @@ fn derive_fetch_inbox_domain_events(
             subject,
             thread_id,
             project_value,
-            body_excerpt,
+            body_md,
         ));
     }
     events
@@ -6362,10 +6365,37 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
     readiness_check_with_integrity(config, false)
 }
 
+#[allow(clippy::too_many_lines)]
 fn readiness_check_with_integrity(
     config: &mcp_agent_mail_core::Config,
     run_integrity_check: bool,
 ) -> Result<(), String> {
+    let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
+
+    // Pre-flight check: Auto-recover missing SQLite files before acquiring pool connections
+    // that would otherwise create a fresh empty DB (bypassing archive reconstruction).
+    if run_integrity_check 
+        && config.integrity_check_on_startup 
+        && !is_memory
+        && let Some(sqlite_path) =
+            mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
+    {
+        let storage_root = std::path::Path::new(&config.storage_root);
+        if !sqlite_path.exists() {
+            let recovery_res = if storage_root.is_dir() {
+                mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
+                    &sqlite_path,
+                    storage_root,
+                )
+            } else {
+                mcp_agent_mail_db::ensure_sqlite_file_healthy(&sqlite_path)
+            };
+            if let Err(e) = recovery_res {
+                return Err(format!("Failed to recover missing SQLite database: {e}"));
+            }
+        }
+    }
+
     let pool_timeout_ms = config
         .database_pool_timeout
         .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
@@ -6383,18 +6413,72 @@ fn readiness_check_with_integrity(
         run_migrations: true,
         warmup_connections: 0,
     };
-    let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
+    
     let cx = Cx::for_testing();
-    let conn = match block_on(pool.acquire(&cx)) {
-        asupersync::Outcome::Ok(c) => c,
-        asupersync::Outcome::Err(e) => return Err(e.to_string()),
-        asupersync::Outcome::Cancelled(_) => return Err("readiness cancelled".to_string()),
-        asupersync::Outcome::Panicked(p) => {
-            return Err(format!("readiness panic: {}", p.message()));
+    let mut pool = create_pool(&db_config).map_err(|e| e.to_string())?;
+    let mut conn;
+    let mut retry_after_recovery = false;
+
+    loop {
+        match block_on(pool.acquire(&cx)) {
+            asupersync::Outcome::Ok(c) => {
+                conn = c;
+                if let Err(e) = conn.query_sync("SELECT 1", &[]) {
+                    if !retry_after_recovery
+                        && run_integrity_check
+                        && mcp_agent_mail_db::is_corruption_error_message(&e.to_string())
+                    {
+                        // Fall through to recovery
+                    } else {
+                        return Err(e.to_string());
+                    }
+                } else {
+                    break; // Success!
+                }
+            }
+            asupersync::Outcome::Err(e) => {
+                if !retry_after_recovery
+                    && run_integrity_check
+                    && mcp_agent_mail_db::is_corruption_error_message(&e.to_string())
+                {
+                    // Fall through to recovery
+                } else {
+                    return Err(e.to_string());
+                }
+            }
+            asupersync::Outcome::Cancelled(_) => return Err("readiness cancelled".to_string()),
+            asupersync::Outcome::Panicked(p) => {
+                return Err(format!("readiness panic: {}", p.message()))
+            }
         }
-    };
-    conn.query_sync("SELECT 1", &[])
-        .map_err(|e| e.to_string())?;
+
+        // We only reach here if we hit a corruption error and haven't retried yet.
+        retry_after_recovery = true;
+        tracing::warn!("SQLite corruption detected during readiness check; attempting automatic recovery");
+        if let Some(sqlite_path) =
+            mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
+        {
+            let storage_root = std::path::Path::new(&config.storage_root);
+            let recovery_res = if storage_root.is_dir() {
+                mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
+                    &sqlite_path,
+                    storage_root,
+                )
+            } else {
+                mcp_agent_mail_db::ensure_sqlite_file_healthy(&sqlite_path)
+            };
+            if let Err(rec_e) = recovery_res {
+                return Err(format!(
+                    "SQLite corruption detected and automatic recovery failed: {rec_e}"
+                ));
+            }
+            // Recreate pool because old connections might be broken/stale
+            pool = create_pool(&db_config).map_err(|e| e.to_string())?;
+        } else {
+            return Err("SQLite corruption detected but unable to resolve database path".to_string());
+        }
+    }
+
     let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
     drop(conn);
 
@@ -6406,13 +6490,14 @@ fn readiness_check_with_integrity(
             });
     if run_integrity_check
         && config.integrity_check_on_startup
-        && !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)
+        && !is_memory
     {
         if skip_startup_integrity {
             tracing::debug!(
                 "startup integrity quick-check skipped (schema fingerprint unchanged and cache is fresh)"
             );
         } else {
+            // Note: If we just recovered above, this is redundant but extremely fast and safe.
             pool.run_startup_integrity_check()
                 .map_err(|e| format!("startup integrity check failed: {e}"))?;
             if let Some((sqlite_path, fingerprint)) = startup_integrity_fingerprint {

@@ -8677,12 +8677,9 @@ struct ProjectsAdoptRecord {
 }
 
 fn git_output_text(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.arg("5s").arg("git").arg("-C").arg(cwd).args(args);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -18671,7 +18668,7 @@ mod tests {
     #[test]
     fn help_doctor_lists_subcommands() {
         let h = help_text_for(&["am", "doctor", "--help"]);
-        for cmd in ["check", "repair", "backups", "restore"] {
+        for cmd in ["check", "repair", "backups", "restore", "fix"] {
             assert!(
                 h.contains(cmd),
                 "doctor help missing subcommand '{cmd}'\n{h}"
@@ -18687,6 +18684,51 @@ mod tests {
                 h.contains(flag),
                 "doctor repair help missing flag '{flag}'\n{h}"
             );
+        }
+    }
+
+    #[test]
+    fn help_doctor_fix_lists_flags() {
+        let h = help_text_for(&["am", "doctor", "fix", "--help"]);
+        for flag in ["--dry-run", "--yes", "--json"] {
+            assert!(
+                h.contains(flag),
+                "doctor fix help missing flag '{flag}'\n{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_doctor_fix_schema_stable() {
+        let output = serde_json::json!({
+            "dry_run": true,
+            "fixed": 0,
+            "failed": 0,
+            "skipped": 6,
+            "fixable_checks": FIXABLE_CHECKS,
+            "results": [
+                {"check": "legacy_python_alias", "action": "skip", "detail": "No legacy aliases found"},
+                {"check": "path_order", "action": "dry_run", "detail": "Would append ~/.local/bin"},
+                {"check": "mcp_config", "action": "skip", "detail": "No Python-pointing MCP configs found"},
+                {"check": "storage_root_git_index_lock", "action": "skip", "detail": "No stale index.lock files"},
+                {"check": "guard_hooks", "action": "skip", "detail": "Guard hooks already installed"},
+                {"check": "wal_mode", "action": "skip", "detail": "WAL mode already enabled"},
+            ]
+        });
+        assert!(output["dry_run"].is_boolean());
+        assert!(output["fixed"].is_number());
+        assert!(output["failed"].is_number());
+        assert!(output["skipped"].is_number());
+        assert!(output["fixable_checks"].is_array());
+        assert!(output["results"].is_array());
+        for r in output["results"].as_array().unwrap() {
+            assert!(r["check"].is_string(), "check field must be string");
+            let action = r["action"].as_str().unwrap();
+            assert!(
+                ["fixed", "failed", "skip", "dry_run"].contains(&action),
+                "action must be fixed/failed/skip/dry_run, got {action}"
+            );
+            assert!(r["detail"].is_string(), "detail field must be string");
         }
     }
 
@@ -23173,7 +23215,7 @@ fn ensure_dir(path: &Path) -> CliResult<()> {
 
 fn compute_git_branch(path: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
-        .arg("-C")
+        .args(["-C"])
         .arg(path)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()

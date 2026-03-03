@@ -149,7 +149,7 @@ fn prompt_missing_inputs(
         inputs.provider = Some(prompt_provider_selection(env)?);
     }
 
-    let provider = inputs.provider.unwrap();
+    let provider = inputs.provider.unwrap_or_else(|| unreachable!());
 
     // Prompt for bundle path if not specified
     if inputs.bundle_path.is_none() {
@@ -197,7 +197,7 @@ fn validate_non_interactive(
     }
 
     // Validate provider-specific requirements
-    let provider = inputs.provider.unwrap();
+    let provider = inputs.provider.unwrap_or_else(|| unreachable!());
     validate_provider_requirements(provider, &inputs)?;
 
     Ok(inputs)

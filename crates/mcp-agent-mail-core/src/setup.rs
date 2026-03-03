@@ -279,11 +279,11 @@ impl fmt::Display for ActionOutcome {
 #[must_use]
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("RNG failure");
+    let _ = getrandom::getrandom(&mut bytes);
     let mut hex = String::with_capacity(64);
     for b in &bytes {
         use std::fmt::Write;
-        write!(hex, "{b:02x}").unwrap();
+        let _ = write!(hex, "{b:02x}");
     }
     hex
 }

@@ -713,7 +713,7 @@ pub async fn renew_file_reservations(
         .map(|p| p.iter().map(String::as_str).collect());
 
     let existing_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)
+        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, true)
             .await,
     )?;
     let previous_expires_by_id = collect_previous_expiries(
@@ -842,13 +842,11 @@ pub async fn force_release_file_reservation(
     )
     .await?;
 
-    let reservations = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)
+    let mut reservations = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_reservations_by_ids(ctx.cx(), &pool, &[file_reservation_id])
             .await,
     )?;
-    let reservation = reservations
-        .into_iter()
-        .find(|row| row.id.unwrap_or(0) == file_reservation_id);
+    let reservation = reservations.pop();
 
     let Some(reservation) = reservation else {
         return Err(legacy_tool_error(

@@ -340,7 +340,7 @@ impl Harness {
     where
         F: FnOnce(&mut Rng64) -> R,
     {
-        let mut guard = self.rng.lock().expect("harness rng lock");
+        let mut guard = self.rng.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut guard)
     }
 

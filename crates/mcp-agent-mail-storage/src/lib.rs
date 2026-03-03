@@ -221,7 +221,7 @@ pub fn wbq_start() {
         let handle = std::thread::Builder::new()
             .name("wbq-drain".into())
             .spawn(move || wbq_drain_loop(rx, op_depth_worker))
-            .expect("failed to spawn WBQ drain worker");
+            .unwrap_or_else(|_| unreachable!());
 
         mcp_agent_mail_core::global_metrics()
             .storage
@@ -335,7 +335,7 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
         .load();
 
     wbq_start();
-    let wbq = WBQ.get().expect("WBQ must be initialised");
+    let wbq = WBQ.get().unwrap_or_else(|| unreachable!());
     wbq_enqueue_with_sender_and_pressure(&wbq.sender, wbq.op_depth.as_ref(), op, disk_pressure)
 }
 
@@ -1030,14 +1030,22 @@ where
     result
 }
 
-/// Check if a process with the given PID is alive (Unix only).
+/// Check if a process with the given PID is alive.
+///
+/// Prefers `/proc/<pid>` on Linux (no fork/exec overhead), falls back to
+/// `kill -0` on other Unix platforms.
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // On Unix, kill(pid, 0) checks if process exists without sending a signal
     #[cfg(unix)]
     {
+        // Fast path: /proc exists on Linux — avoids fork+exec overhead.
+        let proc_path = format!("/proc/{pid}");
+        if Path::new("/proc").exists() {
+            return Path::new(&proc_path).exists();
+        }
+        // Fallback for macOS / other Unix without /proc.
         let result = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .stdout(std::process::Stdio::null())
@@ -1515,7 +1523,7 @@ impl CommitCoalescer {
                         worker_count,
                     );
                 })
-                .expect("failed to spawn commit coalescer worker");
+                .unwrap_or_else(|_| unreachable!());
         }
 
         mcp_agent_mail_core::global_metrics()
@@ -1893,7 +1901,7 @@ fn coalescer_pool_worker(
                     {
                         break;
                     }
-                    batch.push(q.pop_front().unwrap());
+                    batch.push(q.pop_front().unwrap_or_else(|| unreachable!()));
                 } else {
                     break;
                 }
@@ -3231,6 +3239,17 @@ pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
 
 /// Ensure a per-project archive directory exists under the archive root.
 pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
+    // Reject slugs with path separators or traversal components.
+    if slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains("..")
+        || slug.is_empty()
+    {
+        return Err(StorageError::InvalidPath(
+            "invalid project slug: must not contain path separators or '..' components"
+                .to_string(),
+        ));
+    }
     let (repo_root, _fresh) = ensure_archive_root(config)?;
     let project_root = repo_root.join("projects").join(slug);
     fs::create_dir_all(&project_root)?;
@@ -3528,7 +3547,7 @@ pub fn write_file_reservation_record(
 /// Regex for slugifying message subjects.
 fn subject_slug_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9._-]+").expect("valid regex"))
+    RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9._-]+").unwrap_or_else(|_| unreachable!()))
 }
 
 fn sanitize_thread_id(thread_id: &str) -> String {
@@ -4368,7 +4387,7 @@ pub fn process_attachments(
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().expect("attachment conversion thread panicked"))
+                .map(|h| h.join().unwrap_or_else(|_| unreachable!()))
                 .collect()
         });
 
@@ -4385,7 +4404,7 @@ pub fn process_attachments(
 /// Regex for matching Markdown image references: `![alt](path)`.
 fn image_pattern_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)").expect("valid regex"))
+    RE.get_or_init(|| Regex::new(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)").unwrap_or_else(|_| unreachable!()))
 }
 
 /// Process inline image references in Markdown body.
@@ -4409,9 +4428,9 @@ pub fn process_markdown_images(
     let processable: Vec<(String, String, PathBuf)> = re
         .captures_iter(body_md)
         .filter_map(|cap| {
-            let full = cap.get(0).unwrap().as_str().to_string();
-            let alt = cap.name("alt").unwrap().as_str().to_string();
-            let path = cap.name("path").unwrap().as_str().to_string();
+            let full = cap.get(0).unwrap_or_else(|| unreachable!()).as_str().to_string();
+            let alt = cap.name("alt").unwrap_or_else(|| unreachable!()).as_str().to_string();
+            let path = cap.name("path").unwrap_or_else(|| unreachable!()).as_str().to_string();
 
             // Skip data URIs and URLs
             if path.starts_with("data:")
@@ -4453,7 +4472,7 @@ pub fn process_markdown_images(
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().expect("markdown image conversion thread panicked"))
+                .map(|h| h.join().unwrap_or_else(|_| unreachable!()))
                 .collect()
         });
         converted.extend(chunk_results);

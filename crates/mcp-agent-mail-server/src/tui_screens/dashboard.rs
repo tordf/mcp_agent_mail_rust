@@ -301,8 +301,7 @@ struct RecentMessagePreview {
     subject: String,
     thread_id: String,
     project: String,
-    /// Truncated body excerpt (first ~200 chars) for inline preview.
-    body_excerpt: String,
+    body_md: String,
 }
 
 impl RecentMessagePreview {
@@ -315,7 +314,7 @@ impl RecentMessagePreview {
                 subject,
                 thread_id,
                 project,
-                body_excerpt,
+                body_md,
                 ..
             } => Some(Self {
                 timestamp_micros: *timestamp_micros,
@@ -326,7 +325,7 @@ impl RecentMessagePreview {
                 subject: subject.clone(),
                 thread_id: thread_id.clone(),
                 project: project.clone(),
-                body_excerpt: body_excerpt.clone(),
+                body_md: body_md.clone(),
             }),
             MailEvent::MessageReceived {
                 timestamp_micros,
@@ -335,7 +334,7 @@ impl RecentMessagePreview {
                 subject,
                 thread_id,
                 project,
-                body_excerpt,
+                body_md,
                 ..
             } => Some(Self {
                 timestamp_micros: *timestamp_micros,
@@ -346,7 +345,7 @@ impl RecentMessagePreview {
                 subject: subject.clone(),
                 thread_id: thread_id.clone(),
                 project: project.clone(),
-                body_excerpt: body_excerpt.clone(),
+                body_md: body_md.clone(),
             }),
             _ => None,
         }
@@ -5259,7 +5258,7 @@ fn render_recent_message_preview_panel(
             let theme = crate::tui_theme::markdown_theme();
             let mut text = crate::tui_markdown::render_body(&preview.to_markdown(), &theme);
             if let Some(body_text) =
-                crate::tui_markdown::render_message_body_blockquote(&preview.body_excerpt, &theme)
+                crate::tui_markdown::render_message_body_blockquote(&preview.body_md, &theme)
             {
                 text.push_line(Line::raw(""));
                 for line in body_text.lines() {
@@ -6314,7 +6313,7 @@ mod tests {
         assert_eq!(first.to, "SilverWolf, RedPine");
         assert_eq!(first.thread_id, "br-3vwi.6.5");
         assert_eq!(
-            first.body_excerpt,
+            first.body_md,
             "Working on the initial update for the feature"
         );
 
@@ -6336,7 +6335,7 @@ mod tests {
         assert_eq!(second.from, "TealBasin");
         assert_eq!(second.to, "GoldFox");
         assert_eq!(second.subject, "Ack received");
-        assert_eq!(second.body_excerpt, "Acknowledged your message");
+        assert_eq!(second.body_md, "Acknowledged your message");
     }
 
     #[test]
@@ -6350,7 +6349,7 @@ mod tests {
             subject: "Test subject".to_string(),
             thread_id: "t-1".to_string(),
             project: "proj".to_string(),
-            body_excerpt: "Hello, this is the body content".to_string(),
+            body_md: "Hello, this is the body content".to_string(),
         };
         // Body is no longer in to_markdown(); it's rendered separately via
         // render_message_body_blockquote() in render_recent_message_preview_panel.
@@ -6362,7 +6361,7 @@ mod tests {
         // Verify the canonical blockquote renders the body
         let theme = crate::tui_theme::markdown_theme();
         let blockquote =
-            crate::tui_markdown::render_message_body_blockquote(&preview.body_excerpt, &theme);
+            crate::tui_markdown::render_message_body_blockquote(&preview.body_md, &theme);
         assert!(
             blockquote.is_some(),
             "non-empty body should produce blockquote via canonical renderer"
@@ -6380,11 +6379,11 @@ mod tests {
             subject: "Test subject".to_string(),
             thread_id: "t-1".to_string(),
             project: "proj".to_string(),
-            body_excerpt: String::new(),
+            body_md: String::new(),
         };
         let theme = crate::tui_theme::markdown_theme();
         assert!(
-            crate::tui_markdown::render_message_body_blockquote(&preview.body_excerpt, &theme)
+            crate::tui_markdown::render_message_body_blockquote(&preview.body_md, &theme)
                 .is_none(),
             "empty body should not produce blockquote via canonical renderer"
         );
@@ -6401,7 +6400,7 @@ mod tests {
             subject: "Status update".to_string(),
             thread_id: "br-3vwi.6.5".to_string(),
             project: "data-projects-mcp-agent-mail-rust".to_string(),
-            body_excerpt: "Shipped diagnostics updates".to_string(),
+            body_md: "Shipped diagnostics updates".to_string(),
         };
 
         let md = preview.to_markdown();
@@ -6432,7 +6431,7 @@ mod tests {
             subject: "S".to_string(),
             thread_id: "t".to_string(),
             project: "p".to_string(),
-            body_excerpt: "body".to_string(),
+            body_md: "body".to_string(),
         };
         assert!(stale.is_stale());
     }
@@ -8113,11 +8112,11 @@ mod tests {
             .as_ref()
             .expect("preview should exist after message event");
         assert!(
-            !preview.body_excerpt.trim().is_empty(),
-            "E2: body_excerpt must not be empty when event contains body"
+            !preview.body_md.trim().is_empty(),
+            "E2: body_md must not be empty when event contains body"
         );
         assert_eq!(
-            preview.body_excerpt,
+            preview.body_md,
             "This is the actual message body with real content"
         );
     }

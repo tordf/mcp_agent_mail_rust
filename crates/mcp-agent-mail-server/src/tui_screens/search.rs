@@ -1224,7 +1224,11 @@ impl SearchCockpitScreen {
     /// Sync the `VirtualizedListState` with our cursor position.
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
-        state.select(Some(self.cursor));
+        if self.results.is_empty() {
+            state.select(None);
+        } else {
+            state.select(Some(self.cursor));
+        }
     }
 
     fn rebuild_result_rows(&mut self) {
@@ -6441,9 +6445,9 @@ mod tests {
             .focused_synthetic
             .expect("should have synthetic event");
         match &event {
-            crate::tui_events::MailEvent::MessageSent { body_excerpt, .. } => {
+            crate::tui_events::MailEvent::MessageSent { body_md, .. } => {
                 assert_eq!(
-                    body_excerpt, &expected_body,
+                    body_md, &expected_body,
                     "synthetic event must carry full_body from search result"
                 );
             }
@@ -6465,9 +6469,9 @@ mod tests {
             .focused_synthetic
             .expect("should have synthetic event");
         match &event {
-            crate::tui_events::MailEvent::MessageSent { body_excerpt, .. } => {
+            crate::tui_events::MailEvent::MessageSent { body_md, .. } => {
                 assert_eq!(
-                    body_excerpt, "short preview text",
+                    body_md, "short preview text",
                     "when full_body is None, should fall back to body_preview"
                 );
             }

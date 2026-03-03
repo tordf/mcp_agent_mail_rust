@@ -506,13 +506,11 @@ impl DbPool {
             });
         }
 
-        // Check if the file exists first; a missing file is not corruption.
+        // Check if the file exists first. If missing, it requires recovery (e.g. from archive or backup).
         if !Path::new(&self.sqlite_path).exists() {
-            return Ok(integrity::IntegrityCheckResult {
-                ok: true,
-                details: vec!["ok".to_string()],
-                duration_us: 0,
-                kind: integrity::CheckKind::Quick,
+            return Err(DbError::IntegrityCorruption {
+                message: "Database file is missing".to_string(),
+                details: vec!["File not found on disk".to_string()],
             });
         }
 
@@ -580,11 +578,9 @@ impl DbPool {
         }
 
         if !Path::new(&self.sqlite_path).exists() {
-            return Ok(integrity::IntegrityCheckResult {
-                ok: true,
-                details: vec!["ok".to_string()],
-                duration_us: 0,
-                kind: integrity::CheckKind::Full,
+            return Err(DbError::IntegrityCorruption {
+                message: "Database file is missing".to_string(),
+                details: vec!["File not found on disk".to_string()],
             });
         }
 
@@ -1304,7 +1300,7 @@ fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 #[allow(clippy::result_large_err)]
 fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     if !path.exists() {
-        return Ok(true);
+        return Ok(false);
     }
     let path_str = path.to_string_lossy();
     let conn = match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
@@ -1355,11 +1351,10 @@ fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
 
 #[allow(clippy::result_large_err)]
 fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
-    if let Some(storage_root) = env_value("STORAGE_ROOT") {
-        let storage_root_path = Path::new(&storage_root);
-        if storage_root_path.is_dir() {
-            return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
-        }
+    let config = mcp_agent_mail_core::Config::from_env();
+    let storage_root_path = config.storage_root.as_path();
+    if storage_root_path.is_dir() {
+        return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
     }
     ensure_sqlite_file_healthy(primary_path)
 }
@@ -1605,19 +1600,27 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
 /// originally or after successful recovery).
 #[allow(clippy::result_large_err)]
 pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
-    if sqlite_file_is_healthy(primary_path)? {
+    let exists = primary_path.exists();
+    if exists && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
+
     if let Some(backup_path) = find_healthy_backup(primary_path) {
         restore_from_backup(primary_path, &backup_path)?;
         if sqlite_file_is_healthy(primary_path)? {
             return Ok(());
         }
-        return Err(SqlError::Custom(format!(
-            "database file {} was restored from {}, but health probes still failed",
-            primary_path.display(),
-            backup_path.display()
-        )));
+        if exists {
+            return Err(SqlError::Custom(format!(
+                "database file {} was restored from {}, but health probes still failed",
+                primary_path.display(),
+                backup_path.display()
+            )));
+        }
+        // If missing originally and restore failed, fall through to reinitialize
+    } else if !exists {
+        // Missing file, no backup. Normal fresh startup.
+        return Ok(());
     }
 
     reinitialize_without_backup(primary_path)?;
@@ -1642,7 +1645,8 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<(), SqlError> {
-    if sqlite_file_is_healthy(primary_path)? {
+    let exists = primary_path.exists();
+    if exists && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
 
@@ -1655,6 +1659,13 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         tracing::warn!(
             "backup restore didn't produce a healthy file; falling through to archive reconstruction"
         );
+    } else if !exists {
+        // Missing file, no backup.
+        if !storage_root.join("projects").is_dir() {
+            // Normal fresh startup (no projects directory).
+            return Ok(());
+        }
+        // Missing file, but archive has projects. We want to reconstruct!
     }
 
     // Priority 2: Reconstruct from Git archive
@@ -2782,15 +2793,15 @@ mod tests {
         assert!(!healthy, "corrupt file should not be healthy");
     }
 
-    /// Verify `sqlite_file_is_healthy` returns true for non-existent file.
+    /// Verify `sqlite_file_is_healthy` returns false for non-existent file.
     #[test]
-    fn sqlite_file_is_healthy_nonexistent_is_ok() {
+    fn sqlite_file_is_healthy_nonexistent_is_false() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does_not_exist.db");
         let healthy = sqlite_file_is_healthy(&path).expect("should not error");
         assert!(
-            healthy,
-            "non-existent file is considered healthy (not corrupt)"
+            !healthy,
+            "non-existent file should not be considered healthy"
         );
     }
 

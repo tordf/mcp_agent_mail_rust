@@ -266,7 +266,7 @@ pub fn text_to_micros(
     // Special case: date-only strings won't parse as NaiveDateTime,
     // try NaiveDate and convert to midnight.
     if let Ok(date) = chrono::NaiveDate::parse_from_str(without_tz, "%Y-%m-%d") {
-        let dt = date.and_hms_opt(0, 0, 0).expect("midnight is always valid");
+        let dt = date.and_hms_opt(0, 0, 0).unwrap_or_default();
         return Ok(Some(crate::timestamps::naive_to_micros(dt)));
     }
 

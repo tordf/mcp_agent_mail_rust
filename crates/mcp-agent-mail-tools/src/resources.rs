@@ -3285,13 +3285,13 @@ fn reservation_compute_pattern_activity(
     }
 
     let git_activity = if matches && want_git {
-        let spec = reservation_git_pathspec(workspace_rel.unwrap(), &normalized);
+        let spec = reservation_git_pathspec(workspace_rel.unwrap_or_else(|| std::path::Path::new("")), &normalized);
         let spec = if has_glob {
             format!(":(glob){spec}")
         } else {
             spec
         };
-        reservation_git_latest_activity_micros(repo_root.unwrap(), &[spec])
+        reservation_git_latest_activity_micros(repo_root.unwrap_or_else(|| std::path::Path::new("")), &[spec])
     } else {
         None
     };

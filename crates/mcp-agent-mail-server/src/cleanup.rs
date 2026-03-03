@@ -460,8 +460,10 @@ fn check_filesystem_activity(
         // Fast path: use `git ls-files -c -o --exclude-standard -- pattern` to get matching files.
         // This leverages git's index and ignores `.gitignore`d folders like `target/` which would
         // otherwise cause insane CPU usage during synchronous directory traversal.
-        let git_ls = std::process::Command::new("git")
+        let git_ls = std::process::Command::new("timeout")
             .args([
+                "5s",
+                "git",
                 "-C",
                 &workspace.to_string_lossy(),
                 "ls-files",
@@ -548,8 +550,8 @@ fn git_head_oid_for_workspace(workspace: &Path) -> Option<String> {
     if !workspace.exists() {
         return None;
     }
-    let output = std::process::Command::new("git")
-        .args(["-C", &workspace.to_string_lossy(), "rev-parse", "HEAD"])
+    let output = std::process::Command::new("timeout")
+        .args(["5s", "git", "-C", &workspace.to_string_lossy(), "rev-parse", "HEAD"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -570,8 +572,10 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
     }
 
     // Use git log with the path pattern directly (git handles pathspecs including globs).
-    let output = std::process::Command::new("git")
+    let output = std::process::Command::new("timeout")
         .args([
+            "5s",
+            "git",
             "-C",
             &workspace.to_string_lossy(),
             "log",
@@ -642,17 +646,15 @@ fn write_cleanup_artifacts(
         return Err("project lookup failed".into());
     };
 
-    let Outcome::Ok(all_reservations) =
-        block_on(async { queries::list_file_reservations(cx, pool, project_id, false).await })
+    let Outcome::Ok(target_reservations) =
+        block_on(async { queries::get_reservations_by_ids(cx, pool, released_ids).await })
     else {
         return Err("failed to list reservations for artifact generation".into());
     };
 
     let mut res_jsons = Vec::new();
-    for row in all_reservations {
-        if let Some(id) = row.id
-            && released_ids.contains(&id)
-        {
+    for row in target_reservations {
+        if let Some(id) = row.id {
             // We need the agent name, which isn't in FileReservationRow, so we look it up
             let agent_name =
                 match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {

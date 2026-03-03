@@ -430,7 +430,11 @@ impl MailExplorerScreen {
     /// Sync the `VirtualizedListState` selection with the current cursor.
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
-        state.select(Some(self.cursor));
+        if self.entries.is_empty() {
+            state.select(None);
+        } else {
+            state.select(Some(self.cursor));
+        }
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected message.
@@ -2676,9 +2680,9 @@ mod tests {
             .focused_synthetic
             .expect("should have synthetic event");
         match &event {
-            crate::tui_events::MailEvent::MessageSent { body_excerpt, .. } => {
+            crate::tui_events::MailEvent::MessageSent { body_md, .. } => {
                 assert_eq!(
-                    body_excerpt, "Important deployment update with details",
+                    body_md, "Important deployment update with details",
                     "synthetic event must carry body_md from DisplayEntry"
                 );
             }
@@ -2697,9 +2701,9 @@ mod tests {
             .focused_synthetic
             .expect("should have synthetic event");
         match &event {
-            crate::tui_events::MailEvent::MessageSent { body_excerpt, .. } => {
+            crate::tui_events::MailEvent::MessageSent { body_md, .. } => {
                 assert!(
-                    body_excerpt.is_empty(),
+                    body_md.is_empty(),
                     "empty body_md should yield empty excerpt, not placeholder"
                 );
             }

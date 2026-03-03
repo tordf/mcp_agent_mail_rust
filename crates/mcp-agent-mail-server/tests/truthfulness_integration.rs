@@ -1459,7 +1459,7 @@ fn e7_smoke_dashboard_renders_with_data() {
                 subject: format!("Test message {i}"),
                 thread_id: "thread-alpha".to_string(),
                 project: "alpha-proj".to_string(),
-                body_excerpt: format!("This is **real markdown** body for msg {i}"),
+                body_md: format!("This is **real markdown** body for msg {i}"),
             },
         );
     }

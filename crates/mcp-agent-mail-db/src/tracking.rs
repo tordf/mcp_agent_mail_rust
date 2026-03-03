@@ -28,9 +28,9 @@ const SLOW_QUERY_LIMIT: usize = 50;
 /// Used only for slow-query logging and the legacy `extract_table()` API.
 static TABLE_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
-        Regex::new(r#"(?i)\binsert\s+(?:or\s+\w+\s+)?into\s+([\w.`"\[\]]+)"#).unwrap(),
-        Regex::new(r#"(?i)\bupdate\s+([\w.`"\[\]]+)"#).unwrap(),
-        Regex::new(r#"(?i)\bfrom\s+([\w.`"\[\]]+)"#).unwrap(),
+        Regex::new(r#"(?i)\binsert\s+(?:or\s+\w+\s+)?into\s+([\w.`"\[\]]+)"#).unwrap_or_else(|_| unreachable!()),
+        Regex::new(r#"(?i)\bupdate\s+([\w.`"\[\]]+)"#).unwrap_or_else(|_| unreachable!()),
+        Regex::new(r#"(?i)\bfrom\s+([\w.`"\[\]]+)"#).unwrap_or_else(|_| unreachable!()),
     ]
 });
 
@@ -631,7 +631,7 @@ pub fn record_query(sql: &str, duration_us: u64) {
 fn extract_table(sql: &str) -> Option<String> {
     /// Compiled pattern to split on schema dots, capturing optional schema segments.
     static SCHEMA_DOT: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"[`"\[\]]*\.[`"\[\]]*"#).unwrap());
+        LazyLock::new(|| Regex::new(r#"[`"\[\]]*\.[`"\[\]]*"#).unwrap_or_else(|_| unreachable!()));
 
     for pattern in TABLE_PATTERNS.iter() {
         if let Some(captures) = pattern.captures(sql)

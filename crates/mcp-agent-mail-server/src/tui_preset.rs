@@ -523,7 +523,7 @@ impl PresetManager {
         self.presets.get(&self.active).unwrap_or_else(|| {
             self.presets
                 .get("default")
-                .expect("default preset must exist")
+                .unwrap_or_else(|| unreachable!())
         })
     }
 

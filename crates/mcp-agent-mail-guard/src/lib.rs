@@ -539,9 +539,21 @@ def check_conflicts(paths, reservations):
                     break
     return conflicts
 
+def is_truthy(val):
+    if not val:
+        return False
+    return str(val).strip().lower() in ("1", "true", "t", "yes", "y")
+
 def main():
     if not AGENT_NAME:
         # No agent context; skip guard check
+        sys.exit(0)
+
+    if is_truthy(os.environ.get("AGENT_MAIL_BYPASS")):
+        sys.exit(0)
+
+    enforcement_enabled = os.environ.get("FILE_RESERVATIONS_ENFORCEMENT_ENABLED")
+    if enforcement_enabled is not None and not is_truthy(enforcement_enabled):
         sys.exit(0)
 
     if HOOK_NAME == "pre-push":

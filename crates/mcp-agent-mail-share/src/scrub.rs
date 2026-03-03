@@ -31,29 +31,29 @@ const ATTACHMENT_REDACT_KEYS: &[&str] = &[
 static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         // GitHub tokens
-        Regex::new(r"(?i)ghp_[A-Za-z0-9]{36,}").unwrap(),
-        Regex::new(r"(?i)github_pat_[A-Za-z0-9_]{20,}").unwrap(),
+        Regex::new(r"(?i)ghp_[A-Za-z0-9]{36,}").unwrap_or_else(|_| unreachable!()),
+        Regex::new(r"(?i)github_pat_[A-Za-z0-9_]{20,}").unwrap_or_else(|_| unreachable!()),
         // Slack tokens
-        Regex::new(r"(?i)xox[baprs]-[A-Za-z0-9\-]{10,}").unwrap(),
+        Regex::new(r"(?i)xox[baprs]-[A-Za-z0-9\-]{10,}").unwrap_or_else(|_| unreachable!()),
         // OpenAI / generic sk- keys
-        Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap(),
+        Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap_or_else(|_| unreachable!()),
         // Bearer tokens
-        Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\./+=]{16,}").unwrap(),
+        Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\./+=]{16,}").unwrap_or_else(|_| unreachable!()),
         // URL-embedded basic auth credentials
-        Regex::new(r"(?i)https?://[^/\s:@]+:[^@\s/]+@").unwrap(),
+        Regex::new(r"(?i)https?://[^/\s:@]+:[^@\s/]+@").unwrap_or_else(|_| unreachable!()),
         // Environment-variable references likely to contain secrets
-        Regex::new(r"(?i)\$[A-Z_][A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z0-9_]*").unwrap(),
+        Regex::new(r"(?i)\$[A-Z_][A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z0-9_]*").unwrap_or_else(|_| unreachable!()),
         // JWTs (three base64url segments)
-        Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+").unwrap(),
+        Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+").unwrap_or_else(|_| unreachable!()),
         // AWS access key IDs (always start with AKIA)
-        Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+        Regex::new(r"AKIA[0-9A-Z]{16}").unwrap_or_else(|_| unreachable!()),
         // PEM private keys (multi-line block)
         Regex::new(r"(?s)-----BEGIN[A-Z ]* PRIVATE KEY-----.*?-----END[A-Z ]* PRIVATE KEY-----")
-            .unwrap(),
+            .unwrap_or_else(|_| unreachable!()),
         // Anthropic API keys
-        Regex::new(r"(?i)sk-ant-[A-Za-z0-9\-]{20,}").unwrap(),
+        Regex::new(r"(?i)sk-ant-[A-Za-z0-9\-]{20,}").unwrap_or_else(|_| unreachable!()),
         // GitLab tokens
-        Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap(),
+        Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap_or_else(|_| unreachable!()),
     ]
 });
 

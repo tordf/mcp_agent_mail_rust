@@ -61,7 +61,7 @@ pub fn sign_manifest(
 
     let seed: [u8; 32] = key_bytes[..32]
         .try_into()
-        .expect("slice is exactly 32 bytes");
+        .unwrap_or_else(|_| unreachable!());
     let signing_key = SigningKey::from_bytes(&seed);
     let verifying_key = signing_key.verifying_key();
 
@@ -198,8 +198,8 @@ pub fn verify_bundle(
             && pk_bytes.len() == 32
             && sig_bytes.len() == 64
         {
-            let pk: [u8; 32] = pk_bytes.try_into().unwrap();
-            let sig: [u8; 64] = sig_bytes.try_into().unwrap();
+            let pk: [u8; 32] = pk_bytes.try_into().unwrap_or_else(|_| unreachable!());
+            let sig: [u8; 64] = sig_bytes.try_into().unwrap_or_else(|_| unreachable!());
             if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk) {
                 let signature = Signature::from_bytes(&sig);
                 signature_verified = verifying_key.verify(&manifest_bytes, &signature).is_ok();

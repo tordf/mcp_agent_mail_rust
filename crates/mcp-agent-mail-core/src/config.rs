@@ -859,7 +859,7 @@ fn global_config_cache_get() -> Config {
     if guard.is_none() {
         *guard = Some(Config::from_env());
     }
-    guard.as_ref().expect("just initialized").clone()
+    guard.as_ref().cloned().unwrap_or_else(Config::from_env)
 }
 
 fn global_config_cache_reset() {

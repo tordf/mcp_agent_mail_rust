@@ -369,7 +369,7 @@ impl DbPoller {
             .spawn(move || {
                 self.run();
             })
-            .expect("spawn tui-db-poller thread");
+            .unwrap_or_else(|_| unreachable!());
         DbPollerHandle {
             join: Some(join),
             stop,
@@ -516,15 +516,11 @@ fn maybe_attempt_sqlite_recovery(sqlite_path: &str, reason: &str) {
     }
 
     let sqlite_path_buf = Path::new(sqlite_path).to_path_buf();
-    let storage_root = mcp_agent_mail_core::config::env_value("STORAGE_ROOT");
-    #[allow(clippy::option_if_let_else)]
-    let recovery_result = if let Some(root) = storage_root {
-        let root_path = Path::new(&root);
-        if root_path.is_dir() {
-            ensure_sqlite_file_healthy_with_archive(&sqlite_path_buf, root_path)
-        } else {
-            ensure_sqlite_file_healthy(&sqlite_path_buf)
-        }
+    let config = mcp_agent_mail_core::Config::from_env();
+    let root_path = config.storage_root.as_path();
+    
+    let recovery_result = if root_path.is_dir() {
+        ensure_sqlite_file_healthy_with_archive(&sqlite_path_buf, root_path)
     } else {
         ensure_sqlite_file_healthy(&sqlite_path_buf)
     };

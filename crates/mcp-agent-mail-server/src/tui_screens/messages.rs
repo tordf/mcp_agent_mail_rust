@@ -1677,7 +1677,11 @@ impl MessageBrowserScreen {
     /// Sync the `VirtualizedListState` with our cursor position.
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
-        state.select(Some(self.cursor));
+        if self.results.is_empty() {
+            state.select(None);
+        } else {
+            state.select(Some(self.cursor));
+        }
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected message.
@@ -2347,7 +2351,7 @@ impl MessageBrowserScreen {
         events
             .iter()
             .filter_map(|e| {
-                let (id, from, to, subject, thread_id, project, body_excerpt) = match e {
+                let (id, from, to, subject, thread_id, project, body_md) = match e {
                     MailEvent::MessageSent {
                         id,
                         from,
@@ -2355,7 +2359,7 @@ impl MessageBrowserScreen {
                         subject,
                         thread_id,
                         project,
-                        body_excerpt,
+                        body_md,
                         ..
                     }
                     | MailEvent::MessageReceived {
@@ -2365,7 +2369,7 @@ impl MessageBrowserScreen {
                         subject,
                         thread_id,
                         project,
-                        body_excerpt,
+                        body_md,
                         ..
                     } => (
                         *id,
@@ -2374,7 +2378,7 @@ impl MessageBrowserScreen {
                         subject.as_str(),
                         thread_id.as_str(),
                         project.as_str(),
-                        body_excerpt.as_str(),
+                        body_md.as_str(),
                     ),
                     _ => return None,
                 };
@@ -2396,7 +2400,7 @@ impl MessageBrowserScreen {
                     thread_id: thread_id.to_string(),
                     timestamp_iso: micros_to_iso(e.timestamp_micros()),
                     timestamp_micros: e.timestamp_micros(),
-                    body_md: body_excerpt.to_string(),
+                    body_md: body_md.to_string(),
                     importance: "normal".to_string(),
                     ack_required: false,
                     show_project,
@@ -7010,7 +7014,7 @@ mod tests {
             subject: "hello world".to_string(),
             thread_id: "t-1".to_string(),
             project: "myproj".to_string(),
-            body_excerpt: "Test body content".to_string(),
+            body_md: "Test body content".to_string(),
         });
         // Push a MessageReceived event
         let _ = state.push_event(MailEvent::MessageReceived {
@@ -7024,7 +7028,7 @@ mod tests {
             subject: "re: hello world".to_string(),
             thread_id: "t-1".to_string(),
             project: "myproj".to_string(),
-            body_excerpt: "Reply body content".to_string(),
+            body_md: "Reply body content".to_string(),
         });
         // Push a non-message event (should be filtered out)
         let _ = state.push_event(MailEvent::http_request("GET", "/foo", 200, 1, "127.0.0.1"));

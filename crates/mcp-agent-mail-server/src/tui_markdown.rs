@@ -121,13 +121,13 @@ pub fn render_message_body_preview(body_md: &str, max_chars: usize) -> Option<St
 /// Returns `None` when the body is empty/whitespace-only.
 #[must_use]
 pub fn render_message_body_blockquote(
-    body_excerpt: &str,
+    body_md: &str,
     theme: &MarkdownTheme,
 ) -> Option<Text<'static>> {
-    if body_excerpt.trim().is_empty() {
+    if body_md.trim().is_empty() {
         return None;
     }
-    let trimmed_excerpt = body_excerpt.trim_end_matches('\n');
+    let trimmed_excerpt = body_md.trim_end_matches('\n');
     let quoted = format!("> {}", trimmed_excerpt.replace('\n', "\n> "));
     Some(render_body(&quoted, theme))
 }

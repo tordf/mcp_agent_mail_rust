@@ -1539,7 +1539,14 @@ impl MailScreen for ReservationsScreen {
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
 
+        // Snapshot counts *before* data changes so render_summary_band can
+        // compute trend arrows by comparing live summary_counts() (post-update)
+        // with prev_counts (pre-update).
         let mut changed = false;
+        if dirty.db_stats || dirty.events {
+            let (a, e, s, x) = self.summary_counts();
+            self.prev_counts = (a as u64, e as u64, s as u64, x as u64);
+        }
         if dirty.db_stats {
             let snapshot = state.db_stats_snapshot();
             if let Some(snapshot) = snapshot.clone() {
@@ -1563,10 +1570,9 @@ impl MailScreen for ReservationsScreen {
             changed |= self.ingest_events(state);
         }
         if changed || (tick_count.is_multiple_of(10) && dirty.any()) {
-            let (a, e, s, x) = self.summary_counts();
-            self.prev_counts = (a as u64, e as u64, s as u64, x as u64);
             self.rebuild_sorted();
 
+            let (a, e, s, x) = self.summary_counts();
             let raw_count = u64::try_from(self.reservations.len()).unwrap_or(u64::MAX);
             let rendered_count = u64::try_from(self.sorted_keys.len()).unwrap_or(u64::MAX);
             let dropped_count = raw_count.saturating_sub(rendered_count);

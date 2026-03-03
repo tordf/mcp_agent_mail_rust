@@ -1196,7 +1196,9 @@ fn colorize_json_line(line: &str) -> String {
             num.push(c);
             while let Some(&next) = chars.peek() {
                 if next.is_ascii_digit() || next == '.' {
-                    num.push(chars.next().unwrap());
+                    if let Some(ch) = chars.next() {
+                        num.push(ch);
+                    }
                 } else {
                     break;
                 }

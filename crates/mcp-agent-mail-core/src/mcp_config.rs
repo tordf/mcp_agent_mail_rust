@@ -816,7 +816,7 @@ pub fn create_fresh_config_text(params: &NewServerEntryParams) -> String {
     servers.insert(TARGET_SERVER_NAME.to_string(), entry);
     let mut doc = Map::new();
     doc.insert("mcpServers".to_string(), Value::Object(servers));
-    serde_json::to_string_pretty(&doc).expect("serialization of fresh config cannot fail") + "\n"
+    serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n"
 }
 
 /// Result of setting up an MCP config file.

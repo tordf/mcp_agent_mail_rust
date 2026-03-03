@@ -369,12 +369,17 @@ impl MailScreen for ProjectsScreen {
         // startup grace period before showing the degraded banner.
         self.db_context_unavailable = current_gen.db_stats_gen == 0 && tick_count >= 30;
 
+        // Snapshot totals *before* data changes so render_summary_band can
+        // compute trend arrows by comparing live compute_totals() (post-update)
+        // with prev_totals (pre-update).
+        if dirty.events || dirty.db_stats {
+            self.prev_totals = self.compute_totals();
+        }
         if dirty.events {
             self.ingest_events(state);
         }
         // Rebuild every second, but only when data changed.
         if tick_count.is_multiple_of(10) && (dirty.db_stats || dirty.events) {
-            self.prev_totals = self.compute_totals();
             self.rebuild_from_state(state);
         }
 

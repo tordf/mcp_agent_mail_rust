@@ -395,8 +395,8 @@ pub enum MailEvent {
         subject: String,
         thread_id: String,
         project: String,
-        /// Truncated excerpt of `body_md` (first ~200 chars) for dashboard/preview use.
-        body_excerpt: String,
+        /// Full markdown body.
+        body_md: String,
     },
     MessageReceived {
         seq: u64,
@@ -409,8 +409,8 @@ pub enum MailEvent {
         subject: String,
         thread_id: String,
         project: String,
-        /// Truncated excerpt of `body_md` (first ~200 chars) for dashboard/preview use.
-        body_excerpt: String,
+        /// Full markdown body.
+        body_md: String,
     },
     ReservationGranted {
         seq: u64,
@@ -532,7 +532,7 @@ impl MailEvent {
         subject: impl Into<String>,
         thread_id: impl Into<String>,
         project: impl Into<String>,
-        body_excerpt: impl Into<String>,
+        body_md: impl Into<String>,
     ) -> Self {
         Self::MessageSent {
             seq: 0,
@@ -545,7 +545,7 @@ impl MailEvent {
             subject: subject.into(),
             thread_id: thread_id.into(),
             project: project.into(),
-            body_excerpt: body_excerpt.into(),
+            body_md: body_md.into(),
         }
     }
 
@@ -557,7 +557,7 @@ impl MailEvent {
         subject: impl Into<String>,
         thread_id: impl Into<String>,
         project: impl Into<String>,
-        body_excerpt: impl Into<String>,
+        body_md: impl Into<String>,
     ) -> Self {
         Self::MessageReceived {
             seq: 0,
@@ -570,7 +570,7 @@ impl MailEvent {
             subject: subject.into(),
             thread_id: thread_id.into(),
             project: project.into(),
-            body_excerpt: body_excerpt.into(),
+            body_md: body_md.into(),
         }
     }
 
@@ -2280,7 +2280,7 @@ mod tests {
                 subject: "start".to_string(),
                 thread_id: "br-10wc.15".to_string(),
                 project: "proj".to_string(),
-                body_excerpt: "Starting work on the task".to_string(),
+                body_md: "Starting work on the task".to_string(),
             },
             MailEvent::MessageReceived {
                 seq: 4,
@@ -2293,7 +2293,7 @@ mod tests {
                 subject: "ack".to_string(),
                 thread_id: "br-10wc.15".to_string(),
                 project: "proj".to_string(),
-                body_excerpt: "Acknowledged".to_string(),
+                body_md: "Acknowledged".to_string(),
             },
             MailEvent::ReservationGranted {
                 seq: 5,

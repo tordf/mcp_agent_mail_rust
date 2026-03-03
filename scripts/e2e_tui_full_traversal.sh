@@ -13,11 +13,16 @@
 # Artifacts:
 #   tests/artifacts/tui_full_traversal/<timestamp>/
 #     traversal_results.json   — machine-readable per-screen activation latencies
+#     traversal_gate_verdict.json — p95/p99 budget verdict + failing modes
+#     pressure_resize_regression_report.json — event-pressure/resize-storm PTY regression metrics + budgets
+#     flash_detection_report.json — frame-diff/repaint-churn flash detection verdict + failing scenarios
 #     baseline_profile_summary.json — baseline CPU/thread/syscall/redraw profile
 #     cross_layer_attribution_report.json — ranked attribution map + next-track order
 #     forward_transcript.txt   — normalized PTY output (Tab forward)
 #     backward_transcript.txt  — normalized PTY output (Shift+Tab backward)
 #     jump_transcript.txt      — normalized PTY output (direct number keys)
+#     pressure_transcript.txt  — normalized PTY output (rapid mixed input)
+#     resize_storm_transcript.txt — normalized PTY output (deterministic resize storm)
 #     seed_data.json           — data fixtures used for seeding
 
 set -euo pipefail
@@ -30,12 +35,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 e2e_init_artifacts
-e2e_banner "TUI Full-Screen Traversal Repro Harness (br-legjy.1.1)"
+e2e_banner "TUI Full-Screen Traversal Repro Harness (br-legjy.1.1 + br-legjy.6.1 + br-legjy.3.4)"
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
 FIXTURE_PROFILE="${E2E_FIXTURE_PROFILE:-medium}"
 CAPTURE_BASELINE_PROFILE="${E2E_CAPTURE_BASELINE_PROFILE:-1}"
 BASELINE_PROFILE_STRICT="${E2E_BASELINE_PROFILE_STRICT:-0}"
+TRAVERSAL_BUDGET_QUIESCE_P95_MS="${TRAVERSAL_BUDGET_QUIESCE_P95_MS:-200}"
+TRAVERSAL_BUDGET_QUIESCE_P99_MS="${TRAVERSAL_BUDGET_QUIESCE_P99_MS:-500}"
+PRESSURE_BUDGET_FIRST_BYTE_P95_MS="${PRESSURE_BUDGET_FIRST_BYTE_P95_MS:-75}"
+PRESSURE_BUDGET_QUIESCE_P95_MS="${PRESSURE_BUDGET_QUIESCE_P95_MS:-260}"
+PRESSURE_BUDGET_QUIESCE_P99_MS="${PRESSURE_BUDGET_QUIESCE_P99_MS:-700}"
+RESIZE_BUDGET_FIRST_BYTE_P95_MS="${RESIZE_BUDGET_FIRST_BYTE_P95_MS:-90}"
+RESIZE_BUDGET_QUIESCE_P95_MS="${RESIZE_BUDGET_QUIESCE_P95_MS:-320}"
+RESIZE_BUDGET_REPAINT_BURST_MAX="${RESIZE_BUDGET_REPAINT_BURST_MAX:-14}"
+FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX="${FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX:-0.20}"
+FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX="${FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX:-0.75}"
+FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX="${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX:-60}"
 
 for cmd in python3 curl; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -76,7 +92,67 @@ case "${BASELINE_PROFILE_STRICT}" in
         ;;
 esac
 
+case "${TRAVERSAL_BUDGET_QUIESCE_P95_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid TRAVERSAL_BUDGET_QUIESCE_P95_MS='${TRAVERSAL_BUDGET_QUIESCE_P95_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${TRAVERSAL_BUDGET_QUIESCE_P99_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid TRAVERSAL_BUDGET_QUIESCE_P99_MS='${TRAVERSAL_BUDGET_QUIESCE_P99_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${PRESSURE_BUDGET_FIRST_BYTE_P95_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid PRESSURE_BUDGET_FIRST_BYTE_P95_MS='${PRESSURE_BUDGET_FIRST_BYTE_P95_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${PRESSURE_BUDGET_QUIESCE_P95_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid PRESSURE_BUDGET_QUIESCE_P95_MS='${PRESSURE_BUDGET_QUIESCE_P95_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${PRESSURE_BUDGET_QUIESCE_P99_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid PRESSURE_BUDGET_QUIESCE_P99_MS='${PRESSURE_BUDGET_QUIESCE_P99_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${RESIZE_BUDGET_FIRST_BYTE_P95_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid RESIZE_BUDGET_FIRST_BYTE_P95_MS='${RESIZE_BUDGET_FIRST_BYTE_P95_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${RESIZE_BUDGET_QUIESCE_P95_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid RESIZE_BUDGET_QUIESCE_P95_MS='${RESIZE_BUDGET_QUIESCE_P95_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${RESIZE_BUDGET_REPAINT_BURST_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid RESIZE_BUDGET_REPAINT_BURST_MAX='${RESIZE_BUDGET_REPAINT_BURST_MAX}'. Expected numeric ratio."
+        ;;
+esac
+case "${FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX='${FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX}'. Expected numeric ratio."
+        ;;
+esac
+case "${FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX='${FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX}'. Expected numeric ratio."
+        ;;
+esac
+case "${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX='${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX}'. Expected numeric ratio."
+        ;;
+esac
+
 e2e_log "Baseline profiling capture enabled: ${CAPTURE_BASELINE_PROFILE} (strict=${BASELINE_PROFILE_STRICT})"
+e2e_log "Traversal quiesce budgets: p95<=${TRAVERSAL_BUDGET_QUIESCE_P95_MS}ms, p99<=${TRAVERSAL_BUDGET_QUIESCE_P99_MS}ms"
+e2e_log "Pressure budgets: first_byte_p95<=${PRESSURE_BUDGET_FIRST_BYTE_P95_MS}ms, quiesce_p95<=${PRESSURE_BUDGET_QUIESCE_P95_MS}ms, quiesce_p99<=${PRESSURE_BUDGET_QUIESCE_P99_MS}ms"
+e2e_log "Resize-storm budgets: first_byte_p95<=${RESIZE_BUDGET_FIRST_BYTE_P95_MS}ms, quiesce_p95<=${RESIZE_BUDGET_QUIESCE_P95_MS}ms, repaint_burst<=${RESIZE_BUDGET_REPAINT_BURST_MAX}x"
+e2e_log "Flash budgets: empty_frame_ratio<=${FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX}, frame_bounce_ratio<=${FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX}, repaint_ops_per_kb<=${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX}"
 
 pick_port() {
 python3 - <<'PY'
@@ -151,6 +227,7 @@ run_timed_pty_interaction() {
 
     python3 - "${raw_output}" "${timing_file}" "${keystroke_script}" "$@" <<'PYEOF' 2>"${pty_stderr}"
 import datetime
+import hashlib
 import json
 import os
 import pty
@@ -345,6 +422,8 @@ else:
             "total_bytes": got,
         }
 
+    ansi_step_re = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\].*?(?:\x07|\x1b\\)|[\x40-\x5f]|\([\x20-\x7e]|\)[\x20-\x7e])")
+
     # Initial read: wait for TUI to render
     t_start = time.monotonic()
     init = read_with_latency(max_wait=5.0)
@@ -356,34 +435,81 @@ else:
         "output_bytes": init["total_bytes"],
     })
 
+    def apply_resize(step):
+        resize = step.get("resize")
+        if not isinstance(resize, dict):
+            return None
+        try:
+            step_rows = int(resize.get("rows", rows))
+            step_cols = int(resize.get("cols", cols))
+        except (TypeError, ValueError):
+            return None
+        step_rows = max(8, min(step_rows, 120))
+        step_cols = max(24, min(step_cols, 320))
+        winsize_step = struct.pack("HHHH", step_rows, step_cols, 0, 0)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize_step)
+        try:
+            os.kill(pid, signal.SIGWINCH)
+        except ProcessLookupError:
+            pass
+        return {"rows": step_rows, "cols": step_cols}
+
     # Execute keystroke script with timing
     for i, step in enumerate(keystroke_script):
         max_wait_s = step.get("delay_ms", 200) / 1000.0
         keys = step.get("keys", "")
         step_label = step.get("label", f"step_{i}")
-
-        # Decode escape sequences in key strings
-        keys_bytes = keys.encode("utf-8").decode("unicode_escape").encode("latin-1")
+        resize_applied = None
 
         t_before = time.monotonic()
+        chunk_start_idx = len(chunks)
+        resize_applied = apply_resize(step)
 
-        try:
-            os.write(master_fd, keys_bytes)
-        except OSError:
-            break
+        if keys:
+            # Decode escape sequences in key strings
+            keys_bytes = keys.encode("utf-8").decode("unicode_escape").encode("latin-1")
+            try:
+                os.write(master_fd, keys_bytes)
+            except OSError:
+                break
 
         r = read_with_latency(max_wait=max_wait_s)
         t_after = time.monotonic()
+        segment_raw = b"".join(chunks[chunk_start_idx:])
+        segment_text = segment_raw.decode("utf-8", errors="replace")
+        segment_clean = ansi_step_re.sub("", segment_text).replace("\r", "").replace("\x00", "")
+        frame_hash = hashlib.sha1(segment_clean.encode("utf-8")).hexdigest()[:16] if segment_clean else "empty"
+        frame_cursor_home_ops = len(re.findall(r"\x1b\[[0-9;]*H", segment_text))
+        frame_clear_ops = len(re.findall(r"\x1b\[[0-9;]*2J", segment_text))
+        frame_erase_line_ops = len(re.findall(r"\x1b\[[0-9;]*K", segment_text))
+        frame_nonempty_lines = sum(1 for line in segment_clean.splitlines() if line.strip())
+
+        if resize_applied and keys:
+            input_kind = "resize+keys"
+        elif resize_applied:
+            input_kind = "resize_only"
+        elif keys:
+            input_kind = "keys_only"
+        else:
+            input_kind = "noop"
 
         timings.append({
             "step": step_label,
             "keys": keys,
+            "input_kind": input_kind,
+            "resize": resize_applied,
             "max_wait_ms": step.get("delay_ms", 200),
             "wall_ms": round((t_after - t_before) * 1000, 2),
             "first_byte_ms": r["first_byte_ms"],
             "quiesce_ms": r["quiesce_ms"],
             "render_ms": r["render_ms"],
             "output_bytes_delta": r["total_bytes"],
+            "frame_hash": frame_hash,
+            "frame_chars": len(segment_clean),
+            "frame_nonempty_lines": frame_nonempty_lines,
+            "frame_cursor_home_ops": frame_cursor_home_ops,
+            "frame_clear_ops": frame_clear_ops,
+            "frame_erase_line_ops": frame_erase_line_ops,
         })
 
     # Final read
@@ -1120,13 +1246,13 @@ for mode in ["forward", "backward", "jump"]:
     if s["count"] > 0:
         print(f"  {mode:10s}: {s['count']:2d} screens | "
               f"first_byte={fb['mean_ms']:6.1f}ms | "
-              f"quiesce mean={s['mean_ms']:6.1f}ms p95={s['p95_ms']:6.1f}ms max={s['max_ms']:6.1f}ms")
+              f"quiesce mean={s['mean_ms']:6.1f}ms p95={s['p95_ms']:6.1f}ms p99={s['p99_ms']:6.1f}ms max={s['max_ms']:6.1f}ms")
 o = report["overall"]["quiesce"]
 fb = report["overall"]["first_byte"]
 if o["count"] > 0:
     print(f"  {'overall':10s}: {o['count']:2d} screens | "
           f"first_byte={fb['mean_ms']:6.1f}ms | "
-          f"quiesce mean={o['mean_ms']:6.1f}ms p95={o['p95_ms']:6.1f}ms max={o['max_ms']:6.1f}ms")
+          f"quiesce mean={o['mean_ms']:6.1f}ms p95={o['p95_ms']:6.1f}ms p99={o['p99_ms']:6.1f}ms max={o['max_ms']:6.1f}ms")
 PYEOF
 
 if [ -f "${RESULTS_FILE}" ]; then
@@ -1148,6 +1274,669 @@ assert r['jump']['summary_quiesce']['count'] >= 14
     e2e_pass "aggregate: report has all 3 traversal modes with >= 14 screens each"
 else
     e2e_fail "aggregate: report missing data"
+fi
+
+# ────────────────────────────────────────────────────────────────────
+# Case 4b: Traversal latency budget gate (F1)
+# ────────────────────────────────────────────────────────────────────
+e2e_case_banner "traversal_latency_budget_gate"
+
+GATE_FILE="${E2E_ARTIFACT_DIR}/traversal_gate_verdict.json"
+if python3 - "${RESULTS_FILE}" "${GATE_FILE}" "${TRAVERSAL_BUDGET_QUIESCE_P95_MS}" "${TRAVERSAL_BUDGET_QUIESCE_P99_MS}" <<'PYEOF'
+import datetime
+import json
+import sys
+
+results_path, gate_path, p95_budget_s, p99_budget_s = sys.argv[1:5]
+p95_budget = float(p95_budget_s)
+p99_budget = float(p99_budget_s)
+
+with open(results_path, "r", encoding="utf-8") as f:
+    report = json.load(f)
+
+samples = []
+failures = []
+
+def check(detail: str, summary: dict, required_min_count: int) -> None:
+    count = int(summary.get("count", 0) or 0)
+    p50 = float(summary.get("median_ms", 0) or 0)
+    p95 = float(summary.get("p95_ms", 0) or 0)
+    p99 = float(summary.get("p99_ms", 0) or 0)
+    max_ms = float(summary.get("max_ms", 0) or 0)
+
+    reasons = []
+    if count < required_min_count:
+        reasons.append(f"insufficient_samples:{count}<{required_min_count}")
+    if count > 0 and not (p50 <= p95 <= p99 <= max_ms):
+        reasons.append("percentile_order_violation")
+
+    within_p95 = count > 0 and p95 <= p95_budget
+    within_p99 = count > 0 and p99 <= p99_budget
+    within_budget = within_p95 and within_p99 and not reasons
+
+    sample = {
+        "surface": "screen_activation_quiesce",
+        "detail": detail,
+        "count": count,
+        "p50_ms": round(p50, 2),
+        "p95_ms": round(p95, 2),
+        "p99_ms": round(p99, 2),
+        "max_ms": round(max_ms, 2),
+        "budget_p95_ms": p95_budget,
+        "budget_p99_ms": p99_budget,
+        "within_p95_budget": within_p95,
+        "within_p99_budget": within_p99,
+        "within_budget": within_budget,
+        "reasons": reasons,
+    }
+    samples.append(sample)
+    if not within_budget:
+        failures.append(sample)
+
+check("forward", report.get("forward", {}).get("summary_quiesce", {}), 14)
+check("backward", report.get("backward", {}).get("summary_quiesce", {}), 14)
+check("jump", report.get("jump", {}).get("summary_quiesce", {}), 14)
+check("overall", report.get("overall", {}).get("quiesce", {}), 42)
+
+gate = {
+    "schema_version": "tui_traversal_gate.v1",
+    "harness": "tui_full_traversal",
+    "bead": "br-legjy.6.1",
+    "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "budgets_ms": {
+        "quiesce_p95_max": p95_budget,
+        "quiesce_p99_max": p99_budget,
+    },
+    "samples": samples,
+    "all_within_budget": len(failures) == 0,
+    "failing_samples": [
+        {
+            "detail": sample["detail"],
+            "p95_ms": sample["p95_ms"],
+            "p99_ms": sample["p99_ms"],
+            "reasons": sample["reasons"],
+        }
+        for sample in failures
+    ],
+    "repro": {
+        "command": "bash tests/e2e/test_tui_full_traversal.sh",
+        "env": {
+            "TRAVERSAL_BUDGET_QUIESCE_P95_MS": p95_budget,
+            "TRAVERSAL_BUDGET_QUIESCE_P99_MS": p99_budget,
+        },
+    },
+}
+
+with open(gate_path, "w", encoding="utf-8") as f:
+    json.dump(gate, f, indent=2)
+    f.write("\n")
+
+print("=== Traversal Budget Gate ===")
+for sample in samples:
+    verdict = "PASS" if sample["within_budget"] else "FAIL"
+    print(
+        f"  {sample['detail']:8s} {verdict} "
+        f"(p95={sample['p95_ms']:.2f}ms<= {p95_budget:.2f}ms, "
+        f"p99={sample['p99_ms']:.2f}ms<= {p99_budget:.2f}ms)"
+    )
+if failures:
+    print(f"  failing_modes={','.join(s['detail'] for s in failures)}")
+
+sys.exit(0 if len(failures) == 0 else 1)
+PYEOF
+then
+    e2e_pass "traversal gate: all modes within quiesce p95/p99 budgets"
+else
+    e2e_fail "traversal gate: one or more modes exceeded quiesce p95/p99 budgets"
+fi
+
+if [ -f "${GATE_FILE}" ]; then
+    e2e_save_artifact "traversal_gate_verdict_copy.json" "$(cat "${GATE_FILE}")"
+else
+    e2e_fail "traversal gate: verdict artifact missing"
+fi
+
+if python3 - "${GATE_FILE}" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    gate = json.load(f)
+
+assert gate["schema_version"] == "tui_traversal_gate.v1"
+assert gate["bead"] == "br-legjy.6.1"
+assert isinstance(gate["all_within_budget"], bool)
+assert len(gate["samples"]) == 4
+for sample in gate["samples"]:
+    for key in (
+        "surface",
+        "detail",
+        "count",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "max_ms",
+        "budget_p95_ms",
+        "budget_p99_ms",
+        "within_budget",
+    ):
+        assert key in sample
+PYEOF
+then
+    e2e_pass "traversal gate: verdict artifact schema complete"
+else
+    e2e_fail "traversal gate: verdict artifact schema incomplete"
+fi
+
+
+# ────────────────────────────────────────────────────────────────────
+# Case 4c: Event-pressure + resize-storm PTY regressions (C4)
+# ────────────────────────────────────────────────────────────────────
+e2e_case_banner "event_pressure_resize_regressions"
+
+# Pressure scenario: rapid mixed navigation input cadence.
+read -r WORKP DBP STORAGEP <<< "$(setup_server_env "pressure")"
+PORTP="$(pick_port)"
+
+DATABASE_URL="sqlite:////${DBP}" \
+STORAGE_ROOT="${STORAGEP}" \
+HTTP_HOST="127.0.0.1" \
+HTTP_PORT="${PORTP}" \
+HTTP_RBAC_ENABLED=0 \
+HTTP_RATE_LIMIT_ENABLED=0 \
+HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
+TUI_ENABLED=0 \
+    "${BIN}" serve --host 127.0.0.1 --port "${PORTP}" --no-tui &
+HEADLESS_PIDP=$!
+
+if wait_for_server "${PORTP}" 15; then
+    seed_realistic_data "${PORTP}" "${FIXTURE_PROFILE}"
+else
+    e2e_fatal "Headless server failed to start for pressure scenario seeding"
+fi
+
+kill "${HEADLESS_PIDP}" 2>/dev/null || true
+wait "${HEADLESS_PIDP}" 2>/dev/null || true
+sleep 1
+
+TRANSCRIPTP="${E2E_ARTIFACT_DIR}/pressure_transcript.txt"
+TIMINGP="${E2E_ARTIFACT_DIR}/pressure_timing.json"
+
+KEYSP='['
+KEYSP+='{"delay_ms": 1800, "keys": "", "label": "initial_render"}'
+for i in $(seq 1 60); do
+    if [ $((i % 10)) -eq 0 ]; then
+        KEYS_LABEL="pressure_jump_to_Search_${i}"
+        KEYS_VALUE="5"
+    elif [ $((i % 4)) -eq 0 ]; then
+        KEYS_LABEL="pressure_backtab_${i}"
+        KEYS_VALUE="${BACKTAB_KEY_JSON}"
+    else
+        KEYS_LABEL="pressure_tab_${i}"
+        KEYS_VALUE="\\t"
+    fi
+    KEYS_DELAY=140
+    KEYSP+=",{\"delay_ms\": ${KEYS_DELAY}, \"keys\": \"${KEYS_VALUE}\", \"label\": \"${KEYS_LABEL}\"}"
+done
+KEYSP+=",{\"delay_ms\": 300, \"keys\": \"q\", \"label\": \"quit\"}"
+KEYSP+=']'
+
+if ! run_timed_pty_interaction "pressure" "${TRANSCRIPTP}" "${TIMINGP}" "${KEYSP}" \
+    env \
+    DATABASE_URL="sqlite:////${DBP}" \
+    STORAGE_ROOT="${STORAGEP}" \
+    HTTP_HOST="127.0.0.1" \
+    HTTP_PORT="${PORTP}" \
+    HTTP_RBAC_ENABLED=0 \
+    HTTP_RATE_LIMIT_ENABLED=0 \
+    HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
+    "${BIN}" serve --host 127.0.0.1 --port "${PORTP}"; then
+    e2e_fatal "pressure traversal PTY interaction failed"
+fi
+
+if python3 - "${TIMINGP}" <<'PYEOF'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    doc = json.load(f)
+pressure_steps = [t for t in doc.get("timings", []) if str(t.get("step", "")).startswith("pressure_")]
+assert len(pressure_steps) >= 50
+PYEOF
+then
+    e2e_pass "pressure: timing artifact valid with >=50 pressure steps"
+else
+    e2e_fail "pressure: timing artifact missing expected pressure steps"
+fi
+
+# Resize-storm scenario: deterministic alternating resize + navigation cadence.
+read -r WORKR DBR STORAGER <<< "$(setup_server_env "resize_storm")"
+PORTR="$(pick_port)"
+
+DATABASE_URL="sqlite:////${DBR}" \
+STORAGE_ROOT="${STORAGER}" \
+HTTP_HOST="127.0.0.1" \
+HTTP_PORT="${PORTR}" \
+HTTP_RBAC_ENABLED=0 \
+HTTP_RATE_LIMIT_ENABLED=0 \
+HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
+TUI_ENABLED=0 \
+    "${BIN}" serve --host 127.0.0.1 --port "${PORTR}" --no-tui &
+HEADLESS_PIDR=$!
+
+if wait_for_server "${PORTR}" 15; then
+    seed_realistic_data "${PORTR}" "${FIXTURE_PROFILE}"
+else
+    e2e_fatal "Headless server failed to start for resize-storm scenario seeding"
+fi
+
+kill "${HEADLESS_PIDR}" 2>/dev/null || true
+wait "${HEADLESS_PIDR}" 2>/dev/null || true
+sleep 1
+
+TRANSCRIPTR="${E2E_ARTIFACT_DIR}/resize_storm_transcript.txt"
+TIMINGR="${E2E_ARTIFACT_DIR}/resize_storm_timing.json"
+
+KEYSR='['
+KEYSR+='{"delay_ms": 1800, "keys": "", "label": "initial_render"}'
+for i in $(seq 1 24); do
+    rows=$((18 + (i % 6) * 5))
+    cols=$((70 + (i % 7) * 12))
+    if [ $((i % 3)) -eq 0 ]; then
+        key_value="${BACKTAB_KEY_JSON}"
+        key_label="backtab"
+    else
+        key_value="\\t"
+        key_label="tab"
+    fi
+    KEYSR+=",{\"delay_ms\": 170, \"keys\": \"${key_value}\", \"label\": \"resize_${i}_${rows}x${cols}_${key_label}\", \"resize\": {\"rows\": ${rows}, \"cols\": ${cols}}}"
+done
+KEYSR+=",{\"delay_ms\": 300, \"keys\": \"q\", \"label\": \"quit\"}"
+KEYSR+=']'
+
+if ! run_timed_pty_interaction "resize_storm" "${TRANSCRIPTR}" "${TIMINGR}" "${KEYSR}" \
+    env \
+    DATABASE_URL="sqlite:////${DBR}" \
+    STORAGE_ROOT="${STORAGER}" \
+    HTTP_HOST="127.0.0.1" \
+    HTTP_PORT="${PORTR}" \
+    HTTP_RBAC_ENABLED=0 \
+    HTTP_RATE_LIMIT_ENABLED=0 \
+    HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
+    "${BIN}" serve --host 127.0.0.1 --port "${PORTR}"; then
+    e2e_fatal "resize-storm PTY interaction failed"
+fi
+
+if python3 - "${TIMINGR}" <<'PYEOF'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    doc = json.load(f)
+steps = [t for t in doc.get("timings", []) if str(t.get("step", "")).startswith("resize_")]
+resize_steps = [t for t in steps if isinstance(t.get("resize"), dict)]
+assert len(steps) >= 20
+assert len(resize_steps) >= 20
+PYEOF
+then
+    e2e_pass "resize-storm: timing artifact valid with >=20 resize steps"
+else
+    e2e_fail "resize-storm: timing artifact missing expected resize steps"
+fi
+
+PRESSURE_RESIZE_REPORT="${E2E_ARTIFACT_DIR}/pressure_resize_regression_report.json"
+if python3 - "${TIMINGP}" "${TIMINGR}" "${PRESSURE_RESIZE_REPORT}" \
+    "${PRESSURE_BUDGET_FIRST_BYTE_P95_MS}" \
+    "${PRESSURE_BUDGET_QUIESCE_P95_MS}" \
+    "${PRESSURE_BUDGET_QUIESCE_P99_MS}" \
+    "${RESIZE_BUDGET_FIRST_BYTE_P95_MS}" \
+    "${RESIZE_BUDGET_QUIESCE_P95_MS}" \
+    "${RESIZE_BUDGET_REPAINT_BURST_MAX}" <<'PYEOF'
+import datetime
+import json
+import statistics
+import sys
+
+(
+    pressure_path,
+    resize_path,
+    report_path,
+    pressure_fb_budget_s,
+    pressure_q95_budget_s,
+    pressure_q99_budget_s,
+    resize_fb_budget_s,
+    resize_q95_budget_s,
+    resize_burst_budget_s,
+) = sys.argv[1:10]
+
+pressure_fb_budget = float(pressure_fb_budget_s)
+pressure_q95_budget = float(pressure_q95_budget_s)
+pressure_q99_budget = float(pressure_q99_budget_s)
+resize_fb_budget = float(resize_fb_budget_s)
+resize_q95_budget = float(resize_q95_budget_s)
+resize_burst_budget = float(resize_burst_budget_s)
+
+with open(pressure_path, "r", encoding="utf-8") as f:
+    pressure_doc = json.load(f)
+with open(resize_path, "r", encoding="utf-8") as f:
+    resize_doc = json.load(f)
+
+def percentile(values, p):
+    if not values:
+        return 0.0
+    vals = sorted(values)
+    idx = min(len(vals) - 1, max(0, int((len(vals) - 1) * p)))
+    return float(vals[idx])
+
+def summarize_steps(steps):
+    first = [float(s["first_byte_ms"]) for s in steps if s.get("first_byte_ms") is not None]
+    quiesce = [float(s.get("quiesce_ms", 0) or 0) for s in steps]
+    delta = [float(s.get("output_bytes_delta", 0) or 0) for s in steps]
+    median_delta = statistics.median(delta) if delta else 0.0
+    burst_factor = (max(delta) / median_delta) if delta and median_delta > 0 else (max(delta) if delta else 0.0)
+    return {
+        "count": len(steps),
+        "first_byte_p95_ms": round(percentile(first, 0.95), 2),
+        "quiesce_p95_ms": round(percentile(quiesce, 0.95), 2),
+        "quiesce_p99_ms": round(percentile(quiesce, 0.99), 2),
+        "output_bytes_p95": round(percentile(delta, 0.95), 2),
+        "output_bytes_median": round(median_delta, 2),
+        "output_bytes_max": round(max(delta), 2) if delta else 0.0,
+        "repaint_burst_factor": round(float(burst_factor), 3),
+    }
+
+pressure_steps = [s for s in pressure_doc.get("timings", []) if str(s.get("step", "")).startswith("pressure_")]
+resize_steps = [s for s in resize_doc.get("timings", []) if str(s.get("step", "")).startswith("resize_")]
+resize_event_count = sum(1 for s in resize_steps if isinstance(s.get("resize"), dict))
+
+pressure_summary = summarize_steps(pressure_steps)
+resize_summary = summarize_steps(resize_steps)
+
+pressure_reasons = []
+if pressure_summary["count"] < 50:
+    pressure_reasons.append("insufficient_pressure_samples")
+if pressure_summary["first_byte_p95_ms"] > pressure_fb_budget:
+    pressure_reasons.append("pressure_first_byte_p95_exceeded")
+if pressure_summary["quiesce_p95_ms"] > pressure_q95_budget:
+    pressure_reasons.append("pressure_quiesce_p95_exceeded")
+if pressure_summary["quiesce_p99_ms"] > pressure_q99_budget:
+    pressure_reasons.append("pressure_quiesce_p99_exceeded")
+
+resize_reasons = []
+if resize_summary["count"] < 20:
+    resize_reasons.append("insufficient_resize_samples")
+if resize_event_count < 20:
+    resize_reasons.append("insufficient_resize_events")
+if resize_summary["first_byte_p95_ms"] > resize_fb_budget:
+    resize_reasons.append("resize_first_byte_p95_exceeded")
+if resize_summary["quiesce_p95_ms"] > resize_q95_budget:
+    resize_reasons.append("resize_quiesce_p95_exceeded")
+if resize_summary["repaint_burst_factor"] > resize_burst_budget:
+    resize_reasons.append("resize_repaint_burst_exceeded")
+
+samples = [
+    {
+        "scenario": "event_pressure",
+        "summary": pressure_summary,
+        "within_budget": len(pressure_reasons) == 0,
+        "reasons": pressure_reasons,
+        "budgets": {
+            "first_byte_p95_ms_max": pressure_fb_budget,
+            "quiesce_p95_ms_max": pressure_q95_budget,
+            "quiesce_p99_ms_max": pressure_q99_budget,
+        },
+        "ansi_metrics": pressure_doc.get("ansi_metrics", {}),
+    },
+    {
+        "scenario": "resize_storm",
+        "summary": {
+            **resize_summary,
+            "resize_event_count": resize_event_count,
+        },
+        "within_budget": len(resize_reasons) == 0,
+        "reasons": resize_reasons,
+        "budgets": {
+            "first_byte_p95_ms_max": resize_fb_budget,
+            "quiesce_p95_ms_max": resize_q95_budget,
+            "repaint_burst_factor_max": resize_burst_budget,
+        },
+        "ansi_metrics": resize_doc.get("ansi_metrics", {}),
+    },
+]
+
+failing = [s for s in samples if not s["within_budget"]]
+report = {
+    "schema_version": "tui_pressure_resize_gate.v1",
+    "harness": "tui_full_traversal",
+    "bead": "br-legjy.3.4",
+    "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "samples": samples,
+    "all_within_budget": len(failing) == 0,
+    "failing_samples": [
+        {"scenario": s["scenario"], "reasons": s["reasons"]} for s in failing
+    ],
+    "repro": {
+        "command": "bash tests/e2e/test_tui_full_traversal.sh",
+        "env": {
+            "PRESSURE_BUDGET_FIRST_BYTE_P95_MS": pressure_fb_budget,
+            "PRESSURE_BUDGET_QUIESCE_P95_MS": pressure_q95_budget,
+            "PRESSURE_BUDGET_QUIESCE_P99_MS": pressure_q99_budget,
+            "RESIZE_BUDGET_FIRST_BYTE_P95_MS": resize_fb_budget,
+            "RESIZE_BUDGET_QUIESCE_P95_MS": resize_q95_budget,
+            "RESIZE_BUDGET_REPAINT_BURST_MAX": resize_burst_budget,
+        },
+    },
+}
+
+with open(report_path, "w", encoding="utf-8") as f:
+    json.dump(report, f, indent=2)
+    f.write("\n")
+
+print("=== Event Pressure + Resize Storm Regression Gate ===")
+for sample in samples:
+    verdict = "PASS" if sample["within_budget"] else "FAIL"
+    summary = sample["summary"]
+    print(
+        f"  {sample['scenario']:14s} {verdict} "
+        f"(count={summary.get('count', 0)}, first_p95={summary.get('first_byte_p95_ms', 0):.2f}ms, "
+        f"quiesce_p95={summary.get('quiesce_p95_ms', 0):.2f}ms, "
+        f"quiesce_p99={summary.get('quiesce_p99_ms', 0):.2f}ms)"
+    )
+    if sample["scenario"] == "resize_storm":
+        print(
+            f"    resize_events={summary.get('resize_event_count', 0)} "
+            f"repaint_burst={summary.get('repaint_burst_factor', 0):.3f}x"
+        )
+if failing:
+    print("  failing=" + ",".join(s["scenario"] for s in failing))
+
+sys.exit(0 if len(failing) == 0 else 1)
+PYEOF
+then
+    e2e_pass "pressure/resize regression gate: all scenarios within budgets"
+else
+    e2e_fail "pressure/resize regression gate: one or more scenarios exceeded budgets"
+fi
+
+if [ -f "${PRESSURE_RESIZE_REPORT}" ]; then
+    e2e_save_artifact "pressure_resize_regression_report_copy.json" "$(cat "${PRESSURE_RESIZE_REPORT}")"
+else
+    e2e_fail "pressure/resize regression gate: report artifact missing"
+fi
+
+if python3 - "${PRESSURE_RESIZE_REPORT}" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    report = json.load(f)
+
+assert report["schema_version"] == "tui_pressure_resize_gate.v1"
+assert report["bead"] == "br-legjy.3.4"
+assert isinstance(report["all_within_budget"], bool)
+assert len(report["samples"]) == 2
+for sample in report["samples"]:
+    for key in ("scenario", "summary", "within_budget", "reasons", "budgets", "ansi_metrics"):
+        assert key in sample
+PYEOF
+then
+    e2e_pass "pressure/resize regression gate: report schema complete"
+else
+    e2e_fail "pressure/resize regression gate: report schema incomplete"
+fi
+
+
+# ────────────────────────────────────────────────────────────────────
+# Case 4d: Deterministic flash-detection gate (F2)
+# ────────────────────────────────────────────────────────────────────
+e2e_case_banner "flash_detection_gate"
+
+FLASH_REPORT="${E2E_ARTIFACT_DIR}/flash_detection_report.json"
+if python3 - "${TIMINGP}" "${TIMINGR}" "${FLASH_REPORT}" \
+    "${FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX}" \
+    "${FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX}" \
+    "${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX}" <<'PYEOF'
+import datetime
+import json
+import sys
+
+timing_pressure, timing_resize, report_path, empty_budget_s, bounce_budget_s, repaint_budget_s = sys.argv[1:7]
+empty_budget = float(empty_budget_s)
+bounce_budget = float(bounce_budget_s)
+repaint_budget = float(repaint_budget_s)
+
+with open(timing_pressure, "r", encoding="utf-8") as f:
+    pressure_doc = json.load(f)
+with open(timing_resize, "r", encoding="utf-8") as f:
+    resize_doc = json.load(f)
+
+def analyze(doc, prefix):
+    steps = [s for s in doc.get("timings", []) if str(s.get("step", "")).startswith(prefix)]
+    n = len(steps)
+    hashes = [str(s.get("frame_hash", "empty") or "empty") for s in steps]
+    frame_chars = [int(s.get("frame_chars", 0) or 0) for s in steps]
+    cursor_home = [int(s.get("frame_cursor_home_ops", 0) or 0) for s in steps]
+    clear_ops = [int(s.get("frame_clear_ops", 0) or 0) for s in steps]
+    erase_ops = [int(s.get("frame_erase_line_ops", 0) or 0) for s in steps]
+    bytes_out = [float(s.get("output_bytes_delta", 0) or 0) for s in steps]
+
+    transitions = sum(1 for i in range(1, n) if hashes[i] != hashes[i - 1])
+    # A-B-A pattern can indicate unstable redraw oscillation.
+    bounce = sum(1 for i in range(2, n) if hashes[i] == hashes[i - 2] and hashes[i] != hashes[i - 1])
+    empty_frames = sum(1 for h, chars in zip(hashes, frame_chars) if h == "empty" or chars < 5)
+
+    repaint_ops_total = sum(cursor_home) + sum(clear_ops) + sum(erase_ops)
+    bytes_total = sum(bytes_out)
+    repaint_ops_per_kb = repaint_ops_total / max(bytes_total / 1024.0, 1.0)
+
+    metrics = {
+        "step_count": n,
+        "frame_transitions": transitions,
+        "frame_bounce_events": bounce,
+        "frame_bounce_ratio": round(bounce / max(n - 2, 1), 4),
+        "empty_frame_count": empty_frames,
+        "empty_frame_ratio": round(empty_frames / max(n, 1), 4),
+        "repaint_ops_total": repaint_ops_total,
+        "repaint_ops_per_kb": round(repaint_ops_per_kb, 4),
+        "bytes_total": round(bytes_total, 2),
+    }
+
+    reasons = []
+    if n < 20:
+        reasons.append("insufficient_step_count")
+    if metrics["empty_frame_ratio"] > empty_budget:
+        reasons.append("empty_frame_ratio_exceeded")
+    if metrics["frame_bounce_ratio"] > bounce_budget:
+        reasons.append("frame_bounce_ratio_exceeded")
+    if metrics["repaint_ops_per_kb"] > repaint_budget:
+        reasons.append("repaint_ops_per_kb_exceeded")
+
+    return {
+        "scenario": prefix.rstrip("_"),
+        "metrics": metrics,
+        "within_budget": len(reasons) == 0,
+        "reasons": reasons,
+        "budgets": {
+            "empty_frame_ratio_max": empty_budget,
+            "frame_bounce_ratio_max": bounce_budget,
+            "repaint_ops_per_kb_max": repaint_budget,
+        },
+        "ansi_metrics": doc.get("ansi_metrics", {}),
+    }
+
+samples = [
+    analyze(pressure_doc, "pressure_"),
+    analyze(resize_doc, "resize_"),
+]
+failing = [s for s in samples if not s["within_budget"]]
+
+report = {
+    "schema_version": "tui_flash_detection_gate.v1",
+    "harness": "tui_full_traversal",
+    "bead": "br-legjy.6.2",
+    "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "samples": samples,
+    "all_within_budget": len(failing) == 0,
+    "failing_samples": [
+        {"scenario": s["scenario"], "reasons": s["reasons"]} for s in failing
+    ],
+    "repro": {
+        "command": "bash tests/e2e/test_tui_full_traversal.sh",
+        "env": {
+            "FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX": empty_budget,
+            "FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX": bounce_budget,
+            "FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX": repaint_budget,
+        },
+    },
+}
+
+with open(report_path, "w", encoding="utf-8") as f:
+    json.dump(report, f, indent=2)
+    f.write("\n")
+
+print("=== Flash Detection Gate ===")
+for sample in samples:
+    m = sample["metrics"]
+    verdict = "PASS" if sample["within_budget"] else "FAIL"
+    print(
+        f"  {sample['scenario']:8s} {verdict} "
+        f"(steps={m['step_count']}, empty_ratio={m['empty_frame_ratio']:.4f}, "
+        f"bounce_ratio={m['frame_bounce_ratio']:.4f}, repaint_ops_per_kb={m['repaint_ops_per_kb']:.4f})"
+    )
+if failing:
+    print("  failing=" + ",".join(s["scenario"] for s in failing))
+
+sys.exit(0 if len(failing) == 0 else 1)
+PYEOF
+then
+    e2e_pass "flash detection gate: all scenarios within budgets"
+else
+    e2e_fail "flash detection gate: one or more scenarios exceeded budgets"
+fi
+
+if [ -f "${FLASH_REPORT}" ]; then
+    e2e_save_artifact "flash_detection_report_copy.json" "$(cat "${FLASH_REPORT}")"
+else
+    e2e_fail "flash detection gate: report artifact missing"
+fi
+
+if python3 - "${FLASH_REPORT}" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    report = json.load(f)
+
+assert report["schema_version"] == "tui_flash_detection_gate.v1"
+assert report["bead"] == "br-legjy.6.2"
+assert isinstance(report["all_within_budget"], bool)
+assert len(report["samples"]) == 2
+for sample in report["samples"]:
+    for key in ("scenario", "metrics", "within_budget", "reasons", "budgets", "ansi_metrics"):
+        assert key in sample
+PYEOF
+then
+    e2e_pass "flash detection gate: report schema complete"
+else
+    e2e_fail "flash detection gate: report schema incomplete"
 fi
 
 

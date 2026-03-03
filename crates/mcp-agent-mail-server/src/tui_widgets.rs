@@ -4990,7 +4990,7 @@ pub fn generate_contact_graph_mermaid(
 
     let mut out = String::from("graph LR\n");
     for agent in &ordered_agents {
-        let id = ids.get(agent).expect("agent id should exist");
+        let id = ids.get(agent).map_or("", String::as_str);
         let _ = writeln!(out, "    {id}[\"{}\"]", mermaid_label(agent, 64));
     }
     for ((from, to), count) in counts {
@@ -5003,7 +5003,7 @@ pub fn generate_contact_graph_mermaid(
         }
     }
     for agent in &ordered_agents {
-        let id = ids.get(agent).expect("agent id should exist");
+        let id = ids.get(agent).map_or("", String::as_str);
         let _ = writeln!(
             out,
             "    style {id} fill:{},stroke:{MERMAID_STROKE},stroke-width:1px",
@@ -5039,7 +5039,7 @@ pub fn generate_thread_flow_mermaid(thread_messages: &[MermaidThreadMessage]) ->
     for participant in &participants {
         let id = participant_ids
             .get(participant)
-            .expect("participant id should exist");
+            .map_or("", String::as_str);
         let _ = writeln!(
             out,
             "    participant {id} as {}",
@@ -5109,7 +5109,7 @@ pub fn generate_system_overview_mermaid(
     for project in &ordered_projects {
         let id = project_ids
             .get(&project.slug)
-            .expect("project id should exist");
+            .map_or("", String::as_str);
         let _ = writeln!(
             out,
             "    {id}[\"Project: {}\"]",
@@ -5119,7 +5119,7 @@ pub fn generate_system_overview_mermaid(
     for agent in &ordered_agents {
         let id = agent_ids
             .get(&(agent.project_slug.clone(), agent.name.clone()))
-            .expect("agent id should exist");
+            .map_or("", String::as_str);
         let _ = writeln!(
             out,
             "    {id}[\"Agent: {}\"]",
@@ -5155,7 +5155,7 @@ pub fn generate_system_overview_mermaid(
     for agent in &ordered_agents {
         let agent_id = agent_ids
             .get(&(agent.project_slug.clone(), agent.name.clone()))
-            .expect("agent id should exist");
+            .map_or("", String::as_str);
         if let Some(project_id) = project_ids.get(&agent.project_slug) {
             let _ = writeln!(out, "    {project_id} --> {agent_id}");
         }
@@ -5163,7 +5163,7 @@ pub fn generate_system_overview_mermaid(
     for agent in &ordered_agents {
         let agent_id = agent_ids
             .get(&(agent.project_slug.clone(), agent.name.clone()))
-            .expect("agent id should exist");
+            .map_or("", String::as_str);
         let _ = writeln!(
             out,
             "    style {agent_id} fill:{},stroke:{MERMAID_STROKE},stroke-width:1px",
@@ -7102,7 +7102,7 @@ mod tests {
             subject: "test".into(),
             thread_id: "t1".into(),
             project: "p1".into(),
-            body_excerpt: String::new(),
+            body_md: String::new(),
         }
     }
 

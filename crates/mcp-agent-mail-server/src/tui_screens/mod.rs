@@ -734,7 +734,7 @@ pub fn screen_meta(id: MailScreenId) -> &'static MailScreenMeta {
     MAIL_SCREEN_REGISTRY
         .iter()
         .find(|m| m.id == id)
-        .expect("all screen IDs must be in registry")
+        .unwrap_or_else(|| unreachable!())
 }
 
 /// All screen IDs in display order.

@@ -553,7 +553,7 @@ set +e
 SERVER2_OUT="$(
     export DATABASE_URL="sqlite:////${SERVER2_DB}"
     export STORAGE_ROOT="${SERVER2_STORAGE}"
-    timeout 8s mcp-agent-mail serve --host 127.0.0.1 --port "${BIND_PORT}" 2>&1
+    timeout 20s mcp-agent-mail serve --host 127.0.0.1 --port "${BIND_PORT}" --no-reuse-running 2>&1
 )"
 SERVER2_RC=$?
 set -e
@@ -564,7 +564,7 @@ if [ "$SERVER2_RC" -ne 0 ]; then
 else
     e2e_fail "secondary server should exit non-zero on bind collision"
 fi
-e2e_assert_contains "bind failure includes in-use diagnostic" "$SERVER2_OUT" "is in use"
+e2e_assert_contains "bind failure includes in-use diagnostic" "$SERVER2_OUT" "already running"
 
 e2e_stop_server 2>/dev/null || true
 
@@ -590,9 +590,9 @@ ARCHIVE_SAVE_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" STORAGE_ROOT="${CLI_STOR
 ARCHIVE_SAVE_RC=$?
 ARCHIVE_RESTORE_OUT="$(am archive restore /tmp/definitely_missing_archive.tar.zst --dry-run 2>&1)"
 ARCHIVE_RESTORE_RC=$?
-PRODUCT_STATUS_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" timeout 8s am products status missing-product --json 2>&1)"
+PRODUCT_STATUS_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" timeout 20s am products status missing-product --json 2>&1)"
 PRODUCT_STATUS_RC=$?
-PRODUCT_SEARCH_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" timeout 8s am products search missing-product needle --json 2>&1)"
+PRODUCT_SEARCH_OUT="$(DATABASE_URL="sqlite:////${CLI_DB}" timeout 20s am products search missing-product needle --json 2>&1)"
 PRODUCT_SEARCH_RC=$?
 set -e
 

@@ -723,7 +723,7 @@ fn ts_display_full(micros: i64) -> String {
 /// Python parity: `created_relative`.
 fn ts_display_relative(micros: i64) -> String {
     let now = now_micros();
-    let delta_secs = (now - micros) / 1_000_000;
+    let delta_secs = (now - micros).max(0) / 1_000_000;
     if delta_secs < 60 {
         "Just now".to_string()
     } else if delta_secs < 3600 {
@@ -2181,7 +2181,7 @@ fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, 
 
 /// Estimate the size of a directory tree, returned as a human-readable string.
 fn estimate_repo_size(path: &std::path::Path) -> String {
-    // Try `du -sh` with timeout, fall back to "Unknown"
+    // Try `du -sh` with timeout to prevent server lockup on massive/networked NFS archives.
     match std::process::Command::new("du")
         .args(["-sh", &path.display().to_string()])
         .output()

@@ -1381,6 +1381,15 @@ impl MailScreen for TimelineScreen {
                     // Capital-V cycles timeline views (Events -> Commits -> Combined).
                     KeyCode::Char('V') => {
                         self.view_mode = self.view_mode.next_primary();
+                        if matches!(
+                            self.view_mode,
+                            TimelineViewMode::Commits | TimelineViewMode::Combined
+                        ) {
+                            // Force an immediate refresh on the next tick even if no
+                            // new timeline events were emitted.
+                            self.last_commit_refresh_tick = 0;
+                            self.last_commit_refresh_at = None;
+                        }
                         self.clamp_cursor_for_mode();
                         self.prune_selection_to_visible();
                     }
@@ -1518,28 +1527,56 @@ impl MailScreen for TimelineScreen {
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
-
+        let commit_mode = matches!(
+            self.view_mode,
+            TimelineViewMode::Commits | TimelineViewMode::Combined
+        );
+        let should_refresh_commits = commit_mode
+            && (dirty.events
+                || dirty.db_stats
+                || self.commit_refresh_rx.is_some()
+                || self.commit_entries.is_empty());
         if dirty.events {
             self.pane.ingest(state);
+        }
+        if should_refresh_commits {
             self.refresh_commit_entries(tick_count, state);
+        }
+        let touched_timeline = dirty.events || should_refresh_commits;
+        if touched_timeline {
             self.prune_selection_to_visible();
             self.sync_list_state();
-
+        }
+        if dirty.events || dirty.db_stats || should_refresh_commits {
             let raw_count = u64::try_from(self.pane.entries.len()).unwrap_or(u64::MAX);
             let rendered_count = u64::try_from(self.pane.filtered_len()).unwrap_or(u64::MAX);
             let dropped_count = raw_count.saturating_sub(rendered_count);
+            let combined_rows = if self.view_mode == TimelineViewMode::Combined {
+                self.combined_rows().len()
+            } else {
+                0
+            };
             let cfg = state.config_snapshot();
             let transport_mode = cfg.transport_mode().to_string();
             state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
                 screen: "timeline".to_string(),
                 scope: "timeline.events".to_string(),
                 query_params: format!(
-                    "view_mode={:?};verbosity={:?};kind_filters={};source_filters={};commits={}",
+                    "view_mode={:?};verbosity={:?};kind_filters={};source_filters={};event_rows={};commit_rows={};combined_rows={};commit_projects={};commit_authors={};commit_msg={};commit_resv={};commit_errors={};commit_churn=+{}-{}",
                     self.view_mode,
                     self.pane.verbosity,
                     self.pane.kind_filter.len(),
                     self.pane.source_filter.len(),
+                    self.pane.entries.len(),
                     self.commit_entries.len(),
+                    combined_rows,
+                    self.commit_stats.active_projects,
+                    self.commit_stats.unique_authors,
+                    self.commit_stats.message_commits,
+                    self.commit_stats.reservation_commits,
+                    self.commit_stats.refresh_errors,
+                    self.commit_stats.churn_insertions,
+                    self.commit_stats.churn_deletions,
                 ),
                 raw_count,
                 rendered_count,
@@ -2668,7 +2705,7 @@ fn build_filter_tag(
 // ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+    mod tests {
     use super::*;
     use crate::tui_layout::DockPosition;
     use ftui_harness::buffer_to_text;
@@ -2713,6 +2750,66 @@ mod tests {
             recipients: vec!["SilentOwl".to_string()],
             author: author.to_string(),
         }
+    }
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("git command should run");
+        assert!(status.success(), "git command should succeed: {args:?}");
+    }
+
+    fn seed_timeline_repo(repo: &std::path::Path) {
+        run_git(repo, &["init", "-b", "main"]);
+        run_git(repo, &["config", "user.email", "timeline-test@example.com"]);
+        run_git(repo, &["config", "user.name", "Timeline Test"]);
+    }
+
+    fn commit_project_fixture(
+        repo: &std::path::Path,
+        project_slug: &str,
+        relative_path: &str,
+        subject: &str,
+    ) {
+        let file = repo.join("projects").join(project_slug).join(relative_path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).expect("create project fixture directories");
+        }
+        std::fs::write(&file, format!("fixture for {subject}\n")).expect("write fixture file");
+        let rel = file
+            .strip_prefix(repo)
+            .expect("fixture file should be inside repo")
+            .to_string_lossy()
+            .to_string();
+        run_git(repo, &["add", &rel]);
+        run_git(repo, &["commit", "-m", subject]);
+    }
+
+    fn project_summary(id: i64, slug: &str) -> crate::tui_events::ProjectSummary {
+        crate::tui_events::ProjectSummary {
+            id,
+            slug: slug.to_string(),
+            human_key: format!("/tmp/{slug}"),
+            agent_count: 0,
+            message_count: 0,
+            reservation_count: 0,
+            created_at: 0,
+        }
+    }
+
+    fn drive_commit_refresh(screen: &mut TimelineScreen, state: &TuiSharedState, max_ticks: u64) {
+        screen.last_visible_at.set(Some(Instant::now()));
+        for tick in 1..=max_ticks {
+            screen.tick(tick, state);
+            if screen.commit_refresh_rx.is_none() && !screen.commit_entries.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("commit refresh did not complete in {max_ticks} ticks");
     }
 
     fn seed_log_filter_fixture(pane: &mut TimelinePane) {
@@ -3676,6 +3773,143 @@ mod tests {
         stats.refresh_errors = 0;
         let no_err_line = stats.summary_line();
         assert!(!no_err_line.contains("errs:"));
+    }
+
+    #[test]
+    fn commit_refresh_runs_on_db_stats_change_without_new_events() {
+        let dir = tempfile::tempdir().expect("create timeline repo tempdir");
+        seed_timeline_repo(dir.path());
+        commit_project_fixture(
+            dir.path(),
+            "proj-a",
+            "messages/2026/03/msg.md",
+            "mail: BluePuma -> SilentOwl | hello",
+        );
+        let config = mcp_agent_mail_core::Config {
+            storage_root: dir.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let mut screen = TimelineScreen::new();
+        screen.view_mode = TimelineViewMode::Commits;
+
+        // Mark baseline generation as clean, then mutate only DB stats.
+        screen.last_data_gen = state.data_generation();
+        let mut new_stats = crate::tui_events::DbStatSnapshot::default();
+        new_stats.projects_list.push(project_summary(1, "proj-a"));
+        state.update_db_stats(new_stats);
+
+        drive_commit_refresh(&mut screen, &state, 120);
+
+        assert!(
+            !screen.commit_entries.is_empty(),
+            "commit view should refresh from db-stats generation changes"
+        );
+        assert!(
+            screen
+                .commit_entries
+                .iter()
+                .any(|entry| entry.project_slug == "proj-a"),
+            "commit entries should include proj-a fixture commits"
+        );
+    }
+
+    #[test]
+    fn commit_refresh_aggregates_cross_project_and_tracks_refresh_errors() {
+        let dir = tempfile::tempdir().expect("create timeline repo tempdir");
+        seed_timeline_repo(dir.path());
+        commit_project_fixture(
+            dir.path(),
+            "proj-a",
+            "messages/2026/03/msg.md",
+            "mail: BluePuma -> SilentOwl | hello",
+        );
+        commit_project_fixture(
+            dir.path(),
+            "proj-b",
+            "file_reservations/lease.json",
+            "file_reservation: lock projects/proj-b/src/**",
+        );
+        let config = mcp_agent_mail_core::Config {
+            storage_root: dir.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let mut screen = TimelineScreen::new();
+        screen.view_mode = TimelineViewMode::Commits;
+
+        let new_stats = crate::tui_events::DbStatSnapshot {
+            projects_list: vec![
+                project_summary(1, "proj-a"),
+                project_summary(2, "proj-b"),
+                // Intentionally missing project to exercise refresh error reporting.
+                project_summary(3, "proj-missing"),
+            ],
+            ..Default::default()
+        };
+        state.update_db_stats(new_stats);
+
+        drive_commit_refresh(&mut screen, &state, 120);
+
+        assert!(
+            screen
+                .commit_entries
+                .iter()
+                .any(|entry| entry.project_slug == "proj-a")
+        );
+        assert!(
+            screen
+                .commit_entries
+                .iter()
+                .any(|entry| entry.project_slug == "proj-b")
+        );
+        assert!(
+            screen.commit_stats.active_projects >= 2,
+            "expected at least proj-a and proj-b in active project stats"
+        );
+        assert!(
+            screen.commit_stats.refresh_errors >= 1,
+            "missing project should increment refresh_errors"
+        );
+    }
+
+    #[test]
+    fn timeline_diagnostics_include_commit_source_details() {
+        let dir = tempfile::tempdir().expect("create timeline repo tempdir");
+        seed_timeline_repo(dir.path());
+        commit_project_fixture(
+            dir.path(),
+            "proj-a",
+            "messages/2026/03/msg.md",
+            "mail: BluePuma -> SilentOwl | hello",
+        );
+        let config = mcp_agent_mail_core::Config {
+            storage_root: dir.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let mut screen = TimelineScreen::new();
+        screen.view_mode = TimelineViewMode::Commits;
+
+        let mut new_stats = crate::tui_events::DbStatSnapshot::default();
+        new_stats.projects_list.push(project_summary(1, "proj-a"));
+        state.update_db_stats(new_stats);
+
+        drive_commit_refresh(&mut screen, &state, 120);
+
+        let diagnostics = state.screen_diagnostics_recent("timeline", 10);
+        let joined = diagnostics
+            .iter()
+            .map(|(_, diag)| diag.query_params.clone())
+            .collect::<Vec<_>>()
+            .join(" || ");
+        assert!(
+            joined.contains("commit_rows=")
+                && joined.contains("commit_projects=")
+                && joined.contains("commit_errors=")
+                && joined.contains("commit_churn=+"),
+            "expected commit diagnostics fields in timeline query params: {joined}"
+        );
     }
 
     #[test]

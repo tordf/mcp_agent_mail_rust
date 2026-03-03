@@ -10,9 +10,10 @@
 #   6. LogViewer filtering path (search/filter flow)
 #   7. LogViewer auto-follow behavior
 #   8. Timeline preset lifecycle via Ctrl+S/Ctrl+L/Delete
-#   9. Hostile markdown sanitization (script removal)
-#   10. Empty thread rendering path
-#   11. Large-thread/tree rendering performance envelope
+#   9. Timeline commit refresh cross-project aggregation + diagnostics
+#   10. Hostile markdown sanitization (script removal)
+#   11. Empty thread rendering path
+#   12. Large-thread/tree rendering performance envelope
 #
 # Notes:
 # - Uses existing server crate rendering tests as black-box end-to-end checks.
@@ -417,6 +418,22 @@ run_render_case \
     "Timeline filter state: verbosity/kind/source saved to screen_filter_presets.json, reloaded, and deleted." \
     "Preset store captures values, load restores them, and delete removes all timeline presets." \
     test -p mcp-agent-mail-server --test pty_e2e_search timeline_preset_shortcuts_persist_and_reload_filters -- --nocapture
+
+# Case 7c
+run_render_case \
+    "case07c_timeline_commit_refresh_cross_project" \
+    "Timeline commit refresh aggregates cross-project commits and records refresh errors" \
+    "Timeline commit mode refresh with project list [proj-a, proj-b, proj-missing]." \
+    "Commit entries include proj-a/proj-b and diagnostics include commit_rows/projects/errors/churn fields." \
+    test -p mcp-agent-mail-server --lib tui_screens::timeline::tests::commit_refresh_aggregates_cross_project_and_tracks_refresh_errors -- --nocapture
+
+# Case 7d
+run_render_case \
+    "case07d_timeline_commit_refresh_diagnostics" \
+    "Timeline diagnostics include commit-source detail fields after commit refresh" \
+    "Commit mode refresh emits timeline diagnostics with commit-focused query params." \
+    "Diagnostic payload includes commit_rows, commit_projects, commit_errors, and commit_churn." \
+    test -p mcp-agent-mail-server --lib tui_screens::timeline::tests::timeline_diagnostics_include_commit_source_details -- --nocapture
 
 # Case 8
 run_render_case \

@@ -141,11 +141,11 @@ pub fn label_to_keycodes(label: &str) -> Vec<KeyCode> {
         "F12" => vec![KeyCode::F(12)],
         // Ranges
         "1-9" => (1..=9)
-            .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap()))
+            .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap_or('0')))
             .collect(),
         "1-9,0" => {
             let mut out: Vec<KeyCode> = (1..=9)
-                .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap()))
+                .map(|n| KeyCode::Char(char::from_digit(n, 10).unwrap_or('0')))
                 .collect();
             out.push(KeyCode::Char('0'));
             out
@@ -155,7 +155,7 @@ pub fn label_to_keycodes(label: &str) -> Vec<KeyCode> {
         s if s.starts_with("Shift+") => vec![],
         // Single char
         s if s.len() == 1 => {
-            let ch = s.chars().next().unwrap();
+            let ch = s.chars().next().unwrap_or(' ');
             vec![KeyCode::Char(ch)]
         }
         // Slash-separated shortcuts like "j/k" or "i/Enter"

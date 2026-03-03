@@ -1783,7 +1783,10 @@ fn build_message(
                             .or_else(|| {
                                 a.get("type")
                                     .and_then(|s| s.as_str())
-                                    .filter(|kind| *kind != "file" && *kind != "inline")
+                                    .filter(|kind| {
+                                        // Disposition values are not MIME types
+                                        !matches!(*kind, "file" | "inline" | "auto")
+                                    })
                             })
                             .unwrap_or("application/octet-stream")
                             .to_string(),
@@ -5582,6 +5585,163 @@ mod tests {
         assert_eq!(message.attachments[1].name, "notes.txt");
         assert_eq!(message.attachments[1].size, "98");
         assert_eq!(message.attachments[1].mime_type, "text/plain");
+    }
+
+    #[test]
+    fn test_attachment_type_only_no_media_type_falls_back_to_octet_stream() {
+        // Bug: "auto" type was not filtered, leaking as a mime_type value.
+        // All disposition values (file, inline, auto) must fall back to
+        // application/octet-stream when no media_type/content_type is present.
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        let attachments = serde_json::json!([
+            { "type": "file", "bytes": 100, "name": "a.bin" },
+            { "type": "inline", "bytes": 200, "name": "b.bin" },
+            { "type": "auto", "bytes": 300, "name": "c.bin" },
+            { "type": "image/png", "bytes": 400, "name": "d.png" },
+        ])
+        .to_string();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(102),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Type filter test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("TF-THREAD".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(attachments),
+            ],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (4, 102, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipient");
+
+        let message = build_message(&conn, 1, 102).expect("build message");
+        assert_eq!(message.attachments.len(), 4);
+        // "file", "inline", "auto" are disposition values → fall back to octet-stream
+        assert_eq!(message.attachments[0].mime_type, "application/octet-stream");
+        assert_eq!(message.attachments[1].mime_type, "application/octet-stream");
+        assert_eq!(message.attachments[2].mime_type, "application/octet-stream");
+        // "image/png" in type field is a valid mime_type fallback
+        assert_eq!(message.attachments[3].mime_type, "image/png");
+    }
+
+    #[test]
+    fn test_thread_ack_all_done() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(103),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Ack done test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("ACK-DONE-THREAD".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert message");
+        // Both recipients have ack_ts set
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (5, 103, 2, 'to', NULL, 111111),
+                (6, 103, 3, 'to', NULL, 222222)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let thread = build_thread(&conn, 1, "ACK-DONE-THREAD", Some(10), None, false)
+            .expect("build thread");
+        assert_eq!(thread.messages[0].ack, "done");
+    }
+
+    #[test]
+    fn test_thread_ack_required_none_acked() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(104),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Ack needed test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("ACK-REQ-THREAD".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert message");
+        // Both recipients have ack_ts = NULL
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (7, 104, 2, 'to', NULL, NULL),
+                (8, 104, 3, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let thread = build_thread(&conn, 1, "ACK-REQ-THREAD", Some(10), None, false)
+            .expect("build thread");
+        assert_eq!(thread.messages[0].ack, "required");
+    }
+
+    #[test]
+    fn test_thread_ack_not_required_shows_none() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(105),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("No ack test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("NO-ACK-THREAD".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (9, 105, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipient");
+
+        let thread = build_thread(&conn, 1, "NO-ACK-THREAD", Some(10), None, false)
+            .expect("build thread");
+        assert_eq!(thread.messages[0].ack, "none");
     }
 
     // ── is_prose_command ────────────────────────────────────────────────

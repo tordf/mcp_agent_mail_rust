@@ -43,27 +43,27 @@ pub enum CanonPolicy {
 static SECRET_PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
     vec![
         // GitHub tokens
-        regex::Regex::new(r"(?i)ghp_[A-Za-z0-9]{36,}").unwrap(),
-        regex::Regex::new(r"(?i)github_pat_[A-Za-z0-9_]{20,}").unwrap(),
+        regex::Regex::new(r"(?i)ghp_[A-Za-z0-9]{36,}").unwrap_or_else(|_| unreachable!()),
+        regex::Regex::new(r"(?i)github_pat_[A-Za-z0-9_]{20,}").unwrap_or_else(|_| unreachable!()),
         // Slack tokens
-        regex::Regex::new(r"(?i)xox[baprs]-[A-Za-z0-9\-]{10,}").unwrap(),
+        regex::Regex::new(r"(?i)xox[baprs]-[A-Za-z0-9\-]{10,}").unwrap_or_else(|_| unreachable!()),
         // OpenAI / generic sk- keys
-        regex::Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap(),
+        regex::Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap_or_else(|_| unreachable!()),
         // Bearer tokens
-        regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{16,}").unwrap(),
+        regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{16,}").unwrap_or_else(|_| unreachable!()),
         // JWTs (three base64url segments)
-        regex::Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+").unwrap(),
+        regex::Regex::new(r"eyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+").unwrap_or_else(|_| unreachable!()),
         // AWS access key IDs
-        regex::Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+        regex::Regex::new(r"AKIA[0-9A-Z]{16}").unwrap_or_else(|_| unreachable!()),
         // PEM private keys
-        regex::Regex::new(r"-----BEGIN[A-Z ]* PRIVATE KEY-----").unwrap(),
+        regex::Regex::new(r"-----BEGIN[A-Z ]* PRIVATE KEY-----").unwrap_or_else(|_| unreachable!()),
         // Anthropic API keys
-        regex::Regex::new(r"(?i)sk-ant-[A-Za-z0-9\-]{20,}").unwrap(),
+        regex::Regex::new(r"(?i)sk-ant-[A-Za-z0-9\-]{20,}").unwrap_or_else(|_| unreachable!()),
         // GitLab tokens
-        regex::Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap(),
+        regex::Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap_or_else(|_| unreachable!()),
         // Generic env-style secrets (KEY=value or TOKEN=value)
         regex::Regex::new(r"(?i)(?:AGENT_MAIL_TOKEN|API_KEY|SECRET_KEY|PASSWORD)\s*=\s*\S+")
-            .unwrap(),
+            .unwrap_or_else(|_| unreachable!()),
     ]
 });
 
@@ -78,33 +78,33 @@ static SECRET_PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
 #[must_use]
 pub fn strip_markdown(input: &str) -> String {
     static RE_CODE_FENCE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?ms)^```[^\n]*\n.*?^```").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"(?ms)^```[^\n]*\n.*?^```").unwrap_or_else(|_| unreachable!()));
     static RE_INLINE_CODE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"`[^`]+`").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"`[^`]+`").unwrap_or_else(|_| unreachable!()));
     static RE_IMAGE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"!\[([^\]]*)\]\([^)]+\)").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"!\[([^\]]*)\]\([^)]+\)").unwrap_or_else(|_| unreachable!()));
     static RE_LINK: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\[([^\]]*)\]\([^)]+\)").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"\[([^\]]*)\]\([^)]+\)").unwrap_or_else(|_| unreachable!()));
     static RE_HEADER: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^#{1,6}\s+").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"(?m)^#{1,6}\s+").unwrap_or_else(|_| unreachable!()));
     static RE_BOLD_ITALIC: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\*{1,3}([^*]+)\*{1,3}").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"\*{1,3}([^*]+)\*{1,3}").unwrap_or_else(|_| unreachable!()));
     static RE_UNDERSCORE_EMPHASIS: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"_{1,3}([^_]+)_{1,3}").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"_{1,3}([^_]+)_{1,3}").unwrap_or_else(|_| unreachable!()));
     static RE_STRIKETHROUGH: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"~~([^~]+)~~").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"~~([^~]+)~~").unwrap_or_else(|_| unreachable!()));
     static RE_BLOCKQUOTE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^>\s*").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"(?m)^>\s*").unwrap_or_else(|_| unreachable!()));
     static RE_HR: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^[-*_]{3,}\s*$").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"(?m)^[-*_]{3,}\s*$").unwrap_or_else(|_| unreachable!()));
     static RE_LIST_MARKER: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^(\s*)[-*+]\s+").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"(?m)^(\s*)[-*+]\s+").unwrap_or_else(|_| unreachable!()));
     static RE_ORDERED_LIST: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^(\s*)\d+\.\s+").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"(?m)^(\s*)\d+\.\s+").unwrap_or_else(|_| unreachable!()));
     static RE_HTML_TAG: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap_or_else(|_| unreachable!()));
     static RE_TABLE_SEPARATOR: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?m)^\|?[\s-]+\|[\s\-|]+$").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"(?m)^\|?[\s-]+\|[\s\-|]+$").unwrap_or_else(|_| unreachable!()));
     let mut text = input.to_owned();
 
     // Remove code fences first (before other patterns match inside them)

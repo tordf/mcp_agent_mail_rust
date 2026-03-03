@@ -32,21 +32,21 @@ const BOOLEAN_OPERATORS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
 
 /// Characters that are special to Tantivy query grammar
 static SPECIAL_CHARS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[\[\]{}^~\\]").expect("special chars regex"));
+    LazyLock::new(|| Regex::new(r"[\[\]{}^~\\]").unwrap_or_else(|_| unreachable!()));
 
 /// Lone wildcards and punctuation-only patterns
 static UNSEARCHABLE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[\*\.\?!()]+$").expect("unsearchable regex"));
+    LazyLock::new(|| Regex::new(r"^[\*\.\?!()]+$").unwrap_or_else(|_| unreachable!()));
 
 /// Hyphenated token: ASCII alphanumeric segments joined by hyphens
 /// We use a simpler regex without lookbehind (not supported by `regex` crate)
 /// and handle the "already quoted" case in the replacement function.
 static HYPHENATED_TOKEN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+").expect("hyphenated regex"));
+    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+").unwrap_or_else(|_| unreachable!()));
 
 /// Multiple consecutive spaces
 static MULTI_SPACE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r" {2,}").expect("multi-space regex"));
+    LazyLock::new(|| Regex::new(r" {2,}").unwrap_or_else(|_| unreachable!()));
 
 /// Canonical supported structured-hint fields.
 const QUERY_HINT_FIELDS: &[&str] = &["from", "thread", "project", "before", "after", "importance"];

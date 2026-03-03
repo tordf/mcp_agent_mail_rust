@@ -805,7 +805,7 @@ impl LayoutComposition {
     #[must_use]
     pub fn primary(&self) -> Rect {
         self.rect(PanelSlot::Primary)
-            .expect("primary panel should always exist")
+            .unwrap_or_default()
     }
 }
 
