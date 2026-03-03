@@ -26,6 +26,7 @@ pub mod mcp_config;
 pub mod memory;
 pub mod metrics;
 pub mod models;
+pub mod pane_identity;
 pub mod pattern_overlap;
 pub mod search_types;
 pub mod setup;
@@ -94,5 +95,10 @@ pub use search_types::{
     ImportanceFilter, ScoreFactor, SearchFilter, SearchHit, SearchMode, SearchQuery, SearchResults,
     StageExplanation, StageScoreInput, compose_explain_report, compose_hit_explanation,
     factor_sort_cmp, missing_stage, redact_hit_explanation, redact_report_for_docs,
+};
+pub use pane_identity::{
+    canonical_identity_path, cleanup_all_stale_identities, cleanup_stale_identities,
+    list_identities, resolve_identity, resolve_identity_current_pane, write_identity,
+    write_identity_current_pane,
 };
 pub use slo::{OpClass, PoolHealth};

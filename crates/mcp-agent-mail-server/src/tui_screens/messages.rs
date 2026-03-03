@@ -2193,6 +2193,24 @@ impl MessageBrowserScreen {
         Rect::new(search.x, search.y, search.width.max(content.width), height)
     }
 
+    fn detail_content_wrap_width(area: Rect) -> usize {
+        if area.width == 0 {
+            return 80;
+        }
+        let inner_width = area.width.saturating_sub(2);
+        let width_with_scrollbar = if inner_width > 6 {
+            inner_width.saturating_sub(1)
+        } else {
+            inner_width
+        };
+        let content_width = if width_with_scrollbar > 2 {
+            width_with_scrollbar.saturating_sub(2)
+        } else {
+            width_with_scrollbar
+        };
+        usize::from(content_width.max(1))
+    }
+
     /// Rough estimate of lines in the detail panel for a message entry.
     fn detail_max_scroll(&self) -> usize {
         let Some(entry) = self.results.get(self.cursor) else {
@@ -2205,8 +2223,72 @@ impl MessageBrowserScreen {
         } else {
             usize::from(area.height.saturating_sub(2))
         };
-        let width = if area.width == 0 { 80 } else { area.width };
-        let total_lines = estimate_message_detail_lines(entry, width);
+        let content_width = Self::detail_content_wrap_width(area);
+        let total_lines = if self.detail_view_mode.get() == DetailViewMode::JsonTree {
+            let tree_snapshot = {
+                let mut tree = self.json_tree_state.borrow_mut();
+                if tree.sync_body(&entry.body_md) {
+                    tree.clamp_cursor();
+                    Some((tree.rows(), tree.cursor()))
+                } else {
+                    None
+                }
+            };
+
+            if let Some((rows, cursor)) = tree_snapshot {
+                let mut combined_lines: Vec<Line<'static>> = vec![
+                    Line::raw(format!("From:    {}", entry.from_agent)),
+                    Line::raw(format!("To:      {}", entry.to_agents)),
+                    Line::raw(format!("Subject: {}", entry.subject)),
+                ];
+                if !entry.thread_id.is_empty() {
+                    combined_lines.push(Line::raw(format!("Thread:  {}", entry.thread_id)));
+                }
+                combined_lines.push(Line::raw(format!("Project: {}", entry.project_slug)));
+                combined_lines.push(Line::raw(format!("Time:    {}", entry.timestamp_iso)));
+                combined_lines.push(Line::raw(format!("Import.: {}", entry.importance)));
+                if entry.ack_required {
+                    combined_lines.push(Line::raw("Ack:     required".to_string()));
+                }
+                if entry.id >= 0 {
+                    combined_lines.push(Line::raw(format!("ID:      #{}", entry.id)));
+                }
+                combined_lines.push(Line::raw(String::new()));
+                combined_lines.push(Line::raw("--- JSON Tree ---".to_string()));
+
+                let tp = crate::tui_theme::TuiThemePalette::current();
+                let selected_style = Style::default().fg(tp.selection_indicator).bold();
+                let marker_style = Style::default().fg(tp.text_disabled);
+                for (idx, row) in rows.iter().enumerate() {
+                    let selected = idx == cursor;
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    spans.push(Span::styled(
+                        if selected {
+                            "▸ ".to_string()
+                        } else {
+                            "  ".to_string()
+                        },
+                        if selected {
+                            selected_style
+                        } else {
+                            marker_style
+                        },
+                    ));
+                    spans.extend(row.line.spans().iter().cloned());
+                    combined_lines.push(Line::from_spans(spans));
+                }
+
+                estimate_wrapped_line_count(&combined_lines, content_width)
+            } else {
+                let width_for_estimate =
+                    u16::try_from(content_width.saturating_add(2)).unwrap_or(u16::MAX);
+                estimate_message_detail_lines(entry, width_for_estimate)
+            }
+        } else {
+            let width_for_estimate =
+                u16::try_from(content_width.saturating_add(2)).unwrap_or(u16::MAX);
+            estimate_message_detail_lines(entry, width_for_estimate)
+        };
         total_lines.saturating_sub(visible_height)
     }
 
@@ -5584,6 +5666,40 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
         assert_eq!(screen.detail_view_mode.get(), DetailViewMode::Markdown);
+    }
+
+    #[test]
+    fn detail_max_scroll_uses_json_tree_rows_when_tree_mode_active() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.last_detail_area.set(Rect::new(0, 0, 80, 12));
+        let dense_json = format!(
+            "{{{}}}",
+            (0..20)
+                .map(|i| format!("\"k{i}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        screen.results.push(MessageEntry {
+            id: 1,
+            subject: "Dense JSON".to_string(),
+            from_agent: "BlueLake".to_string(),
+            to_agents: "GreenCastle".to_string(),
+            project_slug: "proj".to_string(),
+            thread_id: String::new(),
+            timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
+            timestamp_micros: 0,
+            body_md: dense_json,
+            importance: "normal".to_string(),
+            ack_required: false,
+            show_project: false,
+        });
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
+        assert_eq!(screen.detail_view_mode.get(), DetailViewMode::JsonTree);
+        assert!(
+            screen.detail_max_scroll() > 0,
+            "json tree mode should account for expanded row count in max-scroll calculation"
+        );
     }
 
     // ── consumes_text_input ─────────────────────────────────────────

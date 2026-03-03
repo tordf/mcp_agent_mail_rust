@@ -370,6 +370,12 @@ pub enum Commands {
         #[arg(long)]
         version: Option<String>,
     },
+    /// Cross-platform service management (systemd on Linux, launchd on macOS).
+    #[command(name = "service")]
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1899,6 +1905,42 @@ pub enum ToolingCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum ServiceCommand {
+    /// Generate and register a platform-native service configuration.
+    ///
+    /// On Linux: creates a systemd user unit at ~/.config/systemd/user/agent-mail.service
+    /// On macOS: creates a LaunchAgent at ~/Library/LaunchAgents/com.agent-mail.plist
+    ///
+    /// Idempotent: safe to run multiple times.
+    Install {
+        /// Override the host the server listens on (default: 127.0.0.1).
+        #[arg(long)]
+        host: Option<String>,
+        /// Override the port the server listens on (default: 8765).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Disable bearer token authentication for the managed server.
+        #[arg(long)]
+        no_auth: bool,
+    },
+    /// Remove the service configuration and stop the running service.
+    Uninstall,
+    /// Check if the service is running, show PID, uptime, and port.
+    Status,
+    /// Tail service logs (journalctl --user on Linux, log show on macOS).
+    Logs {
+        /// Number of recent log lines to show (default: 50).
+        #[arg(long, short = 'n', default_value_t = 50)]
+        lines: u32,
+        /// Follow (tail -f style) — stream new lines as they arrive.
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
+    /// Graceful restart: SIGTERM with force-kill fallback.
+    Restart,
+}
+
 pub fn run() -> i32 {
     run_with_invocation_name("am")
 }
@@ -2076,6 +2118,7 @@ fn execute(cli: Cli) -> CliResult<()> {
                 handle_self_update_full(force, version)
             }
         }
+        Commands::Service { action } => handle_service(action),
     }
 }
 
@@ -3755,6 +3798,7 @@ fn is_sqlite_recovery_error_message(message: &str) -> bool {
         || lower.contains("cursor stack is empty")
         || lower.contains("called `option::unwrap()` on a `none` value")
         || lower.contains("internal error")
+        || lower.contains("cursor must be on a leaf")
 }
 
 fn sqlite_conn_quick_check_ok(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
@@ -3918,7 +3962,7 @@ fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
 fn sqlite_doctor_sanity_with_health_probe<F>(
     db_path: &str,
     mut health_probe: F,
-) -> CliResult<(bool, String, bool)>
+) -> CliResult<(bool, String, bool, bool)>
 where
     F: FnMut(&Path) -> CliResult<bool>,
 {
@@ -3935,6 +3979,7 @@ where
             return Ok((
                 false,
                 format!("Database file does not exist: {}", selected_path.display()),
+                false,
                 false,
             ));
         }
@@ -3990,6 +4035,7 @@ where
         return Ok((
             false,
             "Database file is 0 bytes (empty/corrupt)".to_string(),
+            used_absolute_fallback,
             fallback_due_to_missing_configured_path,
         ));
     }
@@ -4009,11 +4055,17 @@ where
                     file_size
                 )
             };
-            return Ok((true, detail, fallback_due_to_missing_configured_path));
+            return Ok((
+                true,
+                detail,
+                used_absolute_fallback,
+                fallback_due_to_missing_configured_path,
+            ));
         }
         return Ok((
             true,
             format!("quick_check OK ({file_size} bytes)"),
+            used_absolute_fallback,
             fallback_due_to_missing_configured_path,
         ));
     }
@@ -4024,11 +4076,12 @@ where
             "Health probes failed for {} (possible corruption)",
             selected_path.display()
         ),
+        used_absolute_fallback,
         fallback_due_to_missing_configured_path,
     ))
 }
 
-fn sqlite_doctor_file_sanity(db_path: &str) -> CliResult<(bool, String, bool)> {
+fn sqlite_doctor_file_sanity(db_path: &str) -> CliResult<(bool, String, bool, bool)> {
     sqlite_doctor_sanity_with_health_probe(db_path, sqlite_file_is_healthy)
 }
 
@@ -4051,6 +4104,7 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     }
 
     let backup_prefix = format!("{file_name}.backup-");
+    let backup_bak_prefix = format!("{file_name}.bak.");
     let recovery_prefix = format!("{file_name}.recovery");
     if let Ok(entries) = std::fs::read_dir(parent) {
         for entry in entries.flatten() {
@@ -4062,10 +4116,12 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
                 continue;
             };
 
-            let priority = if name.starts_with(&backup_prefix) {
+            let priority = if name.starts_with(&backup_bak_prefix) {
                 1
-            } else if name.starts_with(&recovery_prefix) {
+            } else if name.starts_with(&backup_prefix) {
                 2
+            } else if name.starts_with(&recovery_prefix) {
+                3
             } else {
                 continue;
             };
@@ -4200,6 +4256,17 @@ fn sqlite_absolute_candidate_path(path: &str) -> Option<String> {
         return None;
     }
     Some(absolute_candidate.to_string_lossy().into_owned())
+}
+
+fn resolve_sqlite_path_with_absolute_candidate(path: &str) -> String {
+    let mut resolved = path.to_string();
+    if resolved != ":memory:"
+        && !Path::new(&resolved).exists()
+        && let Some(absolute_path) = sqlite_absolute_candidate_path(&resolved)
+    {
+        resolved = absolute_path;
+    }
+    resolved
 }
 
 fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
@@ -6919,6 +6986,19 @@ fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
     }
 }
 
+fn migrate_format_requires_force(format: &mcp_agent_mail_db::migrate::TimestampFormat) -> bool {
+    matches!(
+        format,
+        mcp_agent_mail_db::migrate::TimestampFormat::Unknown(_)
+    )
+}
+
+fn migrate_format_needs_conversion_attempt(
+    format: &mcp_agent_mail_db::migrate::TimestampFormat,
+) -> bool {
+    format.needs_migration() || migrate_format_requires_force(format)
+}
+
 fn handle_migrate_cmd(
     check: bool,
     rollback: bool,
@@ -6943,7 +7023,8 @@ fn handle_migrate_cmd(
                 "cannot rollback an in-memory database".to_string(),
             ));
         }
-        return handle_migrate_rollback(Path::new(&path), backup_dir.as_deref(), force);
+        let rollback_path = resolve_sqlite_path_with_absolute_candidate(&path);
+        return handle_migrate_rollback(Path::new(&rollback_path), backup_dir.as_deref(), force);
     }
 
     if path == ":memory:" {
@@ -6951,12 +7032,7 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
-    let mut resolved_path = path.clone();
-    if !Path::new(&resolved_path).exists()
-        && let Some(abs_path) = sqlite_absolute_candidate_path(&resolved_path)
-    {
-        resolved_path = abs_path;
-    }
+    let mut resolved_path = resolve_sqlite_path_with_absolute_candidate(&path);
     let mut db_path = PathBuf::from(&resolved_path);
     if !db_path.exists() {
         ftui_runtime::ftui_println!("Database file does not exist: {resolved_path}");
@@ -6974,9 +7050,17 @@ fn handle_migrate_cmd(
     let migrate_database_url = format!("sqlite:///{}", db_path.display());
 
     ftui_runtime::ftui_println!("Database format: {format}");
+    let requires_force = migrate_format_requires_force(&format);
+    let needs_conversion_attempt = migrate_format_needs_conversion_attempt(&format);
 
     if check {
         // --check mode: just report and exit
+        if requires_force {
+            ftui_runtime::ftui_println!(
+                "Unknown timestamp format detected. Run `am migrate --force` to attempt migration with backup."
+            );
+            return Ok(());
+        }
         if format.needs_migration() {
             ftui_runtime::ftui_println!("Migration needed: run `am migrate` to convert.");
             return Ok(());
@@ -6986,14 +7070,14 @@ fn handle_migrate_cmd(
     }
 
     // For Unknown format, require --force before any mutating operation.
-    if matches!(format, migrate::TimestampFormat::Unknown(_)) && !force {
+    if requires_force && !force {
         return Err(CliError::Other(
             "unknown timestamp format detected; use --force to migrate anyway".to_string(),
         ));
     }
 
-    // Create a pristine backup before schema migration for legacy-format DBs.
-    let mut backup_path = if format.needs_migration() {
+    // Create a pristine backup before schema migration whenever conversion may be attempted.
+    let mut backup_path = if needs_conversion_attempt {
         let path = create_db_backup(&db_path, backup_dir.as_deref())?;
         ftui_runtime::ftui_println!("Backup created: {}", path.display());
         Some(path)
@@ -7011,7 +7095,7 @@ fn handle_migrate_cmd(
                     snapshot.display()
                 ))
             })?;
-            if is_sqlite_recovery_error_message(&schema_err.to_string()) && format.needs_migration()
+            if is_sqlite_recovery_error_message(&schema_err.to_string()) && needs_conversion_attempt
             {
                 used_schema_fallback = true;
                 ftui_runtime::ftui_eprintln!(
@@ -7026,11 +7110,15 @@ fn handle_migrate_cmd(
     }
 
     // Step 2: Capture pre-conversion row counts.
-    let conn = open_db_sync_with_database_url(&migrate_database_url)?;
+    // Reopen without schema-init side effects: fallback path intentionally avoids
+    // unstable schema DDL and should proceed directly to timestamp conversion.
+    let (conn, _opened_path) = open_sqlite_with_fallback(&resolved_path)?;
     let before_counts = collect_table_row_counts(&conn);
 
-    if !format.needs_migration() {
-        ftui_runtime::ftui_println!("Database is already in Rust format. No migration needed.");
+    if !needs_conversion_attempt {
+        ftui_runtime::ftui_println!(
+            "Database does not contain migratable TEXT timestamps. No timestamp conversion needed."
+        );
         return Ok(());
     }
 
@@ -7050,10 +7138,7 @@ fn handle_migrate_cmd(
     let summary = migrate::convert_all_timestamps(&conn)
         .map_err(|e| CliError::Other(format!("timestamp conversion failed: {e}")))?;
 
-    // Step 5: VACUUM to reclaim space
-    let _ = conn.execute_raw("VACUUM");
-
-    // Step 6: Verify
+    // Step 5: Verify
     let after = migrate::detect_timestamp_format(&conn)
         .map_err(|e| CliError::Other(format!("post-migration verification failed: {e}")))?;
     let verification = verify_migration_integrity(&conn, &before_counts);
@@ -7102,6 +7187,12 @@ fn handle_migrate_cmd(
     if after.needs_migration() {
         ftui_runtime::ftui_eprintln!(
             "Warning: database still contains TEXT timestamps after migration."
+        );
+        ftui_runtime::ftui_eprintln!("  Post-migration format: {after}");
+    }
+    if matches!(after, migrate::TimestampFormat::Unknown(_)) {
+        ftui_runtime::ftui_eprintln!(
+            "Warning: post-migration timestamp format is still unknown; inspect DB contents manually."
         );
         ftui_runtime::ftui_eprintln!("  Post-migration format: {after}");
     }
@@ -9863,14 +9954,14 @@ fn handle_doctor_check_with(
     let mut db_file_sanity_failed = false;
 
     // Check 1: Database accessible (non-mutating; avoid auto-recovery side effects).
-    let (db_ok, db_status, db_detail) = match open_db_for_doctor_check_with_context(database_url)
+    let (db_status, db_detail) = match open_db_for_doctor_check_with_context(database_url)
         .and_then(|opened| {
             opened
                 .conn
                 .query_sync("SELECT 1 AS one", &[])
                 .map(|_| ())
                 .map_err(|e| CliError::Other(format!("database probe failed: {e}")))?;
-            let status = if opened.fallback_due_to_missing_configured_path {
+            let status = if opened.used_absolute_fallback {
                 "warn"
             } else {
                 "ok"
@@ -9894,8 +9985,8 @@ fn handle_doctor_check_with(
             };
             Ok((status, detail))
         }) {
-        Ok((status, detail)) => (true, status.to_string(), detail),
-        Err(e) => (false, "fail".to_string(), format!("Cannot open database: {e}")),
+        Ok((status, detail)) => (status.to_string(), detail),
+        Err(e) => ("fail".to_string(), format!("Cannot open database: {e}")),
     };
     checks.push(serde_json::json!({
         "check": "database",
@@ -9913,16 +10004,17 @@ fn handle_doctor_check_with(
             Ok(db_path) => {
                 if db_path != ":memory:" {
                     match sqlite_doctor_file_sanity(&db_path) {
-                        Ok((qc_ok, detail, fallback_due_to_missing_configured_path)) => {
+                        Ok((
+                            qc_ok,
+                            detail,
+                            used_absolute_fallback,
+                            _fallback_due_to_missing_configured_path,
+                        )) => {
                             if !qc_ok {
                                 db_file_sanity_failed = true;
                             }
                             let status = if qc_ok {
-                                if fallback_due_to_missing_configured_path {
-                                    "warn"
-                                } else {
-                                    "ok"
-                                }
+                                if used_absolute_fallback { "warn" } else { "ok" }
                             } else {
                                 "fail"
                             };
@@ -12937,6 +13029,542 @@ fn truncate_str(s: &str, max: usize) -> String {
         let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{truncated}...")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Service management (systemd on Linux, launchd on macOS)
+// ---------------------------------------------------------------------------
+
+/// Service name constants.
+const SERVICE_NAME: &str = "agent-mail";
+const SYSTEMD_UNIT_NAME: &str = "agent-mail.service";
+const LAUNCHD_LABEL: &str = "com.agent-mail";
+
+fn handle_service(action: ServiceCommand) -> CliResult<()> {
+    match action {
+        ServiceCommand::Install {
+            host,
+            port,
+            no_auth,
+        } => handle_service_install(host, port, no_auth),
+        ServiceCommand::Uninstall => handle_service_uninstall(),
+        ServiceCommand::Status => handle_service_status(),
+        ServiceCommand::Logs { lines, follow } => handle_service_logs(lines, follow),
+        ServiceCommand::Restart => handle_service_restart(),
+    }
+}
+
+/// Resolve the absolute path to the current `am` binary.
+fn resolve_am_binary_path() -> CliResult<PathBuf> {
+    std::env::current_exe()
+        .map_err(|e| CliError::Other(format!("cannot resolve am binary path: {e}")))
+        .map(|p| {
+            // Follow symlinks to the real binary.
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
+}
+
+/// Detect the current platform service backend.
+enum ServiceBackend {
+    Systemd,
+    Launchd,
+}
+
+fn detect_service_backend() -> CliResult<ServiceBackend> {
+    if cfg!(target_os = "macos") {
+        Ok(ServiceBackend::Launchd)
+    } else if cfg!(target_os = "linux") {
+        Ok(ServiceBackend::Systemd)
+    } else {
+        Err(CliError::Other(
+            "service management is only supported on Linux (systemd) and macOS (launchd)"
+                .to_string(),
+        ))
+    }
+}
+
+// -- Install ----------------------------------------------------------------
+
+fn handle_service_install(host: Option<String>, port: Option<u16>, no_auth: bool) -> CliResult<()> {
+    let am_bin = resolve_am_binary_path()?;
+    let backend = detect_service_backend()?;
+
+    match backend {
+        ServiceBackend::Systemd => service_install_systemd(&am_bin, host, port, no_auth),
+        ServiceBackend::Launchd => service_install_launchd(&am_bin, host, port, no_auth),
+    }
+}
+
+fn service_install_systemd(
+    am_bin: &Path,
+    host: Option<String>,
+    port: Option<u16>,
+    no_auth: bool,
+) -> CliResult<()> {
+    let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
+    let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
+    std::fs::create_dir_all(&unit_dir)?;
+
+    let unit_path = unit_dir.join(SYSTEMD_UNIT_NAME);
+
+    let listen_host = host.as_deref().unwrap_or("127.0.0.1");
+    let listen_port = port.unwrap_or(8765);
+
+    let mut exec_args = format!(
+        "{} serve-http --host {} --port {} --no-tui",
+        am_bin.display(),
+        listen_host,
+        listen_port,
+    );
+    if no_auth {
+        exec_args.push_str(" --no-auth");
+    }
+
+    let unit_content = format!(
+        r#"[Unit]
+Description=MCP Agent Mail Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={exec_args}
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
+"#,
+    );
+
+    std::fs::write(&unit_path, &unit_content)?;
+    ftui_runtime::ftui_println!("Wrote {}", unit_path.display());
+
+    // Reload and enable+start
+    run_cmd("systemctl", &["--user", "daemon-reload"])?;
+    run_cmd(
+        "systemctl",
+        &["--user", "enable", "--now", SYSTEMD_UNIT_NAME],
+    )?;
+
+    ftui_runtime::ftui_println!(
+        "Service installed and started (systemd user unit: {})",
+        SYSTEMD_UNIT_NAME
+    );
+    ftui_runtime::ftui_println!("Listening on http://{}:{}", listen_host, listen_port);
+    Ok(())
+}
+
+fn service_install_launchd(
+    am_bin: &Path,
+    host: Option<String>,
+    port: Option<u16>,
+    no_auth: bool,
+) -> CliResult<()> {
+    let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
+    let agents_dir = PathBuf::from(&home).join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents_dir)?;
+
+    let plist_path = agents_dir.join(format!("{LAUNCHD_LABEL}.plist"));
+
+    let listen_host = host.as_deref().unwrap_or("127.0.0.1");
+    let listen_port = port.unwrap_or(8765);
+
+    let log_dir = PathBuf::from(&home).join("Library/Logs/agent-mail");
+    std::fs::create_dir_all(&log_dir)?;
+
+    let mut args_xml = format!(
+        r#"        <string>{am_bin}</string>
+        <string>serve-http</string>
+        <string>--host</string>
+        <string>{listen_host}</string>
+        <string>--port</string>
+        <string>{listen_port}</string>
+        <string>--no-tui</string>"#,
+        am_bin = am_bin.display(),
+    );
+    if no_auth {
+        args_xml.push_str("\n        <string>--no-auth</string>");
+    }
+
+    let plist_content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+{args_xml}
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{log_dir}/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
+"#,
+        log_dir = log_dir.display(),
+    );
+
+    // Stop existing job first (ignore errors — may not be loaded).
+    let _ = run_cmd(
+        "launchctl",
+        &[
+            "bootout",
+            &format!("gui/{}", get_uid()),
+            &plist_path.display().to_string(),
+        ],
+    );
+
+    std::fs::write(&plist_path, &plist_content)?;
+    ftui_runtime::ftui_println!("Wrote {}", plist_path.display());
+
+    run_cmd(
+        "launchctl",
+        &[
+            "bootstrap",
+            &format!("gui/{}", get_uid()),
+            &plist_path.display().to_string(),
+        ],
+    )?;
+
+    ftui_runtime::ftui_println!("Service installed and started (LaunchAgent: {LAUNCHD_LABEL})");
+    ftui_runtime::ftui_println!("Listening on http://{}:{}", listen_host, listen_port);
+    Ok(())
+}
+
+// -- Uninstall --------------------------------------------------------------
+
+fn handle_service_uninstall() -> CliResult<()> {
+    let backend = detect_service_backend()?;
+    match backend {
+        ServiceBackend::Systemd => service_uninstall_systemd(),
+        ServiceBackend::Launchd => service_uninstall_launchd(),
+    }
+}
+
+fn service_uninstall_systemd() -> CliResult<()> {
+    // Stop and disable.
+    let _ = run_cmd("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME]);
+    let _ = run_cmd("systemctl", &["--user", "disable", SYSTEMD_UNIT_NAME]);
+
+    let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
+    let unit_path = PathBuf::from(&home)
+        .join(".config/systemd/user")
+        .join(SYSTEMD_UNIT_NAME);
+
+    if unit_path.exists() {
+        std::fs::remove_file(&unit_path)?;
+        ftui_runtime::ftui_println!("Removed {}", unit_path.display());
+    } else {
+        ftui_runtime::ftui_println!("Unit file not found (already removed?)");
+    }
+
+    run_cmd("systemctl", &["--user", "daemon-reload"])?;
+    ftui_runtime::ftui_println!("Service uninstalled");
+    Ok(())
+}
+
+fn service_uninstall_launchd() -> CliResult<()> {
+    let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
+    let plist_path = PathBuf::from(&home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+
+    if plist_path.exists() {
+        let _ = run_cmd(
+            "launchctl",
+            &[
+                "bootout",
+                &format!("gui/{}", get_uid()),
+                &plist_path.display().to_string(),
+            ],
+        );
+        std::fs::remove_file(&plist_path)?;
+        ftui_runtime::ftui_println!("Removed {}", plist_path.display());
+    } else {
+        ftui_runtime::ftui_println!("Plist not found (already removed?)");
+    }
+
+    ftui_runtime::ftui_println!("Service uninstalled");
+    Ok(())
+}
+
+// -- Status -----------------------------------------------------------------
+
+fn handle_service_status() -> CliResult<()> {
+    let backend = detect_service_backend()?;
+    match backend {
+        ServiceBackend::Systemd => service_status_systemd(),
+        ServiceBackend::Launchd => service_status_launchd(),
+    }
+}
+
+fn service_status_systemd() -> CliResult<()> {
+    // Show rich status via systemctl.
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "status", SYSTEMD_UNIT_NAME])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !stdout.is_empty() {
+        ftui_runtime::ftui_println!("{}", stdout.trim_end());
+    }
+    if !stderr.is_empty() {
+        ftui_runtime::ftui_eprintln!("{}", stderr.trim_end());
+    }
+
+    // systemctl status exits 3 when the service is stopped — that's informational, not an error.
+    if !output.status.success() && output.status.code() != Some(3) {
+        // Check if the unit even exists.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let unit_path = PathBuf::from(&home)
+            .join(".config/systemd/user")
+            .join(SYSTEMD_UNIT_NAME);
+        if !unit_path.exists() {
+            ftui_runtime::ftui_println!(
+                "Service is not installed. Run `am service install` first."
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn service_status_launchd() -> CliResult<()> {
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &format!("gui/{}/{LAUNCHD_LABEL}", get_uid())])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        ftui_runtime::ftui_println!("{}", stdout.trim_end());
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let plist_path = PathBuf::from(&home)
+            .join("Library/LaunchAgents")
+            .join(format!("{LAUNCHD_LABEL}.plist"));
+        if plist_path.exists() {
+            ftui_runtime::ftui_println!("Service is installed but not running.");
+            if !stderr.is_empty() {
+                ftui_runtime::ftui_eprintln!("{}", stderr.trim_end());
+            }
+        } else {
+            ftui_runtime::ftui_println!(
+                "Service is not installed. Run `am service install` first."
+            );
+        }
+    }
+
+    // Supplement with a port check — try to reach the HTTP endpoint.
+    service_probe_http();
+
+    Ok(())
+}
+
+/// Quick HTTP probe against the default port for supplementary status info.
+fn service_probe_http() {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let addr = "127.0.0.1:8765";
+    match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(500)) {
+        Ok(_) => ftui_runtime::ftui_println!("Port 8765: reachable (server responding)"),
+        Err(_) => ftui_runtime::ftui_println!("Port 8765: not reachable"),
+    }
+}
+
+// -- Logs -------------------------------------------------------------------
+
+fn handle_service_logs(lines: u32, follow: bool) -> CliResult<()> {
+    let backend = detect_service_backend()?;
+    match backend {
+        ServiceBackend::Systemd => service_logs_systemd(lines, follow),
+        ServiceBackend::Launchd => service_logs_launchd(lines, follow),
+    }
+}
+
+fn service_logs_systemd(lines: u32, follow: bool) -> CliResult<()> {
+    let mut args = vec![
+        "--user".to_string(),
+        "-u".to_string(),
+        SYSTEMD_UNIT_NAME.to_string(),
+        "-n".to_string(),
+        lines.to_string(),
+        "--no-pager".to_string(),
+    ];
+    if follow {
+        args.push("-f".to_string());
+    }
+
+    let status = std::process::Command::new("journalctl")
+        .args(&args)
+        .status()?;
+
+    if !status.success() {
+        return Err(CliError::Other(format!(
+            "journalctl exited with code {}",
+            status.code().unwrap_or(-1)
+        )));
+    }
+    Ok(())
+}
+
+fn service_logs_launchd(lines: u32, follow: bool) -> CliResult<()> {
+    let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
+    let log_dir = PathBuf::from(&home).join("Library/Logs/agent-mail");
+    let stderr_log = log_dir.join("stderr.log");
+    let stdout_log = log_dir.join("stdout.log");
+
+    // Prefer stderr.log (where Rust tracing/log output goes), fall back to stdout.
+    let log_file = if stderr_log.exists() {
+        &stderr_log
+    } else if stdout_log.exists() {
+        &stdout_log
+    } else {
+        ftui_runtime::ftui_println!(
+            "No log files found in {}. Has the service been started?",
+            log_dir.display()
+        );
+        return Ok(());
+    };
+
+    if follow {
+        let status = std::process::Command::new("tail")
+            .args([
+                "-n",
+                &lines.to_string(),
+                "-f",
+                &log_file.display().to_string(),
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(CliError::Other("tail exited with error".to_string()));
+        }
+    } else {
+        let status = std::process::Command::new("tail")
+            .args(["-n", &lines.to_string(), &log_file.display().to_string()])
+            .status()?;
+        if !status.success() {
+            return Err(CliError::Other("tail exited with error".to_string()));
+        }
+    }
+    Ok(())
+}
+
+// -- Restart ----------------------------------------------------------------
+
+fn handle_service_restart() -> CliResult<()> {
+    let backend = detect_service_backend()?;
+    match backend {
+        ServiceBackend::Systemd => service_restart_systemd(),
+        ServiceBackend::Launchd => service_restart_launchd(),
+    }
+}
+
+fn service_restart_systemd() -> CliResult<()> {
+    ftui_runtime::ftui_println!("Restarting {SERVICE_NAME} via systemd...");
+    run_cmd("systemctl", &["--user", "restart", SYSTEMD_UNIT_NAME])?;
+    ftui_runtime::ftui_println!("Service restarted");
+    Ok(())
+}
+
+fn service_restart_launchd() -> CliResult<()> {
+    ftui_runtime::ftui_println!("Restarting {SERVICE_NAME} via launchd...");
+
+    let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
+    let plist_path = PathBuf::from(&home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+
+    if !plist_path.exists() {
+        return Err(CliError::Other(
+            "Service is not installed. Run `am service install` first.".to_string(),
+        ));
+    }
+
+    let domain_target = format!("gui/{}/{LAUNCHD_LABEL}", get_uid());
+
+    // Try graceful stop first (kickstart -k sends SIGTERM then restarts).
+    let result = run_cmd("launchctl", &["kickstart", "-kp", &domain_target]);
+
+    if result.is_err() {
+        // Fallback: bootout + bootstrap
+        ftui_runtime::ftui_println!("Kickstart failed, falling back to bootout+bootstrap...");
+        let _ = run_cmd(
+            "launchctl",
+            &[
+                "bootout",
+                &format!("gui/{}", get_uid()),
+                &plist_path.display().to_string(),
+            ],
+        );
+        // Brief pause to allow the process to exit.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        run_cmd(
+            "launchctl",
+            &[
+                "bootstrap",
+                &format!("gui/{}", get_uid()),
+                &plist_path.display().to_string(),
+            ],
+        )?;
+    }
+
+    ftui_runtime::ftui_println!("Service restarted");
+    Ok(())
+}
+
+// -- Helpers ----------------------------------------------------------------
+
+/// Run an external command, returning an error on non-zero exit.
+fn run_cmd(program: &str, args: &[&str]) -> CliResult<()> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| CliError::Other(format!("failed to run {program}: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::Other(format!(
+            "{program} {} exited with code {}: {}",
+            args.join(" "),
+            output.status.code().unwrap_or(-1),
+            stderr.trim_end()
+        )));
+    }
+    Ok(())
+}
+
+/// Get the current user's UID (for launchd domain-target).
+fn get_uid() -> u32 {
+    // Use the `id -u` command to avoid a libc dependency and stay within forbid(unsafe_code).
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(501) // 501 is the typical first user UID on macOS
 }
 
 #[cfg(test)]
@@ -22809,6 +23437,43 @@ mod tests {
     }
 
     #[test]
+    fn resolve_sqlite_path_with_absolute_candidate_prefers_existing_absolute_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("resolve_absolute.sqlite3");
+        std::fs::write(&absolute_db, b"seed").expect("write absolute db");
+
+        let relative_path = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        assert!(
+            !relative_path.exists(),
+            "relative fixture should be absent so absolute fallback path is exercised"
+        );
+
+        let resolved =
+            resolve_sqlite_path_with_absolute_candidate(&relative_path.display().to_string());
+        assert_eq!(
+            resolved,
+            absolute_db.to_string_lossy(),
+            "resolver should prefer existing absolute candidate when relative path is missing"
+        );
+    }
+
+    #[test]
+    fn resolve_sqlite_path_with_absolute_candidate_keeps_explicit_relative_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("resolve_explicit_relative.sqlite3");
+        std::fs::write(&absolute_db, b"seed").expect("write absolute db");
+
+        let relative_path = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        let explicit_relative = format!("./{}", relative_path.display());
+
+        let resolved = resolve_sqlite_path_with_absolute_candidate(&explicit_relative);
+        assert_eq!(
+            resolved, explicit_relative,
+            "explicit relative sqlite paths must not be rewritten to absolute fallback candidates"
+        );
+    }
+
+    #[test]
     fn doctor_check_uses_absolute_fallback_for_malformed_relative_database_url() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -22841,8 +23506,16 @@ mod tests {
         assert_eq!(database["status"], "warn");
         let database_detail = database["detail"].as_str().unwrap_or_default();
         assert!(
-            database_detail.contains("configured path missing"),
-            "database check should explain configured path mismatch, got: {database_detail}"
+            database_detail.contains("absolute fallback"),
+            "database check should mention absolute fallback path, got: {database_detail}"
+        );
+        assert!(
+            database_detail.contains("configured path:"),
+            "database check should include configured-path context, got: {database_detail}"
+        );
+        assert!(
+            !database_detail.contains("configured path missing"),
+            "malformed-relative case should not report missing configured path: {database_detail}"
         );
 
         let sanity = checks
@@ -22854,10 +23527,6 @@ mod tests {
         assert!(
             detail.contains("absolute fallback"),
             "db_file_sanity should mention absolute fallback, got: {detail}"
-        );
-        assert!(
-            detail.contains("configured path missing"),
-            "db_file_sanity should mention configured path mismatch, got: {detail}"
         );
 
         let _ = std::fs::remove_file(&relative_path);
@@ -22899,17 +23568,30 @@ mod tests {
             .iter()
             .find(|c| c["check"].as_str() == Some("database"))
             .expect("database check");
-        assert_eq!(database["status"], "ok");
+        assert_eq!(database["status"], "warn");
+        let database_detail = database["detail"].as_str().unwrap_or_default();
+        assert!(
+            database_detail.contains("absolute fallback"),
+            "database check should mention absolute fallback path, got: {database_detail}"
+        );
+        assert!(
+            database_detail.contains("configured path missing"),
+            "database check should include missing-configured-path context, got: {database_detail}"
+        );
 
         let sanity = checks
             .iter()
             .find(|c| c["check"].as_str() == Some("db_file_sanity"))
             .expect("db_file_sanity check");
-        assert_eq!(sanity["status"], "ok");
+        assert_eq!(sanity["status"], "warn");
         let detail = sanity["detail"].as_str().unwrap_or_default();
         assert!(
             detail.contains("absolute fallback"),
             "db_file_sanity should mention absolute fallback, got: {detail}"
+        );
+        assert!(
+            detail.contains("configured path missing"),
+            "db_file_sanity should include missing-configured-path context, got: {detail}"
         );
 
         assert!(
@@ -23111,6 +23793,47 @@ mod tests {
         assert!(is_sqlite_recovery_error_message(
             "Query error: cursor stack is empty"
         ));
+        assert!(is_sqlite_recovery_error_message(
+            "Query error: cursor must be on a leaf"
+        ));
+    }
+
+    #[test]
+    fn migrate_format_conversion_attempt_logic_handles_unknown_formats() {
+        use mcp_agent_mail_db::migrate::TimestampFormat;
+
+        assert!(migrate_format_needs_conversion_attempt(
+            &TimestampFormat::PythonText
+        ));
+        assert!(migrate_format_needs_conversion_attempt(
+            &TimestampFormat::Mixed {
+                text_tables: vec!["messages".to_string()]
+            }
+        ));
+        assert!(migrate_format_needs_conversion_attempt(
+            &TimestampFormat::Unknown("blob".to_string())
+        ));
+        assert!(!migrate_format_needs_conversion_attempt(
+            &TimestampFormat::RustMicros
+        ));
+        assert!(!migrate_format_needs_conversion_attempt(
+            &TimestampFormat::Empty
+        ));
+    }
+
+    #[test]
+    fn migrate_format_force_requirement_only_applies_to_unknown() {
+        use mcp_agent_mail_db::migrate::TimestampFormat;
+
+        assert!(migrate_format_requires_force(&TimestampFormat::Unknown(
+            "blob".to_string()
+        )));
+        assert!(!migrate_format_requires_force(&TimestampFormat::PythonText));
+        assert!(!migrate_format_requires_force(&TimestampFormat::Mixed {
+            text_tables: vec!["messages".to_string()]
+        }));
+        assert!(!migrate_format_requires_force(&TimestampFormat::RustMicros));
+        assert!(!migrate_format_requires_force(&TimestampFormat::Empty));
     }
 
     #[test]
@@ -23137,6 +23860,40 @@ mod tests {
             .expect("query marker");
         let marker: String = rows.first().unwrap().get_named("value").unwrap();
         assert_eq!(marker, "from-backup", "should restore from .bak backup");
+    }
+
+    #[test]
+    fn recover_sqlite_file_restores_timestamped_bak_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+        conn.execute_raw("CREATE TABLE marker(value TEXT)")
+            .expect("create marker table");
+        conn.execute_raw("INSERT INTO marker(value) VALUES('from-ts-backup')")
+            .expect("seed marker");
+        let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+        drop(conn);
+
+        let backup_path = db_path.with_file_name(format!(
+            "{}.bak.20260303_000000",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::copy(&db_path, &backup_path).expect("create timestamped .bak backup");
+        std::fs::write(&db_path, b"THIS FILE IS CORRUPT").expect("corrupt primary");
+
+        recover_sqlite_file(&db_path).expect("recover from timestamped backup");
+        let reopened =
+            mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open restored db");
+        let rows = reopened
+            .query_sync("SELECT value FROM marker", &[])
+            .expect("query marker");
+        let marker: String = rows.first().unwrap().get_named("value").unwrap();
+        assert_eq!(
+            marker, "from-ts-backup",
+            "should restore from .bak.<timestamp>"
+        );
     }
 
     #[test]

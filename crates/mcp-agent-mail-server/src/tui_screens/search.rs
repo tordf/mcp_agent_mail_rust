@@ -2288,23 +2288,45 @@ impl SearchCockpitScreen {
         area.width > 0 && area.height > 0
     }
 
+    fn detail_content_wrap_width(area: Rect) -> usize {
+        if area.width == 0 {
+            return 80;
+        }
+        let inner_width = area.width.saturating_sub(2);
+        let width_with_scrollbar = if inner_width > 6 {
+            inner_width.saturating_sub(1)
+        } else {
+            inner_width
+        };
+        let content_width = if width_with_scrollbar > 2 {
+            width_with_scrollbar.saturating_sub(2)
+        } else {
+            width_with_scrollbar
+        };
+        usize::from(content_width.max(1))
+    }
+
+    fn detail_visible_rows(area: Rect) -> usize {
+        if area.height == 0 {
+            return 8;
+        }
+        let inner_height = area.height.saturating_sub(2);
+        let content_height = inner_height.saturating_sub(1); // action bar
+        let paragraph_height = if content_height > 1 {
+            content_height.saturating_sub(1) // top padding before paragraph
+        } else {
+            content_height
+        };
+        usize::from(paragraph_height.max(1))
+    }
+
     fn detail_max_scroll(&self) -> usize {
         let Some(entry) = self.results.get(self.cursor) else {
             return 0;
         };
         let area = self.last_detail_area.get();
-        // Border (2) + action bar (1) are fixed; only content body scrolls.
-        // Fallback viewport for pre-render calls (unit tests or early key events).
-        let visible = if area.height <= 3 {
-            8
-        } else {
-            usize::from(area.height.saturating_sub(3))
-        };
-        let width = if area.width == 0 {
-            80
-        } else {
-            area.width.saturating_sub(2).max(1)
-        };
+        let visible = Self::detail_visible_rows(area);
+        let width = Self::detail_content_wrap_width(area);
         let total = if self.detail_view_mode.get() == DetailViewMode::JsonTree {
             let tree_snapshot = entry.full_body.as_deref().and_then(|body| {
                 let mut tree = self.json_tree_state.borrow_mut();
@@ -2328,14 +2350,14 @@ impl SearchCockpitScreen {
                     Some(rows.as_slice()),
                     cursor,
                 );
-                estimate_wrapped_text_lines(&detail_text, usize::from(width))
+                estimate_wrapped_text_lines(&detail_text, width)
             } else {
                 let detail_text = self.cached_rendered_detail(entry);
-                estimate_wrapped_text_lines(detail_text.as_ref(), usize::from(width))
+                estimate_wrapped_text_lines(detail_text.as_ref(), width)
             }
         } else {
             let detail_text = self.cached_rendered_detail(entry);
-            estimate_wrapped_text_lines(detail_text.as_ref(), usize::from(width))
+            estimate_wrapped_text_lines(detail_text.as_ref(), width)
         };
         total.saturating_sub(visible)
     }
@@ -5286,7 +5308,7 @@ fn render_detail(
         return;
     }
 
-    let visible = usize::from(content_h);
+    let visible = usize::from(content_area.height.max(1));
     let line_count = detail_text.lines().len().max(1);
     let total_estimated = if line_count <= visible {
         line_count

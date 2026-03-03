@@ -1599,12 +1599,14 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
         .unwrap_or("storage.sqlite3");
     let quarantined_db = primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
 
-    std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
-        SqlError::Custom(format!(
-            "failed to quarantine corrupted database {}: {e}",
-            primary_path.display()
-        ))
-    })?;
+    if primary_path.exists() {
+        std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to quarantine corrupted database {}: {e}",
+                primary_path.display()
+            ))
+        })?;
+    }
 
     if let Err(e) = quarantine_sidecar(primary_path, "-wal", &timestamp) {
         tracing::warn!(

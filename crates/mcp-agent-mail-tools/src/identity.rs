@@ -630,6 +630,22 @@ Check that all parameters have valid values."
     });
     try_write_agent_profile(config, &project.slug, &agent_json);
 
+    // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
+    if let Some(result) = mcp_agent_mail_core::write_identity_current_pane(&project_key, &row.name)
+    {
+        match result {
+            Ok(path) => {
+                tracing::debug!(
+                    "wrote pane identity file: {}",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("failed to write pane identity file: {e}");
+            }
+        }
+    }
+
     let response = AgentResponse {
         id: row.id.unwrap_or(0),
         name: row.name,
@@ -825,6 +841,22 @@ Choose a different name (or omit the name to auto-generate one)."
     });
     try_write_agent_profile(config, &project.slug, &agent_json);
 
+    // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
+    if let Some(result) = mcp_agent_mail_core::write_identity_current_pane(&project_key, &row.name)
+    {
+        match result {
+            Ok(path) => {
+                tracing::debug!(
+                    "wrote pane identity file: {}",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("failed to write pane identity file: {e}");
+            }
+        }
+    }
+
     let response = AgentResponse {
         id: row.id.unwrap_or(0),
         name: row.name,
@@ -938,6 +970,99 @@ pub async fn whois(
         },
         recent_commits,
     };
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+/// Resolve the agent name for a tmux pane from the canonical identity file.
+///
+/// # Parameters
+/// - `project_key`: Absolute path to the project directory
+/// - `pane_id`: Optional tmux pane identifier (reads $TMUX_PANE if omitted)
+///
+/// # Returns
+/// The agent name if found, or an error if no identity file exists.
+#[tool(
+    description = "Resolve the agent name for a tmux pane from the canonical per-pane identity file.\n\nChecks the following locations in priority order:\n1. Canonical: ~/.config/agent-mail/identity/<project_hash>/<pane_id>\n2. Legacy Claude Code: ~/.claude/agent-mail/identity.<pane_id>\n3. Legacy NTM: /tmp/agent-mail-name.<project_hash>.<pane_id>\n\nParameters\n----------\nproject_key : str\n    Absolute path to the project directory (used to scope the lookup).\npane_id : Optional[str]\n    Tmux pane identifier (e.g., \"%0\", \"%3\"). If omitted, reads $TMUX_PANE.\n\nReturns\n-------\ndict\n    { agent_name, pane_id, identity_path }"
+)]
+pub async fn resolve_pane_identity(
+    _ctx: &McpContext,
+    project_key: String,
+    pane_id: Option<String>,
+) -> McpResult<String> {
+    let effective_pane = match pane_id {
+        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+        _ => std::env::var("TMUX_PANE").unwrap_or_default(),
+    };
+
+    if effective_pane.is_empty() {
+        return Err(legacy_tool_error(
+            "MISSING_PANE_ID",
+            "No pane_id provided and $TMUX_PANE is not set. \
+             Provide pane_id explicitly or run inside a tmux session.",
+            true,
+            json!({}),
+        ));
+    }
+
+    let canonical_path =
+        mcp_agent_mail_core::canonical_identity_path(&project_key, &effective_pane);
+
+    match mcp_agent_mail_core::resolve_identity(&project_key, &effective_pane) {
+        Some(agent_name) => {
+            let response = json!({
+                "agent_name": agent_name,
+                "pane_id": effective_pane,
+                "identity_path": canonical_path.to_string_lossy(),
+            });
+            serde_json::to_string(&response)
+                .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+        }
+        None => Err(legacy_tool_error(
+            "IDENTITY_NOT_FOUND",
+            &format!(
+                "No identity file found for pane '{effective_pane}' in project '{project_key}'. \
+                 Register an agent first with register_agent or macro_start_session."
+            ),
+            false,
+            json!({
+                "pane_id": effective_pane,
+                "project_key": project_key,
+                "checked_path": canonical_path.to_string_lossy(),
+            }),
+        )),
+    }
+}
+
+/// Clean up stale per-pane identity files for dead tmux panes.
+///
+/// # Parameters
+/// - `project_key`: Optional project key to scope cleanup (cleans all projects if omitted)
+///
+/// # Returns
+/// List of removed file paths.
+#[tool(
+    description = "Remove stale per-pane identity files for tmux panes that no longer exist.\n\nQueries tmux for live panes and removes identity files that reference dead panes.\nSafety: does nothing if tmux is not running (to avoid accidentally removing everything).\n\nParameters\n----------\nproject_key : Optional[str]\n    If provided, only clean up identity files for this project.\n    If omitted, clean up across all projects.\n\nReturns\n-------\ndict\n    { removed_count, removed_paths }"
+)]
+pub async fn cleanup_pane_identities(
+    _ctx: &McpContext,
+    project_key: Option<String>,
+) -> McpResult<String> {
+    let removed = match project_key {
+        Some(key) => mcp_agent_mail_core::cleanup_stale_identities(&key),
+        None => mcp_agent_mail_core::cleanup_all_stale_identities(),
+    };
+
+    let paths: Vec<String> = removed
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    let response = json!({
+        "removed_count": removed.len(),
+        "removed_paths": paths,
+    });
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))

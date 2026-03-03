@@ -105,17 +105,18 @@ use mcp_agent_mail_db::{
     DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
 };
 use mcp_agent_mail_tools::{
-    AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, ConfigEnvironmentQueryResource,
-    ConfigEnvironmentResource, CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox,
-    FetchInboxProduct, FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation,
-    HealthCheck, IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListContacts,
-    MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
-    MailboxResource, MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource,
-    OutboxResource, ProductDetailsResource, ProductsLink, ProjectDetailsResource,
-    ProjectsListQueryResource, ProjectsListResource, RegisterAgent, ReleaseBuildSlot,
-    ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage, RequestContact,
-    RespondContact, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
-    SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
+    AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CleanupPaneIdentities,
+    ConfigEnvironmentQueryResource, ConfigEnvironmentResource, CreateAgentIdentity, EnsureProduct,
+    EnsureProject, FetchInbox, FetchInboxProduct, FileReservationPaths,
+    FileReservationsResource, ForceReleaseFileReservation, HealthCheck, IdentityProjectResource,
+    InboxResource, InstallPrecommitGuard, ListContacts, MacroContactHandshake,
+    MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
+    MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
+    ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
+    ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
+    RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
+    SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread,
+    SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
     ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
     ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
     ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
@@ -488,6 +489,20 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         CreateAgentIdentity,
     );
     let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
+    let server = add_tool(
+        server,
+        config,
+        "resolve_pane_identity",
+        clusters::IDENTITY,
+        ResolvePaneIdentity,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "cleanup_pane_identities",
+        clusters::IDENTITY,
+        CleanupPaneIdentities,
+    );
     let server = add_tool(
         server,
         config,
