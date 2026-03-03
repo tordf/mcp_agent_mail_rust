@@ -3606,4 +3606,284 @@ mod tests {
             }
         }
     }
+
+    // ── br-31zb9: theme snapshot tests (JadePine) ────────────────
+
+    /// Deterministic palette snapshot for one theme.
+    /// Returns a compact fingerprint string of key palette fields.
+    fn palette_snapshot(id: ThemeId) -> String {
+        let p = TuiThemePalette::for_theme(id);
+        format!(
+            "tab_active_bg={:08x} panel_bg={:08x} status_bg={:08x} \
+             text_primary={:08x} selection_bg={:08x} severity_critical={:08x} \
+             list_hover_bg={:08x} badge_urgent_bg={:08x}",
+            p.tab_active_bg.0,
+            p.panel_bg.0,
+            p.status_bg.0,
+            p.text_primary.0,
+            p.selection_bg.0,
+            p.severity_critical.0,
+            p.list_hover_bg.0,
+            p.badge_urgent_bg.0,
+        )
+    }
+
+    #[test]
+    fn snapshot_5_themes_produce_distinct_palettes() {
+        let themes = [
+            ThemeId::CyberpunkAurora,
+            ThemeId::Darcula,
+            ThemeId::LumenLight,
+            ThemeId::NordicFrost,
+            ThemeId::Doom,
+        ];
+        let snapshots: Vec<String> = themes.iter().map(|&id| palette_snapshot(id)).collect();
+
+        // Each snapshot must be non-empty
+        for (i, snap) in snapshots.iter().enumerate() {
+            assert!(
+                !snap.is_empty(),
+                "theme {:?} produced empty snapshot",
+                themes[i]
+            );
+        }
+
+        // All 5 must be pairwise distinct
+        for i in 0..snapshots.len() {
+            for j in (i + 1)..snapshots.len() {
+                assert_ne!(
+                    snapshots[i], snapshots[j],
+                    "themes {:?} and {:?} produced identical palette snapshots",
+                    themes[i], themes[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_cyberpunk_aurora_palette_stability() {
+        let snap = palette_snapshot(ThemeId::CyberpunkAurora);
+        // Assert that at least one key color (panel_bg) is in the dark range
+        let p = TuiThemePalette::for_theme(ThemeId::CyberpunkAurora);
+        assert!(
+            rel_luminance(p.panel_bg) < 0.15,
+            "CyberpunkAurora panel_bg should be dark (luminance {:.3})",
+            rel_luminance(p.panel_bg)
+        );
+        assert!(
+            snap.contains("panel_bg="),
+            "snapshot must contain panel_bg field"
+        );
+    }
+
+    #[test]
+    fn snapshot_lumen_light_palette_stability() {
+        let p = TuiThemePalette::for_theme(ThemeId::LumenLight);
+        assert!(
+            rel_luminance(p.panel_bg) > 0.6,
+            "LumenLight panel_bg should be light (luminance {:.3})",
+            rel_luminance(p.panel_bg)
+        );
+        assert!(
+            rel_luminance(p.text_primary) < 0.3,
+            "LumenLight text_primary should be dark text (luminance {:.3})",
+            rel_luminance(p.text_primary)
+        );
+    }
+
+    #[test]
+    fn snapshot_darcula_palette_stability() {
+        let p = TuiThemePalette::for_theme(ThemeId::Darcula);
+        assert!(
+            rel_luminance(p.panel_bg) < 0.15,
+            "Darcula panel_bg should be dark (luminance {:.3})",
+            rel_luminance(p.panel_bg)
+        );
+        assert!(
+            contrast_ratio(p.text_primary, p.panel_bg) >= 3.5,
+            "Darcula text contrast should be readable"
+        );
+    }
+
+    #[test]
+    fn snapshot_nordic_frost_palette_stability() {
+        let p = TuiThemePalette::for_theme(ThemeId::NordicFrost);
+        assert!(
+            rel_luminance(p.panel_bg) < 0.2,
+            "NordicFrost panel_bg should be dark (luminance {:.3})",
+            rel_luminance(p.panel_bg)
+        );
+        assert!(
+            contrast_ratio(p.text_primary, p.panel_bg) >= 3.0,
+            "NordicFrost text contrast should be readable"
+        );
+    }
+
+    #[test]
+    fn snapshot_doom_palette_stability() {
+        let p = TuiThemePalette::for_theme(ThemeId::Doom);
+        assert!(
+            rel_luminance(p.panel_bg) < 0.15,
+            "Doom panel_bg should be dark (luminance {:.3})",
+            rel_luminance(p.panel_bg)
+        );
+        // Doom's severity_critical should be a strong red (high R channel)
+        assert!(
+            p.severity_critical.r() > 150,
+            "Doom severity_critical should have strong red (r={})",
+            p.severity_critical.r()
+        );
+    }
+
+    #[test]
+    fn snapshot_5_themes_render_frames_without_panic() {
+        use crate::tui_app::{MailAppModel, MailMsg};
+        use crate::tui_bridge::TuiSharedState;
+        use ftui::{Event, Frame, GraphemePool, Model};
+        use mcp_agent_mail_core::Config;
+
+        let themes = [
+            ThemeId::CyberpunkAurora,
+            ThemeId::Darcula,
+            ThemeId::LumenLight,
+            ThemeId::NordicFrost,
+            ThemeId::Doom,
+        ];
+
+        for &theme_id in &themes {
+            let _guard = ScopedThemeLock::new(theme_id);
+            let config = Config::default();
+            let state = TuiSharedState::new(&config);
+            let mut model = MailAppModel::new(state);
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+            let mut pool = GraphemePool::new();
+            let mut frame = Frame::new(120, 40, &mut pool);
+            model.view(&mut frame);
+
+            assert_eq!(frame.width(), 120, "theme {:?} frame width", theme_id);
+            assert_eq!(frame.height(), 40, "theme {:?} frame height", theme_id);
+        }
+    }
+
+    #[test]
+    fn snapshot_5_themes_markdown_styles_differ() {
+        let themes = [
+            ThemeId::CyberpunkAurora,
+            ThemeId::Darcula,
+            ThemeId::LumenLight,
+            ThemeId::NordicFrost,
+            ThemeId::Doom,
+        ];
+        let mut h1_fgs = Vec::new();
+        for &theme_id in &themes {
+            let _guard = ScopedThemeLock::new(theme_id);
+            let md = markdown_theme();
+            assert!(md.h1.fg.is_some(), "theme {:?} h1 missing fg", theme_id);
+            assert!(
+                md.code_block.fg.is_some(),
+                "theme {:?} code_block missing fg",
+                theme_id
+            );
+            h1_fgs.push(md.h1.fg);
+        }
+        // At least 3 of 5 themes should produce distinct h1 colors
+        let unique: std::collections::HashSet<_> = h1_fgs.iter().collect();
+        assert!(
+            unique.len() >= 3,
+            "expected at least 3 distinct h1 colors across 5 themes, got {}",
+            unique.len()
+        );
+    }
+
+    // ── br-31zb9: 16ms budget enforcement tests (JadePine) ──────
+
+    #[test]
+    fn budget_dashboard_render_under_16ms() {
+        use crate::tui_app::{MailAppModel, MailMsg};
+        use crate::tui_bridge::TuiSharedState;
+        use crate::tui_events::MailEvent;
+        use crate::tui_screens::MailScreenId;
+        use ftui::{Event, Frame, GraphemePool, Model};
+        use mcp_agent_mail_core::Config;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+        let config = Config::default();
+        let state = TuiSharedState::with_event_capacity(&config, 2_000);
+
+        // Populate with 1000 events (realistic load)
+        for idx in 0..1000_u64 {
+            let event = MailEvent::message_received(
+                i64::try_from(idx + 1).unwrap_or(1),
+                "BudgetSender",
+                vec!["BudgetReceiver".to_string()],
+                format!("budget test message {idx}"),
+                format!("budget-thread-{}", idx % 32),
+                "budget-project",
+                "benchmark body for 16ms budget test",
+            );
+            let _ = state.push_event(event);
+        }
+
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        let _ = model.update(MailMsg::SwitchScreen(MailScreenId::Dashboard));
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+        // Warm up: render once to populate caches
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(120, 40, &mut pool);
+        model.view(&mut frame);
+
+        // Timed render (5 iterations, take median)
+        let mut durations = Vec::new();
+        for _ in 0..5 {
+            let mut pool = GraphemePool::new();
+            let mut frame = Frame::new(120, 40, &mut pool);
+            let start = Instant::now();
+            model.view(&mut frame);
+            durations.push(start.elapsed());
+        }
+        durations.sort();
+        let median = durations[2]; // median of 5
+
+        assert!(
+            median.as_millis() < 16,
+            "dashboard render should complete within 16ms budget, took {}ms (median of 5)",
+            median.as_millis()
+        );
+    }
+
+    #[test]
+    fn budget_theme_switch_under_1ms() {
+        use std::time::Instant;
+
+        let themes = [
+            ThemeId::CyberpunkAurora,
+            ThemeId::Darcula,
+            ThemeId::LumenLight,
+            ThemeId::NordicFrost,
+            ThemeId::Doom,
+        ];
+        let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
+
+        // Warm up
+        for &id in &themes {
+            let _ = set_theme_and_get_name(id);
+        }
+
+        let start = Instant::now();
+        for &id in &themes {
+            let name = set_theme_and_get_name(id);
+            assert!(!name.is_empty());
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 5,
+            "cycling 5 themes should take <5ms total, took {}ms",
+            elapsed.as_millis()
+        );
+    }
 }
