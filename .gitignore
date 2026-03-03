@@ -125,6 +125,46 @@ vendor/
 # Beads backup/conflict files
 .beads/*.bak_*
 
+# Beads DB corruption snapshots
+.beads/*.corrupt.*
+.beads/*.corrupt_*
+
+# IDE config (agent-generated)
+.vscode/
+
+# Clippy output files
+clippy.log
+clippy_output.*
+clippy_out.*
+
+# SQLite memory-mode test DB files (leaked by in-memory URI tests)
+crates/mcp-agent-mail-db/file:*
+
+# Agent-generated Python fix scripts
+/fix_*.py
+
+# Dist build output
+dist/
+
+# OpenCode config (local agent config)
+opencode.json
+
+# Python cache
+__pycache__/
+scripts/__pycache__/
+
+# SQLite corruption snapshots (timestamped)
+*.sqlite3.corrupt
+*.sqlite3.corrupt-*
+*.sqlite3-shm.corrupt-*
+*.sqlite3-wal.corrupt-*
+
+# Native TUI test artifacts
+tests/artifacts_native/
+
+# E2E TUI test scripts (ephemeral)
+tests/e2e/test_tui_*.sh
+
 # One-off test scripts at repo root
 /test_*.rs
 
