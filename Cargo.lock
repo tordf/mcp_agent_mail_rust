@@ -1479,7 +1479,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1655,7 +1655,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4193,7 +4193,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4594,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "clap",
  "criterion",
@@ -4620,7 +4620,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4656,7 +4656,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "asupersync",
  "clap",
@@ -4678,7 +4678,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "criterion",
@@ -4701,7 +4701,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4744,7 +4744,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "git2",
@@ -4759,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "criterion",
@@ -4789,7 +4789,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4828,7 +4828,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "atty",
  "base64 0.22.1",
@@ -4850,7 +4850,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4875,7 +4875,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-wasm"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -5132,7 +5132,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5400,7 +5400,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6030,7 +6030,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6524,7 +6524,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7479,7 +7479,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.3",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8503,7 +8503,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
