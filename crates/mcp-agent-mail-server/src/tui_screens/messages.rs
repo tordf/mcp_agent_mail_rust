@@ -2750,8 +2750,16 @@ impl MailScreen for MessageBrowserScreen {
                 Cmd::batch(batch)
             }
             "batch_mark_unread" => {
+                let ids = self.selected_message_ids_sorted();
                 self.clear_message_selection();
-                Cmd::None
+                let mut batch = Vec::new();
+                for id in ids {
+                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
+                        "mark_unread".to_string(),
+                        format!("msg:{id}"),
+                    )));
+                }
+                Cmd::batch(batch)
             }
             _ => Cmd::None,
         }
@@ -7064,5 +7072,100 @@ mod tests {
         assert_eq!(high.importance, "high");
         // Sender truncation in render is at 12 chars
         assert!(high.from_agent.len() > 12);
+    }
+
+    // ── Batch operation tests (br-2bbt.10) ──────────────────────────
+
+    #[test]
+    fn batch_acknowledge_dispatches_individual_actions() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(10, "thread-a", "One"));
+        screen
+            .results
+            .push(test_message_entry(20, "thread-b", "Two"));
+        screen
+            .results
+            .push(test_message_entry(30, "thread-c", "Three"));
+        screen.selected_message_ids.select(10);
+        screen.selected_message_ids.select(30);
+
+        let cmd = screen.handle_action("batch_acknowledge", "batch:10,30");
+        // Should clear selection
+        assert!(screen.selected_message_ids.is_empty());
+        // Should return a batch of individual acknowledge commands
+        match cmd {
+            Cmd::Batch(cmds) => {
+                assert_eq!(cmds.len(), 2, "should dispatch 2 acknowledge actions");
+            }
+            other => panic!("expected Cmd::Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_mark_read_dispatches_individual_actions() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(5, "thread-a", "One"));
+        screen
+            .results
+            .push(test_message_entry(6, "thread-b", "Two"));
+        screen.selected_message_ids.select(5);
+        screen.selected_message_ids.select(6);
+
+        let cmd = screen.handle_action("batch_mark_read", "batch:5,6");
+        assert!(screen.selected_message_ids.is_empty());
+        match cmd {
+            Cmd::Batch(cmds) => {
+                assert_eq!(cmds.len(), 2, "should dispatch 2 mark_read actions");
+            }
+            other => panic!("expected Cmd::Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_mark_unread_dispatches_individual_actions() {
+        let mut screen = MessageBrowserScreen::new();
+        screen
+            .results
+            .push(test_message_entry(7, "thread-a", "One"));
+        screen
+            .results
+            .push(test_message_entry(8, "thread-b", "Two"));
+        screen
+            .results
+            .push(test_message_entry(9, "thread-c", "Three"));
+        screen.selected_message_ids.select(7);
+        screen.selected_message_ids.select(8);
+        screen.selected_message_ids.select(9);
+
+        let cmd = screen.handle_action("batch_mark_unread", "batch:7,8,9");
+        assert!(screen.selected_message_ids.is_empty());
+        match cmd {
+            Cmd::Batch(cmds) => {
+                assert_eq!(cmds.len(), 3, "should dispatch 3 mark_unread actions");
+            }
+            other => panic!("expected Cmd::Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_acknowledge_with_empty_selection_returns_noop() {
+        let mut screen = MessageBrowserScreen::new();
+        let cmd = screen.handle_action("batch_acknowledge", "batch:");
+        // Cmd::batch with empty vec collapses to Cmd::None
+        assert!(
+            matches!(cmd, Cmd::None | Cmd::Batch(_)),
+            "empty selection should produce noop or empty batch"
+        );
+    }
+
+    #[test]
+    fn unknown_action_returns_none() {
+        let mut screen = MessageBrowserScreen::new();
+        let cmd = screen.handle_action("nonexistent_action", "ctx");
+        assert!(matches!(cmd, Cmd::None));
     }
 }

@@ -4684,4 +4684,70 @@ mod tests {
         assert!(screen.apply_named_preset("from-config"));
         assert_eq!(screen.pane.verbosity, VerbosityTier::Minimal);
     }
+
+    // ── Batch selection v/V distinction tests (br-2bbt.10) ──────────
+
+    #[test]
+    fn lowercase_v_and_uppercase_v_are_distinct_on_timeline() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        screen.pane.verbosity = VerbosityTier::All;
+        screen.pane.cursor = 0;
+
+        // lowercase v: enters visual selection mode
+        let v_lower = Event::Key(ftui::KeyEvent::new(KeyCode::Char('v')));
+        screen.update(&v_lower, &state);
+        assert!(
+            screen.selected_timeline_keys.visual_mode(),
+            "lowercase v should enter visual mode"
+        );
+        let view_before = screen.view_mode;
+
+        // uppercase V: cycles view mode (Events -> Commits -> Combined)
+        let v_upper = Event::Key(ftui::KeyEvent::new(KeyCode::Char('V')));
+        screen.update(&v_upper, &state);
+        assert_ne!(
+            screen.view_mode, view_before,
+            "uppercase V should cycle view mode"
+        );
+        // Visual mode should have been exited by view change (prune_selection clears)
+    }
+
+    #[test]
+    fn select_all_then_batch_copy_has_correct_count() {
+        let mut screen = TimelineScreen::new();
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            2,
+            MailEvent::http_request("GET", "/two", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            3,
+            MailEvent::http_request("GET", "/three", 200, 1, "127.0.0.1"),
+        );
+        screen.pane.verbosity = VerbosityTier::All;
+
+        screen.select_all_visible_rows();
+        assert_eq!(screen.selected_timeline_keys.len(), 3);
+
+        let (actions, _anchor, context_id) = screen
+            .contextual_actions()
+            .expect("batch contextual actions");
+        assert!(context_id.starts_with("batch:"));
+        assert!(
+            actions.iter().any(|a| a.label.contains("Copy")),
+            "batch actions should include copy"
+        );
+    }
 }

@@ -32,6 +32,16 @@ use crate::tui_bridge::TuiSharedState;
 // Re-export the Event type that screens use
 pub use ftui::Event;
 
+/// Zero-allocation case-insensitive string comparison for sort comparators.
+/// Folds ASCII bytes to lowercase on the fly — no heap allocation per call.
+#[inline]
+#[must_use]
+pub fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes()
+        .map(|b| b.to_ascii_lowercase())
+        .cmp(b.bytes().map(|b| b.to_ascii_lowercase()))
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // MailScreenId — type-safe screen identifiers
 // ──────────────────────────────────────────────────────────────────────
@@ -1304,5 +1314,96 @@ mod tests {
         assert_eq!(data_gen.console_log_seq, 0);
         assert_eq!(data_gen.db_stats_gen, 0);
         assert_eq!(data_gen.request_gen, 0);
+    }
+
+    // ── SelectionState comprehensive tests (br-2bbt.10) ────────────
+
+    #[test]
+    fn selection_state_toggle_returns_correct_membership() {
+        let mut state = SelectionState::new();
+        assert!(state.toggle(42));  // select → true
+        assert!(!state.toggle(42)); // deselect → false
+        assert!(state.toggle(42));  // re-select → true
+    }
+
+    #[test]
+    fn selection_state_select_and_deselect() {
+        let mut state = SelectionState::new();
+        state.select(1);
+        state.select(2);
+        assert_eq!(state.len(), 2);
+        state.deselect(&1);
+        assert_eq!(state.len(), 1);
+        assert!(!state.contains(&1));
+        assert!(state.contains(&2));
+    }
+
+    #[test]
+    fn selection_state_selected_items_returns_all() {
+        let mut state = SelectionState::new();
+        state.select(3);
+        state.select(1);
+        state.select(2);
+        let mut items = state.selected_items();
+        items.sort_unstable();
+        assert_eq!(items, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn selection_state_clear_resets_visual_mode() {
+        let mut state = SelectionState::new();
+        state.select(1);
+        state.toggle_visual_mode();
+        assert!(state.visual_mode());
+        state.clear();
+        assert!(state.is_empty());
+        assert!(!state.visual_mode());
+    }
+
+    #[test]
+    fn selection_state_retain_filters_items() {
+        let mut state = SelectionState::new();
+        state.select_all(vec![1, 2, 3, 4, 5]);
+        state.retain(|v| *v % 2 == 0);
+        assert_eq!(state.len(), 2);
+        assert!(state.contains(&2));
+        assert!(state.contains(&4));
+        assert!(!state.contains(&1));
+    }
+
+    #[test]
+    fn selection_state_duplicate_select_is_idempotent() {
+        let mut state = SelectionState::new();
+        state.select(7);
+        state.select(7);
+        state.select(7);
+        assert_eq!(state.len(), 1);
+    }
+
+    #[test]
+    fn selection_state_deselect_nonexistent_is_no_op() {
+        let mut state = SelectionState::<i64>::new();
+        state.deselect(&99);
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn selection_state_set_visual_mode() {
+        let mut state = SelectionState::<i64>::new();
+        state.set_visual_mode(true);
+        assert!(state.visual_mode());
+        state.set_visual_mode(false);
+        assert!(!state.visual_mode());
+    }
+
+    #[test]
+    fn selection_state_with_string_keys() {
+        let mut state = SelectionState::new();
+        state.select("agent:GreenCastle:src/*.rs".to_string());
+        state.select("agent:BlueLake:lib/*.rs".to_string());
+        assert_eq!(state.len(), 2);
+        assert!(state.contains(&"agent:GreenCastle:src/*.rs".to_string()));
+        state.toggle("agent:GreenCastle:src/*.rs".to_string());
+        assert_eq!(state.len(), 1);
     }
 }
