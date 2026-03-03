@@ -126,13 +126,7 @@ fn recent_system_health_diagnostics(
     state: &TuiSharedState,
     limit: usize,
 ) -> Vec<(u64, ScreenDiagnosticSnapshot)> {
-    state
-        .screen_diagnostics_since(0)
-        .into_iter()
-        .filter(|(_, diag)| diag.screen == "system_health")
-        .rev()
-        .take(limit)
-        .collect()
+    state.screen_diagnostics_recent("system_health", limit)
 }
 
 /// Width classes for adaptive dashboard layout.

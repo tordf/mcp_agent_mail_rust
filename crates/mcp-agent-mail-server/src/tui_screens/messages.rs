@@ -2213,6 +2213,9 @@ impl MessageBrowserScreen {
     fn execute_search(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let Some(conn) = &self.db_conn else {
+            // Avoid hot-looping failed open attempts on every tick.
+            self.search_dirty = false;
+            self.db_conn_attempted = false;
             return;
         };
 

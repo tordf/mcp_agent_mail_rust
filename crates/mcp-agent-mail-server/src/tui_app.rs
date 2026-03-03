@@ -33,7 +33,7 @@ use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
 use ftui_runtime::program::{Cmd, Model};
-use ftui_runtime::subscription::{Every, Subscription};
+use ftui_runtime::subscription::Subscription;
 use ftui_runtime::tick_strategy::{ScreenTickDispatch, TickDecision, TickStrategy};
 use mcp_agent_mail_db::DbPoolConfig;
 
@@ -63,9 +63,6 @@ use crate::tui_widgets::{
 /// Previous 33 ms (30 fps) caused excessive terminal writes and visible
 /// flashing, especially with ambient effects enabled.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
-/// Stable subscription id for app-level housekeeping ticks.
-const HOUSEKEEPING_TICK_SUBSCRIPTION_ID: u64 = 0x4D41_494C_5F54_494B; // "MAIL_TIK"
-
 const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
 const PALETTE_DYNAMIC_THREAD_CAP: usize = 50;
@@ -1305,6 +1302,10 @@ pub struct MailAppModel {
     inspector_selected_index: usize,
     /// Whether the inspector properties panel is visible.
     inspector_show_properties: bool,
+    /// Persistent contrast-guard cache. Kept across frames so that contrast
+    /// calculations are amortised rather than recomputed from scratch on every
+    /// render.  Cleared when the theme changes (see `apply_theme` / `cycle_theme`).
+    contrast_guard_cache: RefCell<ContrastGuardCache>,
     /// Sender for deferred actions from modal callbacks.
     action_tx: std::sync::mpsc::Sender<(String, String)>,
     /// Receiver for deferred actions from modal callbacks.
@@ -1397,6 +1398,7 @@ impl MailAppModel {
             quit_confirm_armed_at: None,
             quit_confirm_source: None,
             compose_state: None,
+            contrast_guard_cache: RefCell::new(ContrastGuardCache::default()),
             inspector: InspectorState::new(),
             inspector_last_tree_len: Cell::new(0),
             inspector_selected_index: 0,
@@ -2412,6 +2414,7 @@ impl MailAppModel {
         if theme_id != ThemeId::HighContrast {
             self.last_non_hc_theme = theme_id;
         }
+        *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
         self.sync_theme_snapshot();
         self.persist_appearance_settings();
         name
@@ -2426,6 +2429,7 @@ impl MailAppModel {
         if theme_id != ThemeId::HighContrast {
             self.last_non_hc_theme = theme_id;
         }
+        *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
         self.sync_theme_snapshot();
         self.persist_appearance_settings();
         display
@@ -3117,6 +3121,7 @@ impl MailAppModel {
                 if theme_id != ThemeId::HighContrast {
                     self.last_non_hc_theme = theme_id;
                 }
+                *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
                 self.sync_theme_snapshot();
                 self.persist_appearance_settings();
                 self.notifications.notify(
@@ -4492,7 +4497,7 @@ impl Model for MailAppModel {
 
         // Final readability guard: normalize low-contrast cells so every
         // visible glyph remains legible across all themes (especially light).
-        apply_frame_contrast_guard(frame, &tp);
+        apply_frame_contrast_guard(frame, &tp, &mut self.contrast_guard_cache.borrow_mut());
 
         // Keep an exportable snapshot of the last fully rendered frame.
         //
@@ -4513,11 +4518,13 @@ impl Model for MailAppModel {
     }
 
     fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
-        vec![Box::new(Every::with_id(
-            HOUSEKEEPING_TICK_SUBSCRIPTION_ID,
-            TICK_INTERVAL,
-            || MailMsg::HousekeepingTick,
-        ))]
+        // NOTE: The `HousekeepingTick` subscription was removed because
+        // `Event::Tick` already calls `run_housekeeping_tick` (line 3617).
+        // Having both caused double housekeeping per 100 ms cycle: double
+        // event processing, double toast animation advancement (toasts
+        // expired 2× faster than intended), and doubled reservation-expiry
+        // checks.
+        vec![]
     }
 
     fn as_screen_tick_dispatch(&mut self) -> Option<&mut dyn ScreenTickDispatch> {
@@ -6164,18 +6171,6 @@ struct ContrastGuardCache {
 }
 
 impl ContrastGuardCache {
-    fn with_frame_capacity(width: u16, height: u16) -> Self {
-        let estimated_cells = usize::from(width).saturating_mul(usize::from(height));
-        let color_cap = estimated_cells.min(4096);
-        Self {
-            readable_fg_by_bg: HashMap::with_capacity(color_cap),
-            decorative_fg_by_bg: HashMap::with_capacity(color_cap),
-            min_text_ratio_by_bg: HashMap::with_capacity(color_cap),
-            min_decorative_ratio_by_bg: HashMap::with_capacity(color_cap),
-            ratio_by_colors: HashMap::with_capacity(color_cap.saturating_mul(2)),
-        }
-    }
-
     fn best_readable_fg(
         &mut self,
         bg: PackedRgba,
@@ -6235,10 +6230,13 @@ impl ContrastGuardCache {
 }
 
 /// Normalize low-contrast rendered cells to readable theme-safe foreground colors.
-fn apply_frame_contrast_guard(frame: &mut Frame, tp: &crate::tui_theme::TuiThemePalette) {
+fn apply_frame_contrast_guard(
+    frame: &mut Frame,
+    tp: &crate::tui_theme::TuiThemePalette,
+    cache: &mut ContrastGuardCache,
+) {
     let height = frame.buffer.height();
     let width = frame.buffer.width();
-    let mut cache = ContrastGuardCache::with_frame_capacity(width, height);
     let fallback_surface = contrast_guard_surface(tp);
 
     for y in 0..height {
@@ -6864,7 +6862,7 @@ mod tests {
         frame.buffer.set(1, 0, unreadable);
 
         let tp = crate::tui_theme::TuiThemePalette::current();
-        apply_frame_contrast_guard(&mut frame, &tp);
+        apply_frame_contrast_guard(&mut frame, &tp, &mut ContrastGuardCache::default());
 
         let fixed = frame.buffer.get(1, 0).expect("cell exists after guard");
         assert!(
@@ -6885,7 +6883,7 @@ mod tests {
         frame.buffer.set(1, 0, decorative);
 
         let tp = crate::tui_theme::TuiThemePalette::current();
-        apply_frame_contrast_guard(&mut frame, &tp);
+        apply_frame_contrast_guard(&mut frame, &tp, &mut ContrastGuardCache::default());
 
         let fixed = frame.buffer.get(1, 0).expect("decorative cell exists");
         let ratio = contrast_ratio(fixed.fg, fixed.bg);
@@ -6912,7 +6910,7 @@ mod tests {
         frame.buffer.set(1, 0, unreadable);
 
         let tp = crate::tui_theme::TuiThemePalette::current();
-        apply_frame_contrast_guard(&mut frame, &tp);
+        apply_frame_contrast_guard(&mut frame, &tp, &mut ContrastGuardCache::default());
 
         let fixed = frame.buffer.get(1, 0).expect("cell exists after guard");
         let worst_ratio = [tp.panel_bg, tp.bg_surface, tp.bg_deep]
@@ -6940,7 +6938,7 @@ mod tests {
         frame.buffer.set(1, 0, unreadable);
 
         let tp = crate::tui_theme::TuiThemePalette::current();
-        apply_frame_contrast_guard(&mut frame, &tp);
+        apply_frame_contrast_guard(&mut frame, &tp, &mut ContrastGuardCache::default());
 
         let fixed = frame.buffer.get(1, 0).expect("grapheme cell exists");
         let min_ratio = minimum_text_contrast_for_bg(fixed.bg);
@@ -6963,7 +6961,7 @@ mod tests {
         frame.buffer.set(0, 0, space);
 
         let tp = crate::tui_theme::TuiThemePalette::current();
-        apply_frame_contrast_guard(&mut frame, &tp);
+        apply_frame_contrast_guard(&mut frame, &tp, &mut ContrastGuardCache::default());
 
         let result = frame.buffer.get(0, 0).expect("space cell exists");
         assert_eq!(result.fg, PackedRgba::rgb(255, 255, 255));
@@ -6981,7 +6979,7 @@ mod tests {
         frame.buffer.set(0, 0, space);
 
         let tp = crate::tui_theme::TuiThemePalette::current();
-        apply_frame_contrast_guard(&mut frame, &tp);
+        apply_frame_contrast_guard(&mut frame, &tp, &mut ContrastGuardCache::default());
 
         let result = frame.buffer.get(0, 0).expect("space cell exists");
         assert_ne!(

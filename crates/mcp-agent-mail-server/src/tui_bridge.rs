@@ -768,6 +768,32 @@ impl TuiSharedState {
             .cloned()
             .collect()
     }
+
+    /// Return up to `limit` most recent diagnostics for a given screen.
+    #[must_use]
+    pub fn screen_diagnostics_recent(
+        &self,
+        screen: &str,
+        limit: usize,
+    ) -> Vec<(u64, ScreenDiagnosticSnapshot)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let diagnostics = self
+            .screen_diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut result = Vec::with_capacity(limit.min(diagnostics.len()));
+        for (seq, diag) in diagnostics.iter().rev() {
+            if diag.screen == screen {
+                result.push((*seq, diag.clone()));
+                if result.len() >= limit {
+                    break;
+                }
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]
