@@ -317,15 +317,34 @@ e2e_assert_file_exists "migrated database exists in STORAGE_ROOT" "${MIGRATED_DB
 e2e_assert_file_exists "original python database still exists" "${PYTHON_DB}"
 
 MIGRATED_DB_SNAPSHOT="${WORK}/migrated_storage_snapshot.sqlite3"
-cp -p "${MIGRATED_DB}" "${MIGRATED_DB_SNAPSHOT}"
+SNAPSHOT_ESCAPED="$(printf "%s" "${MIGRATED_DB_SNAPSHOT}" | sed "s/'/''/g")"
+if sqlite3 "${MIGRATED_DB}" ".timeout 5000" ".backup '${SNAPSHOT_ESCAPED}'" >/dev/null 2>&1; then
+    e2e_pass "consistent sqlite snapshot created for validation"
+else
+    cp -p "${MIGRATED_DB}" "${MIGRATED_DB_SNAPSHOT}"
+    [ -f "${MIGRATED_DB}-wal" ] && cp -p "${MIGRATED_DB}-wal" "${MIGRATED_DB_SNAPSHOT}-wal"
+    [ -f "${MIGRATED_DB}-shm" ] && cp -p "${MIGRATED_DB}-shm" "${MIGRATED_DB_SNAPSHOT}-shm"
+    e2e_pass "fallback sqlite snapshot copy created for validation"
+fi
+
+set +e
 PROJECT_TS_TYPE="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT typeof(created_at) FROM projects WHERE id=1;")"
+PROJECT_TS_RC=$?
 MESSAGE_TS_TYPE="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT typeof(created_ts) FROM messages WHERE id=1;")"
+MESSAGE_TS_RC=$?
 RES_TS_TYPE="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT typeof(created_ts) FROM file_reservations WHERE id=1;")"
+RES_TS_RC=$?
+MIGRATED_SUBJECT="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT subject FROM messages WHERE id=1;")"
+MIGRATED_SUBJECT_RC=$?
+set -e
+
+e2e_assert_exit_code "projects.created_at query succeeds on migrated snapshot" "0" "${PROJECT_TS_RC}"
+e2e_assert_exit_code "messages.created_ts query succeeds on migrated snapshot" "0" "${MESSAGE_TS_RC}"
+e2e_assert_exit_code "file_reservations.created_ts query succeeds on migrated snapshot" "0" "${RES_TS_RC}"
+e2e_assert_exit_code "messages.subject query succeeds on migrated snapshot" "0" "${MIGRATED_SUBJECT_RC}"
 e2e_assert_eq "projects.created_at migrated to integer" "integer" "${PROJECT_TS_TYPE}"
 e2e_assert_eq "messages.created_ts migrated to integer" "integer" "${MESSAGE_TS_TYPE}"
 e2e_assert_eq "file_reservations.created_ts migrated to integer" "integer" "${RES_TS_TYPE}"
-
-MIGRATED_SUBJECT="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT subject FROM messages WHERE id=1;")"
 e2e_assert_eq "message subject preserved across migration" "Legacy migration message" "${MIGRATED_SUBJECT}"
 
 # ===========================================================================

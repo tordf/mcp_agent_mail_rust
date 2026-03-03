@@ -21,6 +21,8 @@ mkdir -p "$DEST"
 info() { :; }
 ok() { :; }
 warn() { :; }
+err() { :; }
+verbose() { :; }
 
 extract_alias_helpers() {
     local out="$1"
@@ -111,7 +113,7 @@ HOME="$(new_home case04)"
 printf "# alias am='python -m mcp_agent_mail'\n" > "${HOME}/.zshrc"
 assert_not_detected "commented alias"
 
-e2e_case_banner "5) Multiple aliases in one file -> all discovered over repeated passes"
+e2e_case_banner "5) Multiple aliases in one file -> all displaced in one run"
 HOME="$(new_home case05)"
 cat > "${HOME}/.zshrc" <<'EOF'
 alias am='python -m mcp_agent_mail first'
@@ -120,8 +122,8 @@ EOF
 assert_detected "first alias in multi-alias file" "${HOME}/.zshrc" "alias" "0"
 e2e_assert_contains "first alias content selected" "${PYTHON_ALIAS_CONTENT}" "first"
 displace_python_alias
-assert_detected "second alias still discoverable after first displaced" "${HOME}/.zshrc" "alias" "0"
-e2e_assert_contains "second alias content selected" "${PYTHON_ALIAS_CONTENT}" "second"
+e2e_assert_eq "multi-alias displacement count" "2" "${PYTHON_ALIAS_DISPLACED_COUNT}"
+assert_not_detected "all aliases removed from multi-alias file"
 
 e2e_case_banner "6) Alias in .zshrc but not .bashrc -> .zshrc reported"
 HOME="$(new_home case06)"
@@ -129,14 +131,14 @@ printf "export ZDOTDIR=\"%s\"\n" "$HOME" > "${HOME}/.bashrc"
 printf "alias am='python -m zsh_only'\n" > "${HOME}/.zshrc"
 assert_detected "zshrc precedence" "${HOME}/.zshrc" "alias" "0"
 
-e2e_case_banner "7) Alias in both .zshrc and .bashrc -> both reported across passes"
+e2e_case_banner "7) Alias in both .zshrc and .bashrc -> both displaced in one run"
 HOME="$(new_home case07)"
 printf "alias am='python -m zsh_first'\n" > "${HOME}/.zshrc"
 printf "alias am='python -m bash_second'\n" > "${HOME}/.bashrc"
 assert_detected "both files pass 1 (zsh preferred)" "${HOME}/.zshrc" "alias" "0"
 displace_python_alias
-assert_detected "both files pass 2 (bash discovered)" "${HOME}/.bashrc" "alias" "0"
-e2e_assert_contains "bash alias content surfaced" "${PYTHON_ALIAS_CONTENT}" "bash_second"
+e2e_assert_eq "cross-rc displacement count" "2" "${PYTHON_ALIAS_DISPLACED_COUNT}"
+assert_not_detected "both files no longer expose active alias"
 
 e2e_case_banner "8) Function definition am() -> detected"
 HOME="$(new_home case08)"
@@ -249,7 +251,11 @@ printf "alias am='python -m readonly_case'\n" > "${HOME}/.zshrc"
 chmod 444 "${HOME}/.zshrc"
 readonly_mode_before="$(file_mode "${HOME}/.zshrc")"
 assert_detected "readonly detection" "${HOME}/.zshrc" "alias" "0"
+set +e
 displace_python_alias
+readonly_rc=$?
+set -e
+e2e_assert_eq "readonly displacement returns nonzero" "1" "${readonly_rc}"
 readonly_mode_after="$(file_mode "${HOME}/.zshrc")"
 e2e_assert_eq "readonly mode preserved" "$readonly_mode_before" "$readonly_mode_after"
 

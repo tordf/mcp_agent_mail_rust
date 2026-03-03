@@ -8,13 +8,17 @@
     -Version vX.Y.Z   Install a specific release tag (default: latest)
     -Dest PATH        Install directory (default: %LOCALAPPDATA%\Programs\mcp-agent-mail)
     -Force            Reinstall even if the same version is already present
+    -NoVerify         Skip checksum verification (not recommended)
+    -Verify           Force checksum verification (default behavior)
 #>
 
 [CmdletBinding()]
 param(
     [string]$Version = "",
     [string]$Dest = "",
-    [switch]$Force
+    [switch]$Force,
+    [switch]$NoVerify,
+    [switch]$Verify
 )
 
 Set-StrictMode -Version Latest
@@ -34,6 +38,12 @@ $Dest = [System.IO.Path]::GetFullPath($Dest)
 if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     throw "install.ps1 is only supported on Windows."
 }
+
+if ($Verify -and $NoVerify) {
+    throw "Cannot combine -Verify and -NoVerify."
+}
+
+$ShouldVerifyChecksum = if ($NoVerify) { $false } else { $true }
 
 if ([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType]::Tls12) {
     # no-op: TLS 1.2 already enabled
@@ -62,7 +72,14 @@ function Normalize-Version {
         return ""
     }
     $trimmed = $RawVersion.Trim()
-    if ($trimmed.StartsWith("v")) {
+    $semverMatch = [regex]::Match(
+        $trimmed,
+        "(?<!\d)v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z\.-]+)?(?:\+[0-9A-Za-z\.-]+)?)"
+    )
+    if ($semverMatch.Success) {
+        return $semverMatch.Groups[1].Value
+    }
+    if ($trimmed.StartsWith("v", [System.StringComparison]::OrdinalIgnoreCase)) {
         return $trimmed.Substring(1)
     }
     return $trimmed
@@ -156,6 +173,112 @@ function Download-File {
         $invokeParams.UseBasicParsing = $true
     }
     Invoke-WebRequest @invokeParams
+}
+
+function Get-Sha256Hex {
+    param([string]$FilePath)
+    if (-not (Test-Path -LiteralPath $FilePath)) {
+        throw "SHA256 source file not found: $FilePath"
+    }
+    return (Get-FileHash -LiteralPath $FilePath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Parse-ChecksumHex {
+    param([string]$ChecksumText)
+    if ([string]::IsNullOrWhiteSpace($ChecksumText)) {
+        throw "Checksum text is empty."
+    }
+    $match = [regex]::Match($ChecksumText, "(?i)\b([a-f0-9]{64})\b")
+    if (-not $match.Success) {
+        throw "Could not parse SHA256 checksum from text."
+    }
+    return $match.Groups[1].Value.ToLowerInvariant()
+}
+
+function Verify-ChecksumFile {
+    param(
+        [string]$FilePath,
+        [string]$ExpectedChecksum
+    )
+    $expected = Parse-ChecksumHex -ChecksumText $ExpectedChecksum
+    $actual = Get-Sha256Hex -FilePath $FilePath
+    if ($actual -ne $expected) {
+        throw "Checksum verification failed. Expected $expected but got $actual."
+    }
+    Write-Ok "Checksum verified ($($actual.Substring(0, 16))...)"
+}
+
+function Install-BinariesAtomically {
+    param(
+        [string]$AmSource,
+        [string]$ServerSource,
+        [string]$InstallDir
+    )
+
+    if (-not (Test-Path -LiteralPath $AmSource)) {
+        throw "Atomic install source missing: $AmSource"
+    }
+    if (-not (Test-Path -LiteralPath $ServerSource)) {
+        throw "Atomic install source missing: $ServerSource"
+    }
+
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+
+    $amDest = Join-Path $InstallDir "am.exe"
+    $serverDest = Join-Path $InstallDir "mcp-agent-mail.exe"
+    $nonce = [Guid]::NewGuid().ToString("N")
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+    $amTemp = "$amDest.tmp.$nonce"
+    $serverTemp = "$serverDest.tmp.$nonce"
+    $amBackup = $null
+    $serverBackup = $null
+
+    try {
+        Copy-Item -LiteralPath $AmSource -Destination $amTemp -Force
+        Copy-Item -LiteralPath $ServerSource -Destination $serverTemp -Force
+
+        if (Test-Path -LiteralPath $amDest) {
+            $amBackup = "$amDest.bak.preinstall-$stamp-$nonce"
+            Move-Item -LiteralPath $amDest -Destination $amBackup -Force
+        }
+        if (Test-Path -LiteralPath $serverDest) {
+            $serverBackup = "$serverDest.bak.preinstall-$stamp-$nonce"
+            Move-Item -LiteralPath $serverDest -Destination $serverBackup -Force
+        }
+
+        Move-Item -LiteralPath $amTemp -Destination $amDest -Force
+        Move-Item -LiteralPath $serverTemp -Destination $serverDest -Force
+
+        if ($null -ne $amBackup -and (Test-Path -LiteralPath $amBackup)) {
+            Remove-Item -LiteralPath $amBackup -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $serverBackup -and (Test-Path -LiteralPath $serverBackup)) {
+            Remove-Item -LiteralPath $serverBackup -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        $installError = $_.Exception.Message
+        if (Test-Path -LiteralPath $amDest) {
+            Remove-Item -LiteralPath $amDest -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $serverDest) {
+            Remove-Item -LiteralPath $serverDest -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $amBackup -and (Test-Path -LiteralPath $amBackup)) {
+            Move-Item -LiteralPath $amBackup -Destination $amDest -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $serverBackup -and (Test-Path -LiteralPath $serverBackup)) {
+            Move-Item -LiteralPath $serverBackup -Destination $serverDest -Force -ErrorAction SilentlyContinue
+        }
+        throw "Atomic binary replacement failed. Rollback attempted. Root error: $installError"
+    } finally {
+        if (Test-Path -LiteralPath $amTemp) {
+            Remove-Item -LiteralPath $amTemp -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $serverTemp) {
+            Remove-Item -LiteralPath $serverTemp -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Get-PythonProbeSpecs {
@@ -407,9 +530,20 @@ try {
     $zipPath = Join-Path $workDir $AssetName
     $extractDir = Join-Path $workDir "extract"
     $assetUrl = "https://github.com/$Owner/$Repo/releases/download/$resolvedVersion/$AssetName"
+    $checksumPath = Join-Path $workDir "$AssetName.sha256"
 
     Write-Info "Downloading $assetUrl"
     Download-File -Url $assetUrl -OutFile $zipPath
+
+    if ($ShouldVerifyChecksum) {
+        $checksumUrl = "$assetUrl.sha256"
+        Write-Info "Downloading checksum $checksumUrl"
+        Download-File -Url $checksumUrl -OutFile $checksumPath
+        $checksumText = Get-Content -LiteralPath $checksumPath -Raw
+        Verify-ChecksumFile -FilePath $zipPath -ExpectedChecksum $checksumText
+    } else {
+        Write-WarnText "Checksum verification skipped (-NoVerify)"
+    }
 
     Write-Info "Extracting archive"
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
@@ -420,10 +554,8 @@ try {
         throw "Release archive did not contain am.exe and mcp-agent-mail.exe."
     }
 
-    New-Item -ItemType Directory -Path $Dest -Force | Out-Null
-    Copy-Item -LiteralPath $amSource.FullName -Destination (Join-Path $Dest "am.exe") -Force
-    Copy-Item -LiteralPath $serverSource.FullName -Destination (Join-Path $Dest "mcp-agent-mail.exe") -Force
-    Write-Ok "Installed binaries to $Dest"
+    Install-BinariesAtomically -AmSource $amSource.FullName -ServerSource $serverSource.FullName -InstallDir $Dest
+    Write-Ok "Installed binaries to $Dest (atomic replace)"
 
     $pythonModulePresent = Test-PythonModuleAvailable
     $pythonAmExecutables = @(Get-PythonAmExecutables -InstallDir $Dest)
