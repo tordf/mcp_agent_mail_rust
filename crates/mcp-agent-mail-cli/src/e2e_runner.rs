@@ -1797,10 +1797,10 @@ impl Runner {
         let mut failed = 0u32;
         let mut skipped = 0u32;
 
-        // Strip ANSI escape codes
-        let ansi_regex = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap_or_else(|_| {
-            regex::Regex::new(r"$^").unwrap() // Never-matching fallback
-        });
+        // Strip ANSI escape codes (compiled once, reused across calls)
+        static ANSI_RE: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap());
+        let ansi_regex = &*ANSI_RE;
 
         for line in output.lines() {
             let clean_line = ansi_regex.replace_all(line, "");

@@ -1752,41 +1752,39 @@ fn build_message(
             .and_then(|v| v.as_array().cloned())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|a| {
-                        Some(AttachmentInfo {
-                            name: a
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| {
-                                    a.get("path").and_then(|v| v.as_str()).and_then(|path| {
-                                        std::path::Path::new(path)
-                                            .file_name()
-                                            .and_then(std::ffi::OsStr::to_str)
-                                    })
+                    .map(|a| AttachmentInfo {
+                        name: a
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                a.get("path").and_then(|v| v.as_str()).and_then(|path| {
+                                    std::path::Path::new(path)
+                                        .file_name()
+                                        .and_then(std::ffi::OsStr::to_str)
                                 })
-                                .unwrap_or("attachment")
-                                .to_string(),
-                            size: a
-                                .get("bytes")
-                                .and_then(|v| v.as_u64())
-                                .or_else(|| a.get("size").and_then(|v| v.as_u64()))
-                                .map(|bytes| bytes.to_string())
-                                .or_else(|| {
-                                    a.get("size").and_then(|v| v.as_str()).map(str::to_string)
-                                })
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            mime_type: a
-                                .get("media_type")
-                                .or_else(|| a.get("content_type"))
-                                .and_then(|s| s.as_str())
-                                .or_else(|| {
-                                    a.get("type")
-                                        .and_then(|s| s.as_str())
-                                        .filter(|kind| *kind != "file" && *kind != "inline")
-                                })
-                                .unwrap_or("application/octet-stream")
-                                .to_string(),
-                        })
+                            })
+                            .unwrap_or("attachment")
+                            .to_string(),
+                        size: a
+                            .get("bytes")
+                            .and_then(|v| v.as_u64())
+                            .or_else(|| a.get("size").and_then(|v| v.as_u64()))
+                            .map(|bytes| bytes.to_string())
+                            .or_else(|| {
+                                a.get("size").and_then(|v| v.as_str()).map(str::to_string)
+                            })
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        mime_type: a
+                            .get("media_type")
+                            .or_else(|| a.get("content_type"))
+                            .and_then(|s| s.as_str())
+                            .or_else(|| {
+                                a.get("type")
+                                    .and_then(|s| s.as_str())
+                                    .filter(|kind| *kind != "file" && *kind != "inline")
+                            })
+                            .unwrap_or("application/octet-stream")
+                            .to_string(),
                     })
                     .collect()
             })

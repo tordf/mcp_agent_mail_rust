@@ -1503,6 +1503,7 @@ impl CommitCoalescer {
                         w_sizes,
                         w_pending,
                         flush_interval,
+                        worker_count,
                     );
                 })
                 .expect("failed to spawn commit coalescer worker");
@@ -1781,6 +1782,7 @@ impl Drop for CommitCoalescer {
 /// 5. Update per-repo and global metrics
 /// 6. If more work remains across any repo, re-signal condvar
 /// 7. Repeat
+#[allow(clippy::too_many_arguments)]
 fn coalescer_pool_worker(
     repos: Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
     work_cv: Arc<(Mutex<u64>, std::sync::Condvar)>,
@@ -1789,6 +1791,7 @@ fn coalescer_pool_worker(
     batch_sizes: Arc<Mutex<VecDeque<usize>>>,
     pending_requests: Arc<AtomicU64>,
     flush_interval: Duration,
+    worker_count: usize,
 ) {
     // Reduce idle wakeups while keeping periodic safety probes in case a
     // notification is lost under extreme contention.
@@ -1981,7 +1984,7 @@ fn coalescer_pool_worker(
             let (lock, cvar) = &*work_cv;
             {
                 let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
-                *wake_tokens = wake_tokens.saturating_add(1);
+                *wake_tokens = wake_tokens.saturating_add(1).min(worker_count as u64);
             }
             cvar.notify_one();
         }

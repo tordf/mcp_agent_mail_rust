@@ -838,18 +838,17 @@ fn capitalize_first(s: &str) -> String {
 /// Generates a random valid agent name.
 #[must_use]
 pub fn generate_agent_name() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Simple pseudo-random using system time
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-
-    let mut hasher = DefaultHasher::new();
-    seed.hash(&mut hasher);
-    let hash = hasher.finish();
+    let mut seed_bytes = [0u8; 8];
+    // Fall back to a time-based pseudo-random value if getrandom fails
+    if getrandom::getrandom(&mut seed_bytes).is_err() {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&seed, &mut hasher);
+        seed_bytes = std::hash::Hasher::finish(&hasher).to_ne_bytes();
+    }
+    let hash = u64::from_ne_bytes(seed_bytes);
 
     let adj_idx = usize::try_from(hash % (VALID_ADJECTIVES.len() as u64)).unwrap_or(0);
     let noun_idx = usize::try_from((hash >> 32) % (VALID_NOUNS.len() as u64)).unwrap_or(0);

@@ -323,15 +323,23 @@ impl GateError {
 ///
 /// Returns (category, error_count, error_summary).
 fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>) {
-    // Rust compiler error pattern: error[E0XXX]: message
-    let compiler_pattern = regex::Regex::new(r"^error\[E\d+\]: (.+)$").ok();
-    // Test failure patterns
-    let test_panic = regex::Regex::new(r"thread '(.+)' panicked").ok();
-    let test_failed = regex::Regex::new(r"^---- (.+) ----$").ok();
-    // Clippy warning/error
-    let clippy_pattern = regex::Regex::new(r"^warning: (.+)$").ok();
-    // rustfmt diff
-    let format_pattern = regex::Regex::new(r"^Diff in (.+):$").ok();
+    use std::sync::LazyLock;
+    static RE_COMPILER: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^error\[E\d+\]: (.+)$").unwrap());
+    static RE_PANIC: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"thread '(.+)' panicked").unwrap());
+    static RE_TEST_FAIL: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^---- (.+) ----$").unwrap());
+    static RE_CLIPPY: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^warning: (.+)$").unwrap());
+    static RE_FORMAT: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^Diff in (.+):$").unwrap());
+
+    let compiler_pattern = Some(&*RE_COMPILER);
+    let test_panic = Some(&*RE_PANIC);
+    let test_failed = Some(&*RE_TEST_FAIL);
+    let clippy_pattern = Some(&*RE_CLIPPY);
+    let format_pattern = Some(&*RE_FORMAT);
 
     let mut compiler_errors = 0u32;
     let mut test_failures = 0u32;
@@ -344,7 +352,7 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
 
     for line in stderr.lines() {
         // Compiler errors
-        if let Some(ref re) = compiler_pattern
+        if let Some(re) = compiler_pattern.as_ref()
             && let Some(caps) = re.captures(line)
         {
             compiler_errors += 1;
@@ -354,7 +362,7 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
         }
 
         // Test panics
-        if let Some(ref re) = test_panic
+        if let Some(re) = test_panic.as_ref()
             && let Some(caps) = re.captures(line)
         {
             test_failures += 1;
@@ -364,7 +372,7 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
         }
 
         // Test failures (---- test_name ----)
-        if let Some(ref re) = test_failed
+        if let Some(re) = test_failed.as_ref()
             && let Some(caps) = re.captures(line)
         {
             test_failures += 1;
@@ -374,7 +382,7 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
         }
 
         // Clippy warnings
-        if let Some(ref re) = clippy_pattern
+        if let Some(re) = clippy_pattern.as_ref()
             && let Some(caps) = re.captures(line)
         {
             clippy_warnings += 1;
@@ -384,7 +392,7 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
         }
 
         // Format diffs
-        if let Some(ref re) = format_pattern
+        if let Some(re) = format_pattern.as_ref()
             && let Some(caps) = re.captures(line)
         {
             format_diffs += 1;
@@ -444,14 +452,17 @@ fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>
 fn extract_affected_files(stderr: &str) -> Vec<String> {
     // Pattern for file references: path/to/file.ext:line:col
     // Captures common source/config extensions to support polyglot error reporting.
-    let file_pattern = regex::Regex::new(
-        r"(?:^|\s)([\w./\-]+\.(?:rs|py|js|ts|tsx|jsx|md|toml|json|yaml|yml|sh|sql|css|html)):(\d+)",
-    )
-    .ok();
+    static RE_FILE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:^|\s)([\w./\-]+\.(?:rs|py|js|ts|tsx|jsx|md|toml|json|yaml|yml|sh|sql|css|html)):(\d+)",
+        )
+        .unwrap()
+    });
+    let file_pattern = Some(&*RE_FILE);
 
     let mut files = std::collections::HashSet::new();
 
-    if let Some(ref re) = file_pattern {
+    if let Some(re) = file_pattern.as_ref() {
         for caps in re.captures_iter(stderr) {
             if let Some(path) = caps.get(1) {
                 let path_str = path.as_str();
