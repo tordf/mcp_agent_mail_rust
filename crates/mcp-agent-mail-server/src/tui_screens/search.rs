@@ -1386,12 +1386,18 @@ impl SearchCockpitScreen {
         if cursor < self.detail_scroll.get() {
             self.detail_scroll.set(cursor);
         } else if cursor >= self.detail_scroll.get().saturating_add(visible_rows) {
-            self.detail_scroll.set(cursor
-                .saturating_add(1)
-                .saturating_sub(visible_rows)
-                .min(row_count.saturating_sub(visible_rows)));
+            self.detail_scroll.set(
+                cursor
+                    .saturating_add(1)
+                    .saturating_sub(visible_rows)
+                    .min(row_count.saturating_sub(visible_rows)),
+            );
         } else {
-            self.detail_scroll.set(self.detail_scroll.get().min(row_count.saturating_sub(visible_rows)));
+            self.detail_scroll.set(
+                self.detail_scroll
+                    .get()
+                    .min(row_count.saturating_sub(visible_rows)),
+            );
         }
     }
 
@@ -1419,12 +1425,22 @@ impl SearchCockpitScreen {
         let mut handled = true;
         match key.code {
             KeyCode::Char('J') => self.toggle_detail_view_mode(),
-            KeyCode::Char('j') | KeyCode::Down => self.json_tree_state.borrow_mut().move_cursor_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.json_tree_state.borrow_mut().move_cursor_by(-1),
-            KeyCode::Char('d') | KeyCode::PageDown => self.json_tree_state.borrow_mut().move_cursor_by(8),
-            KeyCode::Char('u') | KeyCode::PageUp => self.json_tree_state.borrow_mut().move_cursor_by(-8),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.json_tree_state.borrow_mut().move_cursor_by(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.json_tree_state.borrow_mut().move_cursor_by(-1)
+            }
+            KeyCode::Char('d') | KeyCode::PageDown => {
+                self.json_tree_state.borrow_mut().move_cursor_by(8)
+            }
+            KeyCode::Char('u') | KeyCode::PageUp => {
+                self.json_tree_state.borrow_mut().move_cursor_by(-8)
+            }
             KeyCode::Home => self.json_tree_state.borrow_mut().move_cursor_by(isize::MIN),
-            KeyCode::End | KeyCode::Char('G') => self.json_tree_state.borrow_mut().move_cursor_by(isize::MAX),
+            KeyCode::End | KeyCode::Char('G') => {
+                self.json_tree_state.borrow_mut().move_cursor_by(isize::MAX)
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let _ = self.json_tree_state.borrow_mut().toggle_selected();
             }
@@ -1461,7 +1477,9 @@ impl SearchCockpitScreen {
     }
 
     fn persist_filter_presets(&self) {
-        if let Err(err) = save_screen_filter_presets(&self.filter_presets_path, &self.filter_presets) {
+        if let Err(err) =
+            save_screen_filter_presets(&self.filter_presets_path, &self.filter_presets)
+        {
             tracing::warn!(
                 "search: failed to save presets to {}: {err}",
                 self.filter_presets_path.display()
@@ -1472,7 +1490,10 @@ impl SearchCockpitScreen {
     fn current_preset_values(&self) -> BTreeMap<String, String> {
         let mut values = BTreeMap::new();
         values.insert("query".to_string(), self.query_input.value().to_string());
-        values.insert("scope_mode".to_string(), self.scope_mode.as_str().to_string());
+        values.insert(
+            "scope_mode".to_string(),
+            self.scope_mode.as_str().to_string(),
+        );
         values.insert(
             "doc_kind_filter".to_string(),
             self.doc_kind_filter.route_value().to_string(),
@@ -1634,7 +1655,8 @@ impl SearchCockpitScreen {
             },
             KeyCode::Enter => {
                 let preset_name = self.save_preset_name.clone();
-                if self.save_named_preset(&preset_name, Some(self.save_preset_description.clone())) {
+                if self.save_named_preset(&preset_name, Some(self.save_preset_description.clone()))
+                {
                     self.preset_dialog_mode = PresetDialogMode::None;
                 }
             }
@@ -2291,14 +2313,17 @@ impl SearchCockpitScreen {
     fn scroll_detail_by(&mut self, delta: isize) {
         let max = self.detail_max_scroll();
         if delta.is_negative() {
-            self.detail_scroll.set(self
-                .detail_scroll.get()
-                .saturating_sub(delta.unsigned_abs())
-                .min(max));
+            self.detail_scroll.set(
+                self.detail_scroll
+                    .get()
+                    .saturating_sub(delta.unsigned_abs())
+                    .min(max),
+            );
         } else {
             #[allow(clippy::cast_sign_loss)]
             let add = delta as usize;
-            self.detail_scroll.set(self.detail_scroll.get().saturating_add(add).min(max));
+            self.detail_scroll
+                .set(self.detail_scroll.get().saturating_add(add).min(max));
         }
     }
 
@@ -2824,126 +2849,126 @@ impl MailScreen for SearchCockpitScreen {
                         return Cmd::None;
                     }
                     match key.code {
-                    KeyCode::Char('/') => {
-                        self.focus = Focus::QueryBar;
-                        self.query_input.set_focused(true);
-                    }
-                    KeyCode::Tab | KeyCode::Char('f') => self.focus = Focus::FacetRail,
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if !self.results.is_empty() {
-                            self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                        KeyCode::Char('/') => {
+                            self.focus = Focus::QueryBar;
+                            self.query_input.set_focused(true);
+                        }
+                        KeyCode::Tab | KeyCode::Char('f') => self.focus = Focus::FacetRail,
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !self.results.is_empty() {
+                                self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                                self.detail_scroll.set(0);
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            self.cursor = self.cursor.saturating_sub(1);
                             self.detail_scroll.set(0);
                         }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.cursor = self.cursor.saturating_sub(1);
-                        self.detail_scroll.set(0);
-                    }
-                    KeyCode::Char('G') | KeyCode::End => {
-                        if !self.results.is_empty() {
-                            self.cursor = self.results.len() - 1;
+                        KeyCode::Char('G') | KeyCode::End => {
+                            if !self.results.is_empty() {
+                                self.cursor = self.results.len() - 1;
+                                self.detail_scroll.set(0);
+                            }
+                        }
+                        KeyCode::Char('g') | KeyCode::Home => {
+                            self.cursor = 0;
                             self.detail_scroll.set(0);
                         }
-                    }
-                    KeyCode::Char('g') | KeyCode::Home => {
-                        self.cursor = 0;
-                        self.detail_scroll.set(0);
-                    }
-                    KeyCode::Char('d') | KeyCode::PageDown => {
-                        if !self.results.is_empty() {
-                            self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                        KeyCode::Char('d') | KeyCode::PageDown => {
+                            if !self.results.is_empty() {
+                                self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                                self.detail_scroll.set(0);
+                            }
+                        }
+                        KeyCode::Char('u') | KeyCode::PageUp => {
+                            self.cursor = self.cursor.saturating_sub(20);
                             self.detail_scroll.set(0);
                         }
-                    }
-                    KeyCode::Char('u') | KeyCode::PageUp => {
-                        self.cursor = self.cursor.saturating_sub(20);
-                        self.detail_scroll.set(0);
-                    }
-                    KeyCode::Char('J') => {
-                        let previous_mode = self.detail_view_mode.get();
-                        self.toggle_detail_view_mode();
-                        if previous_mode == DetailViewMode::Markdown
-                            && self.detail_view_mode.get() == DetailViewMode::Markdown
-                        {
-                            self.scroll_detail_by(1);
+                        KeyCode::Char('J') => {
+                            let previous_mode = self.detail_view_mode.get();
+                            self.toggle_detail_view_mode();
+                            if previous_mode == DetailViewMode::Markdown
+                                && self.detail_view_mode.get() == DetailViewMode::Markdown
+                            {
+                                self.scroll_detail_by(1);
+                            }
                         }
-                    }
-                    KeyCode::Char('K') => self.scroll_detail_by(-1),
-                    KeyCode::Char('I') => self.dock.toggle_visible(),
-                    KeyCode::Char(']') => self.dock.grow_dock(),
-                    KeyCode::Char('[') => self.dock.shrink_dock(),
-                    KeyCode::Char('}') => self.dock.cycle_position(),
-                    KeyCode::Char('{') => self.dock.cycle_position_prev(),
-                    KeyCode::Enter => {
-                        if let Some(entry) = self.results.get(self.cursor) {
-                            return Cmd::msg(match entry.doc_kind {
-                                DocKind::Message => {
-                                    MailScreenMsg::DeepLink(DeepLinkTarget::MessageById(entry.id))
-                                }
-                                DocKind::Agent => MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::AgentByName(entry.title.clone()),
-                                ),
-                                DocKind::Project => MailScreenMsg::DeepLink(
-                                    DeepLinkTarget::ProjectBySlug(entry.title.clone()),
-                                ),
-                                DocKind::Thread => MailScreenMsg::DeepLink(
-                                    entry
-                                        .thread_id
-                                        .as_ref()
-                                        .map_or(DeepLinkTarget::MessageById(entry.id), |tid| {
-                                            DeepLinkTarget::ThreadById(tid.clone())
-                                        }),
-                                ),
-                            });
+                        KeyCode::Char('K') => self.scroll_detail_by(-1),
+                        KeyCode::Char('I') => self.dock.toggle_visible(),
+                        KeyCode::Char(']') => self.dock.grow_dock(),
+                        KeyCode::Char('[') => self.dock.shrink_dock(),
+                        KeyCode::Char('}') => self.dock.cycle_position(),
+                        KeyCode::Char('{') => self.dock.cycle_position_prev(),
+                        KeyCode::Enter => {
+                            if let Some(entry) = self.results.get(self.cursor) {
+                                return Cmd::msg(match entry.doc_kind {
+                                    DocKind::Message => MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::MessageById(entry.id),
+                                    ),
+                                    DocKind::Agent => MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::AgentByName(entry.title.clone()),
+                                    ),
+                                    DocKind::Project => MailScreenMsg::DeepLink(
+                                        DeepLinkTarget::ProjectBySlug(entry.title.clone()),
+                                    ),
+                                    DocKind::Thread => {
+                                        MailScreenMsg::DeepLink(
+                                            entry.thread_id.as_ref().map_or(
+                                                DeepLinkTarget::MessageById(entry.id),
+                                                |tid| DeepLinkTarget::ThreadById(tid.clone()),
+                                            ),
+                                        )
+                                    }
+                                });
+                            }
                         }
-                    }
-                    KeyCode::Char('t') => {
-                        self.doc_kind_filter = self.doc_kind_filter.next();
-                        self.search_dirty = true;
-                        self.debounce_remaining = 0;
-                    }
-                    KeyCode::Char('i') => {
-                        self.importance_filter = self.importance_filter.next();
-                        self.search_dirty = true;
-                        self.debounce_remaining = 0;
-                    }
-                    KeyCode::Char('o') => {
-                        if let Some(entry) = self.results.get(self.cursor)
-                            && let Some(ref tid) = entry.thread_id
-                        {
-                            return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(
-                                tid.clone(),
-                            )));
+                        KeyCode::Char('t') => {
+                            self.doc_kind_filter = self.doc_kind_filter.next();
+                            self.search_dirty = true;
+                            self.debounce_remaining = 0;
                         }
-                    }
-                    KeyCode::Char('a') => {
-                        if let Some(entry) = self.results.get(self.cursor)
-                            && let Some(ref agent) = entry.from_agent
-                        {
-                            return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::AgentByName(
-                                agent.clone(),
-                            )));
+                        KeyCode::Char('i') => {
+                            self.importance_filter = self.importance_filter.next();
+                            self.search_dirty = true;
+                            self.debounce_remaining = 0;
                         }
-                    }
-                    KeyCode::Char('T') => {
-                        if let Some(entry) = self.results.get(self.cursor)
-                            && let Some(ts) = entry.created_ts
-                        {
-                            return Cmd::msg(MailScreenMsg::DeepLink(
-                                DeepLinkTarget::TimelineAtTime(ts),
-                            ));
+                        KeyCode::Char('o') => {
+                            if let Some(entry) = self.results.get(self.cursor)
+                                && let Some(ref tid) = entry.thread_id
+                            {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::ThreadById(tid.clone()),
+                                ));
+                            }
                         }
+                        KeyCode::Char('a') => {
+                            if let Some(entry) = self.results.get(self.cursor)
+                                && let Some(ref agent) = entry.from_agent
+                            {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::AgentByName(agent.clone()),
+                                ));
+                            }
+                        }
+                        KeyCode::Char('T') => {
+                            if let Some(entry) = self.results.get(self.cursor)
+                                && let Some(ts) = entry.created_ts
+                            {
+                                return Cmd::msg(MailScreenMsg::DeepLink(
+                                    DeepLinkTarget::TimelineAtTime(ts),
+                                ));
+                            }
+                        }
+                        KeyCode::Char('L') => {
+                            self.query_lab_visible = !self.query_lab_visible;
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                            self.query_input.clear();
+                            self.reset_facets();
+                            self.execute_search(state);
+                        }
+                        _ => {}
                     }
-                    KeyCode::Char('L') => {
-                        self.query_lab_visible = !self.query_lab_visible;
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
-                        self.query_input.clear();
-                        self.reset_facets();
-                        self.execute_search(state);
-                    }
-                    _ => {}
-                }
                 }
             },
             _ => {}
@@ -3208,16 +3233,18 @@ impl MailScreen for SearchCockpitScreen {
                     self.detail_scroll.set(0);
                 }
             }
-            let rendered_body_override = if self.detail_view_mode.get() == DetailViewMode::JsonTree {
+            let rendered_body_override = if self.detail_view_mode.get() == DetailViewMode::JsonTree
+            {
                 None
             } else {
                 selected_entry.and_then(|entry| self.cached_rendered_markdown(entry))
             };
-            let rendered_detail_override = if self.detail_view_mode.get() == DetailViewMode::JsonTree {
-                None
-            } else {
-                selected_entry.map(|entry| self.cached_rendered_detail(entry))
-            };
+            let rendered_detail_override =
+                if self.detail_view_mode.get() == DetailViewMode::JsonTree {
+                    None
+                } else {
+                    selected_entry.map(|entry| self.cached_rendered_detail(entry))
+                };
             render_detail(
                 frame,
                 detail_area,
@@ -5054,8 +5081,16 @@ fn compose_detail_text(
                 let selected = idx == json_cursor;
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 spans.push(Span::styled(
-                    if selected { "▸ ".to_string() } else { "  ".to_string() },
-                    if selected { selected_style } else { marker_style },
+                    if selected {
+                        "▸ ".to_string()
+                    } else {
+                        "  ".to_string()
+                    },
+                    if selected {
+                        selected_style
+                    } else {
+                        marker_style
+                    },
                 ));
                 spans.extend(row.line.spans().iter().cloned());
                 lines.push(Line::from_spans(spans));
@@ -6629,10 +6664,7 @@ mod tests {
         screen.explain_toggle = ExplainToggle::On;
         screen.thread_filter = Some("br-2bbt".to_string());
 
-        assert!(screen.save_named_preset(
-            "triage",
-            Some("search triage defaults".to_string())
-        ));
+        assert!(screen.save_named_preset("triage", Some("search triage defaults".to_string())));
         assert_eq!(screen.preset_names(), vec!["triage".to_string()]);
 
         screen.query_input.clear();
