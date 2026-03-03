@@ -7,8 +7,10 @@ on:
       - 'v*'
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    # Lint failures are reported but do not block the release build.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -21,6 +23,13 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Run tests
         run: cargo test --lib

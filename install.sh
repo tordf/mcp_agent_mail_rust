@@ -22,8 +22,10 @@
 #   --offline          Skip network preflight checks
 #   --force            Force reinstall even if already at version
 #   --uninstall        Remove installed binaries/configuration helpers
-#   --yes              Non-interactive mode for uninstall confirmations
+#   --yes              Non-interactive mode (skip all confirmations)
 #   --purge            With --uninstall, also delete data directories/database
+#   --dry-run          Preview what the installer would do without making changes
+#   --preview          Alias for --dry-run
 #
 set -Eeuo pipefail
 umask 022
@@ -53,6 +55,7 @@ FORCE_INSTALL=0
 UNINSTALL=0
 ASSUME_YES=0
 PURGE=0
+DRY_RUN=0
 OFFLINE="${AM_OFFLINE:-0}"
 VERBOSE_DUMP_LINES=20
 LOG_FILE="${LOG_FILE:-/tmp/am-install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log}"
@@ -2327,7 +2330,7 @@ usage() {
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] \\
                   [--offline] [--no-gum] [--no-verify] [--force] [--from-source] [--verbose] \\
-                  [--uninstall] [--yes] [--purge]
+                  [--uninstall] [--yes] [--purge] [--dry-run]
 
 Installs mcp-agent-mail and am (CLI) binaries.
 
@@ -2345,8 +2348,10 @@ Options:
   --no-verify        Skip checksum + signature verification (for testing only)
   --force            Force reinstall even if same version is installed
   --uninstall        Remove installed binaries/configuration helpers
-  --yes              Non-interactive uninstall confirmations
+  --yes              Non-interactive mode (skip all confirmations)
   --purge            With --uninstall, also delete storage/database data
+  --dry-run          Preview what the installer would do without making changes
+  --preview          Alias for --dry-run
 EOFU
 }
 
@@ -2405,12 +2410,13 @@ while [ $# -gt 0 ]; do
     --uninstall) UNINSTALL=1; shift;;
     --yes|-y) ASSUME_YES=1; shift;;
     --purge) PURGE=1; shift;;
+    --dry-run|--preview) DRY_RUN=1; shift;;
     -h|--help) usage; exit 0;;
     *) shift;;
   esac
 done
 
-verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE}"
+verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
 
 if [ "$UNINSTALL" -eq 1 ]; then
   uninstall
@@ -2452,6 +2458,117 @@ if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
   ok "mcp-agent-mail $VERSION is already installed at $DEST"
   info "Use --force to reinstall"
   exit 0
+fi
+
+# ── Install plan preview / dry-run / piped confirmation ─────────────────────
+
+print_install_plan() {
+  local header_color="1;36"
+  local section_color="1;33"
+
+  echo ""
+  echo -e "\033[${header_color}m=== Installation Plan ===\033[0m"
+  echo ""
+
+  # Section 1: Binaries
+  echo -e "\033[${section_color}m[Binaries]\033[0m"
+  echo "  Version:    ${VERSION}"
+  echo "  Target:     ${TARGET:-source build}"
+  echo "  Dest:       $DEST"
+  echo "  Install:    $DEST/$BIN_SERVER (MCP server)"
+  echo "              $DEST/$BIN_CLI (CLI tool)"
+  if [ "$FROM_SOURCE" -eq 1 ]; then
+    echo "  Method:     Build from source"
+  else
+    echo "  Method:     Download pre-built binary"
+    [ -n "${URL:-}" ] && echo "  URL:        $URL"
+  fi
+  echo ""
+
+  # Section 2: PATH changes
+  echo -e "\033[${section_color}m[PATH]\033[0m"
+  local dest_in_path=0
+  case ":$PATH:" in
+    *:"$DEST":*) dest_in_path=1 ;;
+  esac
+  if [ "$dest_in_path" -eq 1 ]; then
+    echo "  $DEST is already in PATH (no changes needed)"
+  elif [ "$EASY" -eq 1 ]; then
+    for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+      if [ -e "$rc" ] && [ -w "$rc" ]; then
+        if ! grep -qF "export PATH=\"$DEST:\$PATH\"" "$rc" 2>/dev/null; then
+          echo "  Will append PATH export to: $rc"
+        else
+          echo "  PATH export already present in: $rc"
+        fi
+      fi
+    done
+  else
+    echo "  $DEST is NOT in PATH (manual action needed)"
+  fi
+  echo ""
+
+  # Section 3: Python migration
+  if [ "$PYTHON_DETECTED" -eq 1 ]; then
+    echo -e "\033[${section_color}m[Python Migration]\033[0m"
+    [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && echo "  Will disable alias in:  $PYTHON_ALIAS_FILE (line $PYTHON_ALIAS_LINE)"
+    [ "$PYTHON_BINARY_FOUND" -eq 1 ] && echo "  Will displace binary:   $PYTHON_BINARY_PATH"
+    [ -n "$PYTHON_PID" ] && echo "  Will stop Python server: PID $PYTHON_PID"
+    [ "$PYTHON_CLONE_FOUND" -eq 1 ] && echo "  Python clone detected:  $PYTHON_CLONE_PATH (not modified)"
+    echo ""
+  fi
+
+  # Section 4: MCP config
+  local mcp_scan
+  mcp_scan="$(detect_mcp_configs "$PWD" 2>/dev/null || true)"
+  if [ -n "$mcp_scan" ]; then
+    echo -e "\033[${section_color}m[MCP Configurations]\033[0m"
+    local tool path exists_flag
+    while IFS=$'\t' read -r tool path exists_flag; do
+      [ -z "${tool:-}" ] && continue
+      if [ "$exists_flag" = "1" ]; then
+        echo "  Will update: [$tool] $path"
+      else
+        local parent_dir
+        parent_dir=$(dirname "$path")
+        local grandparent_dir
+        grandparent_dir=$(dirname "$parent_dir")
+        if [ -d "$parent_dir" ] || [ -d "$grandparent_dir" ]; then
+          echo "  Will create: [$tool] $path"
+        fi
+      fi
+    done <<< "$mcp_scan"
+    echo ""
+  fi
+
+  # Section 5: Verification
+  if [ "$VERIFY" -eq 1 ]; then
+    echo -e "\033[${section_color}m[Post-install]\033[0m"
+    echo "  Will run verification checks after installation"
+    echo ""
+  fi
+}
+
+# Dry-run mode: show plan and exit
+if [ "$DRY_RUN" -eq 1 ]; then
+  print_install_plan
+  echo -e "\033[1;36m=== Dry run complete (no changes made) ===\033[0m"
+  echo ""
+  exit 0
+fi
+
+# Piped install (EASY=1) confirmation: show plan and ask before proceeding,
+# unless --yes was passed or stdin is not a terminal (true pipe).
+if [ "$EASY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 1 ] && [ -e /dev/tty ]; then
+  print_install_plan
+  printf "Proceed with installation? [Y/n] "
+  read -r confirm </dev/tty 2>/dev/null || confirm="y"
+  case "$confirm" in
+    [nN]*)
+      info "Installation cancelled."
+      exit 0
+      ;;
+  esac
 fi
 
 # Cross-platform locking using mkdir (atomic on all POSIX systems)
