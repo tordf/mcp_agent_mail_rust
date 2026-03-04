@@ -22,6 +22,7 @@
 
 use crate::DbConn;
 use chrono::NaiveDateTime;
+use sqlmodel_core::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
@@ -136,8 +137,8 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
         // Check if table exists first (the table might not exist in older schemas).
         let table_exists = *table_exists_cache.entry(table).or_insert_with(|| {
             let table_check = conn.query_sync(
-                &format!("SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"),
-                &[],
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
+                &[Value::Text(table.to_string())],
             );
             // FrankenSQLite may not support sqlite_master — assume table exists and
             // let the typeof query below fail gracefully instead.

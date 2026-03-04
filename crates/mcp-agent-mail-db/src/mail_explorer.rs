@@ -291,11 +291,18 @@ async fn resolve_agent_ids(
     agent_name: &str,
     project_id: Option<i64>,
 ) -> Outcome<AgentIds, DbError> {
-    let sql = project_id.map_or_else(
-        || "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1".to_string(),
+    let (sql, params) = project_id.map_or_else(
+        || {
+            (
+                "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1".to_string(),
+                vec![Value::Text(agent_name.to_string())],
+            )
+        },
         |pid| {
-            format!(
-                "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1 AND a.project_id = {pid}"
+            (
+                "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1 AND a.project_id = ?2"
+                    .to_string(),
+                vec![Value::Text(agent_name.to_string()), Value::BigInt(pid)],
             )
         },
     );
@@ -306,8 +313,6 @@ async fn resolve_agent_ids(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-
-    let params = vec![Value::Text(agent_name.to_string())];
     let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
         Outcome::Ok(r) => r,
         Outcome::Err(e) => return Outcome::Err(e),

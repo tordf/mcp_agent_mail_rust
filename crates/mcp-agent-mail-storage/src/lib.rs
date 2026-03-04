@@ -6491,7 +6491,7 @@ pub fn check_archive_consistency(
 
     for msg in messages {
         // Build the expected canonical path:
-        // {storage_root}/projects/{slug}/archive/messages/{YYYY}/{MM}/{iso}__{slug}__{id}.md
+        // {storage_root}/projects/{slug}/messages/{YYYY}/{MM}/{iso}__{slug}__{id}.md
         let project_dir = storage_root.join("projects").join(&msg.project_slug);
 
         // Parse the ISO timestamp to extract year/month
@@ -6516,7 +6516,6 @@ pub fn check_archive_consistency(
         };
 
         let messages_dir = project_dir
-            .join("archive")
             .join("messages")
             .join(&year)
             .join(&month);
@@ -9074,12 +9073,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let slug = "test-project";
         // Create the expected archive file structure:
-        // {root}/projects/{slug}/archive/messages/2026/02/{iso}__hello-world__42.md
+        // {root}/projects/{slug}/messages/2026/02/{iso}__hello-world__42.md
         let msg_dir = dir
             .path()
             .join("projects")
             .join(slug)
-            .join("archive")
             .join("messages")
             .join("2026")
             .join("02");
@@ -9112,7 +9110,6 @@ mod tests {
             .path()
             .join("projects")
             .join(slug)
-            .join("archive")
             .join("messages")
             .join("2026")
             .join("02");

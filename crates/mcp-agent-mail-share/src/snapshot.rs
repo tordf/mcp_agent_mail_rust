@@ -257,11 +257,14 @@ fn transfer_tables_frank(src: &DbConn, dst: &SqliteConnection) -> Result<(), Sha
                     .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
                     .collect();
                 if has_id && let Some(val) = row.get_by_name("id") {
-                    last_id = match val {
-                        Value::BigInt(v) => *v,
-                        Value::Int(v) => i64::from(*v),
-                        _ => last_id,
-                    };
+                    match val {
+                        Value::BigInt(v) => last_id = *v,
+                        Value::Int(v) => last_id = i64::from(*v),
+                        _ => {
+                            // Non-integer id: stop pagination to avoid infinite loop
+                            break;
+                        }
+                    }
                 }
                 dst.execute_sync(&insert_sql, &values)
                     .map_err(|e| ShareError::Sqlite {
@@ -325,11 +328,14 @@ fn transfer_tables_c(src: &SqliteConnection, dst: &SqliteConnection) -> Result<(
                     .map(|c| row.get_by_name(c).cloned().unwrap_or(Value::Null))
                     .collect();
                 if has_id && let Some(val) = row.get_by_name("id") {
-                    last_id = match val {
-                        Value::BigInt(v) => *v,
-                        Value::Int(v) => i64::from(*v),
-                        _ => last_id,
-                    };
+                    match val {
+                        Value::BigInt(v) => last_id = *v,
+                        Value::Int(v) => last_id = i64::from(*v),
+                        _ => {
+                            // Non-integer id: stop pagination to avoid infinite loop
+                            break;
+                        }
+                    }
                 }
                 dst.execute_sync(&insert_sql, &values)
                     .map_err(|e| ShareError::Sqlite {

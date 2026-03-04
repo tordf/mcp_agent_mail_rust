@@ -18,10 +18,10 @@
 //! These are acceptable losses because reservations and contacts are transient,
 //! and the core data (messages + agents) is fully recovered.
 
-use crate::DbConn;
 use crate::error::{DbError, DbResult};
 use crate::schema;
 use sqlmodel_core::Value;
+use sqlmodel_sqlite::SqliteConnection as DbConn;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -151,8 +151,29 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
     }
 
     // Clean up any FTS artifacts that may have been left by prior migrations.
-    schema::enforce_runtime_fts_cleanup(&conn)
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: fts cleanup: {e}")))?;
+    // This mirrors `schema::enforce_runtime_fts_cleanup`, but uses canonical
+    // SQLite so reconstruction is not coupled to runtime connection type.
+    let cleanup_sql = [
+        "DROP TRIGGER IF EXISTS fts_messages_ai",
+        "DROP TRIGGER IF EXISTS fts_messages_ad",
+        "DROP TRIGGER IF EXISTS fts_messages_au",
+        "DROP TRIGGER IF EXISTS messages_ai",
+        "DROP TRIGGER IF EXISTS messages_ad",
+        "DROP TRIGGER IF EXISTS messages_au",
+        "DROP TRIGGER IF EXISTS agents_ai",
+        "DROP TRIGGER IF EXISTS agents_ad",
+        "DROP TRIGGER IF EXISTS agents_au",
+        "DROP TRIGGER IF EXISTS projects_ai",
+        "DROP TRIGGER IF EXISTS projects_ad",
+        "DROP TRIGGER IF EXISTS projects_au",
+        "DROP TABLE IF EXISTS fts_agents",
+        "DROP TABLE IF EXISTS fts_projects",
+        "DROP TABLE IF EXISTS fts_messages",
+    ];
+    for stmt in cleanup_sql {
+        conn.execute_raw(stmt)
+            .map_err(|e| DbError::Sqlite(format!("reconstruct: fts cleanup ({stmt}): {e}")))?;
+    }
 
     let mut stats = ReconstructStats::default();
 

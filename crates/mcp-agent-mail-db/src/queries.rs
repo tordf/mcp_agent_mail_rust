@@ -2701,9 +2701,13 @@ pub fn sanitize_fts_query(query: &str) -> Option<String> {
 
     let mut result = trimmed.to_string();
 
-    // FTS5 doesn't support leading wildcards (*foo); strip and recurse
-    if let Some(stripped) = result.strip_prefix('*') {
-        return sanitize_fts_query(stripped);
+    // FTS5 doesn't support leading wildcards (*foo); strip iteratively
+    while result.starts_with('*') {
+        result = result[1..].to_string();
+    }
+    let mut result = result.trim().to_string();
+    if result.is_empty() || !result.chars().any(char::is_alphanumeric) {
+        return None;
     }
 
     // Trailing lone asterisk: "foo *" → "foo"

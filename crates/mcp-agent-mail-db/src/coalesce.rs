@@ -298,29 +298,45 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
 
         match role {
             Role::Joiner(slot) => {
-                mcp_agent_mail_core::evidence_ledger().record(
-                    "coalesce.outcome",
-                    serde_json::json!({ "inflight_count": inflight_count }),
-                    "joined",
-                    Some("join_rate >= 0.3".into()),
-                    0.8,
-                    "coalesce_v1",
-                );
                 match slot.wait(self.join_timeout) {
                     Ok(v) => {
                         self.joined_count.fetch_add(1, Ordering::Relaxed);
+                        mcp_agent_mail_core::evidence_ledger().record(
+                            "coalesce.outcome",
+                            serde_json::json!({ "inflight_count": inflight_count }),
+                            "joined",
+                            Some("join_rate >= 0.3".into()),
+                            0.8,
+                            "coalesce_v1",
+                        );
                         Ok(CoalesceOutcome::Joined(v))
                     }
                     Err(CoalesceJoinError::Timeout) => {
                         self.timeout_count.fetch_add(1, Ordering::Relaxed);
                         // Fallback: execute independently.
                         self.leader_count.fetch_add(1, Ordering::Relaxed);
+                        mcp_agent_mail_core::evidence_ledger().record(
+                            "coalesce.outcome",
+                            serde_json::json!({ "inflight_count": inflight_count }),
+                            "join_timeout_fallback",
+                            Some("join_rate >= 0.3".into()),
+                            0.8,
+                            "coalesce_v1",
+                        );
                         f().map(CoalesceOutcome::Executed)
                     }
                     Err(CoalesceJoinError::LeaderFailed(_)) => {
                         self.leader_failed_count.fetch_add(1, Ordering::Relaxed);
                         // Fallback: execute independently.
                         self.leader_count.fetch_add(1, Ordering::Relaxed);
+                        mcp_agent_mail_core::evidence_ledger().record(
+                            "coalesce.outcome",
+                            serde_json::json!({ "inflight_count": inflight_count }),
+                            "join_leader_failed_fallback",
+                            Some("join_rate >= 0.3".into()),
+                            0.8,
+                            "coalesce_v1",
+                        );
                         f().map(CoalesceOutcome::Executed)
                     }
                 }

@@ -836,8 +836,11 @@ impl SearchMetrics {
             self.shadow_v3_errors_total.inc();
         }
 
-        // Store latency delta with offset to handle negatives
-        let delta_offset = (latency_delta_us + LATENCY_DELTA_OFFSET) as u64;
+        // Store latency delta with offset to handle negatives.
+        // Clamp to avoid underflow when delta is extremely negative (< -OFFSET).
+        let delta_offset = latency_delta_us
+            .saturating_add(LATENCY_DELTA_OFFSET)
+            .max(0) as u64;
         self.shadow_latency_delta_sum_us
             .fetch_add(delta_offset, Ordering::Relaxed);
         self.shadow_latency_delta_count

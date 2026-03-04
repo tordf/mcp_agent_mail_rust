@@ -471,9 +471,7 @@ fn probe_via_curl(parsed: &ParsedUrl, config: &ProbeConfig) -> Result<RawRespons
             "-", // dump headers to stdout
             "--max-time",
             &timeout_secs.to_string(),
-            "-L", // follow redirects (curl handles them)
-            "--max-redirs",
-            "0", // but we handle redirects ourselves
+            // Do not follow redirects — we handle them ourselves
             &url,
         ])
         .output()

@@ -1193,20 +1193,27 @@ pub fn install_precommit_guard(
         database_url: config.database_url.clone(),
         ..Default::default()
     };
-    let abs_db_path = db_cfg
-        .sqlite_path()
-        .ok()
-        .map(|s| {
-            let p = std::path::PathBuf::from(s);
-            if p.exists() {
-                p.canonicalize().unwrap_or(p)
-            } else if p.is_absolute() {
-                p
-            } else {
-                std::env::current_dir().unwrap_or_default().join(p)
-            }
-        })
-        .map(|p| p.to_string_lossy().to_string());
+    
+    let sqlite_path = db_cfg.sqlite_path().unwrap_or_else(|_| ":memory:".to_string());
+    if sqlite_path == ":memory:" {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Cannot install pre-commit guard when using an in-memory database. \
+             Please configure a file-backed database using the DATABASE_URL environment variable.",
+        ));
+    }
+
+    let abs_db_path = {
+        let p = std::path::PathBuf::from(sqlite_path);
+        let p = if p.exists() {
+            p.canonicalize().unwrap_or(p)
+        } else if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        };
+        Some(p.to_string_lossy().to_string())
+    };
 
     // Enable pre-push hook installation by default to match legacy behavior
     mcp_agent_mail_guard::install_guard(&project_key, &repo_path, abs_db_path.as_deref(), true)

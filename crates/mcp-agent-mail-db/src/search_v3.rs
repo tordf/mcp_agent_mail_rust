@@ -664,6 +664,8 @@ fn choose_backfill_plan(
     Ok(BackfillPlan::FullRebuild)
 }
 
+static INDEX_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Index a single message into the global Tantivy bridge.
 ///
 /// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
@@ -675,6 +677,8 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     let Some(bridge) = get_bridge() else {
         return Ok(false); // bridge not initialized, skip silently
     };
+
+    let _guard = INDEX_WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let handles = bridge.handles();
     let mut writer = bridge
@@ -709,6 +713,8 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
     let Some(bridge) = get_bridge() else {
         return Ok(0);
     };
+
+    let _guard = INDEX_WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let handles = bridge.handles();
     let mut writer = bridge
@@ -752,6 +758,8 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let Some(bridge) = get_bridge() else {
         return Ok((0, 0));
     };
+
+    let _guard = INDEX_WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Open a sync connection via FrankenSQLite.
     let db_path_owned = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {

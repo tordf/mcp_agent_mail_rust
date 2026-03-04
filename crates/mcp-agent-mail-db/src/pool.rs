@@ -239,10 +239,10 @@ impl DbPoolStatsSampler {
         let stats = pool.stats();
         let metrics = mcp_agent_mail_core::global_metrics();
 
-        let total = u64::try_from(stats.total_connections).unwrap_or(u64::MAX);
-        let idle = u64::try_from(stats.idle_connections).unwrap_or(u64::MAX);
-        let active = u64::try_from(stats.active_connections).unwrap_or(u64::MAX);
-        let pending = u64::try_from(stats.pending_requests).unwrap_or(u64::MAX);
+        let total = u64::try_from(stats.total_connections).unwrap_or(0);
+        let idle = u64::try_from(stats.idle_connections).unwrap_or(0);
+        let active = u64::try_from(stats.active_connections).unwrap_or(0);
+        let pending = u64::try_from(stats.pending_requests).unwrap_or(0);
 
         metrics.db.pool_total_connections.set(total);
         metrics.db.pool_idle_connections.set(idle);
@@ -1284,7 +1284,9 @@ fn sqlite_pragma_check_is_ok(conn: &DbConn, pragma_sql: &str) -> Result<bool, Sq
         // Some backends may return an empty rowset for success.
         return Ok(true);
     }
-    Ok(details.len() == 1 && details[0] == "ok")
+    Ok(details
+        .iter()
+        .all(|detail| detail.trim().eq_ignore_ascii_case("ok")))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1317,7 +1319,9 @@ fn sqlite_pragma_check_is_ok_canonical(
         // Some backends may return an empty rowset for success.
         return Ok(true);
     }
-    Ok(details.len() == 1 && details[0] == "ok")
+    Ok(details
+        .iter()
+        .all(|detail| detail.trim().eq_ignore_ascii_case("ok")))
 }
 
 #[allow(clippy::result_large_err)]

@@ -315,33 +315,7 @@ pub(crate) fn summarize_messages(
                 }
             }
 
-            // Bullet points and ordered lists => key points
-            if stripped.starts_with('-')
-                || stripped.starts_with('*')
-                || stripped.starts_with('+')
-                || is_ordered_prefix(stripped)
-            {
-                let mut normalized = stripped.to_string();
-                let upper_norm = normalized.to_ascii_uppercase();
-                if (upper_norm.starts_with("- [ ]")
-                    || upper_norm.starts_with("- [X]")
-                    || upper_norm.starts_with("* [ ]")
-                    || upper_norm.starts_with("* [X]")
-                    || upper_norm.starts_with("+ [ ]")
-                    || upper_norm.starts_with("+ [X]"))
-                    && let Some((_, rest)) = normalized.split_once(']')
-                {
-                    normalized = rest.trim().to_string();
-                }
-                let cleaned = normalized
-                    .trim_start_matches(&['-', '+', '*', ' '][..])
-                    .to_string();
-                if !cleaned.is_empty() {
-                    key_points.push(cleaned);
-                }
-            }
-
-            // Checkbox actions
+            // Checkbox actions (checked before bullet key_points to avoid double-counting)
             if stripped.starts_with("- [ ]")
                 || stripped.starts_with("* [ ]")
                 || stripped.starts_with("+ [ ]")
@@ -360,6 +334,20 @@ pub(crate) fn summarize_messages(
                 done_actions += 1;
                 action_items.push(stripped.to_string());
                 continue;
+            }
+
+            // Bullet points and ordered lists => key points
+            if stripped.starts_with('-')
+                || stripped.starts_with('*')
+                || stripped.starts_with('+')
+                || is_ordered_prefix(stripped)
+            {
+                let cleaned = stripped
+                    .trim_start_matches(&['-', '+', '*', ' '][..])
+                    .to_string();
+                if !cleaned.is_empty() {
+                    key_points.push(cleaned);
+                }
             }
 
             let upper = stripped.to_ascii_uppercase();

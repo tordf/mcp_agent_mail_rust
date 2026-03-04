@@ -2647,24 +2647,18 @@ fn build_agents(
                     (SELECT COUNT(*) FROM messages m WHERE m.sender_id = a.id) AS msg_count
              FROM agents a
              WHERE a.project_id = ?
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM agents newer
-                   WHERE newer.project_id = a.project_id
-                     AND newer.name = a.name COLLATE NOCASE
-                     AND (
-                         newer.last_active_ts > a.last_active_ts
-                         OR (newer.last_active_ts = a.last_active_ts AND newer.id > a.id)
-                     )
-               )
              ORDER BY a.last_active_ts DESC, a.id DESC",
             &[Value::BigInt(project_id)],
         )
         .map_err(|e| CliError::Other(format!("agents query: {e}")))?;
 
+    let mut seen_names = std::collections::HashSet::new();
     let mut agents: Vec<AgentRow> = Vec::new();
     for row in &rows {
         let name: String = row.get_named("name").unwrap_or_default();
+        if !seen_names.insert(name.to_lowercase()) {
+            continue;
+        }
         let program: String = row.get_named("program").unwrap_or_default();
         let model: String = row.get_named("model").unwrap_or_default();
         let last_active_ts: i64 = row.get_named("last_active_ts").unwrap_or(0);
@@ -5481,7 +5475,10 @@ mod tests {
         )
         .expect("insert messages");
 
+        
+
         let rows = build_agents(&conn, 1, false, None).expect("build agents");
+
         assert_eq!(rows.len(), 2, "duplicate logical agent should be collapsed");
         assert_eq!(rows[0].name, "rubyprairie");
         assert_eq!(rows[0].program, "codex-cli");

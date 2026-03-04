@@ -3703,9 +3703,9 @@ fn degenerate_stty_size() -> Option<(u16, u16)> {
     }
     let (cols, rows) = parse_stty_size(&output.stdout)?;
     if cols == 0 || rows == 0 {
-        return Some((cols, rows));
+        return None;
     }
-    None
+    Some((cols, rows))
 }
 
 fn request_panel_width_from_columns(columns: u16) -> usize {
@@ -3730,8 +3730,11 @@ fn pretty_num(value: u64) -> String {
 
 /// Format a relative time string like "12s ago", "5m ago", "2h ago".
 fn relative_time_short(now_us: i64, ts_us: i64) -> String {
-    let delta_s = (now_us.saturating_sub(ts_us)) / 1_000_000;
-    if delta_s < 0 {
+    if ts_us >= now_us {
+        return "now".to_string();
+    }
+    let delta_s = (now_us - ts_us) / 1_000_000;
+    if delta_s < 1 {
         "now".to_string()
     } else if delta_s < 60 {
         format!("{delta_s}s ago")
