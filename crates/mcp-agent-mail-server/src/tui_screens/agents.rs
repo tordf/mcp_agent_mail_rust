@@ -214,6 +214,8 @@ pub struct AgentsScreen {
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
     detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
     /// Last observed data-channel generation for dirty-state gating.
     last_data_gen: super::DataGeneration,
     /// True when the DB poller has not yet delivered any data.
@@ -260,6 +262,7 @@ impl AgentsScreen {
             total_msgs_this_tick: 0,
             detail_visible: true,
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             last_data_gen: super::DataGeneration::stale(),
             db_context_unavailable: false,
             cached_status_counts: (0, 0, 0),
