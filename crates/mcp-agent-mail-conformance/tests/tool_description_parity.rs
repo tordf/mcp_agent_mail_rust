@@ -240,7 +240,7 @@ fn compare_input_schemas(tool_name: &str, expected: &Value, actual: &Value) -> V
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Master test: load fixture, build Rust server, compare every tool description.
+/// Main test: load fixture, build Rust server, compare every tool description.
 #[test]
 fn tool_descriptions_match_python_fixture() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());

@@ -1046,33 +1046,15 @@ effective_free_bytes={free}"
     .await?;
     let sender_id = sender.id.unwrap_or(0);
 
-    let mut to = to;
+    let to = to;
     let broadcast = broadcast.unwrap_or(false);
-    if broadcast && !to.is_empty() {
+    if broadcast {
         return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
+            "BROADCAST_DISABLED",
+            "Broadcast messaging is intentionally not supported to prevent agent spam. Address agents specifically.",
             true,
             serde_json::json!({ "argument": "broadcast" }),
         ));
-    }
-    if broadcast {
-        let all_agents = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await
-        )?;
-        for a in all_agents {
-            if a.name != sender_name && a.contact_policy != "block_all" {
-                to.push(a.name);
-            }
-        }
-        if to.is_empty() {
-            return Err(legacy_tool_error(
-                "NO_RECIPIENTS",
-                "Broadcast requested, but no other available agents are registered in the project.",
-                true,
-                serde_json::json!({ "project": project_key }),
-            ));
-        }
     }
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
