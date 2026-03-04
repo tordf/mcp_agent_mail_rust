@@ -973,14 +973,14 @@ pub async fn whois(
 ///
 /// # Parameters
 /// - `project_key`: Absolute path to the project directory
-/// - `pane_id`: Optional tmux pane identifier (reads $TMUX_PANE if omitted)
+/// - `pane_id`: Optional tmux pane identifier (reads `$TMUX_PANE` if omitted)
 ///
 /// # Returns
 /// The agent name if found, or an error if no identity file exists.
 #[tool(
     description = "Resolve the agent name for a tmux pane from the canonical per-pane identity file.\n\nChecks the following locations in priority order:\n1. Canonical: ~/.config/agent-mail/identity/<project_hash>/<pane_id>\n2. Legacy Claude Code: ~/.claude/agent-mail/identity.<pane_id>\n3. Legacy NTM: /tmp/agent-mail-name.<project_hash>.<pane_id>\n\nParameters\n----------\nproject_key : str\n    Absolute path to the project directory (used to scope the lookup).\npane_id : Optional[str]\n    Tmux pane identifier (e.g., \"%0\", \"%3\"). If omitted, reads $TMUX_PANE.\n\nReturns\n-------\ndict\n    { agent_name, pane_id, identity_path }"
 )]
-pub async fn resolve_pane_identity(
+pub fn resolve_pane_identity(
     _ctx: &McpContext,
     project_key: String,
     pane_id: Option<String>,
@@ -1003,8 +1003,23 @@ pub async fn resolve_pane_identity(
     let canonical_path =
         mcp_agent_mail_core::canonical_identity_path(&project_key, &effective_pane);
 
-    match mcp_agent_mail_core::resolve_identity(&project_key, &effective_pane) {
-        Some(agent_name) => {
+    mcp_agent_mail_core::resolve_identity(&project_key, &effective_pane).map_or_else(
+        || {
+            Err(legacy_tool_error(
+                "IDENTITY_NOT_FOUND",
+                format!(
+                    "No identity file found for pane '{effective_pane}' in project '{project_key}'. \
+                     Register an agent first with register_agent or macro_start_session."
+                ),
+                false,
+                json!({
+                    "pane_id": effective_pane,
+                    "project_key": project_key,
+                    "checked_path": canonical_path.to_string_lossy(),
+                }),
+            ))
+        },
+        |agent_name| {
             let response = json!({
                 "agent_name": agent_name,
                 "pane_id": effective_pane,
@@ -1012,21 +1027,8 @@ pub async fn resolve_pane_identity(
             });
             serde_json::to_string(&response)
                 .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
-        }
-        None => Err(legacy_tool_error(
-            "IDENTITY_NOT_FOUND",
-            &format!(
-                "No identity file found for pane '{effective_pane}' in project '{project_key}'. \
-                 Register an agent first with register_agent or macro_start_session."
-            ),
-            false,
-            json!({
-                "pane_id": effective_pane,
-                "project_key": project_key,
-                "checked_path": canonical_path.to_string_lossy(),
-            }),
-        )),
-    }
+        },
+    )
 }
 
 /// Clean up stale per-pane identity files for dead tmux panes.
@@ -1039,14 +1041,14 @@ pub async fn resolve_pane_identity(
 #[tool(
     description = "Remove stale per-pane identity files for tmux panes that no longer exist.\n\nQueries tmux for live panes and removes identity files that reference dead panes.\nSafety: does nothing if tmux is not running (to avoid accidentally removing everything).\n\nParameters\n----------\nproject_key : Optional[str]\n    If provided, only clean up identity files for this project.\n    If omitted, clean up across all projects.\n\nReturns\n-------\ndict\n    { removed_count, removed_paths }"
 )]
-pub async fn cleanup_pane_identities(
+pub fn cleanup_pane_identities(
     _ctx: &McpContext,
     project_key: Option<String>,
 ) -> McpResult<String> {
-    let removed = match project_key {
-        Some(key) => mcp_agent_mail_core::cleanup_stale_identities(&key),
-        None => mcp_agent_mail_core::cleanup_all_stale_identities(),
-    };
+    let removed = project_key
+        .map_or_else(mcp_agent_mail_core::cleanup_all_stale_identities, |key| {
+            mcp_agent_mail_core::cleanup_stale_identities(&key)
+        });
 
     let paths: Vec<String> = removed
         .iter()

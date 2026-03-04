@@ -1354,7 +1354,7 @@ impl SearchCockpitScreen {
         }
     }
 
-    fn toggle_detail_view_mode(&mut self) {
+    fn toggle_detail_view_mode(&self) {
         match self.detail_view_mode.get() {
             DetailViewMode::Markdown => {
                 let Some(entry) = self.results.get(self.cursor) else {
@@ -1401,7 +1401,7 @@ impl SearchCockpitScreen {
         }
     }
 
-    fn handle_json_tree_navigation(&mut self, key: &ftui::KeyEvent) -> bool {
+    fn handle_json_tree_navigation(&self, key: &ftui::KeyEvent) -> bool {
         if self.detail_view_mode.get() != DetailViewMode::JsonTree {
             return false;
         }
@@ -1426,20 +1426,22 @@ impl SearchCockpitScreen {
         match key.code {
             KeyCode::Char('J') => self.toggle_detail_view_mode(),
             KeyCode::Char('j') | KeyCode::Down => {
-                self.json_tree_state.borrow_mut().move_cursor_by(1)
+                self.json_tree_state.borrow_mut().move_cursor_by(1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.json_tree_state.borrow_mut().move_cursor_by(-1)
+                self.json_tree_state.borrow_mut().move_cursor_by(-1);
             }
             KeyCode::Char('d') | KeyCode::PageDown => {
-                self.json_tree_state.borrow_mut().move_cursor_by(8)
+                self.json_tree_state.borrow_mut().move_cursor_by(8);
             }
             KeyCode::Char('u') | KeyCode::PageUp => {
-                self.json_tree_state.borrow_mut().move_cursor_by(-8)
+                self.json_tree_state.borrow_mut().move_cursor_by(-8);
             }
-            KeyCode::Home => self.json_tree_state.borrow_mut().move_cursor_by(isize::MIN),
+            KeyCode::Home => {
+                self.json_tree_state.borrow_mut().move_cursor_by(isize::MIN);
+            }
             KeyCode::End | KeyCode::Char('G') => {
-                self.json_tree_state.borrow_mut().move_cursor_by(isize::MAX)
+                self.json_tree_state.borrow_mut().move_cursor_by(isize::MAX);
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let _ = self.json_tree_state.borrow_mut().toggle_selected();
@@ -2365,7 +2367,7 @@ impl SearchCockpitScreen {
         total.saturating_sub(visible)
     }
 
-    fn scroll_detail_by(&mut self, delta: isize) {
+    fn scroll_detail_by(&self, delta: isize) {
         let max = self.detail_max_scroll();
         if delta.is_negative() {
             self.detail_scroll.set(
@@ -4946,6 +4948,7 @@ fn render_guidance(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn compose_detail_text(
     entry: &ResultEntry,
     highlight_terms: &[QueryTerm],

@@ -987,9 +987,7 @@ async fn run_sqlite_init_once(
         }
     };
 
-    if !run_migrations
-        && let Err(err) = runtime_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
-    {
+    if !run_migrations && let Err(err) = runtime_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
         return Outcome::Err(SqlError::Custom(format!(
             "sqlite init stage=base_pragmas_runtime failed: {err}"
         )));
@@ -2534,7 +2532,10 @@ mod tests {
         }
 
         let type_rows = verify_conn
-            .query_sync("SELECT typeof(created_at) AS t FROM projects WHERE id = 1", &[])
+            .query_sync(
+                "SELECT typeof(created_at) AS t FROM projects WHERE id = 1",
+                &[],
+            )
             .expect("projects type query");
         assert_eq!(
             type_rows[0]
@@ -3105,6 +3106,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn sqlite_file_is_healthy_with_sidecar_invokes_compat_probe() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("compat_probe.db");
@@ -3132,6 +3134,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn sqlite_file_is_healthy_with_sidecar_accepts_compat_unhealthy() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("compat_unhealthy.db");

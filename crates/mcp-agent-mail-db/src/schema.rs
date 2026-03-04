@@ -2536,7 +2536,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("legacy_seeded.sqlite3");
 
-        let seed_sql = r#"
+        let seed_sql = r"
 PRAGMA foreign_keys = OFF;
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -2609,7 +2609,7 @@ VALUES (1, 2, 'to', NULL, NULL);
 
 INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
 VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00', '2026-12-24 15:33:00', NULL);
-"#;
+";
 
         let mut child = Command::new("sqlite3")
             .arg(&db_path)
