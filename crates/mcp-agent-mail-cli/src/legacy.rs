@@ -1528,16 +1528,41 @@ fn backup_db_with_sidecars(db_path: &Path, destination_root: &Path) -> CliResult
     Ok(())
 }
 
+fn checkpoint_sqlite_for_copy(db_path: &Path) -> CliResult<()> {
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let conn = DbConn::open_file(db_path_str).map_err(|e| {
+        CliError::Other(format!("cannot open sqlite DB {}: {e}", db_path.display()))
+    })?;
+    conn.execute_raw("PRAGMA busy_timeout = 60000;")
+        .map_err(|e| CliError::Other(format!("cannot set busy_timeout before copy: {e}")))?;
+    conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+        .map_err(|e| CliError::Other(format!("WAL checkpoint failed before copy: {e}")))?;
+    Ok(())
+}
+
 fn copy_db_with_sidecars(source_db: &Path, target_db: &Path) -> CliResult<()> {
+    if !source_db.exists() {
+        return Err(CliError::Other(format!(
+            "source database does not exist: {}",
+            source_db.display()
+        )));
+    }
+
+    checkpoint_sqlite_for_copy(source_db)?;
+
     if let Some(parent) = target_db.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::copy(source_db, target_db)?;
+
+    // Avoid transporting stale WAL/SHM sidecars into the imported database.
+    // Sidecars are ephemeral and can be inconsistent with the copied main DB.
     for suffix in ["-wal", "-shm"] {
-        let source_sidecar = PathBuf::from(format!("{}{}", source_db.display(), suffix));
-        if source_sidecar.exists() {
-            let target_sidecar = PathBuf::from(format!("{}{}", target_db.display(), suffix));
-            fs::copy(source_sidecar, target_sidecar)?;
+        let mut target_sidecar_os = target_db.as_os_str().to_os_string();
+        target_sidecar_os.push(suffix);
+        let target_sidecar = PathBuf::from(target_sidecar_os);
+        if target_sidecar.exists() {
+            let _ = fs::remove_file(target_sidecar);
         }
     }
     Ok(())
@@ -2209,6 +2234,51 @@ mod tests {
             .and_then(|r| r.get_named::<i64>("c").ok())
             .unwrap_or(0);
         assert_eq!(trigger_count, 0, "legacy FTS triggers should be removed");
+    }
+
+    #[test]
+    fn copy_db_with_sidecars_omits_source_sidecars_and_preserves_main_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_db = tmp.path().join("source.sqlite3");
+        let target_db = tmp.path().join("target.sqlite3");
+
+        let source_conn = DbConn::open_file(source_db.display().to_string()).unwrap();
+        source_conn
+            .execute_raw("CREATE TABLE marker(value TEXT)")
+            .unwrap();
+        source_conn
+            .execute_raw("INSERT INTO marker(value) VALUES('from-source')")
+            .unwrap();
+        let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+        drop(source_conn);
+
+        let source_wal = PathBuf::from(format!("{}-wal", source_db.display()));
+        let source_shm = PathBuf::from(format!("{}-shm", source_db.display()));
+        fs::write(&source_wal, b"source-sidecar-wal").unwrap();
+        fs::write(&source_shm, b"source-sidecar-shm").unwrap();
+
+        copy_db_with_sidecars(&source_db, &target_db).unwrap();
+
+        let target_wal = PathBuf::from(format!("{}-wal", target_db.display()));
+        let target_shm = PathBuf::from(format!("{}-shm", target_db.display()));
+        assert!(
+            !target_wal.exists(),
+            "target copy should not include stale source WAL sidecar"
+        );
+        assert!(
+            !target_shm.exists(),
+            "target copy should not include stale source SHM sidecar"
+        );
+
+        let target_conn = DbConn::open_file(target_db.display().to_string()).unwrap();
+        let rows = target_conn
+            .query_sync("SELECT value FROM marker LIMIT 1", &[])
+            .unwrap();
+        let marker = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("value").ok())
+            .unwrap();
+        assert_eq!(marker, "from-source");
     }
 
     #[cfg(unix)]

@@ -654,9 +654,13 @@ copy_sqlite_snapshot() {
     rm -f "$tmp_db" 2>/dev/null || true
   fi
 
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$src_db" "PRAGMA busy_timeout = 5000; PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
+  fi
+
+  # Sidecars are intentionally omitted to avoid propagating stale WAL/SHM state.
   cp -p "$src_db" "$dest_db"
-  [ -f "${src_db}-wal" ] && cp -p "${src_db}-wal" "${dest_db}-wal"
-  [ -f "${src_db}-shm" ] && cp -p "${src_db}-shm" "${dest_db}-shm"
+  rm -f "${dest_db}-wal" "${dest_db}-shm" 2>/dev/null || true
 }
 
 # T1.3: Detect Python virtualenv and git clone
@@ -3310,6 +3314,13 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
       warn "  $migration_pristine_backup"
     fi
   fi
+
+  if [ "$migration_succeeded" -ne 1 ]; then
+    err "Database migration could not be completed safely."
+    err "Aborting install to avoid running with a potentially inconsistent migrated database."
+    err "Retry with --verbose after reviewing migration diagnostics above."
+    exit 1
+  fi
 fi
 
 # T2.4: Post-install verification
@@ -3340,15 +3351,21 @@ verify_installation() {
   # 3. Check that 'am' resolves to the Rust binary in a login shell
   local shell_name
   shell_name=$(basename "${SHELL:-/bin/sh}")
-  local resolve_cmd
-  case "$shell_name" in
-    zsh)  resolve_cmd="zsh -l -c 'whence -p am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND'" ;;
-    bash) resolve_cmd="bash -l -c 'type -P am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND'" ;;
-    *)    resolve_cmd="sh -l -c 'which am 2>/dev/null || echo NOT_FOUND'" ;;
-  esac
-  verbose "verify_installation:path_resolution_command shell=${shell_name} cmd=${resolve_cmd}"
   local resolved_path
-  resolved_path=$(eval "$resolve_cmd" 2>/dev/null || echo "NOT_FOUND")
+  case "$shell_name" in
+    zsh)
+      resolved_path=$(zsh -l -c 'whence -p am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND")
+      ;;
+    bash)
+      resolved_path=$(bash -l -c 'type -P am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND")
+      ;;
+    fish)
+      resolved_path=$(fish -l -c 'type -P am 2>/dev/null; or which am 2>/dev/null; or echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND")
+      ;;
+    *)
+      resolved_path=$(sh -l -c 'which am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND")
+      ;;
+  esac
   verbose "verify_installation:path_resolution_result resolved=${resolved_path:-NOT_FOUND} expected=${DEST}/${BIN_CLI}"
 
   if [ "$resolved_path" = "NOT_FOUND" ] || [ -z "$resolved_path" ]; then
@@ -3357,8 +3374,21 @@ verify_installation() {
     issues=$((issues + 1))
   elif [ "$resolved_path" != "$DEST/$BIN_CLI" ]; then
     # Check if it's an alias shadowing the binary
-    local alias_check
-    alias_check=$(eval "$shell_name -l -c 'alias am 2>/dev/null || true'" 2>/dev/null || true)
+    local alias_check=""
+    case "$shell_name" in
+      zsh)
+        alias_check=$(zsh -l -c 'alias am 2>/dev/null || true' 2>/dev/null || true)
+        ;;
+      bash)
+        alias_check=$(bash -l -c 'alias am 2>/dev/null || true' 2>/dev/null || true)
+        ;;
+      fish)
+        alias_check=$(fish -l -c 'alias am 2>/dev/null || true' 2>/dev/null || true)
+        ;;
+      *)
+        alias_check=""
+        ;;
+    esac
     if [ -n "$alias_check" ]; then
       warn "VERIFY: 'am' is still aliased in your shell!"
       warn "  Alias: $alias_check"
