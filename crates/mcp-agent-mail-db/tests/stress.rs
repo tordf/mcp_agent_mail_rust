@@ -17,7 +17,8 @@
     clippy::manual_let_else
 )]
 
-use asupersync::runtime::RuntimeBuilder;
+mod common;
+
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::schema;
@@ -55,11 +56,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 /// Retry an async operation up to `max_retries` times on transient `SQLite` lock errors.
@@ -73,10 +70,7 @@ where
 {
     for attempt in 0..=max_retries {
         let cx = Cx::for_testing();
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-        match rt.block_on(f(cx)) {
+        match common::spin_poll(f(cx)) {
             Outcome::Ok(val) => return val,
             Outcome::Err(e) if attempt < max_retries => {
                 let msg = format!("{e:?}");

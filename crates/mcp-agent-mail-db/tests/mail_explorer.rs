@@ -10,9 +10,10 @@
     clippy::missing_const_for_fn
 )]
 
+mod common;
+
 use std::collections::HashMap;
 
-use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::mail_explorer::{
     AckFilter, Direction, ExplorerQuery, GroupMode, SortMode, fetch_explorer_page,
@@ -29,11 +30,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 fn make_pool() -> (DbPool, tempfile::TempDir) {

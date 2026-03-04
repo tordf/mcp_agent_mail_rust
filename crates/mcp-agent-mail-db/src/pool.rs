@@ -354,7 +354,6 @@ impl DbPool {
                 let init_sql = init_sql.clone();
                 let cx2 = cx2.clone();
                 async move {
-                    eprintln!("[pool-factory] start path={sqlite_path} run_migrations={run_migrations}");
                     // Ensure parent directory exists for file-backed DBs.
                     if sqlite_path != ":memory:"
                         && let Err(e) = ensure_sqlite_parent_dir_exists(&sqlite_path)
@@ -367,7 +366,6 @@ impl DbPool {
                     // Run one-time DB initialization (schema + migrations) via a separate
                     // connection to ensure atomic setup before pool connections open.
                     if sqlite_path != ":memory:" {
-                        eprintln!("[pool-factory] getting init gate...");
                         let init_gate = sqlite_init_gate(&sqlite_path);
                         let run_migrations = run_migrations;
 
@@ -391,7 +389,6 @@ impl DbPool {
                                 }
                             })
                             .await;
-                        eprintln!("[pool-factory] init gate returned: {}", if gate_out.is_ok() { "ok" } else { "err" });
 
                         match gate_out {
                             Ok(()) => {}
@@ -405,7 +402,6 @@ impl DbPool {
                     }
 
                     // Now open pool connection (migrations are complete).
-                    eprintln!("[pool-factory] opening pool connection...");
                     let mut conn = if sqlite_path == ":memory:" {
                         match DbConn::open_memory() {
                             Ok(c) => c,
@@ -446,12 +442,10 @@ impl DbPool {
                         }
                     }
 
-                    eprintln!("[pool-factory] done, returning Ok(conn)");
                     Outcome::Ok(conn)
                 }
             })
             .await;
-        eprintln!("[pool-acquire] pool.acquire returned");
 
         let dur_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
             .unwrap_or(u64::MAX);
@@ -968,7 +962,7 @@ impl DbPool {
                 // Idle connections hold FDs to the old (corrupted/unlinked) inode.
                 // test_on_checkout(true) ensures stale connections fail health checks
                 // and get evicted on next acquire, so explicit draining is not required.
-                // If clear_idle() becomes available: self.pool.clear_idle();
+                // TODO(br-10090): call self.pool.clear_idle() once sqlmodel_rust is deployed to workers
                 Ok(true)
             }
             Err(e) => {
@@ -1030,28 +1024,20 @@ fn pool_cache_key(config: &DbPoolConfig) -> String {
 }
 
 fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
-    eprintln!("[init-gate] normalizing path: {sqlite_path}");
     let gate_key = normalize_sqlite_identity_path(sqlite_path);
-    eprintln!("[init-gate] gate_key={gate_key}");
     let gates = SQLITE_INIT_GATES
         .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
-    eprintln!("[init-gate] got gates map, acquiring read lock...");
 
     // Fast path: read lock for existing gate (concurrent readers).
     {
         let guard = gates.read();
-        eprintln!("[init-gate] read lock acquired, checking cache...");
         if let Some(gate) = guard.get(&gate_key) {
-            eprintln!("[init-gate] found existing gate");
             return Arc::clone(gate);
         }
-        eprintln!("[init-gate] no existing gate, need write lock...");
     }
 
     // Slow path: write lock to create a new gate (rare, once per SQLite file).
-    eprintln!("[init-gate] acquiring write lock...");
     let mut guard = gates.write();
-    eprintln!("[init-gate] write lock acquired");
     // Double-check after acquiring write lock.
     if let Some(gate) = guard.get(&gate_key) {
         return Arc::clone(gate);

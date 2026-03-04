@@ -22,10 +22,11 @@
     clippy::uninlined_format_args
 )]
 
+mod common;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 
 use mcp_agent_mail_db::search_planner::SearchQuery;
@@ -69,11 +70,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 /// Build a `FusedHit` with the given `doc_id` and `rrf_score`.

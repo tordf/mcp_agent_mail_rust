@@ -495,6 +495,8 @@ pub struct ThreadExplorerScreen {
     detail_messages: Vec<ThreadMessage>,
     /// Scroll offset in the detail panel.
     detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
     /// Current focus pane.
     focus: Focus,
     /// Lazy-opened DB connection.
@@ -575,6 +577,7 @@ impl ThreadExplorerScreen {
             cursor: 0,
             detail_messages: Vec::new(),
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             focus: Focus::ThreadList,
             db_conn: None,
             db_conn_attempted: false,
@@ -1592,7 +1595,8 @@ impl MailScreen for ThreadExplorerScreen {
                         _ => match key.code {
                             // Preview scrolling/actions while preview has focus.
                             KeyCode::Char('j') | KeyCode::Down => {
-                                self.detail_scroll = self.detail_scroll.saturating_add(1);
+                                let max = self.last_detail_max_scroll.get();
+                                self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
                             }
                             KeyCode::Char('k') | KeyCode::Up => {
                                 self.detail_scroll = self.detail_scroll.saturating_sub(1);
@@ -1832,6 +1836,7 @@ impl MailScreen for ThreadExplorerScreen {
                     self.total_thread_messages,
                     matches!(self.focus, Focus::DetailPanel),
                     self.detail_tree_focus,
+                    &self.last_detail_max_scroll,
                 );
             }
         } else if content_area.height >= THREAD_STACKED_MIN_HEIGHT && self.detail_visible {
@@ -1919,6 +1924,7 @@ impl MailScreen for ThreadExplorerScreen {
                     self.total_thread_messages,
                     matches!(self.focus, Focus::DetailPanel),
                     self.detail_tree_focus,
+                    &self.last_detail_max_scroll,
                 );
             }
         } else {
@@ -1986,6 +1992,7 @@ impl MailScreen for ThreadExplorerScreen {
                             self.total_thread_messages,
                             true,
                             self.detail_tree_focus,
+                            &self.last_detail_max_scroll,
                         );
                     }
                 }
@@ -2911,6 +2918,7 @@ fn render_thread_detail(
     total_thread_messages: usize,
     focused: bool,
     tree_focus: bool,
+    max_scroll_cell: &std::cell::Cell<usize>,
 ) {
     let title = thread.map_or_else(
         || "Thread Detail".to_string(),
@@ -3447,7 +3455,12 @@ fn render_thread_detail(
         }
     });
 
-    let scroll_rows = u16::try_from(scroll).unwrap_or(u16::MAX);
+    let visible_height = usize::from(preview_content.height).max(1);
+    let max_scroll = preview_lines.len().saturating_sub(visible_height);
+    max_scroll_cell.set(max_scroll);
+    
+    let clamped_scroll = scroll.min(max_scroll);
+    let scroll_rows = u16::try_from(clamped_scroll).unwrap_or(u16::MAX);
     Paragraph::new(Text::from_lines(preview_lines))
         .style(crate::tui_theme::text_primary(&tp))
         .wrap(ftui::text::WrapMode::Word)

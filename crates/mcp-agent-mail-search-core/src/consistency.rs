@@ -395,9 +395,10 @@ pub fn full_reindex(
     let mut offset = 0;
     let mut total_applied = 0;
     let mut max_version: i64 = 0;
+    let batch_size = config.batch_size.max(1);
 
     loop {
-        let batch = source.fetch_all_batched(config.batch_size, offset)?;
+        let batch = source.fetch_all_batched(batch_size, offset)?;
         if batch.is_empty() {
             break;
         }
@@ -419,7 +420,7 @@ pub fn full_reindex(
         progress.on_progress(offset, total);
 
         // Stop if we got fewer than batch_size (no more data)
-        if batch_len < config.batch_size {
+        if batch_len < batch_size {
             break;
         }
     }
@@ -1018,6 +1019,34 @@ mod tests {
         // rebuild() resets to 0, then 10 docs added
         assert_eq!(result.stats.docs_indexed, 10);
         assert_eq!(lifecycle.doc_count.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn full_reindex_zero_batch_size_is_clamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        let source = MockSource::new(3);
+        let lifecycle = MockLifecycle::healthy(0);
+
+        let result = full_reindex(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ReindexConfig {
+                batch_size: 0,
+                write_checkpoint: false,
+            },
+            &NoProgress,
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.docs_indexed, 3);
+        assert_eq!(lifecycle.doc_count.load(Ordering::Relaxed), 3);
     }
 
     // ── Repair tests ──

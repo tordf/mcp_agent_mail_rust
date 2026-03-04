@@ -3785,20 +3785,57 @@ fn compact_path(input: &str, max_chars: usize) -> String {
     format!("{head}...{tail}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnsiState {
+    Normal,
+    Esc,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
 /// Strip ANSI escape sequences and return the visible character count.
 #[allow(dead_code)]
 fn strip_ansi_len(s: &str) -> usize {
     let mut len = 0usize;
-    let mut in_esc = false;
+    let mut state = AnsiState::Normal;
     for ch in s.chars() {
-        if in_esc {
-            if ch.is_ascii_alphabetic() {
-                in_esc = false;
+        match state {
+            AnsiState::Normal => {
+                if ch == '\x1b' {
+                    state = AnsiState::Esc;
+                } else {
+                    len += unicode_char_width(ch);
+                }
             }
-        } else if ch == '\x1b' {
-            in_esc = true;
-        } else {
-            len += unicode_char_width(ch);
+            AnsiState::Esc => {
+                if ch == '[' {
+                    state = AnsiState::Csi;
+                } else if ch == ']' {
+                    state = AnsiState::Osc;
+                } else {
+                    state = AnsiState::Normal;
+                }
+            }
+            AnsiState::Csi => {
+                if ch.is_ascii_alphabetic() {
+                    state = AnsiState::Normal;
+                }
+            }
+            AnsiState::Osc => {
+                if ch == '\x07' {
+                    state = AnsiState::Normal;
+                } else if ch == '\x1b' {
+                    state = AnsiState::OscEsc;
+                }
+            }
+            AnsiState::OscEsc => {
+                if ch == '\\' {
+                    state = AnsiState::Normal;
+                } else {
+                    state = AnsiState::Osc;
+                }
+            }
         }
     }
     len

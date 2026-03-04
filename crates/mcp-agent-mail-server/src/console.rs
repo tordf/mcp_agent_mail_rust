@@ -873,19 +873,56 @@ fn compact_path(input: &str, max_chars: usize) -> String {
     format!("...{tail}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnsiState {
+    Normal,
+    Esc,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
 /// Strip ANSI escape sequences and return the visible character count.
 fn strip_ansi_len(s: &str) -> usize {
     let mut count = 0usize;
-    let mut in_escape = false;
+    let mut state = AnsiState::Normal;
     for c in s.chars() {
-        if in_escape {
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
+        match state {
+            AnsiState::Normal => {
+                if c == '\x1b' {
+                    state = AnsiState::Esc;
+                } else {
+                    count += 1;
+                }
             }
-        } else if c == '\x1b' {
-            in_escape = true;
-        } else {
-            count += 1;
+            AnsiState::Esc => {
+                if c == '[' {
+                    state = AnsiState::Csi;
+                } else if c == ']' {
+                    state = AnsiState::Osc;
+                } else {
+                    state = AnsiState::Normal;
+                }
+            }
+            AnsiState::Csi => {
+                if c.is_ascii_alphabetic() {
+                    state = AnsiState::Normal;
+                }
+            }
+            AnsiState::Osc => {
+                if c == '\x07' {
+                    state = AnsiState::Normal;
+                } else if c == '\x1b' {
+                    state = AnsiState::OscEsc;
+                }
+            }
+            AnsiState::OscEsc => {
+                if c == '\\' {
+                    state = AnsiState::Normal;
+                } else {
+                    state = AnsiState::Osc;
+                }
+            }
         }
     }
     count
@@ -904,23 +941,54 @@ fn truncate_to_vis_width(s: &str, max_vis: usize) -> String {
     let keep = max_vis.saturating_sub(1);
     let mut out = String::with_capacity(s.len());
     let mut vis = 0usize;
-    let mut in_escape = false;
+    let mut state = AnsiState::Normal;
     for c in s.chars() {
-        if in_escape {
-            out.push(c);
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
+        match state {
+            AnsiState::Normal => {
+                if c == '\x1b' {
+                    state = AnsiState::Esc;
+                    out.push(c);
+                } else if vis < keep {
+                    out.push(c);
+                    vis += 1;
+                } else {
+                    out.push('…');
+                    out.push_str("\x1b[0m\x1b]8;;\x07"); // Close potential color/OSC 8 link
+                    break;
+                }
             }
-        } else if c == '\x1b' {
-            in_escape = true;
-            out.push(c);
-        } else if vis < keep {
-            out.push(c);
-            vis += 1;
-        } else {
-            out.push('…');
-            out.push_str("\x1b[0m");
-            break;
+            AnsiState::Esc => {
+                out.push(c);
+                if c == '[' {
+                    state = AnsiState::Csi;
+                } else if c == ']' {
+                    state = AnsiState::Osc;
+                } else {
+                    state = AnsiState::Normal;
+                }
+            }
+            AnsiState::Csi => {
+                out.push(c);
+                if c.is_ascii_alphabetic() {
+                    state = AnsiState::Normal;
+                }
+            }
+            AnsiState::Osc => {
+                out.push(c);
+                if c == '\x07' {
+                    state = AnsiState::Normal;
+                } else if c == '\x1b' {
+                    state = AnsiState::OscEsc;
+                }
+            }
+            AnsiState::OscEsc => {
+                out.push(c);
+                if c == '\\' {
+                    state = AnsiState::Normal;
+                } else {
+                    state = AnsiState::Osc;
+                }
+            }
         }
     }
     out
@@ -930,16 +998,44 @@ fn truncate_to_vis_width(s: &str, max_vis: usize) -> String {
 #[must_use]
 pub fn strip_ansi_content(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_escape = false;
+    let mut state = AnsiState::Normal;
     for c in s.chars() {
-        if in_escape {
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
+        match state {
+            AnsiState::Normal => {
+                if c == '\x1b' {
+                    state = AnsiState::Esc;
+                } else {
+                    out.push(c);
+                }
             }
-        } else if c == '\x1b' {
-            in_escape = true;
-        } else {
-            out.push(c);
+            AnsiState::Esc => {
+                if c == '[' {
+                    state = AnsiState::Csi;
+                } else if c == ']' {
+                    state = AnsiState::Osc;
+                } else {
+                    state = AnsiState::Normal;
+                }
+            }
+            AnsiState::Csi => {
+                if c.is_ascii_alphabetic() {
+                    state = AnsiState::Normal;
+                }
+            }
+            AnsiState::Osc => {
+                if c == '\x07' {
+                    state = AnsiState::Normal;
+                } else if c == '\x1b' {
+                    state = AnsiState::OscEsc;
+                }
+            }
+            AnsiState::OscEsc => {
+                if c == '\\' {
+                    state = AnsiState::Normal;
+                } else {
+                    state = AnsiState::Osc;
+                }
+            }
         }
     }
     out
@@ -3083,20 +3179,7 @@ mod tests {
 
     /// Strip ANSI codes from a string (for test assertions).
     fn strip_ansi_content(s: &str) -> String {
-        let mut out = String::new();
-        let mut in_escape = false;
-        for c in s.chars() {
-            if in_escape {
-                if c.is_ascii_alphabetic() {
-                    in_escape = false;
-                }
-            } else if c == '\x1b' {
-                in_escape = true;
-            } else {
-                out.push(c);
-            }
-        }
-        out
+        super::strip_ansi_content(s)
     }
 
     // ── Status/method style tests (br-1m6a.13) ──

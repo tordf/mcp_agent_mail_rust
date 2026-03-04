@@ -28,9 +28,10 @@
     deprecated
 )]
 
+mod common;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_db::search_planner::{
@@ -67,11 +68,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 fn trace(case: &str, engine: &str, rows: usize, elapsed_us: u64) {

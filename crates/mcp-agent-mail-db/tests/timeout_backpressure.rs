@@ -20,7 +20,8 @@
     clippy::redundant_clone
 )]
 
-use asupersync::runtime::RuntimeBuilder;
+mod common;
+
 use asupersync::{Budget, Cx, Outcome, Time};
 use mcp_agent_mail_core::backpressure::{
     self, HealthLevel, HealthSignals, is_shedable_tool, set_shedding_enabled, should_shed_tool,
@@ -47,11 +48,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_request_with_budget(budget);
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on_request_with_budget(budget, f)
 }
 
 fn make_pool() -> (DbPool, tempfile::TempDir) {
@@ -201,19 +198,17 @@ struct DiagnosticsResult {
 }
 
 fn seed_corpus(cx: &Cx, pool: &DbPool) -> i64 {
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-
-    let project_id = rt.block_on(async {
-        let project_id = match queries::ensure_project(cx, pool, "/tmp/test-bp").await {
+    let cx = cx.clone();
+    let pool = pool.clone();
+    common::spin_poll(async {
+        let project_id = match queries::ensure_project(&cx, &pool, "/tmp/test-bp").await {
             Outcome::Ok(p) => p.id.expect("project id"),
             other => panic!("ensure_project failed: {other:?}"),
         };
 
         let agent_id = match queries::register_agent(
-            cx,
-            pool,
+            &cx,
+            &pool,
             project_id,
             "RedHarbor",
             "test-prog",
@@ -251,7 +246,7 @@ fn seed_corpus(cx: &Cx, pool: &DbPool) -> i64 {
         ];
         for (subject, body) in &messages {
             match queries::create_message(
-                cx, pool, project_id, agent_id, subject, body, None, "normal", false, "[]",
+                &cx, &pool, project_id, agent_id, subject, body, None, "normal", false, "[]",
             )
             .await
             {
@@ -260,9 +255,7 @@ fn seed_corpus(cx: &Cx, pool: &DbPool) -> i64 {
             }
         }
         project_id
-    });
-
-    project_id
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────

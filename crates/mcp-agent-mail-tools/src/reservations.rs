@@ -859,6 +859,20 @@ pub async fn force_release_file_reservation(
         ));
     };
 
+    if reservation.project_id != project_id {
+        return Err(legacy_tool_error(
+            "NOT_FOUND",
+            format!(
+                "File reservation id={file_reservation_id} not found for project '{}'.",
+                project.human_key
+            ),
+            true,
+            json!({
+                "file_reservation_id": file_reservation_id,
+            }),
+        ));
+    }
+
     // If already released, return early
     if let Some(released_ts) = reservation.released_ts {
         let response = serde_json::json!({

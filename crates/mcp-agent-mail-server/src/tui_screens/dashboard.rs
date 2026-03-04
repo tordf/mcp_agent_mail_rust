@@ -390,7 +390,7 @@ impl RecentMessagePreview {
         let subject = if self.subject.trim().is_empty() {
             "(no subject)".to_string()
         } else {
-            truncate(&self.subject, 160)
+            truncate(&self.subject, 160).into_owned()
         };
         let thread = if self.thread_id.trim().is_empty() {
             "(none)"
@@ -1824,7 +1824,7 @@ fn render_panel_hint_line(frame: &mut Frame<'_>, inner: Rect, hint: &str) {
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
     let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-    Paragraph::new(truncate(hint, usize::from(hint_area.width)))
+    Paragraph::new(truncate(hint, usize::from(hint_area.width)).into_owned())
         .style(crate::tui_theme::text_meta(&tp))
         .render(hint_area, frame);
 }
@@ -2688,7 +2688,7 @@ fn render_dashboard_query_bar(
             query_terms.len(),
         )
     };
-    Paragraph::new(truncate(&status_line, usize::from(inner.width)))
+    Paragraph::new(truncate(&status_line, usize::from(inner.width)).into_owned())
         .render(Rect::new(inner.x, inner.y + 1, inner.width, 1), frame);
 
     if inner.height < 3 {
@@ -2699,7 +2699,7 @@ fn render_dashboard_query_bar(
     } else {
         "Filtering uses case-insensitive AND matching across each panel"
     };
-    Paragraph::new(truncate(mode_line, usize::from(inner.width)))
+    Paragraph::new(truncate(mode_line, usize::from(inner.width)).into_owned())
         .style(crate::tui_theme::text_meta(&tp))
         .render(Rect::new(inner.x, inner.y + 2, inner.width, 1), frame);
 }
@@ -3333,12 +3333,12 @@ fn render_agents_snapshot_panel(
             Span::styled(marker.to_string(), Style::default().fg(color)),
             Span::raw(" "),
             Span::styled(
-                truncate(&agent.name, 14),
+                truncate(&agent.name, 14).into_owned(),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&agent.program, 9),
+                truncate(&agent.program, 9).into_owned(),
                 crate::tui_theme::text_meta(&tp),
             ),
             Span::raw(" "),
@@ -3454,17 +3454,17 @@ fn render_contacts_snapshot_panel(
         };
         lines.push(Line::from_spans([
             Span::styled(
-                truncate(&contact.from_agent, 10),
+                truncate(&contact.from_agent, 10).into_owned(),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw("→"),
             Span::styled(
-                truncate(&contact.to_agent, 10),
+                truncate(&contact.to_agent, 10).into_owned(),
                 Style::default().fg(tp.text_primary),
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&contact.status, 7),
+                truncate(&contact.status, 7).into_owned(),
                 Style::default().fg(status_color),
             ),
             Span::raw(" "),
@@ -3567,7 +3567,7 @@ fn render_projects_snapshot_panel(
     for project in rows.iter().take(list_budget) {
         lines.push(Line::from_spans([
             Span::styled(
-                truncate(&project.slug, 16),
+                truncate(&project.slug, 16).into_owned(),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
@@ -3674,7 +3674,7 @@ fn render_project_load_panel(
         let bar = ratio_bar(*score, max_score, 8);
         lines.push(Line::from_spans([
             Span::styled(
-                truncate(&project.slug, 14),
+                truncate(&project.slug, 14).into_owned(),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
@@ -3815,17 +3815,17 @@ fn render_reservation_watch_panel(
             Span::styled(mode_marker, Style::default().fg(mode_color)),
             Span::raw(" "),
             Span::styled(
-                truncate(&reservation.agent_name, 10),
+                truncate(&reservation.agent_name, 10).into_owned(),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&reservation.project_slug, 10),
+                truncate(&reservation.project_slug, 10).into_owned(),
                 crate::tui_theme::text_meta(&tp),
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&reservation.path_pattern, path_budget),
+                truncate(&reservation.path_pattern, path_budget).into_owned(),
                 crate::tui_theme::text_meta(&tp),
             ),
         ]));
@@ -3967,7 +3967,7 @@ fn render_reservation_ttl_buckets_panel(
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&soonest.agent_name, 12),
+                truncate(&soonest.agent_name, 12).into_owned(),
                 Style::default().fg(tp.text_primary),
             ),
             Span::raw(" "),
@@ -3975,7 +3975,8 @@ fn render_reservation_ttl_buckets_panel(
                 truncate(
                     &soonest.path_pattern,
                     usize::from(inner.width.saturating_sub(24)),
-                ),
+                )
+                .into_owned(),
                 crate::tui_theme::text_meta(&tp),
             ),
         ]));
@@ -4066,7 +4067,8 @@ fn render_signal_panel(
                 truncate(
                     &anomaly.headline,
                     usize::from(inner.width.saturating_sub(2)),
-                ),
+                )
+                .into_owned(),
                 Style::default().fg(tp.text_primary),
             ),
         ]));
@@ -4088,7 +4090,7 @@ fn render_signal_panel(
         lines.push(Line::from_spans([
             Span::styled(format!("{} ", marker.0), Style::default().fg(marker.1)),
             Span::styled(
-                truncate(&entry.summary, usize::from(inner.width.saturating_sub(2))),
+                truncate(&entry.summary, usize::from(inner.width.saturating_sub(2))).into_owned(),
                 crate::tui_theme::text_meta(&tp),
             ),
         ]));
@@ -4115,7 +4117,7 @@ fn render_signal_panel(
                 Style::default().fg(tp.metric_messages),
             ),
             Span::styled(
-                truncate(&entry.summary, usize::from(inner.width.saturating_sub(2))),
+                truncate(&entry.summary, usize::from(inner.width.saturating_sub(2))).into_owned(),
                 Style::default().fg(tp.text_primary),
             ),
         ]));
@@ -4307,7 +4309,7 @@ fn render_tool_latency_panel_cached(
             Span::styled(latency_badge, Style::default().fg(latency_color)),
             Span::raw(" "),
             Span::styled(
-                truncate(&stats.tool_name, 12),
+                truncate(&stats.tool_name, 12).into_owned(),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
@@ -4481,7 +4483,7 @@ fn render_event_mix_panel(
         lines.push(Line::from_spans([
             Span::styled("• ", crate::tui_theme::text_meta(&tp)),
             Span::styled(
-                truncate(&kind, 12),
+                truncate(&kind, 12).into_owned(),
                 Style::default().fg(tp.text_primary).bold(),
             ),
             Span::raw(" "),
@@ -4601,12 +4603,12 @@ fn render_recent_activity_panel(
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(entry.kind.compact_label(), kind_width),
+                truncate(entry.kind.compact_label(), kind_width).into_owned(),
                 crate::tui_theme::text_meta(&tp),
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&entry.summary, summary_width),
+                truncate(&entry.summary, summary_width).into_owned(),
                 Style::default().fg(tp.text_primary),
             ),
         ]));
@@ -5658,7 +5660,7 @@ fn render_event_log(
                 entry.kind.compact_label(),
                 entry.summary
             );
-            let line = truncate(&raw_line, line_width_budget);
+            let line = truncate(&raw_line, line_width_budget).into_owned();
             if let Some(progress) = shimmer_progresses.get(idx).and_then(|p| *p) {
                 shimmerize_plain_text(&line, progress, SHIMMER_HIGHLIGHT_WIDTH)
             } else {

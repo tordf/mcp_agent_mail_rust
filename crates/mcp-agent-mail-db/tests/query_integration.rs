@@ -14,6 +14,8 @@
     deprecated
 )]
 
+mod common;
+
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::config::SearchEngine;
@@ -86,17 +88,10 @@ fn insert_tantivy_message_doc(
 
 fn block_on<F, Fut, T>(f: F) -> T
 where
-    F: FnOnce(Cx) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
+    F: FnOnce(Cx) -> Fut,
+    Fut: std::future::Future<Output = T>,
 {
-    let runtime = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    runtime.block_on(runtime.handle().spawn(async move {
-        let cx = Cx::current().expect("runtime should provide task context");
-        f(cx).await
-    }))
+    common::block_on(f)
 }
 
 fn make_pool() -> (DbPool, tempfile::TempDir) {
@@ -104,28 +99,13 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
     let db_path = dir
         .path()
         .join(format!("query_integ_{}.db", unique_suffix()));
-
-    // Initialize schema synchronously — the pool factory's async migration path
-    // hangs with Cx::for_testing() because it lacks runtime backing for
-    // conn.execute(cx, ...).await calls.
-    let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-        .expect("open base schema connection");
-    init_conn
-        .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
-        .expect("apply init PRAGMAs");
-    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
-    init_conn
-        .execute_raw(&init_sql)
-        .expect("initialize base schema");
-    drop(init_conn);
-
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
         max_connections: 5,
         min_connections: 1,
         acquire_timeout_ms: 30_000,
         max_lifetime_ms: 3_600_000,
-        run_migrations: false,
+        run_migrations: true,
         warmup_connections: 0,
     };
     let pool = DbPool::new(&config).expect("create pool");
@@ -1433,10 +1413,7 @@ fn respond_contact_updates_status_and_expires() {
     // Request contact
     let pool2 = pool.clone();
     block_on(|cx| async move {
-        match queries::request_contact(
-            &cx, &pool2, pid, fox_id, pid, wolf_id, "hello", 86400,
-        )
-        .await
+        match queries::request_contact(&cx, &pool2, pid, fox_id, pid, wolf_id, "hello", 86400).await
         {
             Outcome::Ok(_) => {}
             other => panic!("request_contact failed: {other:?}"),
@@ -1455,22 +1432,26 @@ fn respond_contact_updates_status_and_expires() {
     });
     assert_eq!(updated_count, 1, "should update exactly one row");
     assert_eq!(link.status, "approved");
-    assert!(link.expires_ts.is_some(), "accepted contact should have expiry");
+    assert!(
+        link.expires_ts.is_some(),
+        "accepted contact should have expiry"
+    );
     assert!(link.updated_ts > 0, "updated_ts should be set");
 
     // Respond: block (no TTL)
     let pool4 = pool.clone();
     let (updated_count2, link2) = block_on(|cx| async move {
-        match queries::respond_contact(&cx, &pool4, pid, fox_id, pid, wolf_id, false, 0)
-            .await
-        {
+        match queries::respond_contact(&cx, &pool4, pid, fox_id, pid, wolf_id, false, 0).await {
             Outcome::Ok(v) => v,
             other => panic!("respond_contact (block) failed: {other:?}"),
         }
     });
     assert_eq!(updated_count2, 1);
     assert_eq!(link2.status, "blocked");
-    assert!(link2.expires_ts.is_none(), "blocked contact should have no expiry");
+    assert!(
+        link2.expires_ts.is_none(),
+        "blocked contact should have no expiry"
+    );
 }
 
 #[test]
@@ -1995,14 +1976,9 @@ fn diag_block_on_with_cx() {
 #[test]
 fn diag_pool_acquire_only() {
     // Pool acquire — the suspected hang point.
-    eprintln!("[diag] creating pool...");
     let (pool, _dir) = make_pool();
-    eprintln!("[diag] pool created, calling block_on...");
     block_on(|cx| async move {
-        eprintln!("[diag] inside async, about to acquire...");
-        let result = pool.acquire(&cx).await;
-        eprintln!("[diag] acquire returned");
-        match result {
+        match pool.acquire(&cx).await {
             Outcome::Ok(_) => 1i32,
             Outcome::Err(e) => panic!("pool acquire failed: {e:?}"),
             Outcome::Cancelled(r) => panic!("pool acquire cancelled: {r:?}"),

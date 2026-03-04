@@ -2446,6 +2446,7 @@ impl MailScreen for AnalyticsScreen {
                     selected_card,
                     self.detail_scroll,
                     self.focus,
+                    &self.last_detail_max_scroll,
                 );
             }
             if status_h > 0 {
@@ -2589,6 +2590,7 @@ impl MailScreen for AnalyticsScreen {
                     selected_card,
                     self.detail_scroll,
                     self.focus,
+                    &self.last_detail_max_scroll,
                 );
             }
             if status_h > 0 {

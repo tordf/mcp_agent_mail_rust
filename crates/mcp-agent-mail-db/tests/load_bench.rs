@@ -25,7 +25,8 @@
     clippy::needless_collect
 )]
 
-use asupersync::runtime::RuntimeBuilder;
+mod common;
+
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::models::{VALID_ADJECTIVES, VALID_NOUNS};
 use mcp_agent_mail_db::queries;
@@ -49,11 +50,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 fn block_on_with_retry<F, Fut, T>(max_retries: usize, f: F) -> T
@@ -62,11 +59,7 @@ where
     Fut: std::future::Future<Output = Outcome<T, mcp_agent_mail_db::DbError>>,
 {
     for attempt in 0..=max_retries {
-        let cx = Cx::for_testing();
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-        match rt.block_on(f(cx)) {
+        match common::block_on(|cx| f(cx)) {
             Outcome::Ok(val) => return val,
             Outcome::Err(e) if attempt < max_retries => {
                 let msg = format!("{e:?}");

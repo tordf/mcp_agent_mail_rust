@@ -29,7 +29,8 @@
     clippy::missing_const_for_fn
 )]
 
-use asupersync::runtime::RuntimeBuilder;
+mod common;
+
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::metrics::Log2Histogram;
 use mcp_agent_mail_db::queries;
@@ -53,11 +54,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 fn cap(s: &str) -> String {

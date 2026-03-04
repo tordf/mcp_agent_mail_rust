@@ -17,9 +17,10 @@
     clippy::too_many_arguments
 )]
 
+mod common;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 
 use mcp_agent_mail_db::search_planner::{Importance, ScopePolicy, SearchQuery, TimeRange};
@@ -59,11 +60,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 fn seed_project(pool: &DbPool, slug: &str) -> i64 {

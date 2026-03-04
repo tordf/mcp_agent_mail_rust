@@ -15,8 +15,9 @@
 
 #![allow(clippy::redundant_clone, clippy::too_many_lines)]
 
+mod common;
+
 use asupersync::cx::Cx;
-use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_db::DbConn as SqliteConnection;
 use mcp_agent_mail_db::schema::{
     self, MIGRATIONS_TABLE_NAME, PRAGMA_SETTINGS_SQL, enforce_runtime_fts_cleanup,
@@ -37,11 +38,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 /// Create a file-backed `SqliteConnection` in a temporary directory.

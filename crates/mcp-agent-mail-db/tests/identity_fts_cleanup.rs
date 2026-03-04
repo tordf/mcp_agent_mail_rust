@@ -4,8 +4,9 @@
 //! FTS5 tables and triggers. These tests verify the migration works correctly
 //! and that `enforce_runtime_fts_cleanup` is safe on a clean database.
 
+mod common;
+
 use asupersync::Cx;
-use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::{DbPool, DbPoolConfig};
 use mcp_agent_mail_db::schema;
@@ -37,11 +38,8 @@ fn v11_migration_drops_all_fts_artifacts() {
     conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
         .expect("apply init pragmas");
 
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
     let cx = Cx::for_testing();
-    rt.block_on(async {
+    common::spin_poll(async {
         schema::migrate_to_latest(&cx, &conn)
             .await
             .into_result()
@@ -63,11 +61,8 @@ fn base_mode_cleanup_is_safe_on_clean_db() {
     conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
         .expect("apply init pragmas");
 
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
     let cx = Cx::for_testing();
-    rt.block_on(async {
+    common::spin_poll(async {
         schema::migrate_to_latest(&cx, &conn)
             .await
             .into_result()
@@ -91,11 +86,8 @@ fn pool_startup_produces_clean_fts_state() {
     };
     let pool = DbPool::new(&config).expect("create pool");
 
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
     let cx = Cx::for_testing();
-    rt.block_on(async {
+    common::spin_poll(async {
         let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
     });
     drop(pool);

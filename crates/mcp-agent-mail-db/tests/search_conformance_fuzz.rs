@@ -25,7 +25,8 @@
     clippy::redundant_clone
 )]
 
-use asupersync::runtime::RuntimeBuilder;
+mod common;
+
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::queries::{extract_like_terms, sanitize_fts_query};
 use mcp_agent_mail_db::search_planner::{
@@ -65,11 +66,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 /// Structured trace output for debugging failures.

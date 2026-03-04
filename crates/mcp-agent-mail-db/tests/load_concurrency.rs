@@ -24,12 +24,13 @@
     clippy::uninlined_format_args
 )]
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
 
-use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Budget, Cx, Outcome};
 
 use mcp_agent_mail_db::search_planner::{RankingMode, SearchQuery};
@@ -73,11 +74,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on(f)
 }
 
 fn block_on_with_budget<F, Fut, T>(budget: Budget, f: F) -> T
@@ -85,11 +82,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let cx = Cx::for_request_with_budget(budget);
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    common::block_on_request_with_budget(budget, f)
 }
 
 /// Seed a project with agents, returning (`project_id`, `agent_ids`).

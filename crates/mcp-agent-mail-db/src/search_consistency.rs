@@ -1021,6 +1021,34 @@ mod tests {
         assert_eq!(lifecycle.doc_count.load(Ordering::Relaxed), 10);
     }
 
+    #[test]
+    fn full_reindex_zero_batch_size_is_clamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        let source = MockSource::new(3);
+        let lifecycle = MockLifecycle::healthy(0);
+
+        let result = full_reindex(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ReindexConfig {
+                batch_size: 0,
+                write_checkpoint: false,
+            },
+            &NoProgress,
+        )
+        .unwrap();
+
+        assert_eq!(result.stats.docs_indexed, 3);
+        assert_eq!(lifecycle.doc_count.load(Ordering::Relaxed), 3);
+    }
+
     // ── Repair tests ──
 
     #[test]

@@ -83,6 +83,8 @@ pub struct ProjectsScreen {
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
     detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
     /// Last observed data-channel generation for dirty-state gating.
     last_data_gen: super::DataGeneration,
     /// True when the DB poller has not yet delivered any data.
@@ -105,6 +107,7 @@ impl ProjectsScreen {
             cached_totals: (0, 0, 0, 0),
             detail_visible: true,
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             last_data_gen: super::DataGeneration::stale(),
             db_context_unavailable: false,
         }
@@ -347,7 +350,8 @@ impl MailScreen for ProjectsScreen {
                     self.detail_visible = !self.detail_visible;
                 }
                 KeyCode::Char('J') => {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    let max = self.last_detail_max_scroll.get();
+                    self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
                 }
                 KeyCode::Char('K') => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
@@ -649,7 +653,7 @@ impl ProjectsScreen {
             lines.push(("Last Activity".into(), relative, None));
         }
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -871,6 +875,7 @@ fn render_kv_lines(
     inner: Rect,
     lines: &[(String, String, Option<ftui::PackedRgba>)],
     scroll: usize,
+    max_scroll_cell: &std::cell::Cell<usize>,
     tp: &crate::tui_theme::TuiThemePalette,
 ) {
     use ftui::widgets::Widget;
@@ -878,6 +883,7 @@ fn render_kv_lines(
     let visible_height = usize::from(inner.height);
     let total_lines = lines.len();
     let max_scroll = total_lines.saturating_sub(visible_height);
+    max_scroll_cell.set(max_scroll);
     let scroll = scroll.min(max_scroll);
     let label_w = 14u16;
 
@@ -956,7 +962,8 @@ fn truncate_path_front(path: &str, max_len: usize) -> String {
     let mut result = String::new();
     let mut width = 0;
     for ch in path.chars() {
-        let cw = display_width(&ch.to_string());
+        let mut b = [0; 4];
+        let cw = display_width(ch.encode_utf8(&mut b));
         if width + cw + 1 > max_len {
             break;
         }
