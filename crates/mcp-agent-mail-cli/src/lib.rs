@@ -4061,11 +4061,11 @@ where
         }
     }
 
-    if let Some(sqlite3_ok) = sqlite_quick_check_via_cli(selected_path.as_path())? {
-        if !sqlite3_ok {
-            sqlite3_probe_failed = true;
-            healthy = false;
-        }
+    if let Some(sqlite3_ok) = sqlite_quick_check_via_cli(selected_path.as_path())?
+        && !sqlite3_ok
+    {
+        sqlite3_probe_failed = true;
+        healthy = false;
     }
 
     let file_size = selected_path.metadata().map(|m| m.len()).map_err(|e| {
