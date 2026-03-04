@@ -30,7 +30,7 @@ AM_BIN="${CARGO_TARGET_DIR}/debug/am"
 BUILD_LOG="${E2E_ARTIFACT_DIR}/diagnostics/build_am.log"
 
 set +e
-cargo build -p mcp-agent-mail-cli --bin am >"${BUILD_LOG}" 2>&1
+e2e_run_cargo build -p mcp-agent-mail-cli --bin am >"${BUILD_LOG}" 2>&1
 build_rc=$?
 set -e
 if [ "$build_rc" -ne 0 ] || [ ! -x "$AM_BIN" ]; then

@@ -243,9 +243,21 @@ impl IndexLayout {
     #[must_use]
     pub fn active_schema(&self, scope: &IndexScope, engine: &str) -> Option<String> {
         let link_path = self.active_link(scope, engine);
-        std::fs::read_link(&link_path)
-            .ok()
-            .and_then(|target| target.file_name().map(|n| n.to_string_lossy().into_owned()))
+        if let Ok(target) = std::fs::read_link(&link_path) {
+            return target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
+        }
+
+        // Non-Unix fallback stores the target path as file contents.
+        let raw_target = std::fs::read_to_string(&link_path).ok()?;
+        let trimmed_target = raw_target.trim();
+        if trimmed_target.is_empty() {
+            return None;
+        }
+        Path::new(trimmed_target)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
     }
 
     /// Check if a schema hash is compatible with the currently active index.
@@ -440,6 +452,21 @@ mod tests {
 
         let result = layout.activate(&scope, "invalid", &schema);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn active_schema_reads_file_target_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Project { project_id: 77 };
+        let schema = SchemaHash::compute(&sample_fields());
+        layout.ensure_dirs(&scope, &schema).unwrap();
+
+        let link_path = layout.active_link(&scope, "lexical");
+        let target = layout.lexical_dir(&scope, &schema);
+        std::fs::write(&link_path, target.to_string_lossy().as_bytes()).unwrap();
+
+        assert_eq!(layout.active_schema(&scope, "lexical"), Some(schema.short().to_owned()));
     }
 
     #[test]

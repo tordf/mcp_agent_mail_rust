@@ -341,7 +341,7 @@ if is_truthy "${AM_TUI_A11Y_SKIP_CONTRAST}"; then
 else
     set +e
     CONTRAST_OUT="$(
-        cargo test -p mcp-agent-mail-server theme_palettes_meet_min_contrast_thresholds -- --nocapture 2>&1
+        e2e_run_cargo test -p mcp-agent-mail-server theme_palettes_meet_min_contrast_thresholds -- --nocapture 2>&1
     )"
     CONTRAST_RC=$?
     set -e

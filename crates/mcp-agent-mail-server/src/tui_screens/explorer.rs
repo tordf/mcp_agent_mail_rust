@@ -453,7 +453,7 @@ impl MailExplorerScreen {
         } else {
             Some(self.cursor)
         };
-        if self.last_synced_cursor == effective_cursor && effective_cursor.is_some() {
+        if self.last_synced_cursor == effective_cursor {
             return;
         }
         self.last_synced_cursor = effective_cursor;
@@ -505,25 +505,14 @@ impl MailExplorerScreen {
 
         // Use cached text filter IDs when the search text hasn't changed,
         // avoiding expensive pool/runtime/Cx recreation on direction/sort/ack changes.
-        let text_match_ids = if let Some((ref cached_text, ref cached_ids)) =
-            self.cached_text_filter
-        {
-            if *cached_text == text_filter {
-                cached_ids.clone()
-            } else {
-                match Self::resolve_text_filter_message_ids(&text_filter) {
-                    Ok(ids) => {
-                        self.cached_text_filter = Some((text_filter.clone(), ids.clone()));
-                        ids
-                    }
-                    Err(e) => {
-                        self.last_error = Some(e);
-                        self.db_conn = Some(conn);
-                        self.search_dirty = false;
-                        return;
-                    }
-                }
-            }
+        let cache_hit = self
+            .cached_text_filter
+            .as_ref()
+            .filter(|(t, _)| *t == text_filter)
+            .map(|(_, ids)| ids.clone());
+
+        let text_match_ids = if let Some(ids) = cache_hit {
+            ids
         } else {
             match Self::resolve_text_filter_message_ids(&text_filter) {
                 Ok(ids) => {

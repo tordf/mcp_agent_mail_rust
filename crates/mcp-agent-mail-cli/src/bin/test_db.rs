@@ -15,7 +15,6 @@ fn main() {
         .unwrap();
     drop(init_conn);
 
-    let cx = asupersync::Cx::for_testing();
     let db_url = format!("sqlite:///{}", db_path.display());
     println!("db_url: {}", db_url);
 
@@ -32,6 +31,7 @@ fn main() {
     println!("pool sqlite_path: {}", pool.sqlite_path());
 
     mcp_agent_mail_cli::context::run_async(async move {
+        let cx = asupersync::Cx::current().expect("runtime should provide task context");
         let conn = pool.acquire(&cx).await.unwrap();
         match conn.query_sync("SELECT count(*) FROM projects", &[]) {
             Ok(rows) => {

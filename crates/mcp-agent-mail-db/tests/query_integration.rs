@@ -1992,9 +1992,14 @@ fn diag_block_on_with_cx() {
 #[test]
 fn diag_pool_acquire_only() {
     // Pool acquire — the suspected hang point.
+    eprintln!("[diag] creating pool...");
     let (pool, _dir) = make_pool();
+    eprintln!("[diag] pool created, calling block_on...");
     block_on(|cx| async move {
-        match pool.acquire(&cx).await {
+        eprintln!("[diag] inside async, about to acquire...");
+        let result = pool.acquire(&cx).await;
+        eprintln!("[diag] acquire returned");
+        match result {
             Outcome::Ok(_) => 1i32,
             Outcome::Err(e) => panic!("pool acquire failed: {e:?}"),
             Outcome::Cancelled(r) => panic!("pool acquire cancelled: {r:?}"),

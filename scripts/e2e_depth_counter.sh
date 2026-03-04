@@ -36,7 +36,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
 e2e_case_banner "interleaved_inc_dec_32_threads"
 e2e_mark_case_start "case01_interleavedincdec32threads"
 set +e
-OUT1="$(cargo test -p mcp-agent-mail-storage depth_counter_stress_interleaved_inc_dec_32_threads -- --nocapture 2>&1)"
+OUT1="$(e2e_run_cargo test -p mcp-agent-mail-storage depth_counter_stress_interleaved_inc_dec_32_threads -- --nocapture 2>&1)"
 RC1=$?
 set -e
 e2e_save_artifact "case_01_interleaved_stdout.txt" "$OUT1"
@@ -49,7 +49,7 @@ e2e_pass "32 threads completed (logged ${THREAD_COUNT})"
 e2e_case_banner "burst_drain_never_wraps"
 e2e_mark_case_start "case02_burstdrainneverwraps"
 set +e
-OUT2="$(cargo test -p mcp-agent-mail-storage depth_counter_stress_burst_drain_never_wraps -- --nocapture 2>&1)"
+OUT2="$(e2e_run_cargo test -p mcp-agent-mail-storage depth_counter_stress_burst_drain_never_wraps -- --nocapture 2>&1)"
 RC2=$?
 set -e
 e2e_save_artifact "case_02_burst_drain_stdout.txt" "$OUT2"
@@ -65,7 +65,7 @@ fi
 e2e_case_banner "rapid_inc_then_bulk_drain"
 e2e_mark_case_start "case03_rapidincthenbulkdrain"
 set +e
-OUT3="$(cargo test -p mcp-agent-mail-storage depth_counter_stress_rapid_inc_then_bulk_drain -- --nocapture 2>&1)"
+OUT3="$(e2e_run_cargo test -p mcp-agent-mail-storage depth_counter_stress_rapid_inc_then_bulk_drain -- --nocapture 2>&1)"
 RC3=$?
 set -e
 e2e_save_artifact "case_03_bulk_drain_stdout.txt" "$OUT3"
@@ -81,7 +81,7 @@ fi
 e2e_case_banner "contention_profile_no_anomaly"
 e2e_mark_case_start "case04_contentionprofilenoanomaly"
 set +e
-OUT4="$(cargo test -p mcp-agent-mail-storage depth_counter_stress_contention_profile_no_anomaly -- --nocapture 2>&1)"
+OUT4="$(e2e_run_cargo test -p mcp-agent-mail-storage depth_counter_stress_contention_profile_no_anomaly -- --nocapture 2>&1)"
 RC4=$?
 set -e
 e2e_save_artifact "case_04_contention_stdout.txt" "$OUT4"
@@ -114,7 +114,7 @@ Safety Properties:
   - Batch drain (256 at a time) works correctly
 
 Reproduction Commands:
-  cargo test -p mcp-agent-mail-storage depth_counter_stress -- --nocapture
+  rch exec -- cargo test -p mcp-agent-mail-storage depth_counter_stress -- --nocapture
 "
 
 e2e_save_artifact "case_05_pressure_report.txt" "$PRESSURE_REPORT"

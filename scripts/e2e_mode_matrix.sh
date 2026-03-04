@@ -18,12 +18,12 @@ MCP_BIN="${CARGO_TARGET_DIR:-/tmp/target-$(whoami)-am}/debug/mcp-agent-mail"
 
 if [ ! -f "$CLI_BIN" ]; then
     e2e_banner "Building CLI binary..."
-    cargo build -p mcp-agent-mail-cli 2>&1 || e2e_fail "CLI binary build failed"
+    e2e_run_cargo build -p mcp-agent-mail-cli 2>&1 || e2e_fail "CLI binary build failed"
 fi
 
 if [ ! -f "$MCP_BIN" ]; then
     e2e_banner "Building MCP binary..."
-    cargo build -p mcp-agent-mail 2>&1 || e2e_fail "MCP binary build failed"
+    e2e_run_cargo build -p mcp-agent-mail 2>&1 || e2e_fail "MCP binary build failed"
 fi
 
 # ---------------------------------------------------------------------------

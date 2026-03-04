@@ -617,7 +617,7 @@ showcase_run_macro_playback_forensics() {
 
     (
         cd "${E2E_PROJECT_ROOT}"
-        cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture
+        e2e_run_cargo test -p mcp-agent-mail-server operator_macro_record_save_load_replay_forensics -- --nocapture
     ) >"${log_path}" 2>&1 || rc=$?
 
     if [ "${rc}" -eq 0 ]; then

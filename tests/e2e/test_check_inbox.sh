@@ -65,7 +65,7 @@ ensure_am_cli() {
     e2e_log "Building mcp-agent-mail-cli..."
     local build_log="${E2E_ARTIFACT_DIR}/logs/cargo_build.log"
     mkdir -p "$(dirname "$build_log")"
-    if ! cargo build -p mcp-agent-mail-cli 2>"$build_log"; then
+    if ! e2e_run_cargo build -p mcp-agent-mail-cli 2>"$build_log"; then
         e2e_fail "Failed to build mcp-agent-mail-cli (see $build_log)"
         return 1
     fi

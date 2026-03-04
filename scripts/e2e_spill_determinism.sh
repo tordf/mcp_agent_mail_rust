@@ -44,12 +44,12 @@ done
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
 
 STRESS_CMD=(
-    cargo test -p mcp-agent-mail-storage
+    e2e_run_cargo test -p mcp-agent-mail-storage
     spill_drain_repeated_seeded_permutations_are_stable
     -- --nocapture
 )
 REPLAY_CMD=(
-    cargo test -p mcp-agent-mail-storage
+    e2e_run_cargo test -p mcp-agent-mail-storage
     spill_drain_seed_replay_contract
     -- --nocapture
 )
@@ -118,8 +118,8 @@ bundle = {
     "insertion_sequence": insertion_sequence,
     "observed_order": observed_order,
     "expected_canonical_order": expected_canonical_order,
-    "reproduction_command": "cargo test -p mcp-agent-mail-storage spill_drain_seed_replay_contract -- --nocapture",
-    "stress_command": "cargo test -p mcp-agent-mail-storage spill_drain_repeated_seeded_permutations_are_stable -- --nocapture",
+    "reproduction_command": "rch exec -- cargo test -p mcp-agent-mail-storage spill_drain_seed_replay_contract -- --nocapture",
+    "stress_command": "rch exec -- cargo test -p mcp-agent-mail-storage spill_drain_repeated_seeded_permutations_are_stable -- --nocapture",
 }
 
 bundle_path.write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")

@@ -35,7 +35,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
 e2e_case_banner "concurrent_recording_benchmark"
 e2e_mark_case_start "case01_concurrentrecordingbenchmark"
 set +e
-BENCH_OUT="$(cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_recording -- --nocapture 2>&1)"
+BENCH_OUT="$(e2e_run_cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_recording -- --nocapture 2>&1)"
 BENCH_RC=$?
 set -e
 e2e_save_artifact "case_01_benchmark_stdout.txt" "$BENCH_OUT"
@@ -53,7 +53,7 @@ fi
 e2e_case_banner "concurrent_read_write_invariant_check"
 e2e_mark_case_start "case02_concurrentreadwriteinvariantcheck"
 set +e
-RW_OUT="$(cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_read_write -- --nocapture 2>&1)"
+RW_OUT="$(e2e_run_cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_read_write -- --nocapture 2>&1)"
 RW_RC=$?
 set -e
 e2e_save_artifact "case_02_concurrent_rw_stdout.txt" "$RW_OUT"
@@ -70,7 +70,7 @@ fi
 e2e_case_banner "quantile_stability_bimodal_load"
 e2e_mark_case_start "case03_quantilestabilitybimodalload"
 set +e
-QUANT_OUT="$(cargo test -p mcp-agent-mail-core histogram_snapshot_quantile_stability_under_load -- --nocapture 2>&1)"
+QUANT_OUT="$(e2e_run_cargo test -p mcp-agent-mail-core histogram_snapshot_quantile_stability_under_load -- --nocapture 2>&1)"
 QUANT_RC=$?
 set -e
 e2e_save_artifact "case_03_quantile_stdout.txt" "$QUANT_OUT"
@@ -92,9 +92,9 @@ Invariants Checked:
   5. zero violations under 4R+4W load: PASS
 
 Reproduction Commands:
-  cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_recording -- --nocapture
-  cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_read_write -- --nocapture
-  cargo test -p mcp-agent-mail-core histogram_snapshot_quantile_stability_under_load -- --nocapture
+  rch exec -- cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_recording -- --nocapture
+  rch exec -- cargo test -p mcp-agent-mail-core histogram_snapshot_benchmark_concurrent_read_write -- --nocapture
+  rch exec -- cargo test -p mcp-agent-mail-core histogram_snapshot_quantile_stability_under_load -- --nocapture
 "
 
 e2e_save_artifact "case_04_invariant_check.txt" "$INVARIANT_REPORT"

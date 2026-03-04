@@ -489,7 +489,7 @@ impl DashboardScreen {
             cached_heatmap: RefCell::new(None),
             heatmap_event_gen: 0,
             cached_query_terms: RefCell::new((String::new(), Vec::new())),
-            cached_tool_latency: RefCell::new((0, Vec::new())),
+            cached_tool_latency: RefCell::new((usize::MAX, Vec::new())),
         }
     }
 
@@ -742,7 +742,7 @@ impl DashboardScreen {
         let entry_count = entries.len();
         {
             let cache = self.cached_tool_latency.borrow();
-            if cache.0 == entry_count && !cache.1.is_empty() {
+            if cache.0 == entry_count {
                 return cache.1.clone();
             }
         }
@@ -1703,13 +1703,11 @@ fn type_filter_signature(type_filter: &HashSet<MailEventKind>) -> String {
     thread_local! {
         static CACHE: RefCell<(u64, String)> = const { RefCell::new((0, String::new())) };
     }
-    // Use a cheap hash of the set to detect changes (avoids sorting every call).
+    // Use a bitmask to create a cheap, perfectly deterministic, order-independent hash.
     let hash: u64 = type_filter
         .iter()
         .map(|k| *k as u64)
-        .fold(type_filter.len() as u64, |acc, v| {
-            acc.wrapping_mul(31).wrapping_add(v)
-        });
+        .fold(0, |acc, v| acc | (1 << v));
     CACHE.with(|cell| {
         let cache = cell.borrow();
         if cache.0 == hash && !cache.1.is_empty() {

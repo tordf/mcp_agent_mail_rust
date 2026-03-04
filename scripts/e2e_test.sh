@@ -40,6 +40,14 @@ _c_red='\033[0;31m'
 _c_blue='\033[0;34m'
 _c_yellow='\033[0;33m'
 
+run_e2e_cargo() {
+    if command -v rch >/dev/null 2>&1; then
+        rch exec -- cargo "$@"
+    else
+        cargo "$@"
+    fi
+}
+
 show_deprecation_notice() {
     cat >&2 <<'EOF'
 [DEPRECATED] scripts/e2e_test.sh is now a compatibility shim.
@@ -217,7 +225,7 @@ run_suite() {
     if [ "$suite_name" = "dual_mode" ] || [ "$suite_name" = "mode_matrix" ] || [ "$suite_name" = "security_privacy" ]; then
         if [ "${E2E_FORCE_BUILD:-0}" = "1" ] || [ ! -f "$cli_bin" ]; then
             echo "  Building native E2E runner binary (am)..."
-            if ! cargo build -p mcp-agent-mail-cli > /dev/null 2>&1; then
+            if ! run_e2e_cargo build -p mcp-agent-mail-cli > /dev/null 2>&1; then
                 echo -e "${_c_red}Failed to build mcp-agent-mail-cli for native ${suite_name} run${_c_reset}"
                 (( total_fail++ )) || true
                 failed_suites+=("$suite_name")

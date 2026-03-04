@@ -28,11 +28,11 @@ MCP_BIN="${CARGO_TARGET_DIR}/debug/mcp-agent-mail"
 
 if [ ! -f "$CLI_BIN" ]; then
     e2e_banner "Building CLI binary..."
-    cargo build -p mcp-agent-mail-cli 2>&1 | tail -3
+    e2e_run_cargo build -p mcp-agent-mail-cli 2>&1 | tail -3
 fi
 if [ ! -f "$MCP_BIN" ]; then
     e2e_banner "Building MCP binary..."
-    cargo build -p mcp-agent-mail 2>&1 | tail -3
+    e2e_run_cargo build -p mcp-agent-mail 2>&1 | tail -3
 fi
 if [ ! -f "$CLI_BIN" ] || [ ! -f "$MCP_BIN" ]; then
     echo "FATAL: Required binaries not found" >&2
