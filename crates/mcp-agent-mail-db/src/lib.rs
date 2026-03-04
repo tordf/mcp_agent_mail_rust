@@ -75,7 +75,7 @@ pub mod tracking;
 
 pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
-pub use error::{DbError, DbResult, is_lock_error, is_pool_exhausted_error};
+pub use error::{DbError, DbResult, is_corruption_error, is_lock_error, is_pool_exhausted_error};
 pub use integrity::{
     CheckKind, IntegrityCheckResult, IntegrityMetrics, attempt_vacuum_recovery, full_check,
     incremental_check, integrity_metrics, is_full_check_due, quick_check,

@@ -667,6 +667,17 @@ impl DashboardScreen {
         self.event_log.push_back(entry);
     }
 
+    /// Invalidate the visible-entries cache (called when events change).
+    fn invalidate_visible_cache(&mut self) {
+        // Force cache rebuild by clearing the stored filter signature.
+        *self.visible_cache_filter_sig.borrow_mut() = VisibleCacheKey {
+            query: "\x00_invalidated".to_string(),
+            ..VisibleCacheKey::default()
+        };
+        self.heatmap_event_gen = self.heatmap_event_gen.wrapping_add(1);
+        *self.cached_heatmap.borrow_mut() = None;
+    }
+
     /// Build the current filter key for cache invalidation.
     fn current_visible_cache_key(&self) -> VisibleCacheKey {
         VisibleCacheKey {
@@ -1268,6 +1279,8 @@ impl MailScreen for DashboardScreen {
         if dirty.events {
             // Ingest new events from ring buffer.
             self.ingest_events(state);
+            // Invalidate visible-entries and heatmap caches.
+            self.invalidate_visible_cache();
         }
         if dirty.events || dirty.db_stats {
             // Synthesize dashboard-friendly deltas from polled DB counters so
@@ -1483,6 +1496,7 @@ impl MailScreen for DashboardScreen {
                 &self.percentile_history,
                 &self.animated_throughput_history,
                 &self.event_log,
+                &self.cached_heatmap,
             );
         }
         if let Some(preview_rect) = comp.rect(PanelSlot::Footer) {
@@ -2646,6 +2660,7 @@ fn render_insight_rail(
     percentile_history: &[PercentileSample],
     throughput_history: &[f64],
     event_log: &VecDeque<EventEntry>,
+    heatmap_cache: &RefCell<Option<HeatmapCache>>,
 ) {
     if area.width < 24 || area.height < 8 {
         return;
@@ -2678,6 +2693,7 @@ fn render_insight_rail(
             percentile_history,
             throughput_history,
             event_log,
+            heatmap_cache,
         );
     }
 
@@ -5080,6 +5096,7 @@ fn render_trend_panel(
     percentile_history: &[PercentileSample],
     throughput_history: &[f64],
     event_log: &VecDeque<EventEntry>,
+    heatmap_cache: &RefCell<Option<HeatmapCache>>,
 ) {
     if area.width < 10 || area.height < 6 {
         return;
@@ -5156,7 +5173,7 @@ fn render_trend_panel(
 
     // Activity heatmap (br-18wct): Braille Canvas showing event density over time.
     if heatmap_h > 0 {
-        render_activity_heatmap(frame, heatmap_area, event_log);
+        render_activity_heatmap(frame, heatmap_area, event_log, heatmap_cache);
     }
 }
 
@@ -5207,16 +5224,40 @@ fn heatmap_intensity_color(intensity: f64, tp: &crate::tui_theme::TuiThemePalett
     crate::tui_theme::lerp_color(neutral_base, vivid, 0.88)
 }
 
+/// Compute heatmap grid from event log for a given number of pixel columns.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn compute_heatmap_grid(event_log: &VecDeque<EventEntry>, num_cols: usize) -> HeatmapCache {
+    let ts_min = event_log.iter().map(|e| e.timestamp_micros).min().unwrap_or(0);
+    let ts_max = event_log.iter().map(|e| e.timestamp_micros).max().unwrap_or(0);
+    let ts_span = (ts_max - ts_min).max(1);
+    let mut grid = vec![vec![0u32; num_cols]; HEATMAP_EVENT_KINDS];
+    for entry in event_log {
+        let col = ((entry.timestamp_micros - ts_min) as f64 / ts_span as f64
+            * (num_cols as f64 - 1.0)) as usize;
+        let col = col.min(num_cols - 1);
+        let row = heatmap_kind_index(entry.kind);
+        grid[row][col] += 1;
+    }
+    let max_count = grid.iter().flat_map(|row| row.iter()).copied().max().unwrap_or(1).max(1);
+    HeatmapCache { ts_min, ts_max, grid, max_count }
+}
+
 /// Render a Braille-mode Canvas heatmap of event activity density.
 ///
 /// X = time (bucketed into columns), Y = event kind, intensity = event count.
+/// Uses `heatmap_cache` to avoid recomputing the grid when event data is unchanged.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-fn render_activity_heatmap(frame: &mut Frame<'_>, area: Rect, event_log: &VecDeque<EventEntry>) {
+fn render_activity_heatmap(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    event_log: &VecDeque<EventEntry>,
+    heatmap_cache: &RefCell<Option<HeatmapCache>>,
+) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = accent_panel_block("Activity Heatmap", tp.metric_messages);
     let inner = block.inner(area);
@@ -5242,59 +5283,35 @@ fn render_activity_heatmap(frame: &mut Frame<'_>, area: Rect, event_log: &VecDeq
     let px_w = chart_area.width as usize * Mode::Braille.cols_per_cell() as usize;
     let px_h = chart_area.height as usize * Mode::Braille.rows_per_cell() as usize;
 
-    // Determine time range from events.
-    let ts_min = event_log
-        .iter()
-        .map(|e| e.timestamp_micros)
-        .min()
-        .unwrap_or(0);
-    let ts_max = event_log
-        .iter()
-        .map(|e| e.timestamp_micros)
-        .max()
-        .unwrap_or(0);
-    let ts_span = (ts_max - ts_min).max(1);
-
-    // Bucket events into a grid: columns = time buckets, rows = event kinds.
-    let num_cols = px_w;
-    let mut grid = vec![vec![0u32; num_cols]; HEATMAP_EVENT_KINDS];
-
-    for entry in event_log {
-        let col = ((entry.timestamp_micros - ts_min) as f64 / ts_span as f64
-            * (num_cols as f64 - 1.0)) as usize;
-        let col = col.min(num_cols - 1);
-        let row = heatmap_kind_index(entry.kind);
-        grid[row][col] += 1;
+    // Use cached grid if available and column count matches; otherwise recompute.
+    let need_recompute = {
+        let cached = heatmap_cache.borrow();
+        cached.as_ref().map_or(true, |c| {
+            c.grid.first().map_or(true, |row| row.len() != px_w)
+        })
+    };
+    if need_recompute {
+        *heatmap_cache.borrow_mut() = Some(compute_heatmap_grid(event_log, px_w));
     }
 
-    // Find max count for intensity normalization.
-    let max_count = grid
-        .iter()
-        .flat_map(|row| row.iter())
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    let cached = heatmap_cache.borrow();
+    let cache = cached.as_ref().expect("heatmap cache just filled");
 
     // Paint onto Braille Canvas.
     let mut painter = Painter::for_area(chart_area, Mode::Braille);
-
-    // Map each kind to a vertical band of sub-pixels.
     let row_height = px_h / HEATMAP_EVENT_KINDS;
     if row_height == 0 {
         return;
     }
 
-    for (kind_idx, kind_row) in grid.iter().enumerate() {
+    for (kind_idx, kind_row) in cache.grid.iter().enumerate() {
         let y_base = kind_idx * row_height;
         for (col, &count) in kind_row.iter().enumerate() {
             if count == 0 {
                 continue;
             }
-            let intensity = (f64::from(count) / f64::from(max_count)).sqrt();
+            let intensity = (f64::from(count) / f64::from(cache.max_count)).sqrt();
             let color = heatmap_intensity_color(intensity, &tp);
-
-            // Fill sub-pixel rows for this kind at this time column.
             for dy in 0..row_height.min(3) {
                 painter.point_colored(col as i32, (y_base + dy) as i32, color);
             }

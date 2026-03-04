@@ -119,6 +119,17 @@ impl DbError {
         }
     }
 
+    /// Whether this error indicates database corruption that may be
+    /// recoverable via backup restore or archive reconstruction.
+    #[must_use]
+    pub fn is_corruption(&self) -> bool {
+        match self {
+            Self::Sqlite(msg) | Self::Pool(msg) => is_corruption_error(msg),
+            Self::IntegrityCorruption { .. } => true,
+            _ => false,
+        }
+    }
+
     /// The legacy error code string for this error.
     #[must_use]
     pub const fn error_code(&self) -> &'static str {
@@ -168,6 +179,19 @@ pub fn is_mvcc_conflict(msg: &str) -> bool {
     lower.contains("write conflict on page")
         || lower.contains("serialization failure")
         || lower.contains("snapshot too old")
+}
+
+/// Check whether an error message indicates database corruption
+/// (malformed image, corrupt schema, etc.) that may be recoverable
+/// via backup restore or archive reconstruction.
+#[must_use]
+pub fn is_corruption_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("database disk image is malformed")
+        || lower.contains("malformed database schema")
+        || lower.contains("database schema is corrupt")
+        || lower.contains("file is not a database")
+        || lower.contains("malformed page")
 }
 
 /// Check whether an error message indicates pool exhaustion.
@@ -425,6 +449,61 @@ mod tests {
         assert!(!is_mvcc_conflict("syntax error"));
         assert!(!is_mvcc_conflict("unique constraint violated"));
         assert!(!is_mvcc_conflict(""));
+    }
+
+    // ── is_corruption ────────────────────────────────────────────────
+
+    #[test]
+    fn corruption_error_from_sqlite_message() {
+        let e = DbError::Sqlite("database disk image is malformed".into());
+        assert!(e.is_corruption());
+    }
+
+    #[test]
+    fn corruption_error_from_pool_message() {
+        let e = DbError::Pool("database disk image is malformed".into());
+        assert!(e.is_corruption());
+    }
+
+    #[test]
+    fn corruption_error_from_integrity_variant() {
+        let e = DbError::IntegrityCorruption {
+            message: "bad page".into(),
+            details: vec!["page 42".into()],
+        };
+        assert!(e.is_corruption());
+    }
+
+    #[test]
+    fn not_corruption_for_lock_error() {
+        let e = DbError::Sqlite("database is locked".into());
+        assert!(!e.is_corruption());
+    }
+
+    #[test]
+    fn not_corruption_for_syntax_error() {
+        let e = DbError::Sqlite("syntax error near SELECT".into());
+        assert!(!e.is_corruption());
+    }
+
+    // ── is_corruption_error (function) ─────────────────────────────
+
+    #[test]
+    fn corruption_error_patterns() {
+        assert!(is_corruption_error("database disk image is malformed"));
+        assert!(is_corruption_error("Database Disk Image Is Malformed")); // case-insensitive
+        assert!(is_corruption_error("malformed database schema: agents"));
+        assert!(is_corruption_error("database schema is corrupt"));
+        assert!(is_corruption_error("file is not a database"));
+        assert!(is_corruption_error("malformed page 42 in btree"));
+    }
+
+    #[test]
+    fn not_corruption_error() {
+        assert!(!is_corruption_error("database is locked"));
+        assert!(!is_corruption_error("syntax error"));
+        assert!(!is_corruption_error("table not found"));
+        assert!(!is_corruption_error(""));
     }
 
     // ── is_pool_exhausted_error ─────────────────────────────────────

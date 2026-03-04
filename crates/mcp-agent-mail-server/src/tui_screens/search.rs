@@ -1888,6 +1888,12 @@ impl SearchCockpitScreen {
     fn execute_search(&mut self, state: &TuiSharedState) {
         let started = Instant::now();
         let raw = self.query_input.value().trim().to_string();
+        self.search_exec_count = self.search_exec_count.saturating_add(1);
+        let facet_signature = self.facet_signature();
+        if !self.last_facet_signature.is_empty() && facet_signature != self.last_facet_signature {
+            self.facet_rebuild_count = self.facet_rebuild_count.saturating_add(1);
+        }
+        self.last_facet_signature = facet_signature;
         self.last_query.clone_from(&raw);
         self.last_diagnostics = None;
         self.last_error = validate_query_syntax(&raw);
@@ -1896,14 +1902,13 @@ impl SearchCockpitScreen {
             self.highlight_terms.clear();
             self.results.clear();
             self.result_rows.clear();
-            self.rendered_markdown_cache.borrow_mut().clear();
-            self.rendered_detail_cache.borrow_mut().clear();
             self.total_sql_rows = 0;
             self.guidance = None;
             self.cursor = 0;
             self.detail_scroll.set(0);
             self.search_dirty = false;
             self.last_search_ms = None;
+            self.refresh_detail_cache_generation();
             return;
         }
 
@@ -1929,6 +1934,7 @@ impl SearchCockpitScreen {
             self.search_dirty = false;
             self.db_context_unavailable = true;
             self.db_conn_attempted = false; // allow retry on next tick
+            self.refresh_detail_cache_generation();
             self.emit_db_unavailable_diagnostic(state, "database connection unavailable");
             return;
         };
@@ -1955,8 +1961,7 @@ impl SearchCockpitScreen {
         }
 
         self.db_conn = Some(conn);
-        self.rendered_markdown_cache.borrow_mut().clear();
-        self.rendered_detail_cache.borrow_mut().clear();
+        self.refresh_detail_cache_generation();
 
         // Generate zero-result guidance from TUI facet state
         self.guidance = if self.results.is_empty() && !raw.is_empty() {
@@ -4665,6 +4670,13 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
         },
         screen.sort_direction.label()
     ));
+    rows.push(format!(
+        "exec:{} facet_delta:{} md_renders:{} detail_gen:{}",
+        screen.search_exec_count,
+        screen.facet_rebuild_count,
+        screen.preview_markdown_render_count.get(),
+        screen.detail_cache_generation
+    ));
     if let Some(diag) = screen
         .last_diagnostics
         .as_ref()
@@ -5843,6 +5855,22 @@ mod tests {
     }
 
     #[test]
+    fn execute_search_invalid_query_tracks_execs_and_facet_changes() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_input.set_value("AND");
+
+        screen.execute_search(&state);
+        assert_eq!(screen.search_exec_count, 1);
+        assert_eq!(screen.facet_rebuild_count, 0);
+
+        screen.importance_filter = ImportanceFilter::Urgent;
+        screen.execute_search(&state);
+        assert_eq!(screen.search_exec_count, 2);
+        assert_eq!(screen.facet_rebuild_count, 1);
+    }
+
+    #[test]
     fn route_string_is_deterministic_and_encoded() {
         let mut screen = SearchCockpitScreen::new();
         screen.query_input.set_value("hello world");
@@ -6725,6 +6753,45 @@ mod tests {
     }
 
     #[test]
+    fn cached_rendered_markdown_counts_only_cache_misses() {
+        let screen = SearchCockpitScreen::new();
+        let entry = make_msg_entry();
+        assert_eq!(screen.preview_markdown_render_count.get(), 0);
+
+        assert!(screen.cached_rendered_markdown(&entry).is_some());
+        assert_eq!(screen.preview_markdown_render_count.get(), 1);
+
+        assert!(screen.cached_rendered_markdown(&entry).is_some());
+        assert_eq!(screen.preview_markdown_render_count.get(), 1);
+    }
+
+    #[test]
+    fn detail_cache_generation_invalidates_detail_render_cache() {
+        let mut screen = SearchCockpitScreen::new();
+        let entry = make_agent_entry();
+
+        screen.refresh_detail_cache_generation();
+        let generation_before = screen.detail_cache_generation;
+        assert!(generation_before > 0);
+
+        let _ = screen.cached_rendered_detail(&entry);
+        assert_eq!(screen.preview_markdown_render_count.get(), 1);
+        let _ = screen.cached_rendered_detail(&entry);
+        assert_eq!(screen.preview_markdown_render_count.get(), 1);
+
+        screen.highlight_terms = vec![QueryTerm {
+            text: "gold".to_string(),
+            kind: QueryTermKind::Word,
+            negated: false,
+        }];
+        screen.refresh_detail_cache_generation();
+        assert!(screen.detail_cache_generation > generation_before);
+
+        let _ = screen.cached_rendered_detail(&entry);
+        assert_eq!(screen.preview_markdown_render_count.get(), 2);
+    }
+
+    #[test]
     fn result_entry_full_body_populated_for_messages() {
         let entry = make_msg_entry();
         assert!(entry.full_body.is_some());
@@ -7168,6 +7235,24 @@ mod tests {
         let l_key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('L')));
         screen.update(&l_key, &state);
         assert!(screen.query_lab_visible);
+    }
+
+    #[test]
+    fn query_lab_renders_exec_and_cache_counters() {
+        let mut screen = SearchCockpitScreen::new();
+        screen.search_exec_count = 3;
+        screen.facet_rebuild_count = 1;
+        screen.detail_cache_generation = 2;
+        screen.preview_markdown_render_count.set(7);
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 32, &mut pool);
+        render_query_lab(&mut frame, Rect::new(0, 0, 120, 32), &screen);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(text.contains("exec:3"), "query lab text: {text}");
+        assert!(text.contains("facet_delta:1"), "query lab text: {text}");
+        assert!(text.contains("md_renders:7"), "query lab text: {text}");
+        assert!(text.contains("detail_gen:2"), "query lab text: {text}");
     }
 
     // ──────────────────────────────────────────────────────────────────

@@ -873,6 +873,89 @@ impl DbPool {
 
         Ok(Some(bak_path))
     }
+
+    /// Attempt one-shot recovery from SQLite corruption detected at runtime.
+    ///
+    /// This should be called when a query returns a corruption error
+    /// (e.g. "database disk image is malformed"). The method:
+    ///
+    /// 1. Logs the corruption event
+    /// 2. Attempts recovery via backup restore or archive reconstruction
+    /// 3. Returns `Ok(true)` if recovery succeeded, `Ok(false)` if the DB
+    ///    is in-memory (no recovery possible), or `Err` if recovery failed.
+    ///
+    /// After a successful recovery, callers should retry their operation
+    /// by re-acquiring a connection from the pool.
+    ///
+    /// Uses a global flag to prevent concurrent recovery attempts.
+    pub fn try_recover_from_corruption(&self, trigger_error: &str) -> DbResult<bool> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(false);
+        }
+
+        // Use a global flag to serialize recovery attempts. Only one thread
+        // should attempt recovery at a time.
+        static RECOVERY_IN_PROGRESS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        if RECOVERY_IN_PROGRESS
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            tracing::warn!(
+                "runtime corruption recovery already in progress; skipping duplicate attempt"
+            );
+            return Ok(false);
+        }
+
+        struct ResetOnDrop;
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                RECOVERY_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = ResetOnDrop;
+
+        tracing::error!(
+            path = %self.sqlite_path,
+            trigger = %trigger_error,
+            "runtime corruption detected; attempting automatic recovery"
+        );
+
+        // Record the corruption event in metrics.
+        let metrics = mcp_agent_mail_core::global_metrics();
+        metrics.db.integrity_failures_total.inc();
+
+        let primary_path = Path::new(&self.sqlite_path);
+        match recover_sqlite_file(primary_path) {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %self.sqlite_path,
+                    "runtime corruption recovery succeeded — connections will use restored database"
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %self.sqlite_path,
+                    error = %e,
+                    "runtime corruption recovery FAILED — manual intervention required (try: am doctor repair)"
+                );
+                Err(DbError::IntegrityCorruption {
+                    message: format!(
+                        "Database corruption detected and automatic recovery failed: {e}. \
+                         Run 'am doctor repair' or 'am doctor reconstruct' to manually recover."
+                    ),
+                    details: vec![trigger_error.to_string()],
+                })
+            }
+        }
+    }
 }
 
 static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<OnceCell<()>>>>> =
