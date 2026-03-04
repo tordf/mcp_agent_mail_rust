@@ -4,7 +4,7 @@
 //! badges, confidence scores, rationale, actionable next steps, severity
 //! summary band, colored left borders, and deep link visual affordances.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::widgets::StatefulWidget;
@@ -170,6 +170,8 @@ pub struct AnalyticsScreen {
     detail_visible: bool,
     /// Last-seen data generation snapshot for dirty-state gating.
     last_data_gen: super::DataGeneration,
+    /// Cached active card indices (filter+sort result). Auto-refreshed when key state changes.
+    cached_active_indices: RefCell<(usize, u8, u8, Vec<usize>)>,
 }
 
 impl AnalyticsScreen {
@@ -183,7 +185,7 @@ impl AnalyticsScreen {
                 cards_produced: 1,
             };
         }
-        Self {
+        let this = Self {
             feed,
             selected: 0,
             table_state: TableState::default(),
@@ -196,7 +198,10 @@ impl AnalyticsScreen {
             cached_viz: AnalyticsVizSnapshot::default(),
             detail_visible: true,
             last_data_gen: super::DataGeneration::stale(),
-        }
+            cached_active_indices: RefCell::new((0, 0, 0, Vec::new())),
+        };
+        this.ensure_active_indices_fresh();
+        this
     }
 
     fn refresh_feed(&mut self, state: Option<&TuiSharedState>) {
@@ -266,7 +271,19 @@ impl AnalyticsScreen {
         }
     }
 
-    fn active_card_indices(&self) -> Vec<usize> {
+    /// Ensure the cached active indices are fresh. Cheap no-op when key matches.
+    fn ensure_active_indices_fresh(&self) {
+        let key = (
+            self.feed.cards.len(),
+            self.severity_filter as u8,
+            self.sort_mode as u8,
+        );
+        {
+            let cache = self.cached_active_indices.borrow();
+            if (cache.0, cache.1, cache.2) == key {
+                return;
+            }
+        }
         let mut indices: Vec<usize> = self
             .feed
             .cards
@@ -282,13 +299,19 @@ impl AnalyticsScreen {
             indices.truncate(1);
         }
 
-        indices
+        *self.cached_active_indices.borrow_mut() = (key.0, key.1, key.2, indices);
+    }
+
+    fn active_card_indices(&self) -> Vec<usize> {
+        self.ensure_active_indices_fresh();
+        let cache = self.cached_active_indices.borrow();
+        cache.3.clone()
     }
 
     fn active_cards(&self) -> Vec<&InsightCard> {
         self.active_card_indices()
-            .into_iter()
-            .filter_map(|idx| self.feed.cards.get(idx))
+            .iter()
+            .filter_map(|idx| self.feed.cards.get(*idx))
             .collect()
     }
 

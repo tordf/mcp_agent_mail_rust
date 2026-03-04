@@ -174,11 +174,29 @@ am share deploy verify-live https://example.github.io/agent-mail \
 ### 2.13 Performance and Determinism Gates
 
 ```bash
+am e2e run --project . tui_full_traversal
 am e2e run --project . soak_harness
 cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture
 cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture
 # Expected: no regressions, no budget failures
 ```
+
+Required `tui_full_traversal` evidence (latest run directory):
+- `tests/artifacts/tui_full_traversal/<timestamp>/traversal_gate_verdict.json`
+- `tests/artifacts/tui_full_traversal/<timestamp>/flash_detection_report.json`
+- `tests/artifacts/tui_full_traversal/<timestamp>/soak_regression_report.json`
+- `tests/artifacts/tui_full_traversal/<timestamp>/lag_flash_gate_triage.md`
+- `tests/artifacts/tui_full_traversal/<timestamp>/summary.json` (`fail=0`)
+
+### 2.13.1 Fail-Fast vs Informational Policy (Lag/Flash Incident Gates)
+
+- **Fail-fast in CI and release promotion:** `tui_full_traversal` is a hard gate. Promotion is blocked if any of `traversal_gate_verdict.json`, `flash_detection_report.json`, or `soak_regression_report.json` has `all_within_budget != true`, if `summary.json` reports failures, or if `lag_flash_gate_triage.md` is missing.
+- **Informational diagnostics:** baseline profiling (`E2E_CAPTURE_BASELINE_PROFILE=1`) is non-blocking for routine CI, and is used for deep attribution or incident triage runs.
+- **Escalation policy:**
+  1. Record failing artifact directory and failing samples in the rollout sign-off log.
+  2. Open/attach an incident bead and link the exact artifact paths.
+  3. Re-run once to rule out transient runner issues.
+  4. If failure reproduces, execute Section 4 rollback steps before further promotion.
 
 ### 2.14 Measurable Gate Thresholds
 
@@ -189,7 +207,7 @@ Promotion from each phase requires all of:
 - Security/privacy pass rate = `100%` (`fail=0` in `E2E security/privacy`).
 - Accessibility pass rate = `100%` (`fail=0` in `E2E TUI accessibility`).
 - Static export/verify-live pass rate = `100%` (`fail=0` in `test_share.sh`; `test_share_verify_live.sh` either passes or emits deterministic skip reason in environments without the command surface).
-- Performance gate status = pass (`perf_security_regressions` + `perf_guardrails` both green, no p95 regression above configured budgets/deltas).
+- Performance gate status = pass (`tui_full_traversal`, `perf_security_regressions`, and `perf_guardrails` all green; no budget failures or p95 regression above configured deltas).
 - CI gate report indicates `decision="go"` and `release_eligible=true`.
 - Release checklist sign-off ledger completed for the phase (owner + UTC timestamp + rationale + evidence paths).
 
@@ -301,7 +319,17 @@ Initiate kill-switch if ANY of:
    # If manual, skip to step 2
    ```
 
-2. **Revert to previous binary version:**
+2. **Capture lag/flash/soak evidence before changing state:**
+   ```bash
+   LATEST_TUI_RUN="$(ls -td tests/artifacts/tui_full_traversal/*/ | head -1)"
+   echo "Latest traversal gate run: ${LATEST_TUI_RUN}"
+   jq '{all_within_budget, failing_samples}' "${LATEST_TUI_RUN}/traversal_gate_verdict.json"
+   jq '{all_within_budget, failing_samples}' "${LATEST_TUI_RUN}/flash_detection_report.json"
+   jq '{all_within_budget, failing_samples}' "${LATEST_TUI_RUN}/soak_regression_report.json"
+   cat "${LATEST_TUI_RUN}/lag_flash_gate_triage.md"
+   ```
+
+3. **Revert to previous binary version:**
    ```bash
    # Option A: Git revert to last known-good commit
    git log --oneline -5  # identify the pre-dual-mode commit
@@ -314,7 +342,7 @@ Initiate kill-switch if ANY of:
    cp /path/to/backup/am /usr/local/bin/
    ```
 
-3. **Restart affected servers:**
+4. **Restart affected servers:**
    ```bash
    # Graceful restart (flushes commit queue)
    # Send SIGTERM, wait for clean exit, then restart
@@ -323,7 +351,7 @@ Initiate kill-switch if ANY of:
    am serve-http
    ```
 
-4. **Verify rollback:**
+5. **Verify rollback:**
    ```bash
    # Server is responding
    curl -sf http://127.0.0.1:8765/mcp/ > /dev/null
@@ -333,7 +361,7 @@ Initiate kill-switch if ANY of:
    # Expected: "healthy"
    ```
 
-5. **Notify stakeholders:**
+6. **Notify stakeholders:**
    - Post in the project coordination channel
    - File a bead documenting the incident and rollback reason
 
@@ -341,22 +369,37 @@ Initiate kill-switch if ANY of:
 
 After rollback, before re-attempting rollout:
 
-1. Reproduce the failure locally using the dual-mode E2E suite:
+1. Reproduce lag/flash/soak regression locally:
+   ```bash
+   E2E_FIXTURE_PROFILE=small E2E_CAPTURE_BASELINE_PROFILE=0 SOAK_DURATION_SECONDS=120 \
+     am e2e run --project . tui_full_traversal
+   ```
+
+2. Inspect gate reports for failing samples:
+   ```bash
+   LATEST_TUI_RUN="$(ls -td tests/artifacts/tui_full_traversal/*/ | head -1)"
+   jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/traversal_gate_verdict.json"
+   jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/flash_detection_report.json"
+   jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/soak_regression_report.json"
+   cat "${LATEST_TUI_RUN}/lag_flash_gate_triage.md"
+   ```
+
+3. Reproduce dual-mode baseline invariants:
    ```bash
    am e2e run --project . dual_mode
    ```
 
-2. Check the structured step logs for the failing scenario:
+4. Check the structured step logs for the failing scenario:
    ```bash
    cat tests/artifacts/dual_mode/*/steps/step_*.json | jq 'select(.passed == false)'
    ```
 
-3. Check failure bundles for reproduction commands:
+5. Check failure bundles for reproduction commands:
    ```bash
    cat tests/artifacts/dual_mode/*/failures/*.json | jq .reproduction
    ```
 
-4. Fix the root cause, add a regression test, and re-run all gate checks
+6. Fix the root cause, add a regression test, and re-run all gate checks
    (Section 2) before re-entering the rollout phases.
 
 ---

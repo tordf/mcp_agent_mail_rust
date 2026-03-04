@@ -308,6 +308,13 @@ jobs:
           SUSTAINED_LOAD_SECS: "5"
           SOAK_DURATION_SECS: "5"
 
+      - name: TUI traversal + flash + soak regression gate
+        run: am e2e run --project . tui_full_traversal
+        env:
+          E2E_FIXTURE_PROFILE: "small"
+          E2E_CAPTURE_BASELINE_PROFILE: "0"
+          SOAK_DURATION_SECONDS: "120"
+
       - name: Verify perf trend artifacts
         if: always()
         run: |
@@ -330,6 +337,62 @@ jobs:
           fi
           echo "Soak trend artifact: ${SOAK_TREND_FILE}"
 
+      - name: Verify TUI traversal/flash/soak gate artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("tests/artifacts/tui_full_traversal")
+          runs = sorted(p for p in root.glob("*/") if p.is_dir())
+          if not runs:
+              print("Missing tests/artifacts/tui_full_traversal/<timestamp>/")
+              raise SystemExit(1)
+          run_dir = runs[-1]
+
+          required_files = [
+              "summary.json",
+              "traversal_gate_verdict.json",
+              "flash_detection_report.json",
+              "soak_regression_report.json",
+              "lag_flash_gate_triage.md",
+          ]
+          missing = [name for name in required_files if not (run_dir / name).is_file()]
+          if missing:
+              print(f"Missing required TUI gate artifacts in {run_dir}: {missing}")
+              raise SystemExit(1)
+
+          failures = []
+          for report_name in (
+              "traversal_gate_verdict.json",
+              "flash_detection_report.json",
+              "soak_regression_report.json",
+          ):
+              report = json.loads((run_dir / report_name).read_text(encoding="utf-8"))
+              if report.get("all_within_budget") is not True:
+                  failures.append(f"{report_name}: all_within_budget != true")
+
+          summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+          if int(summary.get("fail", 1)) != 0:
+              failures.append(f"summary.json: fail={summary.get('fail')} (expected 0)")
+
+          if failures:
+              print("TUI incident regression gate failed:")
+              for item in failures:
+                  print(f" - {item}")
+              triage_path = run_dir / "lag_flash_gate_triage.md"
+              if triage_path.is_file():
+                  print("--- lag_flash_gate_triage.md ---")
+                  print(triage_path.read_text(encoding="utf-8"))
+                  print("--- end lag_flash_gate_triage.md ---")
+              raise SystemExit(1)
+
+          print(f"TUI incident regression gate PASS ({run_dir})")
+          print(f"Triage digest: {run_dir / 'lag_flash_gate_triage.md'}")
+          PY
+
       - name: Validate artifact bundles
         if: always()
         run: |
@@ -347,6 +410,7 @@ jobs:
             tests/artifacts/perf/soak_harness/
             tests/artifacts/soak/multi_project/
             tests/artifacts/tui/soak_replay/
+            tests/artifacts/tui_full_traversal/
           retention-days: 14
           if-no-files-found: ignore
 

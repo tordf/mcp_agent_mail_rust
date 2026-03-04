@@ -52,6 +52,10 @@ cat > "${PYTHON_CLONE}/pyproject.toml" <<'EOF'
 name = "mcp_agent_mail"
 version = "0.0.0"
 EOF
+python3 -m venv "${PYTHON_CLONE}/.venv"
+cat > "${PYTHON_CLONE}/src/mcp_agent_mail/__init__.py" <<'EOF'
+__all__ = []
+EOF
 
 json_query() {
     local json="$1"
@@ -111,17 +115,18 @@ run_installer() {
     set +e
     (
         cd "${RUN_DIR}"
+        # Mirror curl|bash style installer execution while keeping this suite offline.
         HOME="${TEST_HOME}" \
         PATH="${PATH_BASE}" \
         STORAGE_ROOT="${STORAGE_ROOT}" \
-        bash "${INSTALL_SH}" \
+        bash -s -- \
             --version "v${TARGET_VERSION}" \
             --artifact-url "file://${ARTIFACT_PATH}" \
             --dest "${DEST}" \
             --offline \
             --no-verify \
             --no-gum \
-            --easy-mode
+            --easy-mode < "${INSTALL_SH}"
     ) >"${stdout_file}" 2>"${stderr_file}"
     INSTALL_RC=$?
     set -e
@@ -158,7 +163,7 @@ e2e_assert_file_exists "offline artifact created" "${ARTIFACT_PATH}"
 # Seed a legacy Python-like shell alias and config surface.
 cat > "${TEST_HOME}/.zshrc" <<EOF
 # >>> MCP Agent Mail alias
-alias am='cd "${PYTHON_CLONE}" && python3 -m mcp_agent_mail'
+alias am='cd "${PYTHON_CLONE}" && "${PYTHON_CLONE}/.venv/bin/python" -m mcp_agent_mail'
 # <<< MCP Agent Mail alias
 EOF
 cat > "${TEST_HOME}/.bashrc" <<'EOF'
@@ -268,6 +273,84 @@ VALUES (1, 2, 'to', NULL, NULL);
 
 INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
 VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00', '2026-12-24 15:33:00', NULL);
+
+WITH RECURSIVE seq(n) AS (
+  SELECT 2
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 10
+)
+INSERT INTO projects (id, slug, human_key, created_at)
+SELECT
+  n,
+  printf('legacy-project-%02d', n),
+  printf('/tmp/legacy-project-%02d', n),
+  printf('2026-02-24 16:%02d:00.000000', n % 60)
+FROM seq;
+
+WITH RECURSIVE seq(n) AS (
+  SELECT 3
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 22
+)
+INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+SELECT
+  n,
+  ((n - 1) % 10) + 1,
+  printf('LegacyAgent%02d', n),
+  'python',
+  'legacy',
+  printf('bulk-agent-%02d', n),
+  printf('2026-02-24 16:%02d:01', n % 60),
+  printf('2026-02-24 16:%02d:02', n % 60),
+  'auto',
+  'auto'
+FROM seq;
+
+WITH RECURSIVE seq(n) AS (
+  SELECT 2
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 101
+)
+INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+SELECT
+  n,
+  ((n - 1) % 10) + 1,
+  ((n - 1) % 22) + 1,
+  'br-28mgh.8.2-bulk',
+  printf('Legacy bulk message %03d', n),
+  printf('bulk message payload %03d', n),
+  CASE WHEN (n % 2) = 0 THEN 'normal' ELSE 'high' END,
+  CASE WHEN (n % 2) = 0 THEN 0 ELSE 1 END,
+  printf('2026-02-24 17:%02d:%02d.000000', n % 60, (n * 7) % 60),
+  '[]'
+FROM seq;
+
+WITH RECURSIVE seq(n) AS (
+  SELECT 2
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 101
+)
+INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+SELECT n, 2, 'to', NULL, NULL
+FROM seq;
+
+WITH RECURSIVE seq(n) AS (
+  SELECT 2
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 15
+)
+INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+SELECT
+  n,
+  ((n - 1) % 10) + 1,
+  ((n - 1) % 22) + 1,
+  printf('src/legacy/%02d/**', n),
+  CASE WHEN (n % 3) = 0 THEN 0 ELSE 1 END,
+  printf('legacy bulk reservation %02d', n),
+  printf('2026-02-24 18:%02d:00', n % 60),
+  printf('2026-12-24 18:%02d:00', n % 60),
+  NULL
+FROM seq;
 SQL
 
 # ===========================================================================
@@ -372,16 +455,32 @@ RES_TS_TYPE="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT typeof(created_ts) FROM
 RES_TS_RC=$?
 MIGRATED_SUBJECT="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT subject FROM messages WHERE id=1;")"
 MIGRATED_SUBJECT_RC=$?
+PROJECT_COUNT="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT COUNT(*) FROM projects;")"
+PROJECT_COUNT_RC=$?
+AGENT_COUNT="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT COUNT(*) FROM agents;")"
+AGENT_COUNT_RC=$?
+MESSAGE_COUNT="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT COUNT(*) FROM messages;")"
+MESSAGE_COUNT_RC=$?
+RES_COUNT="$(sqlite3 "${MIGRATED_DB_SNAPSHOT}" "SELECT COUNT(*) FROM file_reservations;")"
+RES_COUNT_RC=$?
 set -e
 
 e2e_assert_exit_code "projects.created_at query succeeds on migrated snapshot" "0" "${PROJECT_TS_RC}"
 e2e_assert_exit_code "messages.created_ts query succeeds on migrated snapshot" "0" "${MESSAGE_TS_RC}"
 e2e_assert_exit_code "file_reservations.created_ts query succeeds on migrated snapshot" "0" "${RES_TS_RC}"
 e2e_assert_exit_code "messages.subject query succeeds on migrated snapshot" "0" "${MIGRATED_SUBJECT_RC}"
+e2e_assert_exit_code "projects count query succeeds on migrated snapshot" "0" "${PROJECT_COUNT_RC}"
+e2e_assert_exit_code "agents count query succeeds on migrated snapshot" "0" "${AGENT_COUNT_RC}"
+e2e_assert_exit_code "messages count query succeeds on migrated snapshot" "0" "${MESSAGE_COUNT_RC}"
+e2e_assert_exit_code "file_reservations count query succeeds on migrated snapshot" "0" "${RES_COUNT_RC}"
 e2e_assert_eq "projects.created_at migrated to integer" "integer" "${PROJECT_TS_TYPE}"
 e2e_assert_eq "messages.created_ts migrated to integer" "integer" "${MESSAGE_TS_TYPE}"
 e2e_assert_eq "file_reservations.created_ts migrated to integer" "integer" "${RES_TS_TYPE}"
 e2e_assert_eq "message subject preserved across migration" "Legacy migration message" "${MIGRATED_SUBJECT}"
+e2e_assert_eq "all seeded projects preserved across migration" "10" "${PROJECT_COUNT}"
+e2e_assert_eq "all seeded agents preserved across migration" "22" "${AGENT_COUNT}"
+e2e_assert_eq "all seeded messages preserved across migration" "101" "${MESSAGE_COUNT}"
+e2e_assert_eq "all seeded file reservations preserved across migration" "15" "${RES_COUNT}"
 
 # ===========================================================================
 # Case 4: Rust CLI can read migrated data end-to-end
@@ -393,6 +492,11 @@ if json_query "${PROJECTS_JSON}" "assert any(p.get('human_key') == '/tmp/legacy-
     e2e_pass "list-projects includes migrated legacy project"
 else
     e2e_fail "list-projects includes migrated legacy project"
+fi
+if json_query "${PROJECTS_JSON}" "assert len(d) >= 10"; then
+    e2e_pass "list-projects includes non-trivial migrated dataset volume"
+else
+    e2e_fail "list-projects includes non-trivial migrated dataset volume"
 fi
 
 AGENTS_JSON="$(run_migrated_am agents list --project /tmp/legacy-project --json 2>/dev/null || true)"
@@ -409,6 +513,11 @@ if json_query "${INBOX_JSON}" "assert any(m.get('subject') == 'Legacy migration 
     e2e_pass "mail inbox exposes migrated legacy message"
 else
     e2e_fail "mail inbox exposes migrated legacy message"
+fi
+if json_query "${INBOX_JSON}" "assert any('Legacy bulk message' in (m.get('subject') or '') for m in d)"; then
+    e2e_pass "mail inbox exposes migrated bulk message payload"
+else
+    e2e_fail "mail inbox exposes migrated bulk message payload"
 fi
 
 RES_LIST="$(run_migrated_am file_reservations list legacy-project --all 2>/dev/null || true)"
@@ -474,8 +583,16 @@ fi
 set +e
 git -C "${STORAGE_ROOT}" fsck --no-progress >/dev/null 2>&1
 FSCK_RC=$?
+LOG_HEAD="$(git -C "${STORAGE_ROOT}" log --oneline --max-count 1 2>/dev/null)"
+LOG_RC=$?
 set -e
 e2e_assert_exit_code "storage root git repository remains healthy" "0" "${FSCK_RC}"
+e2e_assert_exit_code "storage root git log is readable" "0" "${LOG_RC}"
+if [ -n "${LOG_HEAD}" ]; then
+    e2e_pass "storage root git history remains readable"
+else
+    e2e_fail "storage root git history remains readable"
+fi
 
 # ===========================================================================
 # Case 7: Docker harness definition exists (optional build smoke)

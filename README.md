@@ -923,6 +923,7 @@ am e2e list
 am e2e run --project .                 # all suites
 am e2e run --project . stdio http      # selected suites
 am e2e run --project . --include tui_  # pattern include
+am e2e run --project . tui_full_traversal  # traversal + flash + soak regression gate
 
 # Legacy compatibility shim (deprecated primary path)
 ./scripts/e2e_test.sh stdio

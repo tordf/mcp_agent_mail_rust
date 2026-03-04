@@ -294,11 +294,8 @@ pub async fn file_reservation_paths(
         ));
     }
 
-    let ttl = match ttl_seconds {
-        Some(t) if t > 0 => t.clamp(60, 31_536_000),
-        _ => 3600, // 1 hour default
-    };
-    if ttl_seconds.is_some_and(|t| t > 0 && t < 60) {
+    let ttl = ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000));
+    if ttl_seconds.is_some_and(|t| t < 60) {
         tracing::warn!(
             "ttl_seconds={} clamped to minimum 60s",
             ttl_seconds.unwrap_or(0)
@@ -687,10 +684,7 @@ pub async fn renew_file_reservations(
     file_reservation_ids: Option<Vec<i64>>,
 ) -> McpResult<String> {
     // Legacy parity: clamp too-small values up to 60 seconds.
-    let extend = match extend_seconds {
-        Some(t) if t > 0 => t.clamp(60, 31_536_000),
-        _ => 1800, // 30 minutes default
-    };
+    let extend = extend_seconds.map_or(1800, |t| t.clamp(60, 31_536_000));
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;

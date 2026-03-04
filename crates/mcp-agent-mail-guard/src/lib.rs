@@ -724,8 +724,12 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
             } else {
                 let _ = std::fs::remove_file(&hook_path);
             }
+            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.cmd")));
+            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.ps1")));
         } else if is_legacy_hook {
             let _ = std::fs::remove_file(&hook_path);
+            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.cmd")));
+            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.ps1")));
         }
     }
 

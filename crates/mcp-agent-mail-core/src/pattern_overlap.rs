@@ -88,12 +88,12 @@ fn first_literal_segment_end(norm: &str) -> Option<usize> {
 }
 
 fn is_directory_prefix(prefix: &str, full: &str) -> bool {
-    !prefix.is_empty()
-        && full.starts_with(prefix)
-        && full
-            .as_bytes()
-            .get(prefix.len())
-            .is_some_and(|b| *b == b'/')
+    prefix.is_empty()
+        || (full.starts_with(prefix)
+            && full
+                .as_bytes()
+                .get(prefix.len())
+                .is_some_and(|b| *b == b'/'))
 }
 
 impl CompiledPattern {
@@ -151,6 +151,12 @@ impl CompiledPattern {
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
         if self.norm == other.norm {
+            return true;
+        }
+
+        // An empty pattern (normalized from "/" or ".") represents the root directory.
+        // Reserving the root directory overlaps with everything in the workspace.
+        if self.norm.is_empty() || other.norm.is_empty() {
             return true;
         }
 

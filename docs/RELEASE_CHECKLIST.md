@@ -188,6 +188,24 @@ ls tests/fixtures/golden_snapshots/mcp_deny_*.txt
 am ci --report tests/artifacts/ci/gate_report.json
 jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifacts/ci/gate_report.json
 # decision must be "go", release_eligible must be true, thresholds must have zero failed_gates
+
+# 8. Lag/flash incident gates emit complete artifacts + triage digest
+am e2e run --project . tui_full_traversal
+LATEST_TUI_RUN="$(ls -td tests/artifacts/tui_full_traversal/*/ | head -1)"
+test -f "${LATEST_TUI_RUN}/traversal_gate_verdict.json"
+test -f "${LATEST_TUI_RUN}/flash_detection_report.json"
+test -f "${LATEST_TUI_RUN}/soak_regression_report.json"
+test -f "${LATEST_TUI_RUN}/lag_flash_gate_triage.md"
+jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/traversal_gate_verdict.json"
+jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/flash_detection_report.json"
+jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/soak_regression_report.json"
+cat "${LATEST_TUI_RUN}/lag_flash_gate_triage.md"
+
+# 9. Soak harness trend artifact exists
+am e2e run --project . soak_harness
+SOAK_TREND="$(find tests/artifacts/perf/soak_harness -type f -name 'perf_timeseries.jsonl' -print -quit)"
+test -n "${SOAK_TREND}"
+wc -l "${SOAK_TREND}"
 ```
 
 ## Rollout Validation
@@ -218,6 +236,17 @@ jq '.decision, .release_eligible, .thresholds, (.gates | length)' tests/artifact
    am e2e run --project . mode_matrix
    am e2e run --project . security_privacy
    am e2e run --project . tui_a11y
+   am e2e run --project . soak_harness
+   am e2e run --project . tui_full_traversal
+   ```
+
+   Incident-gate triage on failure:
+   ```bash
+   LATEST_TUI_RUN="$(ls -td tests/artifacts/tui_full_traversal/*/ | head -1)"
+   cat "${LATEST_TUI_RUN}/lag_flash_gate_triage.md"
+   jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/traversal_gate_verdict.json"
+   jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/flash_detection_report.json"
+   jq '.all_within_budget, .failing_samples' "${LATEST_TUI_RUN}/soak_regression_report.json"
    ```
 
 3. Manual smoke test:

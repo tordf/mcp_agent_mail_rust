@@ -874,7 +874,7 @@ impl DbPool {
         Ok(Some(bak_path))
     }
 
-    /// Attempt one-shot recovery from SQLite corruption detected at runtime.
+    /// Attempt one-shot recovery from `SQLite` corruption detected at runtime.
     ///
     /// This should be called when a query returns a corruption error
     /// (e.g. "database disk image is malformed"). The method:
@@ -889,14 +889,21 @@ impl DbPool {
     ///
     /// Uses a global flag to prevent concurrent recovery attempts.
     pub fn try_recover_from_corruption(&self, trigger_error: &str) -> DbResult<bool> {
-        if self.sqlite_path == ":memory:" {
-            return Ok(false);
-        }
-
         // Use a global flag to serialize recovery attempts. Only one thread
         // should attempt recovery at a time.
         static RECOVERY_IN_PROGRESS: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
+
+        struct ResetOnDrop;
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                RECOVERY_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        if self.sqlite_path == ":memory:" {
+            return Ok(false);
+        }
 
         if RECOVERY_IN_PROGRESS
             .compare_exchange(
@@ -913,12 +920,6 @@ impl DbPool {
             return Ok(false);
         }
 
-        struct ResetOnDrop;
-        impl Drop for ResetOnDrop {
-            fn drop(&mut self) {
-                RECOVERY_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
         let _guard = ResetOnDrop;
 
         tracing::error!(
@@ -927,17 +928,40 @@ impl DbPool {
             "runtime corruption detected; attempting automatic recovery"
         );
 
-        // Record the corruption event in metrics.
+        let primary_path = Path::new(&self.sqlite_path);
+        match sqlite_file_is_healthy(primary_path) {
+            Ok(true) => {
+                tracing::warn!(
+                    path = %self.sqlite_path,
+                    trigger = %trigger_error,
+                    "runtime corruption trigger received, but health probes already pass; skipping recovery"
+                );
+                return Ok(false);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.sqlite_path,
+                    trigger = %trigger_error,
+                    error = %e,
+                    "failed to run pre-recovery health probes; proceeding with recovery attempt"
+                );
+            }
+        }
+
+        // Record the corruption event in metrics only for confirmed/suspected unhealthy state.
         let metrics = mcp_agent_mail_core::global_metrics();
         metrics.db.integrity_failures_total.inc();
 
-        let primary_path = Path::new(&self.sqlite_path);
         match recover_sqlite_file(primary_path) {
             Ok(()) => {
                 tracing::warn!(
                     path = %self.sqlite_path,
-                    "runtime corruption recovery succeeded — connections will use restored database"
+                    "runtime corruption recovery succeeded — clearing idle connections and returning to service"
                 );
+                // CRITICAL: Idle connections hold FDs to the old (corrupted/unlinked) inode.
+                // We MUST clear them so subsequent checkouts open the new file.
+                self.pool.clear_idle();
                 Ok(true)
             }
             Err(e) => {

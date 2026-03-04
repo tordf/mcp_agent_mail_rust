@@ -1120,7 +1120,8 @@ pub async fn create_agent(
     let attach_pol = attachments_policy.unwrap_or("auto");
     let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                      inception_ts, last_active_ts, attachments_policy, contact_policy \
-                     FROM agents WHERE project_id = ? AND name = ? LIMIT 1";
+                     FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                     ORDER BY id ASC LIMIT 1";
     let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
     // Fast duplicate check before insert.
@@ -1222,10 +1223,11 @@ pub async fn get_agent(
 
     let tracked = tracked(&*conn);
 
-    // Optimized: filter by name directly in SQL.
+    // Optimized: filter by name directly in SQL (case-insensitive).
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy \
-               FROM agents WHERE project_id = ? AND name = ? LIMIT 1";
+               FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
+               ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {

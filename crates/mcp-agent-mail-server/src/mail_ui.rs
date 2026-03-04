@@ -1065,7 +1065,7 @@ fn render_inbox(
 
     // Offset-based pagination (Python: offset = (page - 1) * limit).
     let page = page.max(1);
-    let offset = (page - 1) * limit.max(1);
+    let offset = (page - 1).saturating_mul(limit.max(1));
     let items: Vec<InboxMessage> = inbox
         .iter()
         .skip(offset)
@@ -1087,7 +1087,7 @@ fn render_inbox(
         .collect();
 
     let prev_page = if page > 1 { Some(page - 1) } else { None };
-    let next_page = if offset + limit < total {
+    let next_page = if offset.saturating_add(limit) < total {
         Some(page + 1)
     } else {
         None

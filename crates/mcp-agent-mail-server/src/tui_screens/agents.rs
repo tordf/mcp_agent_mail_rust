@@ -404,6 +404,7 @@ impl AgentsScreen {
             match event {
                 MailEvent::MessageSent { from, .. } => {
                     *self.msg_counts.entry(from.clone()).or_insert(0) += 1;
+                    self.cached_total_msgs = self.cached_total_msgs.saturating_add(1);
                     self.total_msgs_this_tick += 1;
                     if !self.reduced_motion {
                         self.message_flash_ticks

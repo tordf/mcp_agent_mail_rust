@@ -16,6 +16,7 @@
 #     traversal_gate_verdict.json — p95/p99 budget verdict + failing modes
 #     pressure_resize_regression_report.json — event-pressure/resize-storm PTY regression metrics + budgets
 #     flash_detection_report.json — frame-diff/repaint-churn flash detection verdict + failing scenarios
+#     soak_regression_report.json — multi-minute soak telemetry + drift/budget verdict
 #     baseline_profile_summary.json — baseline CPU/thread/syscall/redraw profile
 #     cross_layer_attribution_report.json — ranked attribution map + next-track order
 #     forward_transcript.txt   — normalized PTY output (Tab forward)
@@ -23,6 +24,7 @@
 #     jump_transcript.txt      — normalized PTY output (direct number keys)
 #     pressure_transcript.txt  — normalized PTY output (rapid mixed input)
 #     resize_storm_transcript.txt — normalized PTY output (deterministic resize storm)
+#     soak_transcript.txt      — normalized PTY output (multi-minute mixed soak workload)
 #     seed_data.json           — data fixtures used for seeding
 
 set -euo pipefail
@@ -35,7 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 e2e_init_artifacts
-e2e_banner "TUI Full-Screen Traversal Repro Harness (br-legjy.1.1 + br-legjy.6.1 + br-legjy.3.4)"
+e2e_banner "TUI Full-Screen Traversal Repro Harness (br-legjy.1.1 + br-legjy.6.1 + br-legjy.3.4 + br-legjy.6.3)"
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
 FIXTURE_PROFILE="${E2E_FIXTURE_PROFILE:-medium}"
@@ -52,6 +54,15 @@ RESIZE_BUDGET_REPAINT_BURST_MAX="${RESIZE_BUDGET_REPAINT_BURST_MAX:-14}"
 FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX="${FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX:-0.20}"
 FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX="${FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX:-0.75}"
 FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX="${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX:-60}"
+SOAK_DURATION_SECONDS="${SOAK_DURATION_SECONDS:-180}"
+SOAK_STEP_DELAY_MS="${SOAK_STEP_DELAY_MS:-500}"
+SOAK_BUDGET_FIRST_BYTE_P95_MS="${SOAK_BUDGET_FIRST_BYTE_P95_MS:-90}"
+SOAK_BUDGET_QUIESCE_P95_MS="${SOAK_BUDGET_QUIESCE_P95_MS:-260}"
+SOAK_BUDGET_QUIESCE_P99_MS="${SOAK_BUDGET_QUIESCE_P99_MS:-700}"
+SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX="${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX:-30}"
+SOAK_BUDGET_CPU_DRIFT_PCT_MAX="${SOAK_BUDGET_CPU_DRIFT_PCT_MAX:-35}"
+SOAK_BUDGET_WAKE_DRIFT_PCT_MAX="${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX:-40}"
+SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX="${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX:-60}"
 
 for cmd in python3 curl; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -147,12 +158,65 @@ case "${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX}" in
         e2e_fatal "Invalid FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX='${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX}'. Expected numeric ratio."
         ;;
 esac
+case "${SOAK_DURATION_SECONDS}" in
+    ''|*[!0-9]*)
+        e2e_fatal "Invalid SOAK_DURATION_SECONDS='${SOAK_DURATION_SECONDS}'. Expected integer seconds."
+        ;;
+esac
+case "${SOAK_STEP_DELAY_MS}" in
+    ''|*[!0-9]*)
+        e2e_fatal "Invalid SOAK_STEP_DELAY_MS='${SOAK_STEP_DELAY_MS}'. Expected integer milliseconds."
+        ;;
+esac
+case "${SOAK_BUDGET_FIRST_BYTE_P95_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_FIRST_BYTE_P95_MS='${SOAK_BUDGET_FIRST_BYTE_P95_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${SOAK_BUDGET_QUIESCE_P95_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_QUIESCE_P95_MS='${SOAK_BUDGET_QUIESCE_P95_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${SOAK_BUDGET_QUIESCE_P99_MS}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_QUIESCE_P99_MS='${SOAK_BUDGET_QUIESCE_P99_MS}'. Expected numeric milliseconds."
+        ;;
+esac
+case "${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX='${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX}'. Expected numeric percentage."
+        ;;
+esac
+case "${SOAK_BUDGET_CPU_DRIFT_PCT_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_CPU_DRIFT_PCT_MAX='${SOAK_BUDGET_CPU_DRIFT_PCT_MAX}'. Expected numeric percentage."
+        ;;
+esac
+case "${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_WAKE_DRIFT_PCT_MAX='${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX}'. Expected numeric percentage."
+        ;;
+esac
+case "${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX='${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}'. Expected numeric ratio."
+        ;;
+esac
+if [ "${SOAK_DURATION_SECONDS}" -lt 120 ]; then
+    e2e_fatal "SOAK_DURATION_SECONDS must be >=120 (multi-minute minimum), got '${SOAK_DURATION_SECONDS}'"
+fi
+if [ "${SOAK_STEP_DELAY_MS}" -lt 100 ]; then
+    e2e_fatal "SOAK_STEP_DELAY_MS must be >=100ms, got '${SOAK_STEP_DELAY_MS}'"
+fi
 
 e2e_log "Baseline profiling capture enabled: ${CAPTURE_BASELINE_PROFILE} (strict=${BASELINE_PROFILE_STRICT})"
 e2e_log "Traversal quiesce budgets: p95<=${TRAVERSAL_BUDGET_QUIESCE_P95_MS}ms, p99<=${TRAVERSAL_BUDGET_QUIESCE_P99_MS}ms"
 e2e_log "Pressure budgets: first_byte_p95<=${PRESSURE_BUDGET_FIRST_BYTE_P95_MS}ms, quiesce_p95<=${PRESSURE_BUDGET_QUIESCE_P95_MS}ms, quiesce_p99<=${PRESSURE_BUDGET_QUIESCE_P99_MS}ms"
 e2e_log "Resize-storm budgets: first_byte_p95<=${RESIZE_BUDGET_FIRST_BYTE_P95_MS}ms, quiesce_p95<=${RESIZE_BUDGET_QUIESCE_P95_MS}ms, repaint_burst<=${RESIZE_BUDGET_REPAINT_BURST_MAX}x"
 e2e_log "Flash budgets: empty_frame_ratio<=${FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX}, frame_bounce_ratio<=${FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX}, repaint_ops_per_kb<=${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX}"
+e2e_log "Soak setup: duration=${SOAK_DURATION_SECONDS}s, step_delay=${SOAK_STEP_DELAY_MS}ms"
+e2e_log "Soak budgets: first_byte_p95<=${SOAK_BUDGET_FIRST_BYTE_P95_MS}ms, quiesce_p95<=${SOAK_BUDGET_QUIESCE_P95_MS}ms, quiesce_p99<=${SOAK_BUDGET_QUIESCE_P99_MS}ms, latency_drift<=${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX}%, cpu_drift<=${SOAK_BUDGET_CPU_DRIFT_PCT_MAX}%, wake_drift<=${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX}%, repaint_ops_per_kb<=${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}"
 
 pick_port() {
 python3 - <<'PY'
@@ -301,6 +365,7 @@ else:
     # Quiescence gap: if no output arrives within this window after the last
     # byte, we consider the screen render "done".  Kept tight for profiling.
     QUIESCE_GAP_S = float(os.environ.get("E2E_PTY_QUIESCE_MS", "80")) / 1000.0
+    INITIAL_RENDER_MAX_WAIT_S = float(os.environ.get("E2E_PTY_INITIAL_RENDER_MAX_WAIT_MS", "12000")) / 1000.0
 
     def start_profile_tool(name, cmd_args, stdout_path):
         stderr_path = f"{stdout_path}.stderr.txt"
@@ -369,7 +434,9 @@ else:
                     break
         return got
 
-    def read_with_latency(max_wait=2.0):
+    ALT_SCREEN_ENTER_BYTES = b"\x1b[?1049h"
+
+    def read_with_latency(max_wait=2.0, min_capture_ms=0.0, require_alt_screen=False):
         """Read output tracking first-byte and quiescence timing.
 
         Returns dict with:
@@ -377,12 +444,14 @@ else:
           quiesce_ms     - time from call to output quiescence
           render_ms      - time from first byte to quiescence (actual render)
           total_bytes    - bytes received during this call
+          saw_alt_screen - whether alt-screen enter was observed in this window
         """
         t0 = time.monotonic()
         deadline = t0 + max_wait
         got = 0
         first_byte_t = None
         last_byte_t = None
+        saw_alt_screen = False
 
         while True:
             remaining = deadline - time.monotonic()
@@ -406,12 +475,23 @@ else:
                     if first_byte_t is None:
                         first_byte_t = now
                     last_byte_t = now
+                    if ALT_SCREEN_ENTER_BYTES in chunk:
+                        saw_alt_screen = True
                 except OSError:
                     break
             else:
                 # select timed out with no data
                 if first_byte_t is not None:
-                    # We had output and now it stopped — quiesced
+                    now = time.monotonic()
+                    # During startup we can see brief banner output before the
+                    # fullscreen renderer enters alt-screen. Keep waiting (up to
+                    # max_wait) when requested so we don't truncate captures to
+                    # startup text only.
+                    if require_alt_screen and not saw_alt_screen and now < deadline:
+                        continue
+                    if min_capture_ms > 0 and ((now - first_byte_t) * 1000.0) < min_capture_ms and now < deadline:
+                        continue
+                    # We had output and now it stopped — quiesced.
                     break
 
         now = time.monotonic()
@@ -420,19 +500,25 @@ else:
             "quiesce_ms": round((now - t0) * 1000, 2),
             "render_ms": round(((last_byte_t or now) - (first_byte_t or t0)) * 1000, 2) if first_byte_t else 0,
             "total_bytes": got,
+            "saw_alt_screen": saw_alt_screen,
         }
 
     ansi_step_re = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\].*?(?:\x07|\x1b\\)|[\x40-\x5f]|\([\x20-\x7e]|\)[\x20-\x7e])")
 
     # Initial read: wait for TUI to render
     t_start = time.monotonic()
-    init = read_with_latency(max_wait=5.0)
+    init = read_with_latency(
+        max_wait=INITIAL_RENDER_MAX_WAIT_S,
+        min_capture_ms=1000.0,
+        require_alt_screen=True,
+    )
     timings.append({
         "step": "initial_render",
         "first_byte_ms": init["first_byte_ms"],
         "quiesce_ms": init["quiesce_ms"],
         "render_ms": init["render_ms"],
         "output_bytes": init["total_bytes"],
+        "saw_alt_screen": init["saw_alt_screen"],
     })
 
     def apply_resize(step):
@@ -473,7 +559,8 @@ else:
             except OSError:
                 break
 
-        r = read_with_latency(max_wait=max_wait_s)
+        step_min_capture_ms = float(step.get("min_capture_ms", 0) or 0)
+        r = read_with_latency(max_wait=max_wait_s, min_capture_ms=step_min_capture_ms)
         t_after = time.monotonic()
         segment_raw = b"".join(chunks[chunk_start_idx:])
         segment_text = segment_raw.decode("utf-8", errors="replace")
@@ -499,6 +586,7 @@ else:
             "input_kind": input_kind,
             "resize": resize_applied,
             "max_wait_ms": step.get("delay_ms", 200),
+            "min_capture_ms": step_min_capture_ms,
             "wall_ms": round((t_after - t_before) * 1000, 2),
             "first_byte_ms": r["first_byte_ms"],
             "quiesce_ms": r["quiesce_ms"],
@@ -510,6 +598,7 @@ else:
             "frame_cursor_home_ops": frame_cursor_home_ops,
             "frame_clear_ops": frame_clear_ops,
             "frame_erase_line_ops": frame_erase_line_ops,
+            "saw_alt_screen": r["saw_alt_screen"],
         })
 
     # Final read
@@ -1387,7 +1476,7 @@ PYEOF
 then
     e2e_pass "traversal gate: all modes within quiesce p95/p99 budgets"
 else
-    e2e_fail "traversal gate: one or more modes exceeded quiesce p95/p99 budgets"
+    e2e_fail "traversal gate: budgets exceeded; see ${GATE_FILE} and rerun 'am e2e run --project . tui_full_traversal'"
 fi
 
 if [ -f "${GATE_FILE}" ]; then
@@ -1753,7 +1842,7 @@ PYEOF
 then
     e2e_pass "pressure/resize regression gate: all scenarios within budgets"
 else
-    e2e_fail "pressure/resize regression gate: one or more scenarios exceeded budgets"
+    e2e_fail "pressure/resize regression gate: budgets exceeded; see ${PRESSURE_RESIZE_REPORT} and rerun 'am e2e run --project . tui_full_traversal'"
 fi
 
 if [ -f "${PRESSURE_RESIZE_REPORT}" ]; then
@@ -1909,7 +1998,7 @@ PYEOF
 then
     e2e_pass "flash detection gate: all scenarios within budgets"
 else
-    e2e_fail "flash detection gate: one or more scenarios exceeded budgets"
+    e2e_fail "flash detection gate: budgets exceeded; see ${FLASH_REPORT} and rerun 'am e2e run --project . tui_full_traversal'"
 fi
 
 if [ -f "${FLASH_REPORT}" ]; then
@@ -1937,6 +2026,411 @@ then
     e2e_pass "flash detection gate: report schema complete"
 else
     e2e_fail "flash detection gate: report schema incomplete"
+fi
+
+
+# ────────────────────────────────────────────────────────────────────
+# Case 4e: Multi-minute soak gate with drift telemetry (F3)
+# ────────────────────────────────────────────────────────────────────
+e2e_case_banner "multi_minute_soak_gate"
+
+read -r WORKS DBS STORAGES <<< "$(setup_server_env "soak")"
+PORTS="$(pick_port)"
+
+DATABASE_URL="sqlite:////${DBS}" \
+STORAGE_ROOT="${STORAGES}" \
+HTTP_HOST="127.0.0.1" \
+HTTP_PORT="${PORTS}" \
+HTTP_RBAC_ENABLED=0 \
+HTTP_RATE_LIMIT_ENABLED=0 \
+HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
+TUI_ENABLED=0 \
+    "${BIN}" serve --host 127.0.0.1 --port "${PORTS}" --no-tui &
+HEADLESS_PIDS=$!
+
+if wait_for_server "${PORTS}" 15; then
+    seed_realistic_data "${PORTS}" "${FIXTURE_PROFILE}"
+else
+    e2e_fatal "Headless server failed to start for soak scenario seeding"
+fi
+
+kill "${HEADLESS_PIDS}" 2>/dev/null || true
+wait "${HEADLESS_PIDS}" 2>/dev/null || true
+sleep 1
+
+TRANSCRIPTS="${E2E_ARTIFACT_DIR}/soak_transcript.txt"
+TIMINGS="${E2E_ARTIFACT_DIR}/soak_timing.json"
+SOAK_REPORT="${E2E_ARTIFACT_DIR}/soak_regression_report.json"
+SOAK_PROFILE_DIR="${E2E_ARTIFACT_DIR}/soak_profile"
+mkdir -p "${SOAK_PROFILE_DIR}"
+
+SOAK_TOTAL_STEPS=$(( (SOAK_DURATION_SECONDS * 1000 + SOAK_STEP_DELAY_MS - 1) / SOAK_STEP_DELAY_MS ))
+SOAK_MIN_STEPS=$(( SOAK_TOTAL_STEPS * 9 / 10 ))
+if [ "${SOAK_MIN_STEPS}" -lt 60 ]; then
+    SOAK_MIN_STEPS=60
+fi
+e2e_log "Soak scenario: ${SOAK_DURATION_SECONDS}s target, ${SOAK_TOTAL_STEPS} scheduled steps, minimum accepted steps=${SOAK_MIN_STEPS}"
+
+KEYSS='['
+KEYSS+='{"delay_ms": 2200, "keys": "", "label": "initial_render"}'
+for i in $(seq 1 "${SOAK_TOTAL_STEPS}"); do
+    if [ $((i % 20)) -eq 0 ]; then
+        key_value="5"
+        key_label="jump_search"
+    elif [ $((i % 11)) -eq 0 ]; then
+        key_value="${BACKTAB_KEY_JSON}"
+        key_label="backtab"
+    elif [ $((i % 7)) -eq 0 ]; then
+        key_value="0"
+        key_label="jump_projects"
+    elif [ $((i % 5)) -eq 0 ]; then
+        key_value=""
+        key_label="idle"
+    else
+        key_value="\\t"
+        key_label="tab"
+    fi
+
+    if [ $((i % 37)) -eq 0 ]; then
+        rows=$((20 + (i % 8) * 3))
+        cols=$((88 + (i % 9) * 6))
+        KEYSS+=",{\"delay_ms\": ${SOAK_STEP_DELAY_MS}, \"min_capture_ms\": ${SOAK_STEP_DELAY_MS}, \"keys\": \"${key_value}\", \"label\": \"soak_${key_label}_${i}\", \"resize\": {\"rows\": ${rows}, \"cols\": ${cols}}}"
+    else
+        KEYSS+=",{\"delay_ms\": ${SOAK_STEP_DELAY_MS}, \"min_capture_ms\": ${SOAK_STEP_DELAY_MS}, \"keys\": \"${key_value}\", \"label\": \"soak_${key_label}_${i}\"}"
+    fi
+done
+KEYSS+=",{\"delay_ms\": 300, \"keys\": \"q\", \"label\": \"quit\"}"
+KEYSS+=']'
+
+if ! E2E_PROFILE_CAPTURE=1 \
+    E2E_PROFILE_DIR="${SOAK_PROFILE_DIR}" \
+    E2E_PROFILE_LABEL="soak" \
+    run_timed_pty_interaction "soak" "${TRANSCRIPTS}" "${TIMINGS}" "${KEYSS}" \
+        env \
+        DATABASE_URL="sqlite:////${DBS}" \
+        STORAGE_ROOT="${STORAGES}" \
+        HTTP_HOST="127.0.0.1" \
+        HTTP_PORT="${PORTS}" \
+        HTTP_RBAC_ENABLED=0 \
+        HTTP_RATE_LIMIT_ENABLED=0 \
+        HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1 \
+        "${BIN}" serve --host 127.0.0.1 --port "${PORTS}"; then
+    e2e_fatal "soak PTY interaction failed"
+fi
+
+if python3 - "${TIMINGS}" "${SOAK_MIN_STEPS}" <<'PYEOF'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    doc = json.load(f)
+steps = [t for t in doc.get("timings", []) if str(t.get("step", "")).startswith("soak_")]
+min_steps = int(sys.argv[2])
+assert len(steps) >= min_steps
+PYEOF
+then
+    e2e_pass "soak: timing artifact contains required minimum number of soak steps"
+else
+    e2e_fail "soak: timing artifact does not contain enough soak steps"
+fi
+
+if python3 - "${TIMINGS}" "${SOAK_REPORT}" "${SOAK_MIN_STEPS}" "${SOAK_DURATION_SECONDS}" \
+    "${SOAK_BUDGET_FIRST_BYTE_P95_MS}" "${SOAK_BUDGET_QUIESCE_P95_MS}" "${SOAK_BUDGET_QUIESCE_P99_MS}" \
+    "${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX}" "${SOAK_BUDGET_CPU_DRIFT_PCT_MAX}" "${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX}" \
+    "${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}" "${SOAK_PROFILE_DIR}" <<'PYEOF'
+import datetime
+import json
+import re
+import sys
+from pathlib import Path
+
+(
+    timing_path,
+    report_path,
+    min_steps_s,
+    duration_s,
+    first_p95_budget_s,
+    quiesce_p95_budget_s,
+    quiesce_p99_budget_s,
+    latency_drift_budget_s,
+    cpu_drift_budget_s,
+    wake_drift_budget_s,
+    repaint_budget_s,
+    profile_dir_s,
+) = sys.argv[1:13]
+
+min_steps = int(min_steps_s)
+duration_seconds = int(duration_s)
+first_p95_budget = float(first_p95_budget_s)
+quiesce_p95_budget = float(quiesce_p95_budget_s)
+quiesce_p99_budget = float(quiesce_p99_budget_s)
+latency_drift_budget = float(latency_drift_budget_s)
+cpu_drift_budget = float(cpu_drift_budget_s)
+wake_drift_budget = float(wake_drift_budget_s)
+repaint_budget = float(repaint_budget_s)
+profile_dir = Path(profile_dir_s)
+
+with open(timing_path, "r", encoding="utf-8") as f:
+    timing_doc = json.load(f)
+
+steps = [s for s in timing_doc.get("timings", []) if str(s.get("step", "")).startswith("soak_")]
+total_entry = next((s for s in timing_doc.get("timings", []) if s.get("step") == "total"), {})
+
+def percentile(values, p):
+    if not values:
+        return 0.0
+    vals = sorted(values)
+    idx = min(len(vals) - 1, max(0, int((len(vals) - 1) * p)))
+    return float(vals[idx])
+
+def mean(values):
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+def drift_pct(start, end):
+    if start <= 0:
+        return 0.0
+    return ((end - start) / start) * 100.0
+
+def parse_pidstat_process(path: Path):
+    series = []
+    if not path.exists():
+        return series
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not re.match(r"^\d{2}:\d{2}:\d{2}\s+(AM|PM)\s+", line):
+                continue
+            parts = line.split()
+            if len(parts) < 9:
+                continue
+            try:
+                series.append(float(parts[8]))
+            except ValueError:
+                continue
+    return series
+
+def parse_pidstat_wake(path: Path):
+    series = []
+    if not path.exists():
+        return series
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not re.match(r"^\d{2}:\d{2}:\d{2}\s+(AM|PM)\s+", line):
+                continue
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            try:
+                cs = float(parts[5])
+                ncs = float(parts[6])
+            except ValueError:
+                continue
+            series.append(cs + ncs)
+    return series
+
+first = [float(s["first_byte_ms"]) for s in steps if s.get("first_byte_ms") is not None]
+quiesce_raw = [float(s.get("quiesce_ms", 0) or 0) for s in steps]
+min_capture = [float(s.get("min_capture_ms", 0) or 0) for s in steps]
+# For soak we intentionally enforce dwell windows via min_capture_ms.
+# Normalize quiesce by removing that floor so budgets reflect real render quiescence.
+quiesce = [max(0.0, q - m) for q, m in zip(quiesce_raw, min_capture)]
+render = [float(s.get("render_ms", 0) or 0) for s in steps]
+bytes_out = [float(s.get("output_bytes_delta", 0) or 0) for s in steps]
+cursor_home = [int(s.get("frame_cursor_home_ops", 0) or 0) for s in steps]
+clear_ops = [int(s.get("frame_clear_ops", 0) or 0) for s in steps]
+erase_ops = [int(s.get("frame_erase_line_ops", 0) or 0) for s in steps]
+
+count = len(steps)
+window = max(1, count // 3)
+start_q = mean(quiesce[:window])
+end_q = mean(quiesce[-window:]) if quiesce else 0.0
+latency_drift = drift_pct(start_q, end_q)
+latency_growth = max(0.0, latency_drift)
+
+cpu_series = parse_pidstat_process(profile_dir / "soak_pidstat_process.txt")
+wake_series = parse_pidstat_wake(profile_dir / "soak_pidstat_wake.txt")
+
+cpu_start = mean(cpu_series[: max(1, len(cpu_series) // 3)])
+cpu_end = mean(cpu_series[-max(1, len(cpu_series) // 3):]) if cpu_series else 0.0
+cpu_drift = drift_pct(cpu_start, cpu_end)
+cpu_growth = max(0.0, cpu_drift)
+
+wake_start = mean(wake_series[: max(1, len(wake_series) // 3)])
+wake_end = mean(wake_series[-max(1, len(wake_series) // 3):]) if wake_series else 0.0
+wake_drift = drift_pct(wake_start, wake_end)
+wake_growth = max(0.0, wake_drift)
+
+repaint_ops_total = sum(cursor_home) + sum(clear_ops) + sum(erase_ops)
+bytes_total = sum(bytes_out)
+repaint_ops_per_kb = repaint_ops_total / max(bytes_total / 1024.0, 1.0)
+
+duration_ms_actual = float(total_entry.get("wall_ms", 0) or 0)
+duration_ms_expected = float(duration_seconds * 1000)
+
+summary = {
+    "step_count": count,
+    "duration_ms_actual": round(duration_ms_actual, 2),
+    "duration_ms_expected": round(duration_ms_expected, 2),
+    "first_byte_p50_ms": round(percentile(first, 0.50), 2),
+    "first_byte_p95_ms": round(percentile(first, 0.95), 2),
+    "first_byte_p99_ms": round(percentile(first, 0.99), 2),
+    "quiesce_p50_ms": round(percentile(quiesce, 0.50), 2),
+    "quiesce_p95_ms": round(percentile(quiesce, 0.95), 2),
+    "quiesce_p99_ms": round(percentile(quiesce, 0.99), 2),
+    "quiesce_raw_p95_ms": round(percentile(quiesce_raw, 0.95), 2),
+    "quiesce_raw_p99_ms": round(percentile(quiesce_raw, 0.99), 2),
+    "render_p50_ms": round(percentile(render, 0.50), 2),
+    "render_p95_ms": round(percentile(render, 0.95), 2),
+    "latency_drift_pct": round(latency_drift, 2),
+    "latency_growth_pct": round(latency_growth, 2),
+    "cpu_samples": len(cpu_series),
+    "cpu_drift_pct": round(cpu_drift, 2),
+    "cpu_growth_pct": round(cpu_growth, 2),
+    "cpu_p95_percent": round(percentile(cpu_series, 0.95), 2),
+    "wake_samples": len(wake_series),
+    "wake_drift_pct": round(wake_drift, 2),
+    "wake_growth_pct": round(wake_growth, 2),
+    "wake_p95_per_s": round(percentile(wake_series, 0.95), 2),
+    "repaint_ops_total": repaint_ops_total,
+    "repaint_ops_per_kb": round(repaint_ops_per_kb, 4),
+    "bytes_total": round(bytes_total, 2),
+}
+
+reasons = []
+if count < min_steps:
+    reasons.append("insufficient_step_count")
+if duration_ms_actual < duration_ms_expected * 0.90:
+    reasons.append("insufficient_duration")
+if summary["first_byte_p95_ms"] > first_p95_budget:
+    reasons.append("first_byte_p95_exceeded")
+if summary["quiesce_p95_ms"] > quiesce_p95_budget:
+    reasons.append("quiesce_p95_exceeded")
+if summary["quiesce_p99_ms"] > quiesce_p99_budget:
+    reasons.append("quiesce_p99_exceeded")
+if summary["latency_growth_pct"] > latency_drift_budget:
+    reasons.append("latency_drift_exceeded")
+if len(cpu_series) == 0:
+    reasons.append("missing_cpu_telemetry")
+elif summary["cpu_growth_pct"] > cpu_drift_budget:
+    reasons.append("cpu_drift_exceeded")
+if len(wake_series) == 0:
+    reasons.append("missing_wake_telemetry")
+elif summary["wake_growth_pct"] > wake_drift_budget:
+    reasons.append("wake_drift_exceeded")
+if summary["repaint_ops_per_kb"] > repaint_budget:
+    reasons.append("repaint_churn_exceeded")
+
+sample = {
+    "scenario": "multi_minute_soak",
+    "summary": summary,
+    "within_budget": len(reasons) == 0,
+    "reasons": reasons,
+    "budgets": {
+        "min_step_count": min_steps,
+        "duration_ms_min": round(duration_ms_expected * 0.90, 2),
+        "first_byte_p95_ms_max": first_p95_budget,
+        "quiesce_p95_ms_max": quiesce_p95_budget,
+        "quiesce_p99_ms_max": quiesce_p99_budget,
+        "latency_growth_pct_max": latency_drift_budget,
+        "cpu_growth_pct_max": cpu_drift_budget,
+        "wake_growth_pct_max": wake_drift_budget,
+        "repaint_ops_per_kb_max": repaint_budget,
+    },
+    "ansi_metrics": timing_doc.get("ansi_metrics", {}),
+}
+
+report = {
+    "schema_version": "tui_soak_gate.v1",
+    "harness": "tui_full_traversal",
+    "bead": "br-legjy.6.3",
+    "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "samples": [sample],
+    "all_within_budget": sample["within_budget"],
+    "failing_samples": [] if sample["within_budget"] else [{"scenario": sample["scenario"], "reasons": sample["reasons"]}],
+    "artifacts": {
+        "timing_file": timing_path,
+        "profile_dir": str(profile_dir),
+    },
+    "repro": {
+        "command": "bash tests/e2e/test_tui_full_traversal.sh",
+        "env": {
+            "SOAK_DURATION_SECONDS": duration_seconds,
+            "SOAK_STEP_DELAY_MS": int(summary["duration_ms_expected"] / max(count, 1)) if count > 0 else 0,
+            "SOAK_BUDGET_FIRST_BYTE_P95_MS": first_p95_budget,
+            "SOAK_BUDGET_QUIESCE_P95_MS": quiesce_p95_budget,
+            "SOAK_BUDGET_QUIESCE_P99_MS": quiesce_p99_budget,
+            "SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX": latency_drift_budget,
+            "SOAK_BUDGET_CPU_DRIFT_PCT_MAX": cpu_drift_budget,
+            "SOAK_BUDGET_WAKE_DRIFT_PCT_MAX": wake_drift_budget,
+            "SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX": repaint_budget,
+        },
+    },
+}
+
+with open(report_path, "w", encoding="utf-8") as f:
+    json.dump(report, f, indent=2)
+    f.write("\n")
+
+print("=== Multi-Minute Soak Gate ===")
+verdict = "PASS" if sample["within_budget"] else "FAIL"
+print(
+    f"  soak {verdict} "
+    f"(steps={summary['step_count']}, duration_ms={summary['duration_ms_actual']:.2f}, "
+    f"first_p95={summary['first_byte_p95_ms']:.2f}, quiesce_norm_p95={summary['quiesce_p95_ms']:.2f}, "
+    f"quiesce_norm_p99={summary['quiesce_p99_ms']:.2f}, quiesce_raw_p95={summary['quiesce_raw_p95_ms']:.2f}, "
+    f"latency_growth={summary['latency_growth_pct']:.2f}%, "
+    f"cpu_growth={summary['cpu_growth_pct']:.2f}%, wake_growth={summary['wake_growth_pct']:.2f}%)"
+)
+if reasons:
+    print("  failing=" + ",".join(reasons))
+
+sys.exit(0 if sample["within_budget"] else 1)
+PYEOF
+then
+    e2e_pass "soak gate: sustained mixed workload stayed within budgets"
+else
+    e2e_fail "soak gate: sustained mixed workload exceeded budgets; see ${SOAK_REPORT} and rerun 'am e2e run --project . tui_full_traversal'"
+fi
+
+if [ -f "${SOAK_REPORT}" ]; then
+    e2e_save_artifact "soak_regression_report_copy.json" "$(cat "${SOAK_REPORT}")"
+else
+    e2e_fail "soak gate: report artifact missing"
+fi
+
+if python3 - "${SOAK_REPORT}" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    report = json.load(f)
+
+assert report["schema_version"] == "tui_soak_gate.v1"
+assert report["bead"] == "br-legjy.6.3"
+assert isinstance(report["all_within_budget"], bool)
+assert len(report["samples"]) == 1
+sample = report["samples"][0]
+for key in ("scenario", "summary", "within_budget", "reasons", "budgets", "ansi_metrics"):
+    assert key in sample
+for key in (
+    "step_count",
+    "duration_ms_actual",
+    "first_byte_p95_ms",
+    "quiesce_p95_ms",
+    "quiesce_p99_ms",
+    "latency_growth_pct",
+    "cpu_growth_pct",
+    "wake_growth_pct",
+    "repaint_ops_per_kb",
+):
+    assert key in sample["summary"]
+PYEOF
+then
+    e2e_pass "soak gate: report schema complete"
+else
+    e2e_fail "soak gate: report schema incomplete"
 fi
 
 
@@ -2475,6 +2969,93 @@ assert len(r['anti_patterns_to_avoid']) >= 3
     fi
 else
     e2e_skip "baseline profiling disabled (E2E_CAPTURE_BASELINE_PROFILE=0)"
+fi
+
+
+# ────────────────────────────────────────────────────────────────────
+# Case 6: Incident gate triage digest artifact (F4 support)
+# ────────────────────────────────────────────────────────────────────
+e2e_case_banner "incident_gate_triage_digest"
+
+TRIAGE_DIGEST="${E2E_ARTIFACT_DIR}/lag_flash_gate_triage.md"
+if python3 - "${E2E_ARTIFACT_DIR}" "${TRIAGE_DIGEST}" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+artifact_dir = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+
+reports = [
+    ("Traversal latency gate", "traversal_gate_verdict.json"),
+    ("Pressure/resize regression gate", "pressure_resize_regression_report.json"),
+    ("Flash detection gate", "flash_detection_report.json"),
+    ("Multi-minute soak gate", "soak_regression_report.json"),
+]
+
+lines = [
+    "# Lag/Flash Incident Gate Triage Digest",
+    "",
+    f"- Artifact directory: `{artifact_dir}`",
+    "- Primary local repro: `am e2e run --project . tui_full_traversal`",
+    "- Deep attribution repro: `E2E_CAPTURE_BASELINE_PROFILE=1 am e2e run --project . tui_full_traversal`",
+    "",
+]
+
+for title, filename in reports:
+    path = artifact_dir / filename
+    lines.append(f"## {title}")
+    lines.append(f"- Artifact: `{path}`")
+
+    if not path.is_file():
+        lines.append("- Status: missing artifact")
+        lines.append("- Next step: rerun `am e2e run --project . tui_full_traversal` and inspect suite logs")
+        lines.append("")
+        continue
+
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        lines.append("- Status: artifact unreadable")
+        lines.append(f"- Parse error: `{exc}`")
+        lines.append("")
+        continue
+
+    all_within_budget = report.get("all_within_budget")
+    if all_within_budget is True:
+        lines.append("- Status: PASS (`all_within_budget=true`)")
+    elif all_within_budget is False:
+        lines.append("- Status: FAIL (`all_within_budget=false`)")
+    else:
+        lines.append("- Status: UNKNOWN (missing `all_within_budget`)")
+
+    failing_samples = report.get("failing_samples") or []
+    if failing_samples:
+        lines.append("- Failing samples:")
+        for sample in failing_samples:
+            lines.append(f"  - `{json.dumps(sample, sort_keys=True)}`")
+    else:
+        lines.append("- Failing samples: none")
+
+    repro = report.get("repro") or {}
+    repro_cmd = repro.get("command")
+    if repro_cmd:
+        lines.append(f"- Report repro command: `{repro_cmd}`")
+    repro_env = repro.get("env") or {}
+    if repro_env:
+        lines.append("- Report repro env:")
+        for key in sorted(repro_env):
+            lines.append(f"  - `{key}={repro_env[key]}`")
+
+    lines.append("")
+
+output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PYEOF
+then
+    e2e_pass "incident gate triage: lag_flash_gate_triage.md generated"
+    e2e_save_artifact "lag_flash_gate_triage_copy.md" "$(cat "${TRIAGE_DIGEST}")"
+else
+    e2e_fail "incident gate triage: failed to generate lag_flash_gate_triage.md"
 fi
 
 

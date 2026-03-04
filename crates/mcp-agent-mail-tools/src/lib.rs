@@ -132,6 +132,34 @@ pub mod tool_util {
                     "identifier": identifier,
                 }),
             ),
+            DbError::Sqlite(ref message)
+            | DbError::Schema(ref message)
+            | DbError::Pool(ref message)
+                if e.is_corruption() =>
+            {
+                // Attempt automatic recovery before reporting error.
+                if let Ok(pool) = get_db_pool()
+                    && matches!(pool.try_recover_from_corruption(message), Ok(true))
+                {
+                    return legacy_tool_error(
+                        "DATABASE_RECOVERED",
+                        "Database corruption was detected and automatically repaired. \
+                         Please retry your operation.",
+                        true,
+                        json!({ "error_detail": message, "recovered": true }),
+                    );
+                }
+                let message = message.clone();
+                legacy_tool_error(
+                    "DATABASE_CORRUPTION",
+                    format!(
+                        "Database corruption detected: {message}. \
+                         Run 'am doctor repair' or 'am doctor reconstruct' to recover."
+                    ),
+                    false,
+                    json!({ "error_detail": message }),
+                )
+            }
             DbError::Pool(message) => legacy_tool_error(
                 "DATABASE_POOL_EXHAUSTED",
                 "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
@@ -718,6 +746,15 @@ pub mod tool_util {
         }
 
         #[test]
+        fn db_error_to_mcp_error_maps_pool_corruption() {
+            let err =
+                db_error_to_mcp_error(DbError::Pool("database disk image is malformed".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
+            assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
         fn db_error_to_mcp_error_maps_pool_exhausted() {
             let err = db_error_to_mcp_error(DbError::PoolExhausted {
                 message: "all connections in use".into(),
@@ -743,6 +780,15 @@ pub mod tool_util {
             let err = db_error_to_mcp_error(DbError::Schema("migration v4 failed".into()));
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_schema_corruption() {
+            let err =
+                db_error_to_mcp_error(DbError::Schema("database disk image is malformed".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
+            assert_eq!(data["error"]["recoverable"], false);
         }
 
         #[test]

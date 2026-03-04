@@ -39,6 +39,48 @@ if [ -z "${CARGO_TARGET_DIR:-}" ]; then
 fi
 mkdir -p "${CARGO_TARGET_DIR}" 2>/dev/null || true
 
+# Cargo offload policy for E2E harnesses.
+# Default behavior is remote-first via rch (when available) to avoid local
+# build storms in multi-agent sessions.
+E2E_CARGO_FORCE_LOCAL="${E2E_CARGO_FORCE_LOCAL:-0}"
+E2E_CARGO_REQUIRE_RCH="${E2E_CARGO_REQUIRE_RCH:-0}"
+E2E_RCH_TIMEOUT_SECONDS="${E2E_RCH_TIMEOUT_SECONDS:-900}"
+E2E_RCH_MOCK_CIRCUIT_OPEN="${E2E_RCH_MOCK_CIRCUIT_OPEN:-0}"
+
+e2e_run_cargo() {
+    if [ "${E2E_CARGO_FORCE_LOCAL}" = "1" ]; then
+        cargo "$@"
+        return $?
+    fi
+
+    if command -v rch >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            if [ "${E2E_RCH_MOCK_CIRCUIT_OPEN}" = "1" ]; then
+                timeout "${E2E_RCH_TIMEOUT_SECONDS}" \
+                    env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- cargo "$@"
+            else
+                timeout "${E2E_RCH_TIMEOUT_SECONDS}" \
+                    rch exec -- cargo "$@"
+            fi
+        else
+            if [ "${E2E_RCH_MOCK_CIRCUIT_OPEN}" = "1" ]; then
+                env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- cargo "$@"
+            else
+                rch exec -- cargo "$@"
+            fi
+        fi
+        return $?
+    fi
+
+    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ]; then
+        e2e_log "ERROR: rch is required but not available in PATH."
+        return 127
+    fi
+
+    e2e_log "rch unavailable; falling back to local cargo: cargo $*"
+    cargo "$@"
+}
+
 # Root of the project
 E2E_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -1908,14 +1950,14 @@ e2e_ensure_binary() {
         e2e_log "Building ${bin_name}..."
         case "$bin_name" in
             am)
-                cargo build -p "mcp-agent-mail-cli" --bin "am" 2>&1 | tail -5
+                e2e_run_cargo build -p "mcp-agent-mail-cli" --bin "am" 2>&1 | tail -5
                 ;;
             mcp-agent-mail)
-                cargo build -p "mcp-agent-mail" --bin "mcp-agent-mail" 2>&1 | tail -5
+                e2e_run_cargo build -p "mcp-agent-mail" --bin "mcp-agent-mail" 2>&1 | tail -5
                 ;;
             *)
                 # Default: assume package/bin share the same name.
-                cargo build -p "$bin_name" --bin "$bin_name" 2>&1 | tail -5
+                e2e_run_cargo build -p "$bin_name" --bin "$bin_name" 2>&1 | tail -5
                 ;;
         esac
     fi

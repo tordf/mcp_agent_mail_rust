@@ -101,13 +101,28 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
     let db_path = dir
         .path()
         .join(format!("query_integ_{}.db", unique_suffix()));
+
+    // Initialize schema synchronously — the pool factory's async migration path
+    // hangs with Cx::for_testing() because it lacks runtime backing for
+    // conn.execute(cx, ...).await calls.
+    let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+        .expect("open base schema connection");
+    init_conn
+        .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+        .expect("apply init PRAGMAs");
+    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
+    init_conn
+        .execute_raw(&init_sql)
+        .expect("initialize base schema");
+    drop(init_conn);
+
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
         max_connections: 5,
         min_connections: 1,
         acquire_timeout_ms: 30_000,
         max_lifetime_ms: 3_600_000,
-        run_migrations: true,
+        run_migrations: false,
         warmup_connections: 0,
     };
     let pool = DbPool::new(&config).expect("create pool");
@@ -1944,4 +1959,67 @@ fn v3_lexical_audit_summary_counts_match_verdicts() {
         }
         other => panic!("v3 lexical audit search failed: {other:?}"),
     }
+}
+
+// =============================================================================
+// Diagnostic tests: isolate the hang (br-2em1l)
+// =============================================================================
+
+#[test]
+fn diag_block_on_immediate() {
+    // Pure immediate future — no pool, no Cx usage.
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    let val = rt.block_on(async { 42 });
+    assert_eq!(val, 42);
+}
+
+#[test]
+fn diag_block_on_with_cx() {
+    // Future that captures Cx but doesn't use pool.
+    let cx = Cx::for_testing();
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    let val = rt.block_on(async move {
+        let _ = &cx;
+        43
+    });
+    assert_eq!(val, 43);
+}
+
+#[test]
+fn diag_pool_acquire_only() {
+    // Pool acquire — the suspected hang point.
+    let (pool, _dir) = make_pool();
+    block_on(|cx| async move {
+        match pool.acquire(&cx).await {
+            Outcome::Ok(_) => 1i32,
+            Outcome::Err(e) => panic!("pool acquire failed: {e:?}"),
+            Outcome::Cancelled(r) => panic!("pool acquire cancelled: {r:?}"),
+            Outcome::Panicked(p) => panic!("pool acquire panicked: {p:?}"),
+        }
+    });
+}
+
+#[test]
+fn diag_pool_acquire_sync_only() {
+    // Pool acquire bypassing the async block_on — use sync DbConn directly.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join(format!("diag_sync_{}.db", unique_suffix()));
+
+    // Open connection directly (no pool, no runtime).
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+        .expect("open connection");
+    conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+        .expect("pragmas");
+    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
+    conn.execute_raw(&init_sql).expect("schema");
+
+    // Do a simple query sync
+    let rows = conn
+        .query_sync("SELECT COUNT(*) FROM projects", &[])
+        .expect("query");
+    assert_eq!(rows.len(), 1);
 }

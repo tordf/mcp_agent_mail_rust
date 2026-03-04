@@ -3691,6 +3691,10 @@ fn parse_stty_size(stdout: &[u8]) -> Option<(u16, u16)> {
     Some((cols, rows))
 }
 
+const fn is_degenerate_terminal_size(cols: u16, rows: u16) -> bool {
+    cols == 0 || rows == 0
+}
+
 fn degenerate_stty_size() -> Option<(u16, u16)> {
     let output = std::process::Command::new("stty")
         .arg("size")
@@ -3702,10 +3706,10 @@ fn degenerate_stty_size() -> Option<(u16, u16)> {
         return None;
     }
     let (cols, rows) = parse_stty_size(&output.stdout)?;
-    if cols == 0 || rows == 0 {
-        return None;
+    if is_degenerate_terminal_size(cols, rows) {
+        return Some((cols, rows));
     }
-    Some((cols, rows))
+    None
 }
 
 fn request_panel_width_from_columns(columns: u16) -> usize {
@@ -12404,6 +12408,14 @@ mod tests {
         assert_eq!(parse_stty_size(b"0\n"), None);
         assert_eq!(parse_stty_size(b"abc def\n"), None);
         assert_eq!(parse_stty_size(b"24 80 1\n"), None);
+    }
+
+    #[test]
+    fn is_degenerate_terminal_size_only_flags_zero_dimensions() {
+        assert!(is_degenerate_terminal_size(0, 24));
+        assert!(is_degenerate_terminal_size(80, 0));
+        assert!(is_degenerate_terminal_size(0, 0));
+        assert!(!is_degenerate_terminal_size(120, 40));
     }
 
     #[test]

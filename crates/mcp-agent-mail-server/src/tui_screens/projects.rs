@@ -77,6 +77,8 @@ pub struct ProjectsScreen {
     project_activity: HashMap<String, i64>,
     /// Previous totals for `MetricTrend` computation.
     prev_totals: (u64, u64, u64, u64),
+    /// Cached totals for the currently rendered/filtered project list.
+    cached_totals: (u64, u64, u64, u64),
     /// Whether the detail panel is visible on wide screens.
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
@@ -100,6 +102,7 @@ impl ProjectsScreen {
             last_seq: 0,
             project_activity: HashMap::new(),
             prev_totals: (0, 0, 0, 0),
+            cached_totals: (0, 0, 0, 0),
             detail_visible: true,
             detail_scroll: 0,
             last_data_gen: super::DataGeneration::stale(),
@@ -181,6 +184,7 @@ impl ProjectsScreen {
             auth_enabled: cfg.auth_enabled,
         });
 
+        self.cached_totals = totals_from_projects(&rows);
         self.projects = rows;
 
         // Clamp selection
@@ -227,24 +231,19 @@ impl ProjectsScreen {
     }
 
     /// Compute totals for the summary band.
+    #[cfg(test)]
     fn compute_totals(&self) -> (u64, u64, u64, u64) {
-        let project_count = self.projects.len() as u64;
-        let total_agents: u64 = self.projects.iter().map(|p| p.agent_count).sum();
-        let total_msgs: u64 = self.projects.iter().map(|p| p.message_count).sum();
-        let total_reserv: u64 = self.projects.iter().map(|p| p.reservation_count).sum();
-        (project_count, total_agents, total_msgs, total_reserv)
+        totals_from_projects(&self.projects)
     }
 
-    /// Determine activity status for a project row.
-    fn activity_color(&self, proj: &ProjectSummary) -> ftui::PackedRgba {
+    fn activity_color_at(&self, proj: &ProjectSummary, now_micros: i64) -> ftui::PackedRgba {
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let now = chrono::Utc::now().timestamp_micros();
         let last_ts = self.project_activity.get(&proj.slug).copied().unwrap_or(0);
 
         if last_ts <= 0 {
             return tp.activity_stale;
         }
-        let elapsed = now.saturating_sub(last_ts);
+        let elapsed = now_micros.saturating_sub(last_ts);
         if elapsed <= ACTIVE_WINDOW_MICROS {
             tp.activity_active
         } else if elapsed <= IDLE_WINDOW_MICROS {
@@ -254,15 +253,13 @@ impl ProjectsScreen {
         }
     }
 
-    /// Activity status icon for a project.
-    fn activity_icon(&self, proj: &ProjectSummary) -> &'static str {
-        let now = chrono::Utc::now().timestamp_micros();
+    fn activity_icon_at(&self, proj: &ProjectSummary, now_micros: i64) -> &'static str {
         let last_ts = self.project_activity.get(&proj.slug).copied().unwrap_or(0);
 
         if last_ts <= 0 {
             return "\u{25CB}"; // ○
         }
-        let elapsed = now.saturating_sub(last_ts);
+        let elapsed = now_micros.saturating_sub(last_ts);
         if elapsed <= ACTIVE_WINDOW_MICROS {
             "\u{25CF}" // ●
         } else if elapsed <= IDLE_WINDOW_MICROS {
@@ -287,6 +284,14 @@ const fn trend_for(current: u64, previous: u64) -> MetricTrend {
     } else {
         MetricTrend::Flat
     }
+}
+
+fn totals_from_projects(projects: &[ProjectSummary]) -> (u64, u64, u64, u64) {
+    let project_count = projects.len() as u64;
+    let total_agents: u64 = projects.iter().map(|p| p.agent_count).sum();
+    let total_msgs: u64 = projects.iter().map(|p| p.message_count).sum();
+    let total_reserv: u64 = projects.iter().map(|p| p.reservation_count).sum();
+    (project_count, total_agents, total_msgs, total_reserv)
 }
 
 impl MailScreen for ProjectsScreen {
@@ -373,7 +378,7 @@ impl MailScreen for ProjectsScreen {
         // compute trend arrows by comparing live compute_totals() (post-update)
         // with prev_totals (pre-update).
         if dirty.events || dirty.db_stats {
-            self.prev_totals = self.compute_totals();
+            self.prev_totals = self.cached_totals;
         }
         if dirty.events {
             self.ingest_events(state);
@@ -602,8 +607,9 @@ impl ProjectsScreen {
 
         let mut lines: Vec<(String, String, Option<ftui::PackedRgba>)> = Vec::new();
 
-        let activity_color = self.activity_color(proj);
-        let icon = self.activity_icon(proj);
+        let now_micros = chrono::Utc::now().timestamp_micros();
+        let activity_color = self.activity_color_at(proj, now_micros);
+        let icon = self.activity_icon_at(proj, now_micros);
 
         lines.push(("Slug".into(), proj.slug.clone(), None));
         lines.push(("Path".into(), proj.human_key.clone(), None));
@@ -649,7 +655,7 @@ impl ProjectsScreen {
     #[allow(clippy::cast_possible_truncation)]
     fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let (proj_count, total_agents, total_msgs, total_reserv) = self.compute_totals();
+        let (proj_count, total_agents, total_msgs, total_reserv) = self.cached_totals;
         let (prev_proj, prev_agents, prev_msgs, prev_reserv) = self.prev_totals;
 
         let proj_str = proj_count.to_string();
@@ -708,6 +714,7 @@ impl ProjectsScreen {
     #[allow(clippy::cast_possible_truncation)]
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect, wide: bool, narrow: bool) {
         let tp = crate::tui_theme::TuiThemePalette::current();
+        let now_micros = chrono::Utc::now().timestamp_micros();
 
         // Responsive columns
         let (header_cells, widths): (Vec<&str>, Vec<Constraint>) = if narrow {
@@ -755,8 +762,8 @@ impl ProjectsScreen {
             .iter()
             .enumerate()
             .map(|(i, proj)| {
-                let activity_color = self.activity_color(proj);
-                let icon = self.activity_icon(proj);
+                let activity_color = self.activity_color_at(proj, now_micros);
+                let icon = self.activity_icon_at(proj, now_micros);
                 let style = if Some(i) == self.table_state.selected {
                     Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else {
@@ -817,7 +824,7 @@ impl ProjectsScreen {
 
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let (proj_count, total_agents, total_msgs, total_reserv) = self.compute_totals();
+        let (proj_count, total_agents, total_msgs, total_reserv) = self.cached_totals;
 
         let proj_str = proj_count.to_string();
         let agents_str = total_agents.to_string();
@@ -1325,6 +1332,37 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(screen.compute_totals(), (2, 8, 30, 3));
+    }
+
+    #[test]
+    fn rebuild_updates_cached_totals() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 2,
+            projects_list: vec![
+                ProjectSummary {
+                    slug: "alpha".into(),
+                    human_key: "/tmp/alpha".into(),
+                    agent_count: 3,
+                    message_count: 10,
+                    reservation_count: 2,
+                    ..Default::default()
+                },
+                ProjectSummary {
+                    slug: "beta".into(),
+                    human_key: "/tmp/beta".into(),
+                    agent_count: 5,
+                    message_count: 20,
+                    reservation_count: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.cached_totals, (2, 8, 30, 3));
     }
 
     // ── B5: Cardinality truth assertions ────────────────────────────

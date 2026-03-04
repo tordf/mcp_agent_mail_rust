@@ -124,7 +124,7 @@ impl DbError {
     #[must_use]
     pub fn is_corruption(&self) -> bool {
         match self {
-            Self::Sqlite(msg) | Self::Pool(msg) => is_corruption_error(msg),
+            Self::Sqlite(msg) | Self::Pool(msg) | Self::Schema(msg) => is_corruption_error(msg),
             Self::IntegrityCorruption { .. } => true,
             _ => false,
         }
@@ -466,6 +466,12 @@ mod tests {
     }
 
     #[test]
+    fn corruption_error_from_schema_message() {
+        let e = DbError::Schema("database disk image is malformed".into());
+        assert!(e.is_corruption());
+    }
+
+    #[test]
     fn corruption_error_from_integrity_variant() {
         let e = DbError::IntegrityCorruption {
             message: "bad page".into(),
@@ -483,6 +489,12 @@ mod tests {
     #[test]
     fn not_corruption_for_syntax_error() {
         let e = DbError::Sqlite("syntax error near SELECT".into());
+        assert!(!e.is_corruption());
+    }
+
+    #[test]
+    fn not_corruption_for_schema_migration_failure() {
+        let e = DbError::Schema("migration v4 failed".into());
         assert!(!e.is_corruption());
     }
 

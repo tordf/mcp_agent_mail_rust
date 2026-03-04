@@ -126,9 +126,15 @@ pub async fn macro_start_session(
             }
         } else {
             let ttl = match file_reservation_ttl_seconds {
-                Some(t) if t > 0 => t,
-                _ => 3600,
+                Some(t) if t > 0 => t.clamp(60, 31_536_000),
+                _ => 3600, // 1 hour default
             };
+            if file_reservation_ttl_seconds.is_some_and(|t| t > 0 && t < 60) {
+                tracing::warn!(
+                    "file_reservation_ttl_seconds={} clamped to minimum 60s",
+                    file_reservation_ttl_seconds.unwrap_or(0)
+                );
+            }
             let reason = file_reservation_reason.unwrap_or_else(|| "macro-session".to_string());
             let reservation_json = crate::reservations::file_reservation_paths(
                 ctx,
@@ -399,21 +405,18 @@ pub async fn macro_file_reservation_cycle(
     auto_release: Option<bool>,
 ) -> McpResult<String> {
     let ttl = match ttl_seconds {
-        Some(t) if t > 0 => t,
-        _ => 3600,
+        Some(t) if t > 0 => t.clamp(60, 31_536_000),
+        _ => 3600, // 1 hour default
     };
+    if ttl_seconds.is_some_and(|t| t > 0 && t < 60) {
+        tracing::warn!(
+            "ttl_seconds={} clamped to minimum 60s",
+            ttl_seconds.unwrap_or(0)
+        );
+    }
+
     let is_exclusive = exclusive.unwrap_or(true);
     let should_release = auto_release.unwrap_or(false);
-
-    // Validate TTL >= 60 seconds
-    if ttl < 60 {
-        return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "ttl_seconds must be at least 60 seconds",
-            true,
-            serde_json::json!({ "field": "ttl_seconds", "provided": ttl, "min": 60 }),
-        ));
-    }
 
     // Legacy tooling metrics counts the internal reservation tool calls made by this macro.
     crate::metrics::record_call("file_reservation_paths");

@@ -388,6 +388,12 @@ pub struct MailExplorerScreen {
     detail_visible: bool,
     /// Last observed data generation for dirty-state tracking.
     last_data_gen: super::DataGeneration,
+
+    /// Cached text filter IDs: (`search_text`, result).
+    /// Avoids re-creating pool/runtime/Cx when only direction/sort/ack changed.
+    cached_text_filter: Option<(String, Option<std::collections::HashSet<i64>>)>,
+    /// Cursor position at last `sync_focused_event` call, avoids rebuild when unchanged.
+    last_synced_cursor: Option<usize>,
 }
 
 impl MailExplorerScreen {
@@ -424,6 +430,8 @@ impl MailExplorerScreen {
             list_state: RefCell::new(VirtualizedListState::default()),
             detail_visible: true,
             last_data_gen: super::DataGeneration::stale(),
+            cached_text_filter: None,
+            last_synced_cursor: None,
         }
     }
 
@@ -438,7 +446,17 @@ impl MailExplorerScreen {
     }
 
     /// Rebuild the synthetic `MailEvent` for the currently selected message.
+    /// Only rebuilds when the cursor position or entry count changes.
     fn sync_focused_event(&mut self) {
+        let effective_cursor = if self.entries.is_empty() {
+            None
+        } else {
+            Some(self.cursor)
+        };
+        if self.last_synced_cursor == effective_cursor && effective_cursor.is_some() {
+            return;
+        }
+        self.last_synced_cursor = effective_cursor;
         self.focused_synthetic = self.entries.get(self.cursor).map(|e| {
             crate::tui_events::MailEvent::message_sent(
                 e.message_id,
@@ -468,6 +486,7 @@ impl MailExplorerScreen {
         self.db_context_unavailable = self.db_conn.is_none();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute_query(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let Some(conn) = self.db_conn.take() else {
@@ -483,13 +502,40 @@ impl MailExplorerScreen {
         self.db_context_unavailable = false;
 
         let text_filter = self.search_input.value().trim().to_string();
-        let text_match_ids = match Self::resolve_text_filter_message_ids(&text_filter) {
-            Ok(ids) => ids,
-            Err(e) => {
-                self.last_error = Some(e);
-                self.db_conn = Some(conn);
-                self.search_dirty = false;
-                return;
+
+        // Use cached text filter IDs when the search text hasn't changed,
+        // avoiding expensive pool/runtime/Cx recreation on direction/sort/ack changes.
+        let text_match_ids = if let Some((ref cached_text, ref cached_ids)) =
+            self.cached_text_filter
+        {
+            if *cached_text == text_filter {
+                cached_ids.clone()
+            } else {
+                match Self::resolve_text_filter_message_ids(&text_filter) {
+                    Ok(ids) => {
+                        self.cached_text_filter = Some((text_filter.clone(), ids.clone()));
+                        ids
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e);
+                        self.db_conn = Some(conn);
+                        self.search_dirty = false;
+                        return;
+                    }
+                }
+            }
+        } else {
+            match Self::resolve_text_filter_message_ids(&text_filter) {
+                Ok(ids) => {
+                    self.cached_text_filter = Some((text_filter.clone(), ids.clone()));
+                    ids
+                }
+                Err(e) => {
+                    self.last_error = Some(e);
+                    self.db_conn = Some(conn);
+                    self.search_dirty = false;
+                    return;
+                }
             }
         };
 
@@ -571,6 +617,7 @@ impl MailExplorerScreen {
         self.detail_scroll = 0;
         self.last_error = None;
         self.search_dirty = false;
+        self.last_synced_cursor = None; // force focused event rebuild with new entries
         self.db_conn = Some(conn);
     }
 
@@ -912,6 +959,8 @@ impl MailExplorerScreen {
         self.group_mode = GroupMode::None;
         self.ack_filter = AckFilter::All;
         self.agent_filter.clear();
+        self.cached_text_filter = None;
+        self.last_synced_cursor = None;
         self.search_dirty = true;
         self.debounce_remaining = 0;
     }
@@ -1398,28 +1447,20 @@ fn sort_entries(entries: &mut [DisplayEntry], mode: SortMode) {
         SortMode::DateDesc => entries.sort_by_key(|e| std::cmp::Reverse(e.created_ts)),
         SortMode::DateAsc => entries.sort_by_key(|e| e.created_ts),
         SortMode::ImportanceDesc => {
-            entries.sort_by(|a, b| {
-                importance_rank(&b.importance)
-                    .cmp(&importance_rank(&a.importance))
-                    .then_with(|| b.created_ts.cmp(&a.created_ts))
+            // Pre-compute importance ranks to avoid calling importance_rank() 2× per comparison.
+            entries.sort_by_cached_key(|e| {
+                (std::cmp::Reverse(importance_rank(&e.importance)), std::cmp::Reverse(e.created_ts))
             });
         }
         SortMode::AgentAlpha => {
-            entries.sort_by(|a, b| {
-                let agent_a = if a.direction == Direction::Inbound {
-                    &a.sender_name
+            // Pre-compute lowercased agent name to avoid to_lowercase() per comparison.
+            entries.sort_by_cached_key(|e| {
+                let agent = if e.direction == Direction::Inbound {
+                    &e.sender_name
                 } else {
-                    &a.to_agents
+                    &e.to_agents
                 };
-                let agent_b = if b.direction == Direction::Inbound {
-                    &b.sender_name
-                } else {
-                    &b.to_agents
-                };
-                agent_a
-                    .to_lowercase()
-                    .cmp(&agent_b.to_lowercase())
-                    .then_with(|| b.created_ts.cmp(&a.created_ts))
+                (agent.to_lowercase(), std::cmp::Reverse(e.created_ts))
             });
         }
     }

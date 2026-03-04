@@ -153,8 +153,14 @@ fn measure_index_dir_bytes(index_dir: &Path) -> u64 {
             continue;
         };
         for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if ft.is_dir() {
                 stack.push(path);
                 continue;
             }

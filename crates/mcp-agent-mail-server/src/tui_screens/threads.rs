@@ -379,6 +379,30 @@ struct ThreadTreeRow {
 }
 
 #[derive(Debug, Clone)]
+struct TreeRowsCache {
+    key_hash: u64,
+    rows: Vec<ThreadTreeRow>,
+}
+
+/// Compute a cheap hash over message IDs/reply structure and collapsed set
+/// to detect when the tree needs rebuilding.
+fn tree_cache_key_hash(messages: &[ThreadMessage], collapsed: &HashSet<i64>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    messages.len().hash(&mut hasher);
+    for m in messages {
+        m.id.hash(&mut hasher);
+        m.reply_to_id.hash(&mut hasher);
+    }
+    // Sort collapsed IDs for deterministic hashing.
+    let mut sorted: Vec<_> = collapsed.iter().copied().collect();
+    sorted.sort_unstable();
+    for id in sorted {
+        id.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[derive(Debug, Clone)]
 struct MermaidPanelCache {
     source_hash: u64,
     width: u16,
@@ -517,6 +541,8 @@ pub struct ThreadExplorerScreen {
     reduced_motion: bool,
     /// Mermaid thread-flow panel toggle.
     show_mermaid_panel: bool,
+    /// Cached flattened tree rows (hash-invalidated to skip rebuild on each frame).
+    tree_rows_cache: RefCell<Option<TreeRowsCache>>,
     /// Rendered Mermaid panel cache (source hash + dimensions).
     mermaid_cache: RefCell<Option<MermaidPanelCache>>,
     /// Last Mermaid re-render timestamp for debounce.
@@ -572,6 +598,7 @@ impl ThreadExplorerScreen {
             urgent_pulse_on: true,
             reduced_motion: reduced_motion_enabled(),
             show_mermaid_panel: false,
+            tree_rows_cache: RefCell::new(None),
             mermaid_cache: RefCell::new(None),
             mermaid_last_render_at: RefCell::new(None),
             message_drag: MessageDragState::Idle,
@@ -941,9 +968,21 @@ impl ThreadExplorerScreen {
     }
 
     fn detail_tree_rows(&self) -> Vec<ThreadTreeRow> {
+        let key = tree_cache_key_hash(&self.detail_messages, &self.collapsed_tree_ids);
+        {
+            let cache = self.tree_rows_cache.borrow();
+            if let Some(ref c) = *cache
+                && c.key_hash == key {
+                    return c.rows.clone();
+                }
+        }
         let roots = build_thread_tree_items(&self.detail_messages);
         let mut rows = Vec::new();
         flatten_thread_tree_rows(&roots, &self.collapsed_tree_ids, &mut rows);
+        *self.tree_rows_cache.borrow_mut() = Some(TreeRowsCache {
+            key_hash: key,
+            rows: rows.clone(),
+        });
         rows
     }
 
@@ -1734,6 +1773,7 @@ impl MailScreen for ThreadExplorerScreen {
             _ => None,
         };
         let keyboard_move = state.keyboard_move_snapshot();
+        let cached_rows = self.detail_tree_rows();
 
         if rl_split.rects.len() >= 2 && self.detail_visible {
             // Wide: side-by-side list + detail
@@ -1780,6 +1820,7 @@ impl MailScreen for ThreadExplorerScreen {
                     frame,
                     detail_area,
                     &self.detail_messages,
+                    Some(&cached_rows),
                     self.threads.get(self.cursor),
                     self.detail_scroll,
                     self.detail_cursor,
@@ -1866,6 +1907,7 @@ impl MailScreen for ThreadExplorerScreen {
                     frame,
                     detail_area,
                     &self.detail_messages,
+                    Some(&cached_rows),
                     self.threads.get(self.cursor),
                     self.detail_scroll,
                     self.detail_cursor,
@@ -1932,6 +1974,7 @@ impl MailScreen for ThreadExplorerScreen {
                             frame,
                             pane_area,
                             &self.detail_messages,
+                            Some(&cached_rows),
                             self.threads.get(self.cursor),
                             self.detail_scroll,
                             self.detail_cursor,
@@ -2856,6 +2899,7 @@ fn render_thread_detail(
     frame: &mut Frame<'_>,
     area: Rect,
     messages: &[ThreadMessage],
+    prebuilt_tree_rows: Option<&[ThreadTreeRow]>,
     thread: Option<&ThreadSummary>,
     scroll: usize,
     selected_idx: usize,
@@ -2919,9 +2963,19 @@ fn render_thread_detail(
         return;
     }
 
-    let tree_items = build_thread_tree_items(messages);
-    let mut tree_rows = Vec::new();
-    flatten_thread_tree_rows(&tree_items, collapsed_tree_ids, &mut tree_rows);
+    let owned_rows;
+    #[allow(clippy::option_if_let_else)]
+    let tree_rows: &[ThreadTreeRow] = if let Some(rows) = prebuilt_tree_rows {
+        rows
+    } else {
+        let tree_items = build_thread_tree_items(messages);
+        owned_rows = {
+            let mut r = Vec::new();
+            flatten_thread_tree_rows(&tree_items, collapsed_tree_ids, &mut r);
+            r
+        };
+        &owned_rows
+    };
     if tree_rows.is_empty() {
         Paragraph::new("  No hierarchy available.")
             .style(crate::tui_theme::text_hint(&tp))
@@ -4649,6 +4703,7 @@ mod tests {
             &mut frame,
             Rect::new(0, 0, 120, 24),
             &messages,
+            None,
             Some(&thread),
             0,
             0,
@@ -4693,6 +4748,7 @@ mod tests {
             &mut frame,
             Rect::new(0, 0, 120, 24),
             &messages,
+            None,
             None,
             0,
             1,
@@ -5712,6 +5768,7 @@ mod tests {
             &mut frame,
             Rect::new(0, 0, 120, 24),
             &messages,
+            None,
             None,
             0,
             0,

@@ -1263,6 +1263,7 @@ impl MailScreen for DashboardScreen {
                 ftui::MouseEventKind::ScrollUp => {
                     self.scroll_offset += 1;
                     self.auto_follow = false;
+                    self.clamp_scroll_offset();
                 }
                 _ => {}
             },

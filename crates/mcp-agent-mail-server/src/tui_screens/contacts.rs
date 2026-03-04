@@ -147,8 +147,20 @@ pub struct ContactsScreen {
     view_mode: ViewMode,
     /// (Agent Name, x, y) normalized 0.0-1.0
     graph_nodes: Vec<(String, f64, f64)>,
+    /// Fast lookup for node coordinates keyed by agent name.
+    graph_node_lookup: HashMap<String, (f64, f64)>,
     /// Cached flow metrics for graph rendering.
     graph_metrics: GraphFlowMetrics,
+    /// Number of rebuild passes run from shared state.
+    rebuild_count: u64,
+    /// Number of table transform passes run (filter/sort/reduce).
+    table_transform_count: u64,
+    /// Number of graph layout recomputations.
+    graph_layout_recompute_count: u64,
+    /// Last per-rebuild row churn value.
+    row_churn_last: u64,
+    /// Cumulative contact-row churn across rebuilds.
+    row_churn_total: u64,
     graph_selected_idx: usize,
     show_mermaid_panel: bool,
     mermaid_cache: RefCell<Option<MermaidPanelCache>>,
@@ -176,7 +188,13 @@ impl ContactsScreen {
             status_filter: StatusFilter::All,
             view_mode: ViewMode::Table,
             graph_nodes: Vec::new(),
+            graph_node_lookup: HashMap::new(),
             graph_metrics: GraphFlowMetrics::default(),
+            rebuild_count: 0,
+            table_transform_count: 0,
+            graph_layout_recompute_count: 0,
+            row_churn_last: 0,
+            row_churn_total: 0,
             graph_selected_idx: 0,
             show_mermaid_panel: false,
             mermaid_cache: RefCell::new(None),
@@ -222,6 +240,11 @@ impl ContactsScreen {
             if self.sort_asc { cmp } else { cmp.reverse() }
         });
 
+        self.rebuild_count = self.rebuild_count.saturating_add(1);
+        self.table_transform_count = self.table_transform_count.saturating_add(1);
+        self.row_churn_last = contact_row_churn(&self.contacts, &rows);
+        self.row_churn_total = self.row_churn_total.saturating_add(self.row_churn_last);
+
         let rendered_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
         let dropped_count = total_rows.saturating_sub(rendered_count);
         let sort_label = SORT_LABELS.get(self.sort_col).copied().unwrap_or("unknown");
@@ -232,15 +255,25 @@ impl ContactsScreen {
             filter
         };
 
+        self.contacts = rows;
+        let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
+        self.layout_graph(&recent_events);
+        self.graph_metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
+
         let cfg = state.config_snapshot();
         let transport_mode = cfg.transport_mode().to_string();
         state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
             screen: "contacts".to_string(),
             scope: "db_stats.contacts_list".to_string(),
             query_params: format!(
-                "filter={filter};status_filter={};sort_col={sort_label};sort_asc={};total_rows={total_rows}",
+                "filter={filter};status_filter={};sort_col={sort_label};sort_asc={};list_rows={total_rows};total_rows={total_rows};rebuilds={};table_transforms={};layout_recomputes={};row_churn_last={};row_churn_total={}",
                 self.status_filter.label(),
                 self.sort_asc,
+                self.rebuild_count,
+                self.table_transform_count,
+                self.graph_layout_recompute_count,
+                self.row_churn_last,
+                self.row_churn_total,
             ),
             raw_count: total_rows,
             rendered_count,
@@ -251,11 +284,6 @@ impl ContactsScreen {
             transport_mode,
             auth_enabled: cfg.auth_enabled,
         });
-
-        self.contacts = rows;
-        let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
-        self.layout_graph(&recent_events);
-        self.graph_metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
 
         // Clamp selection
         if let Some(sel) = self.table_state.selected
@@ -289,8 +317,10 @@ impl ContactsScreen {
         let mut agents_vec: Vec<String> = agents.into_iter().collect();
         agents_vec.sort();
 
+        self.graph_layout_recompute_count = self.graph_layout_recompute_count.saturating_add(1);
         let count = agents_vec.len();
         self.graph_nodes.clear();
+        self.graph_node_lookup.clear();
         self.graph_selected_idx = self.graph_selected_idx.min(count.saturating_sub(1));
 
         if count == 0 {
@@ -304,6 +334,7 @@ impl ContactsScreen {
             // Center at 0.5, 0.5; radius 0.4
             let x = 0.4f64.mul_add(angle.cos(), 0.5);
             let y = 0.4f64.mul_add(angle.sin(), 0.5);
+            self.graph_node_lookup.insert(agent.clone(), (x, y));
             self.graph_nodes.push((agent, x, y));
         }
     }
@@ -776,8 +807,8 @@ impl ContactsScreen {
         // Draw edges with directional arrowheads and weight-based thickness.
         for contact in &self.contacts {
             if let (Some(start), Some(end)) = (
-                self.find_node(&contact.from_agent),
-                self.find_node(&contact.to_agent),
+                self.graph_node_lookup.get(&contact.from_agent),
+                self.graph_node_lookup.get(&contact.to_agent),
             ) {
                 let color = match contact.status.as_str() {
                     "approved" => tp.contact_approved,
@@ -785,10 +816,10 @@ impl ContactsScreen {
                     _ => tp.contact_pending,
                 };
 
-                let x1 = (start.1 * w).round() as i32;
-                let y1 = (start.2 * h).round() as i32;
-                let x2 = (end.1 * w).round() as i32;
-                let y2 = (end.2 * h).round() as i32;
+                let x1 = (start.0 * w).round() as i32;
+                let y1 = (start.1 * h).round() as i32;
+                let x2 = (end.0 * w).round() as i32;
+                let y2 = (end.1 * h).round() as i32;
 
                 let weight = metrics.edge_weight(&contact.from_agent, &contact.to_agent);
                 let thickness = scaled_level(weight, max_edge_weight, 1, 3);
@@ -921,10 +952,6 @@ impl ContactsScreen {
         } else {
             Paragraph::new("Preparing Mermaid graph...").render(inner, frame);
         }
-    }
-
-    fn find_node(&self, name: &str) -> Option<&(String, f64, f64)> {
-        self.graph_nodes.iter().find(|n| n.0 == name)
     }
 
     /// Count contacts by status (total, approved, pending, blocked).
@@ -1264,6 +1291,44 @@ fn build_graph_flow_metrics(contacts: &[ContactSummary], events: &[MailEvent]) -
     }
 
     metrics
+}
+
+fn contact_row_churn(previous: &[ContactSummary], current: &[ContactSummary]) -> u64 {
+    type ContactSignature = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+    );
+
+    fn signature(contact: &ContactSummary) -> ContactSignature {
+        (
+            contact.from_agent.clone(),
+            contact.to_agent.clone(),
+            contact.from_project_slug.clone(),
+            contact.to_project_slug.clone(),
+            contact.status.clone(),
+            contact.reason.clone(),
+            contact.updated_ts,
+            contact.expires_ts,
+        )
+    }
+
+    let mut deltas: HashMap<ContactSignature, i64> = HashMap::new();
+    for contact in previous {
+        *deltas.entry(signature(contact)).or_insert(0) -= 1;
+    }
+    for contact in current {
+        *deltas.entry(signature(contact)).or_insert(0) += 1;
+    }
+
+    deltas
+        .into_values()
+        .fold(0u64, |acc, delta| acc.saturating_add(delta.unsigned_abs()))
 }
 
 fn message_flow_iter(events: &[MailEvent]) -> impl Iterator<Item = (&str, &[String])> {
@@ -1895,6 +1960,136 @@ mod tests {
                 .iter()
                 .any(|(name, _, _)| name == "OnlyInEvents")
         );
+    }
+
+    #[test]
+    fn graph_layout_populates_lookup_for_all_graph_nodes() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "OnlyInEvents",
+            vec!["Beta".to_string()],
+            "subject",
+            "thread",
+            "project",
+            "",
+        ));
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.graph_node_lookup.len(), screen.graph_nodes.len());
+        for (name, x, y) in &screen.graph_nodes {
+            assert_eq!(screen.graph_node_lookup.get(name), Some(&(*x, *y)));
+        }
+    }
+
+    #[test]
+    fn graph_layout_clears_lookup_when_no_agents_remain() {
+        let mut screen = ContactsScreen::new();
+        screen.contacts.push(ContactSummary {
+            from_agent: "Alpha".to_string(),
+            to_agent: "Beta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        });
+        screen.layout_graph(&[]);
+        assert!(!screen.graph_nodes.is_empty());
+        assert!(!screen.graph_node_lookup.is_empty());
+
+        screen.contacts.clear();
+        screen.layout_graph(&[]);
+        assert!(screen.graph_nodes.is_empty());
+        assert!(screen.graph_node_lookup.is_empty());
+    }
+
+    #[test]
+    fn contact_row_churn_counts_add_remove_and_mutation() {
+        let previous = vec![
+            ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "pending".to_string(),
+                reason: "needs review".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            },
+            ContactSummary {
+                from_agent: "Gamma".to_string(),
+                to_agent: "Delta".to_string(),
+                status: "approved".to_string(),
+                reason: "ok".to_string(),
+                updated_ts: 2,
+                ..Default::default()
+            },
+        ];
+        let current = vec![
+            ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                reason: "needs review".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            },
+            ContactSummary {
+                from_agent: "Gamma".to_string(),
+                to_agent: "Delta".to_string(),
+                status: "approved".to_string(),
+                reason: "ok".to_string(),
+                updated_ts: 2,
+                ..Default::default()
+            },
+            ContactSummary {
+                from_agent: "Iota".to_string(),
+                to_agent: "Kappa".to_string(),
+                status: "pending".to_string(),
+                reason: "new".to_string(),
+                updated_ts: 3,
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(contact_row_churn(&previous, &current), 3);
+        assert_eq!(contact_row_churn(&current, &current), 0);
+    }
+
+    #[test]
+    fn rebuild_diagnostic_includes_contacts_churn_and_recompute_counters() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contacts_list: vec![ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, first) = diagnostics
+            .last()
+            .expect("contacts diagnostic should be emitted");
+        assert!(first.query_params.contains("rebuilds=1"));
+        assert!(first.query_params.contains("table_transforms=1"));
+        assert!(first.query_params.contains("layout_recomputes=1"));
+        assert!(first.query_params.contains("row_churn_last=1"));
+        assert!(first.query_params.contains("row_churn_total=1"));
+
+        screen.rebuild_from_state(&state);
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, second) = diagnostics
+            .last()
+            .expect("contacts diagnostic should be emitted");
+        assert!(second.query_params.contains("rebuilds=2"));
+        assert!(second.query_params.contains("table_transforms=2"));
+        assert!(second.query_params.contains("layout_recomputes=2"));
+        assert!(second.query_params.contains("row_churn_last=0"));
+        assert!(second.query_params.contains("row_churn_total=1"));
     }
 
     #[test]

@@ -1698,6 +1698,7 @@ mod tests {
                 pool_peak_active_connections: 8,
                 pool_utilization_pct: 50,
                 pool_over_80_since_us: 0,
+                integrity_failures_total: 0,
             },
             storage: StorageMetricsSnapshot {
                 wbq_enqueued_total: tool_calls,
