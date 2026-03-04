@@ -24066,8 +24066,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.to_string_lossy().into_owned();
 
-        handle_migrate_with_database_url(&db_url).expect("migrate");
+        init_schema_sqlite_canonical(&db_path_str).expect("initialize canonical schema");
         let conn = open_db_sync_with_database_url(&db_url).expect("open");
         conn.execute_raw("CREATE TABLE marker(value TEXT)")
             .expect("create marker table");
