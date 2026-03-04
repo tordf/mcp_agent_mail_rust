@@ -243,7 +243,7 @@ PRAGMA journal_mode = WAL;
 pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
-PRAGMA journal_mode = 'DELETE';
+PRAGMA journal_mode = WAL;
 ";
 
 /// Per-connection PRAGMAs (safe to run on every new connection).
