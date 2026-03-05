@@ -125,11 +125,8 @@ pub async fn macro_start_session(
                 conflicts: Vec::new(),
             }
         } else {
-            let ttl = match file_reservation_ttl_seconds {
-                Some(t) if t > 0 => t.clamp(60, 31_536_000),
-                _ => 3600, // 1 hour default
-            };
-            if file_reservation_ttl_seconds.is_some_and(|t| t > 0 && t < 60) {
+            let ttl = file_reservation_ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000));
+            if file_reservation_ttl_seconds.is_some_and(|t| t < 60) {
                 tracing::warn!(
                     "file_reservation_ttl_seconds={} clamped to minimum 60s",
                     file_reservation_ttl_seconds.unwrap_or(0)
