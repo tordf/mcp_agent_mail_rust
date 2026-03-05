@@ -1059,7 +1059,7 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
         .ok()
         .and_then(|repo| repo.config().ok())
         .and_then(|cfg| cfg.get_bool("core.ignorecase").ok())
-        .unwrap_or(cfg!(windows))
+        .unwrap_or(false)
 }
 
 /// Read active file reservations from the archive's `file_reservations/` directory.

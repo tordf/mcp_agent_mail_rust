@@ -2466,7 +2466,6 @@ dependencies = [
  "ftui-style",
  "ftui-text",
  "ftui-widgets",
- "proptest",
  "serde_json",
  "tracing",
 ]

@@ -401,11 +401,8 @@ pub async fn macro_file_reservation_cycle(
     reason: Option<String>,
     auto_release: Option<bool>,
 ) -> McpResult<String> {
-    let ttl = match ttl_seconds {
-        Some(t) if t > 0 => t.clamp(60, 31_536_000),
-        _ => 3600, // 1 hour default
-    };
-    if ttl_seconds.is_some_and(|t| t > 0 && t < 60) {
+    let ttl = ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000));
+    if ttl_seconds.is_some_and(|t| t < 60) {
         tracing::warn!(
             "ttl_seconds={} clamped to minimum 60s",
             ttl_seconds.unwrap_or(0)
