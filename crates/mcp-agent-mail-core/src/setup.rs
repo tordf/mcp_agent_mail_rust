@@ -216,18 +216,24 @@ impl SetupParams {
 }
 
 #[must_use]
-fn normalize_client_connect_host(host: &str) -> &str {
+fn normalize_client_connect_host(host: &str) -> std::borrow::Cow<'_, str> {
     let trimmed = host.trim();
     if trimmed.is_empty() {
-        return "127.0.0.1";
+        return std::borrow::Cow::Borrowed("127.0.0.1");
     }
     let unbracketed = trimmed
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(trimmed);
     match unbracketed {
-        "0.0.0.0" | "::" => "127.0.0.1",
-        _ => trimmed,
+        "0.0.0.0" | "::" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        _ => {
+            if unbracketed.contains(':') && !trimmed.starts_with('[') {
+                std::borrow::Cow::Owned(format!("[{unbracketed}]"))
+            } else {
+                std::borrow::Cow::Borrowed(trimmed)
+            }
+        }
     }
 }
 
