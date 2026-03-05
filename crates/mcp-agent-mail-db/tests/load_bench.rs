@@ -59,7 +59,7 @@ where
     Fut: std::future::Future<Output = Outcome<T, mcp_agent_mail_db::DbError>>,
 {
     for attempt in 0..=max_retries {
-        match common::block_on(|cx| f(cx)) {
+        match common::block_on(&f) {
             Outcome::Ok(val) => return val,
             Outcome::Err(e) if attempt < max_retries => {
                 let msg = format!("{e:?}");

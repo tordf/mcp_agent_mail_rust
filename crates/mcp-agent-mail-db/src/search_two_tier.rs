@@ -1029,12 +1029,16 @@ impl<'a> TwoTierSearchIter<'a> {
         // Docs without quality use fast score only.
         let _blend_span = tracing::debug_span!("two_tier.blend", refinement_limit).entered();
         let blend_start = Instant::now();
-        
+
         // Extract raw scores for normalization
-        let raw_fast_scores: Vec<f32> = fast_results.iter().take(refinement_limit).map(|r| r.score).collect();
+        let raw_fast_scores: Vec<f32> = fast_results
+            .iter()
+            .take(refinement_limit)
+            .map(|r| r.score)
+            .collect();
         let fast_norm = normalize_scores(&raw_fast_scores);
         let quality_norm = normalize_scores(&quality_scores);
-        
+
         let weight = self.searcher.config.quality_weight;
         let mut blended: Vec<ScoredResult> = fast_results
             .iter()

@@ -526,17 +526,20 @@ def check_conflicts(paths, reservations):
                 conflicts.append((f, pattern, holder))
                 break
             
-            # Directory prefix matching for non-glob patterns
+            # Directory prefix matching
             has_glob = any(c in normalized_pattern for c in "*?[{{")
-            if not has_glob:
-                # Normal prefix check: file is inside reserved dir
-                if normalized_f.startswith(normalized_pattern + "/"):
-                    conflicts.append((f, pattern, holder))
-                    break
-                # Reverse check: pattern is inside touched file (e.g. dir replaced by file)
-                if normalized_pattern.startswith(normalized_f + "/"):
-                    conflicts.append((f, pattern, holder))
-                    break
+            
+            # 1. Reverse check: pattern is inside touched file (e.g. dir replaced by file)
+            # This applies to ALL patterns, even globs!
+            if normalized_pattern.startswith(normalized_f + "/"):
+                conflicts.append((f, pattern, holder))
+                break
+
+            # 2. Normal prefix check: file is inside reserved dir
+            # This only applies to non-glob patterns!
+            if not has_glob and normalized_f.startswith(normalized_pattern + "/"):
+                conflicts.append((f, pattern, holder))
+                break
     return conflicts
 
 def is_truthy(val):
@@ -1056,7 +1059,7 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
         .ok()
         .and_then(|repo| repo.config().ok())
         .and_then(|cfg| cfg.get_bool("core.ignorecase").ok())
-        .unwrap_or(false)
+        .unwrap_or(cfg!(windows))
 }
 
 /// Read active file reservations from the archive's `file_reservations/` directory.

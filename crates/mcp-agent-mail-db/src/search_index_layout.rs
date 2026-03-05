@@ -244,9 +244,7 @@ impl IndexLayout {
     pub fn active_schema(&self, scope: &IndexScope, engine: &str) -> Option<String> {
         let link_path = self.active_link(scope, engine);
         if let Ok(target) = std::fs::read_link(&link_path) {
-            return target
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned());
+            return target.file_name().map(|n| n.to_string_lossy().into_owned());
         }
 
         // Non-Unix fallback stores the target path as file contents.
@@ -466,7 +464,10 @@ mod tests {
         let target = layout.lexical_dir(&scope, &schema);
         std::fs::write(&link_path, target.to_string_lossy().as_bytes()).unwrap();
 
-        assert_eq!(layout.active_schema(&scope, "lexical"), Some(schema.short().to_owned()));
+        assert_eq!(
+            layout.active_schema(&scope, "lexical"),
+            Some(schema.short().to_owned())
+        );
     }
 
     #[test]

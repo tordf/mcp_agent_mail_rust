@@ -1,8 +1,8 @@
-//! Diagnostic tests for br-2em1l: verify the spin-loop block_on fix.
+//! Diagnostic tests for br-2em1l: verify the spin-loop `block_on` fix.
 //!
-//! These tests confirm that pool.acquire() works correctly when driven by
-//! the common::block_on spin-loop executor, fixing the hang caused by the
-//! runtime's thread::park() mechanism.
+//! These tests confirm that `pool.acquire()` works correctly when driven by
+//! the `common::block_on` spin-loop executor, fixing the hang caused by the
+//! runtime's `thread::park()` mechanism.
 
 mod common;
 
@@ -18,11 +18,13 @@ fn unique_suffix() -> u64 {
 
 fn make_pool_no_migrations() -> (DbPool, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join(format!("diag_nomig_{}.db", unique_suffix()));
+    let db_path = dir
+        .path()
+        .join(format!("diag_nomig_{}.db", unique_suffix()));
 
     // Pre-init schema synchronously.
-    let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-        .expect("open");
+    let init_conn =
+        mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open");
     init_conn
         .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
         .expect("pragmas");

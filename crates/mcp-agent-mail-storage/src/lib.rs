@@ -4505,7 +4505,12 @@ pub fn process_markdown_images(
         };
         result = result.replace(&full_match, &replacement);
         all_rel_paths.extend(stored.rel_paths);
-        all_meta.push(stored.meta);
+        
+        // Strip data_base64 to avoid duplicating the payload in the attachments JSON array,
+        // since the base64 string is already fully embedded in the markdown body above.
+        let mut meta = stored.meta;
+        meta.data_base64 = None;
+        all_meta.push(meta);
     }
 
     Ok((result, all_meta, all_rel_paths))

@@ -58,8 +58,7 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"(?i)(?:AccountKey|SharedAccessKey)=[A-Za-z0-9+/=]{20,}")
             .unwrap_or_else(|_| unreachable!()),
         // GCP service-account private key IDs
-        Regex::new(r#""private_key_id"\s*:\s*"[a-f0-9]{40}""#)
-            .unwrap_or_else(|_| unreachable!()),
+        Regex::new(r#""private_key_id"\s*:\s*"[a-f0-9]{40}""#).unwrap_or_else(|_| unreachable!()),
         // Google API keys
         Regex::new(r"AIza[0-9A-Za-z\-_]{35}").unwrap_or_else(|_| unreachable!()),
         // npm tokens
@@ -953,10 +952,7 @@ mod tests {
     fn scrub_text_finds_npm_tokens() {
         let (result, count) =
             scrub_text("//registry.npmjs.org/:_authToken=npm_abcdefghijklmnopqrstuvwxyz0123456789");
-        assert_eq!(
-            result,
-            "//registry.npmjs.org/:_authToken=[REDACTED]"
-        );
+        assert_eq!(result, "//registry.npmjs.org/:_authToken=[REDACTED]");
         assert_eq!(count, 1);
     }
 

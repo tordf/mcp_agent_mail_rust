@@ -1375,10 +1375,9 @@ pub fn is_corruption_error_message(message: &str) -> bool {
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_pragma_check_is_ok(conn: &DbConn, pragma_sql: &str) -> Result<bool, SqlError> {
-    let rows = conn.query_sync(pragma_sql, &[])?;
+fn sqlite_pragma_check_details_from_rows(rows: &[sqlmodel_core::Row]) -> Vec<String> {
     let mut details: Vec<String> = Vec::with_capacity(rows.len());
-    for row in &rows {
+    for row in rows {
         if let Ok(v) = row.get_named::<String>("quick_check") {
             details.push(v);
         } else if let Ok(v) = row.get_named::<String>("integrity_check") {
@@ -1388,9 +1387,20 @@ fn sqlite_pragma_check_is_ok(conn: &DbConn, pragma_sql: &str) -> Result<bool, Sq
         }
     }
     if details.is_empty() {
-        // Some backends may return an empty rowset for success.
-        return Ok(true);
+        details.push("ok".to_string());
     }
+    details
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_pragma_check_details(conn: &DbConn, pragma_sql: &str) -> Result<Vec<String>, SqlError> {
+    let rows = conn.query_sync(pragma_sql, &[])?;
+    Ok(sqlite_pragma_check_details_from_rows(&rows))
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_pragma_check_is_ok(conn: &DbConn, pragma_sql: &str) -> Result<bool, SqlError> {
+    let details = sqlite_pragma_check_details(conn, pragma_sql)?;
     Ok(details
         .iter()
         .all(|detail| detail.trim().eq_ignore_ascii_case("ok")))
@@ -1407,25 +1417,20 @@ fn sqlite_incremental_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
+fn sqlite_pragma_check_details_canonical(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    pragma_sql: &str,
+) -> Result<Vec<String>, SqlError> {
+    let rows = conn.query_sync(pragma_sql, &[])?;
+    Ok(sqlite_pragma_check_details_from_rows(&rows))
+}
+
+#[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_is_ok_canonical(
     conn: &sqlmodel_sqlite::SqliteConnection,
     pragma_sql: &str,
 ) -> Result<bool, SqlError> {
-    let rows = conn.query_sync(pragma_sql, &[])?;
-    let mut details: Vec<String> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        if let Ok(v) = row.get_named::<String>("quick_check") {
-            details.push(v);
-        } else if let Ok(v) = row.get_named::<String>("integrity_check") {
-            details.push(v);
-        } else if let Some(Value::Text(v)) = row.values().next() {
-            details.push(v.clone());
-        }
-    }
-    if details.is_empty() {
-        // Some backends may return an empty rowset for success.
-        return Ok(true);
-    }
+    let details = sqlite_pragma_check_details_canonical(conn, pragma_sql)?;
     Ok(details
         .iter()
         .all(|detail| detail.trim().eq_ignore_ascii_case("ok")))
@@ -1594,6 +1599,83 @@ fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
 }
 
+#[must_use]
+fn is_index_only_integrity_issue(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("wrong # of entries in index")
+        || lower.contains("missing from index")
+        || lower.contains("rowid") && lower.contains("index")
+}
+
+#[must_use]
+fn details_are_index_only_issues(details: &[String]) -> bool {
+    !details.is_empty()
+        && details.iter().all(|detail| {
+            !detail.trim().eq_ignore_ascii_case("ok") && is_index_only_integrity_issue(detail)
+        })
+}
+
+#[allow(clippy::result_large_err)]
+fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlError> {
+    if !primary_path.exists() {
+        return Ok(false);
+    }
+    let path_str = primary_path.to_string_lossy();
+    let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())?;
+    let quick_details = sqlite_pragma_check_details_canonical(&conn, "PRAGMA quick_check")?;
+    if quick_details
+        .iter()
+        .all(|detail| detail.trim().eq_ignore_ascii_case("ok"))
+    {
+        return Ok(false);
+    }
+    if !details_are_index_only_issues(&quick_details) {
+        return Ok(false);
+    }
+
+    tracing::warn!(
+        path = %primary_path.display(),
+        details = ?quick_details,
+        "detected index-only sqlite corruption; attempting in-place REINDEX repair"
+    );
+
+    conn.execute_raw("REINDEX;")?;
+    let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
+
+    let post_quick = sqlite_pragma_check_details_canonical(&conn, "PRAGMA quick_check")?;
+    if !post_quick
+        .iter()
+        .all(|detail| detail.trim().eq_ignore_ascii_case("ok"))
+    {
+        tracing::warn!(
+            path = %primary_path.display(),
+            details = ?post_quick,
+            "in-place REINDEX completed but quick_check still reports issues"
+        );
+        return Ok(false);
+    }
+
+    let post_incremental =
+        sqlite_pragma_check_details_canonical(&conn, "PRAGMA integrity_check(1)")?;
+    if !post_incremental
+        .iter()
+        .all(|detail| detail.trim().eq_ignore_ascii_case("ok"))
+    {
+        tracing::warn!(
+            path = %primary_path.display(),
+            details = ?post_incremental,
+            "in-place REINDEX passed quick_check but failed integrity_check(1)"
+        );
+        return Ok(false);
+    }
+
+    tracing::warn!(
+        path = %primary_path.display(),
+        "in-place REINDEX repaired index-only sqlite corruption"
+    );
+    Ok(true)
+}
+
 #[allow(clippy::result_large_err)]
 fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
     let config = mcp_agent_mail_core::Config::from_env();
@@ -1662,10 +1744,24 @@ fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
     for candidate in sqlite_backup_candidates(primary_path) {
         match sqlite_file_is_healthy(&candidate) {
             Ok(true) => return Some(candidate),
-            Ok(false) => tracing::warn!(
-                candidate = %candidate.display(),
-                "sqlite backup candidate failed health probes; skipping"
-            ),
+            Ok(false) => match sqlite_file_is_healthy_canonical(&candidate) {
+                Ok(true) => {
+                    tracing::warn!(
+                        candidate = %candidate.display(),
+                        "sqlite backup candidate failed primary health probe but passed canonical probe; accepting candidate"
+                    );
+                    return Some(candidate);
+                }
+                Ok(false) => tracing::warn!(
+                    candidate = %candidate.display(),
+                    "sqlite backup candidate failed health probes; skipping"
+                ),
+                Err(e) => tracing::warn!(
+                    candidate = %candidate.display(),
+                    error = %e,
+                    "sqlite backup candidate canonical probe failed; skipping"
+                ),
+            },
             Err(e) => tracing::warn!(
                 candidate = %candidate.display(),
                 error = %e,
@@ -1854,6 +1950,17 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     if exists && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
+    if exists {
+        match try_repair_index_only_corruption(primary_path) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                path = %primary_path.display(),
+                error = %e,
+                "in-place sqlite index repair probe failed; continuing with standard recovery"
+            ),
+        }
+    }
 
     if let Some(backup_path) = find_healthy_backup(primary_path) {
         restore_from_backup(primary_path, &backup_path)?;
@@ -1898,6 +2005,17 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     let exists = primary_path.exists();
     if exists && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
+    }
+    if exists {
+        match try_repair_index_only_corruption(primary_path) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                path = %primary_path.display(),
+                error = %e,
+                "in-place sqlite index repair probe failed; continuing with archive-aware recovery"
+            ),
+        }
     }
 
     // Priority 1: Restore from backup
@@ -3159,6 +3277,62 @@ mod tests {
         assert!(is_sqlite_recovery_error_message("internal error"));
         assert!(!is_sqlite_recovery_error_message("database is locked"));
         assert!(!is_sqlite_recovery_error_message("table not found"));
+    }
+
+    #[test]
+    fn index_only_integrity_issue_detection() {
+        assert!(is_index_only_integrity_issue(
+            "wrong # of entries in index sqlite_autoindex_agents_1"
+        ));
+        assert!(is_index_only_integrity_issue(
+            "row 4107 missing from index idx_agents_last_active_id_desc"
+        ));
+        assert!(is_index_only_integrity_issue(
+            "rowid 42 missing from index some_idx"
+        ));
+        assert!(!is_index_only_integrity_issue("database disk image is malformed"));
+        assert!(!is_index_only_integrity_issue("file is not a database"));
+    }
+
+    #[test]
+    fn details_are_index_only_issues_requires_all_lines_to_be_index_issues() {
+        assert!(details_are_index_only_issues(&[
+            "wrong # of entries in index sqlite_autoindex_agents_1".to_string(),
+            "row 4108 missing from index idx_agents_last_active_id_desc".to_string(),
+        ]));
+
+        assert!(!details_are_index_only_issues(&["ok".to_string()]));
+        assert!(!details_are_index_only_issues(&[
+            "wrong # of entries in index sqlite_autoindex_agents_1".to_string(),
+            "database disk image is malformed".to_string(),
+        ]));
+        assert!(!details_are_index_only_issues(&[]));
+    }
+
+    #[test]
+    fn try_repair_index_only_corruption_is_noop_for_healthy_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("healthy_repair_probe.db");
+        let path_str = path.to_string_lossy();
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, last_active_ts INTEGER NOT NULL, UNIQUE(project_id, name))",
+        )
+        .expect("create");
+        conn.execute_raw(
+            "CREATE INDEX idx_agents_last_active_id_desc ON agents(last_active_ts DESC, id DESC)",
+        )
+        .expect("index");
+        conn.execute_raw("INSERT INTO agents(id, project_id, name, last_active_ts) VALUES (1, 1, 'agent', 1)")
+            .expect("insert");
+        drop(conn);
+
+        let repaired = try_repair_index_only_corruption(&path).expect("repair probe");
+        assert!(!repaired, "healthy DB should not trigger in-place REINDEX repair");
+        assert!(
+            sqlite_file_is_healthy(&path).expect("health check"),
+            "healthy DB should remain healthy after no-op repair probe"
+        );
     }
 
     /// Verify `sqlite_file_is_healthy` returns false for a corrupt file.

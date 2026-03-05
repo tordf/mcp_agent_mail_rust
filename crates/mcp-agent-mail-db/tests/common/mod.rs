@@ -5,7 +5,7 @@
 //!
 //! ## Why not use the runtime?
 //!
-//! All SQLite operations in this crate are synchronous (wrapped in
+//! All `SQLite` operations in this crate are synchronous (wrapped in
 //! immediately-ready futures).  The asupersync runtime's `block_on` uses
 //! `thread::park()` on `Poll::Pending`, which requires a proper waker to
 //! `unpark` the thread.  Since no I/O driver or timer is registered with

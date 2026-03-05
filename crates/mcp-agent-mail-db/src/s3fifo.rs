@@ -150,9 +150,8 @@ where
         };
 
         if is_ghost {
-            if let Some(pos) = self.ghost.iter().position(|k| k == &key) {
-                self.ghost.remove(pos);
-            }
+            // We do not remove the key from self.ghost here to preserve O(1) amortized performance.
+            // It will naturally be purged by evict_ghost_if_full when it reaches the front.
             if self.main_capacity == 0 {
                 self.evict_small_if_full();
                 self.small.push_back(key.clone());
@@ -290,7 +289,9 @@ where
     /// Evict from Ghost until it is below capacity.
     fn evict_ghost_if_full(&mut self) {
         while self.ghost.len() >= self.ghost_capacity {
-            if let Some(key) = self.ghost.pop_front() {
+            if let Some(key) = self.ghost.pop_front()
+                && matches!(self.index.get(&key), Some(Node::Ghost))
+            {
                 self.index.remove(&key);
             }
         }
