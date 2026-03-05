@@ -1083,11 +1083,16 @@ function unifiedInboxManager() {
         }
       });
 
-      // Render markdown body
+      // Render message body (prefer server-rendered/sanitized HTML for parity)
       this.$nextTick(() => {
         const bodyEl = document.getElementById('message-body-' + msg.id);
-        if (bodyEl && msg.body_md) {
-          // Configure marked for better rendering
+        if (!bodyEl) return;
+
+        const serverHtml = typeof msg.body_html === 'string' ? msg.body_html.trim() : '';
+        if (serverHtml.length > 0) {
+          bodyEl.innerHTML = serverHtml;
+        } else if (msg.body_md) {
+          // Fallback path: client-side markdown render when server HTML is unavailable.
           if (typeof marked !== 'undefined') {
             try {
               marked.setOptions({
@@ -1099,72 +1104,72 @@ function unifiedInboxManager() {
 
               bodyEl.innerHTML = marked.parse(msg.body_md);
             } catch (error) {
-              // Fallback to plain text if parsing fails
               console.error('Markdown parsing failed:', error);
               bodyEl.textContent = msg.body_md;
             }
           } else {
-            // Fallback if marked.js fails to load
             bodyEl.textContent = msg.body_md;
           }
+        } else {
+          bodyEl.textContent = '';
+        }
 
-          // Highlight code blocks
-          if (typeof Prism !== 'undefined') {
-            bodyEl.querySelectorAll('pre code').forEach((block) => {
-              try {
-                Prism.highlightElement(block);
-              } catch (error) {
-                console.warn('Syntax highlighting failed for code block:', error);
-              }
-            });
-          }
-
-          // Add copy buttons to code blocks
-          bodyEl.querySelectorAll('pre').forEach((pre) => {
-            if (pre.parentNode.classList.contains('relative')) return; // Already has button
-
-            const wrapper = document.createElement('div');
-            wrapper.className = 'relative group';
-            pre.parentNode.insertBefore(wrapper, pre);
-            wrapper.appendChild(pre);
-
-            const button = document.createElement('button');
-            button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
-            button.className = 'absolute top-2 right-2 p-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity';
-            button.onclick = async () => {
-              try {
-                if (navigator.clipboard && navigator.clipboard.writeText) {
-                  await navigator.clipboard.writeText(pre.textContent);
-                  button.innerHTML = '<i data-lucide="check" class="w-4 h-4"></i>';
-                  if (typeof window.showToast === 'function') {
-                    window.showToast('Code copied!', 'success');
-                  }
-                  setTimeout(() => {
-                    button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
-                    if (typeof lucide !== 'undefined') {
-                      lucide.createIcons();
-                    }
-                  }, 2000);
-                } else {
-                  // Fallback for browsers without clipboard API
-                  console.warn('Clipboard API not available');
-                  if (typeof window.showToast === 'function') {
-                    window.showToast('Clipboard not supported in this browser', 'error');
-                  }
-                }
-              } catch (error) {
-                console.error('Failed to copy code:', error);
-                if (typeof window.showToast === 'function') {
-                  window.showToast('Failed to copy code', 'error');
-                }
-              }
-            };
-            wrapper.appendChild(button);
+        // Highlight code blocks
+        if (typeof Prism !== 'undefined') {
+          bodyEl.querySelectorAll('pre code').forEach((block) => {
+            try {
+              Prism.highlightElement(block);
+            } catch (error) {
+              console.warn('Syntax highlighting failed for code block:', error);
+            }
           });
+        }
 
-          if (typeof lucide !== 'undefined') {
-            lucide.createIcons();
-          }
+        // Add copy buttons to code blocks
+        bodyEl.querySelectorAll('pre').forEach((pre) => {
+          if (pre.parentNode.classList.contains('relative')) return; // Already has button
+
+          const wrapper = document.createElement('div');
+          wrapper.className = 'relative group';
+          pre.parentNode.insertBefore(wrapper, pre);
+          wrapper.appendChild(pre);
+
+          const button = document.createElement('button');
+          button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
+          button.className = 'absolute top-2 right-2 p-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity';
+          button.onclick = async () => {
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(pre.textContent);
+                button.innerHTML = '<i data-lucide="check" class="w-4 h-4"></i>';
+                if (typeof window.showToast === 'function') {
+                  window.showToast('Code copied!', 'success');
+                }
+                setTimeout(() => {
+                  button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
+                  if (typeof lucide !== 'undefined') {
+                    lucide.createIcons();
+                  }
+                }, 2000);
+              } else {
+                // Fallback for browsers without clipboard API
+                console.warn('Clipboard API not available');
+                if (typeof window.showToast === 'function') {
+                  window.showToast('Clipboard not supported in this browser', 'error');
+                }
+              }
+            } catch (error) {
+              console.error('Failed to copy code:', error);
+              if (typeof window.showToast === 'function') {
+                window.showToast('Failed to copy code', 'error');
+              }
+            }
+          };
+          wrapper.appendChild(button);
+        });
+
+        if (typeof lucide !== 'undefined') {
+          lucide.createIcons();
         }
       });
     },

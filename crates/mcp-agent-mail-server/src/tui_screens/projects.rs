@@ -87,6 +87,8 @@ pub struct ProjectsScreen {
     last_detail_max_scroll: std::cell::Cell<usize>,
     /// Last observed data-channel generation for dirty-state gating.
     last_data_gen: super::DataGeneration,
+    /// Latched when data changes; consumed on the next cadence rebuild.
+    pending_rebuild: bool,
     /// True when the DB poller has not yet delivered any data.
     db_context_unavailable: bool,
 }
@@ -109,6 +111,7 @@ impl ProjectsScreen {
             detail_scroll: 0,
             last_detail_max_scroll: std::cell::Cell::new(0),
             last_data_gen: super::DataGeneration::stale(),
+            pending_rebuild: false,
             db_context_unavailable: false,
         }
     }
@@ -387,9 +390,14 @@ impl MailScreen for ProjectsScreen {
         if dirty.events {
             self.ingest_events(state);
         }
-        // Rebuild every second, but only when data changed.
-        if tick_count.is_multiple_of(10) && (dirty.db_stats || dirty.events) {
+        if dirty.db_stats || dirty.events {
+            self.pending_rebuild = true;
+        }
+        // Rebuild every second, consuming a latched refresh request so updates
+        // are not lost when dirty signals occur off cadence boundaries.
+        if tick_count.is_multiple_of(10) && self.pending_rebuild {
             self.rebuild_from_state(state);
+            self.pending_rebuild = false;
         }
 
         self.last_data_gen = current_gen;
@@ -1602,6 +1610,28 @@ mod tests {
             !screen.db_context_unavailable,
             "should not show banner when poller has delivered data"
         );
+    }
+
+    #[test]
+    fn cadence_rebuild_uses_latched_dirty_signal() {
+        let state = test_state();
+        let mut screen = ProjectsScreen::new();
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            projects_list: vec![ProjectSummary {
+                slug: "phase-latch".to_string(),
+                human_key: "/path/latch".to_string(),
+                created_at: 321,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        screen.tick(9, &state);
+        assert!(screen.projects.is_empty());
+        screen.tick(10, &state);
+        assert_eq!(screen.projects.len(), 1);
     }
 
     #[test]

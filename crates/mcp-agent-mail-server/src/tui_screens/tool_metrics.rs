@@ -351,6 +351,12 @@ pub struct ToolMetricsScreen {
     snapshot_tick: u64,
     /// Last tick where persisted metrics fallback was attempted.
     last_persisted_hydrate_tick: u64,
+    /// Latched DB-stats signal consumed on persisted hydrate cadence.
+    pending_persisted_hydrate: bool,
+    /// Latched request signal consumed on the next runtime hydrate cadence.
+    pending_runtime_hydrate: bool,
+    /// Latched dirty signal consumed on the next rebuild cadence.
+    pending_rebuild: bool,
     /// Animated latency rows consumed by the bar-chart ribbon.
     latency_ribbon_rows: Vec<LatencyRibbonRow>,
     /// Transition state for latency chart values.
@@ -392,6 +398,9 @@ impl ToolMetricsScreen {
             percentile_samples: VecDeque::with_capacity(PERCENTILE_HISTORY),
             snapshot_tick: 0,
             last_persisted_hydrate_tick: 0,
+            pending_persisted_hydrate: false,
+            pending_runtime_hydrate: false,
+            pending_rebuild: false,
             latency_ribbon_rows: Vec::new(),
             latency_chart_transition: ChartTransition::new(CHART_TRANSITION_DURATION),
             chart_animations_enabled: chart_animations_enabled(),
@@ -1410,21 +1419,34 @@ impl MailScreen for ToolMetricsScreen {
         // ── Dirty-state gated data ingestion ────────────────────────
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+        if dirty.db_stats {
+            self.pending_persisted_hydrate = true;
+        }
 
         let hydrate_due = self.last_persisted_hydrate_tick == 0
             || tick_count.wrapping_sub(self.last_persisted_hydrate_tick)
                 >= PERSISTED_HYDRATE_INTERVAL_TICKS;
-        if hydrate_due && (self.tool_map.is_empty() || dirty.db_stats) {
+        if hydrate_due && (self.tool_map.is_empty() || self.pending_persisted_hydrate) {
             self.hydrate_from_persisted_metrics(state);
             self.last_persisted_hydrate_tick = tick_count;
+            self.pending_persisted_hydrate = false;
         }
         if dirty.events {
             self.ingest_events(state);
         }
-        if self.tool_map.is_empty() || (dirty.requests && tick_count.is_multiple_of(20)) {
-            self.hydrate_from_runtime_snapshot();
+        if dirty.requests {
+            self.pending_runtime_hydrate = true;
         }
-        if tick_count.is_multiple_of(10) && (dirty.events || dirty.requests || dirty.db_stats) {
+        if self.tool_map.is_empty()
+            || (self.pending_runtime_hydrate && tick_count.is_multiple_of(20))
+        {
+            self.hydrate_from_runtime_snapshot();
+            self.pending_runtime_hydrate = false;
+        }
+        if dirty.events || dirty.requests || dirty.db_stats {
+            self.pending_rebuild = true;
+        }
+        if tick_count.is_multiple_of(10) && self.pending_rebuild {
             self.rebuild_sorted();
             self.snapshot_percentiles();
             self.snapshot_tick += 1;
@@ -1455,6 +1477,7 @@ impl MailScreen for ToolMetricsScreen {
                 transport_mode,
                 auth_enabled: cfg.auth_enabled,
             });
+            self.pending_rebuild = false;
         }
         // Checkpoint ranks every ~50 ticks for change tracking.
         if tick_count.is_multiple_of(50) {
@@ -1762,6 +1785,47 @@ mod tests {
         assert_eq!(screen.tool_map.len(), 2);
         assert_eq!(screen.tool_map["send_message"].calls, 1);
         assert_eq!(screen.tool_map["fetch_inbox"].calls, 1);
+    }
+
+    #[test]
+    fn cadence_rebuild_uses_latched_dirty_signal() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        let _ = state.push_event(MailEvent::tool_call_end(
+            "send_message",
+            42,
+            Some("ok".into()),
+            1,
+            0.5,
+            vec![],
+            None,
+            None,
+        ));
+
+        // Dirty on non-cadence tick should still rebuild on next cadence tick.
+        screen.tick(9, &state);
+        assert!(screen.sorted_tools.is_empty());
+        screen.tick(10, &state);
+        assert_eq!(screen.sorted_tools, vec!["send_message".to_string()]);
+    }
+
+    #[test]
+    fn persisted_hydrate_uses_latched_db_stats_signal() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+        screen.last_persisted_hydrate_tick = 1;
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            messages: 1,
+            ..Default::default()
+        });
+        screen.tick(2, &state);
+        assert!(screen.pending_persisted_hydrate);
+
+        // Next persisted-hydrate cadence should consume the latched signal.
+        screen.tick(31, &state);
+        assert!(!screen.pending_persisted_hydrate);
     }
 
     #[test]

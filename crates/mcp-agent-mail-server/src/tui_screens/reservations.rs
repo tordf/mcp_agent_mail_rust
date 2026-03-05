@@ -862,7 +862,14 @@ impl ReservationsScreen {
             lines.push(("Status".into(), "Active".into(), Some(tp.activity_active)));
         }
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
     }
 
     fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {

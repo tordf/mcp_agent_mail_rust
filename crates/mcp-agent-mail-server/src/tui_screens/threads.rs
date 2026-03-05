@@ -567,6 +567,8 @@ pub struct ThreadExplorerScreen {
     last_detail_diagnostic_signature: Option<String>,
     /// Last observed data generation for dirty-state tracking.
     last_data_gen: super::DataGeneration,
+    /// Latched when list-relevant data changes; consumed by periodic refresh.
+    pending_list_refresh: bool,
 }
 
 impl ThreadExplorerScreen {
@@ -613,6 +615,7 @@ impl ThreadExplorerScreen {
             last_list_diagnostic_signature: None,
             last_detail_diagnostic_signature: None,
             last_data_gen: super::DataGeneration::stale(),
+            pending_list_refresh: false,
         }
     }
 
@@ -976,8 +979,8 @@ impl ThreadExplorerScreen {
             let cache = self.tree_rows_cache.borrow();
             if let Some(ref c) = *cache
                 && c.key_hash == key {
-                    return c.rows.clone();
-                }
+                return c.rows.clone();
+            }
         }
         let roots = build_thread_tree_items(&self.detail_messages);
         let mut rows = Vec::new();
@@ -1648,10 +1651,14 @@ impl MailScreen for ThreadExplorerScreen {
         // ── Dirty-state gated data ingestion ────────────────────────
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+        if dirty.events || dirty.db_stats {
+            self.pending_list_refresh = true;
+        }
 
         // Initial load or user-driven dirty flag — always honored.
         if self.list_dirty {
             self.refresh_thread_list(state);
+            self.pending_list_refresh = false;
             self.last_data_gen = current_gen;
             return;
         }
@@ -1661,7 +1668,7 @@ impl MailScreen for ThreadExplorerScreen {
         let should_refresh = self
             .last_refresh
             .is_none_or(|t| t.elapsed().as_secs() >= REFRESH_INTERVAL_SECS);
-        if should_refresh && (dirty.events || dirty.db_stats) {
+        if should_refresh && self.pending_list_refresh {
             self.list_dirty = true;
         }
 
@@ -3458,7 +3465,7 @@ fn render_thread_detail(
     let visible_height = usize::from(preview_content.height).max(1);
     let max_scroll = preview_lines.len().saturating_sub(visible_height);
     max_scroll_cell.set(max_scroll);
-    
+
     let clamped_scroll = scroll.min(max_scroll);
     let scroll_rows = u16::try_from(clamped_scroll).unwrap_or(u16::MAX);
     Paragraph::new(Text::from_lines(preview_lines))
@@ -4561,6 +4568,29 @@ mod tests {
         assert!(!handled);
     }
 
+    #[test]
+    fn periodic_refresh_uses_latched_dirty_signal() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.list_dirty = false;
+        screen.last_refresh = Some(Instant::now());
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            messages: 1,
+            ..Default::default()
+        });
+
+        // Dirty arrives before refresh interval elapses; no immediate refresh.
+        screen.tick(1, &state);
+        assert!(!screen.list_dirty);
+
+        // Once interval elapses, the latched signal should trigger refresh even
+        // if this tick has no fresh dirty edge.
+        screen.last_refresh = Some(Instant::now() - Duration::from_secs(REFRESH_INTERVAL_SECS + 1));
+        screen.tick(2, &state);
+        assert!(screen.list_dirty);
+    }
+
     // ── Titles ──────────────────────────────────────────────────────
 
     #[test]
@@ -4709,6 +4739,7 @@ mod tests {
         let messages = vec![make_message(1)];
         let expanded: HashSet<i64> = HashSet::new();
         let collapsed: HashSet<i64> = HashSet::new();
+        let last_detail_max_scroll = std::cell::Cell::new(0usize);
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(120, 24, &mut pool);
 
@@ -4728,6 +4759,7 @@ mod tests {
             12,
             false,
             true,
+            &last_detail_max_scroll,
         );
 
         let text = buffer_to_text(&frame.buffer);
@@ -4754,6 +4786,7 @@ mod tests {
         let messages = vec![root, child];
         let expanded: HashSet<i64> = HashSet::new();
         let collapsed: HashSet<i64> = HashSet::new();
+        let last_detail_max_scroll = std::cell::Cell::new(0usize);
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(120, 24, &mut pool);
 
@@ -4773,6 +4806,7 @@ mod tests {
             2,
             true,
             true,
+            &last_detail_max_scroll,
         );
 
         let text = buffer_to_text(&frame.buffer);
@@ -5774,6 +5808,7 @@ mod tests {
         let messages = vec![msg];
         let expanded: HashSet<i64> = HashSet::new();
         let collapsed: HashSet<i64> = HashSet::new();
+        let last_detail_max_scroll = std::cell::Cell::new(0usize);
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(120, 24, &mut pool);
 
@@ -5793,6 +5828,7 @@ mod tests {
             1,
             true,
             false,
+            &last_detail_max_scroll,
         );
 
         let text = buffer_to_text(&frame.buffer);

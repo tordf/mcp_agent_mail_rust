@@ -454,7 +454,7 @@ fn check_filesystem_activity(
         return false;
     }
 
-    let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
+    let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[') || pattern.contains('{');
 
     if has_glob {
         // Fast path: use `git ls-files -c -o --exclude-standard -- pattern` to get matching files.
@@ -614,7 +614,7 @@ fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf>
         return Vec::new();
     }
 
-    let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
+    let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[') || pattern.contains('{');
 
     if has_glob {
         let base_str = base.to_string_lossy();

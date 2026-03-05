@@ -50,6 +50,13 @@ pub fn render_body(body: &str, theme: &MarkdownTheme) -> Text<'static> {
     renderer.auto_render(&sanitized)
 }
 
+#[must_use]
+fn render_body_gfm(body: &str, theme: &MarkdownTheme) -> Text<'static> {
+    let renderer = MarkdownRenderer::new(theme.clone());
+    let sanitized = sanitize_body(body);
+    renderer.render(&sanitized)
+}
+
 /// Render a potentially incomplete/streaming message body.
 ///
 /// Same as [`render_body`] but closes unclosed fences, bold markers,
@@ -76,7 +83,7 @@ pub const BODY_PREVIEW_MAX_CHARS: usize = 200;
 /// 1. Empty → returns `None` (caller decides placeholder)
 /// 2. JSON auto-detection → wraps in json code fence
 /// 3. Sanitize → strip scripts/style, limit URL schemes
-/// 4. Markdown auto-detect → full GFM or plain text rendering
+/// 4. Force full GFM rendering
 ///
 /// Returns `None` when the body is empty/whitespace-only. The caller
 /// should render a placeholder like "(empty body)" in hint style.
@@ -86,7 +93,7 @@ pub fn render_message_body(body_md: &str, theme: &MarkdownTheme) -> Option<Text<
         return None;
     }
     let prepared = prepare_body_for_render(body_md);
-    Some(render_body(&prepared, theme))
+    Some(render_body_gfm(&prepared, theme))
 }
 
 /// Render a truncated plain-text preview of a message body.
@@ -101,7 +108,8 @@ pub fn render_message_body_preview(body_md: &str, max_chars: usize) -> Option<St
     }
     // Strip markdown syntax for preview: render then extract plain text.
     let theme = MarkdownTheme::default();
-    let rendered = render_body(body_md, &theme);
+    let prepared = prepare_body_for_render(body_md);
+    let rendered = render_body_gfm(&prepared, &theme);
     let plain = rendered
         .lines()
         .iter()
@@ -132,7 +140,7 @@ pub fn render_message_body_blockquote(
     }
     let trimmed_excerpt = body_md.trim_end_matches('\n');
     let quoted = format!("> {}", trimmed_excerpt.replace('\n', "\n> "));
-    Some(render_body(&quoted, theme))
+    Some(render_body_gfm(&quoted, theme))
 }
 
 /// Detect if a body string looks like raw JSON (object or array).
@@ -1230,6 +1238,20 @@ Thanks!";
         let rendered = text_to_string(&text);
         assert!(rendered.contains("Title"));
         assert!(rendered.contains("bold"));
+    }
+
+    #[test]
+    fn render_message_body_forces_single_indicator_markdown() {
+        // Auto-detection can miss one-indicator markdown (for example a lone heading).
+        // Canonical message rendering must still apply full GFM formatting.
+        let result = render_message_body("# Title", &theme());
+        assert!(result.is_some());
+        let rendered = text_to_string(&result.unwrap());
+        assert!(rendered.contains("Title"));
+        assert!(
+            !rendered.contains("# Title"),
+            "heading marker should not be shown literally: {rendered}"
+        );
     }
 
     #[test]

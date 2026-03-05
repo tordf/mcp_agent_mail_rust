@@ -171,6 +171,8 @@ pub struct AnalyticsScreen {
     detail_visible: bool,
     /// Last-seen data generation snapshot for dirty-state gating.
     last_data_gen: super::DataGeneration,
+    /// Latched when data changes; consumed on the next refresh cadence.
+    pending_refresh: bool,
     /// Cached active card indices (filter+sort result). Auto-refreshed when key state changes.
     cached_active_indices: RefCell<(usize, u8, u8, Vec<usize>)>,
 }
@@ -200,6 +202,7 @@ impl AnalyticsScreen {
             cached_viz: AnalyticsVizSnapshot::default(),
             detail_visible: true,
             last_data_gen: super::DataGeneration::stale(),
+            pending_refresh: false,
             cached_active_indices: RefCell::new((0, 0, 0, Vec::new())),
         };
         this.ensure_active_indices_fresh();
@@ -2650,15 +2653,19 @@ impl MailScreen for AnalyticsScreen {
         // ── Dirty-state gated data ingestion ────────────────────────
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+        if dirty.any() {
+            self.pending_refresh = true;
+        }
 
         let should_refresh = self
             .last_refresh_tick
             .is_none_or(|last| tick_count.wrapping_sub(last) >= REFRESH_INTERVAL_TICKS);
-        if should_refresh && dirty.any() {
+        if should_refresh && self.pending_refresh {
             self.refresh_feed(Some(state));
             // Rebuild viz snapshot here (in tick) so view() never does I/O.
             self.cached_viz = build_runtime_viz_snapshot(state);
             self.last_refresh_tick = Some(tick_count);
+            self.pending_refresh = false;
 
             let raw_count = u64::try_from(self.feed.alerts_processed).unwrap_or(u64::MAX);
             let rendered_count = u64::try_from(self.feed.cards.len()).unwrap_or(u64::MAX);
@@ -2892,6 +2899,27 @@ mod tests {
         let state = crate::tui_bridge::TuiSharedState::new(&config);
         screen.tick(1, &state);
         assert_eq!(screen.last_refresh_tick, Some(1));
+    }
+
+    #[test]
+    fn refresh_cadence_uses_latched_dirty_signal() {
+        let mut screen = AnalyticsScreen::new();
+        screen.last_refresh_tick = Some(1);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            messages: 1,
+            ..Default::default()
+        });
+        screen.tick(2, &state);
+        assert_eq!(screen.last_refresh_tick, Some(1));
+        assert!(screen.pending_refresh);
+
+        let cadence_tick = 1 + REFRESH_INTERVAL_TICKS + 1;
+        screen.tick(cadence_tick, &state);
+        assert_eq!(screen.last_refresh_tick, Some(cadence_tick));
+        assert!(!screen.pending_refresh);
     }
 
     #[test]

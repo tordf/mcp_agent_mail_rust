@@ -1442,7 +1442,10 @@ fn sort_entries(entries: &mut [DisplayEntry], mode: SortMode) {
         SortMode::ImportanceDesc => {
             // Pre-compute importance ranks to avoid calling importance_rank() 2× per comparison.
             entries.sort_by_cached_key(|e| {
-                (std::cmp::Reverse(importance_rank(&e.importance)), std::cmp::Reverse(e.created_ts))
+                (
+                    std::cmp::Reverse(importance_rank(&e.importance)),
+                    std::cmp::Reverse(e.created_ts),
+                )
             });
         }
         SortMode::AgentAlpha => {

@@ -1328,7 +1328,11 @@ impl MailScreen for DashboardScreen {
         }
 
         // Refresh stats and compute trends on stat interval.
-        if tick_count.is_multiple_of(STAT_REFRESH_TICKS) && (dirty.db_stats || dirty.requests) {
+        //
+        // IMPORTANT: do not require "dirty" on this exact tick. Data generation
+        // changes are edge-triggered; cadence ticks are phase-based. If those
+        // phases do not align, gating on both can miss refresh forever.
+        if tick_count.is_multiple_of(STAT_REFRESH_TICKS) {
             if let Some(stats) = state.db_stats_snapshot() {
                 if self.current_db_stats.timestamp_micros == 0 {
                     self.current_db_stats = stats.clone();
@@ -7148,6 +7152,38 @@ mod tests {
         assert_eq!(screen.current_db_stats.messages, 9);
         assert_eq!(screen.prev_db_stats.file_reservations, 1);
         assert_eq!(screen.current_db_stats.file_reservations, 4);
+    }
+
+    #[test]
+    fn dashboard_stat_refresh_does_not_require_same_tick_dirty_alignment() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 3,
+            timestamp_micros: 50,
+            ..Default::default()
+        });
+        state.record_request(200, 12);
+
+        // Consume dirty flags on a non-refresh tick so the next cadence tick is
+        // clean-but-ready. Refresh should still happen on cadence.
+        screen.tick(STAT_REFRESH_TICKS.saturating_sub(1), &state);
+        assert!(screen.throughput_history.is_empty());
+        assert!(screen.percentile_history.is_empty());
+
+        screen.tick(STAT_REFRESH_TICKS, &state);
+        assert_eq!(screen.current_db_stats.messages, 3);
+        assert_eq!(screen.throughput_history.len(), 1);
+        assert_eq!(screen.throughput_history[0], 1.0);
+        assert_eq!(screen.percentile_history.len(), 1);
+
+        // Subsequent cadence ticks continue to emit samples even when no new
+        // requests arrived, so throughput trends show an idle baseline.
+        screen.tick(STAT_REFRESH_TICKS * 2, &state);
+        assert_eq!(screen.throughput_history.len(), 2);
+        assert_eq!(screen.throughput_history[1], 0.0);
     }
 
     #[test]

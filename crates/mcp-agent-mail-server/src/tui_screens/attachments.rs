@@ -792,7 +792,14 @@ impl AttachmentExplorerScreen {
         lines.push(("Date".into(), micros_to_iso(entry.created_ts), None));
         lines.push(("Project".into(), entry.project_slug.clone(), None));
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
     }
 
     /// Render the detail panel for the selected attachment.

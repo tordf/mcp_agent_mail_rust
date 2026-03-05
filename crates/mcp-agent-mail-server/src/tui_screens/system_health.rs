@@ -40,6 +40,7 @@ use crate::tui_widgets::{
 use super::{HelpEntry, MailScreen, MailScreenMsg};
 
 const DIAG_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+const DIAG_ACTIVE_GRACE: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
 const WORKER_SLEEP: Duration = Duration::from_millis(500);
@@ -235,6 +236,7 @@ enum ViewMode {
 pub struct SystemHealthScreen {
     snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
     refresh_requested: Arc<AtomicBool>,
+    last_visible_at: Arc<Mutex<Instant>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     view_mode: ViewMode,
@@ -256,17 +258,25 @@ impl SystemHealthScreen {
     pub fn new(state: Arc<TuiSharedState>) -> Self {
         let snapshot = Arc::new(Mutex::new(DiagnosticsSnapshot::default()));
         let refresh_requested = Arc::new(AtomicBool::new(true)); // run once immediately
+        let last_visible_at = Arc::new(Mutex::new(Instant::now()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let worker = {
             let state = state;
             let snapshot = Arc::clone(&snapshot);
             let refresh_requested = Arc::clone(&refresh_requested);
+            let last_visible_at = Arc::clone(&last_visible_at);
             let stop = Arc::clone(&stop);
             thread::Builder::new()
                 .name("am-system-health".to_string())
                 .spawn(move || {
-                    diagnostics_worker_loop(&state, &snapshot, &refresh_requested, &stop);
+                    diagnostics_worker_loop(
+                        &state,
+                        &snapshot,
+                        &refresh_requested,
+                        &last_visible_at,
+                        &stop,
+                    );
                 })
                 .map_or_else(
                     |error| {
@@ -283,6 +293,7 @@ impl SystemHealthScreen {
         Self {
             snapshot,
             refresh_requested,
+            last_visible_at,
             stop,
             worker,
             view_mode: ViewMode::Text,
@@ -296,6 +307,12 @@ impl SystemHealthScreen {
 
     fn request_refresh(&self) {
         self.refresh_requested.store(true, Ordering::Relaxed);
+    }
+
+    fn note_visible(&self) {
+        if let Ok(mut guard) = self.last_visible_at.lock() {
+            *guard = Instant::now();
+        }
     }
 
     fn snapshot(&self) -> DiagnosticsSnapshot {
@@ -971,7 +988,14 @@ impl SystemHealthScreen {
             ));
         }
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
     }
 
     /// Render the findings summary panel (Text mode).
@@ -1018,7 +1042,14 @@ impl SystemHealthScreen {
             }
         }
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
     }
 }
 
@@ -1129,6 +1160,8 @@ impl MailScreen for SystemHealthScreen {
     }
 
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        // Keep background probes active only while this screen is visible.
+        self.note_visible();
         // Outer bordered panel
         let outer_block = crate::tui_panel_helpers::panel_block(" System Health ");
         let inner = outer_block.inner(area);
@@ -1306,6 +1339,7 @@ fn diagnostics_worker_loop(
     state: &TuiSharedState,
     snapshot: &Mutex<DiagnosticsSnapshot>,
     refresh_requested: &AtomicBool,
+    last_visible_at: &Mutex<Instant>,
     stop: &AtomicBool,
 ) {
     // Cache Tailscale IP to avoid spawning a subprocess every diagnostics cycle.
@@ -1316,7 +1350,8 @@ fn diagnostics_worker_loop(
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         let refresh = refresh_requested.swap(false, Ordering::Relaxed);
-        if refresh || now >= next_due {
+        let visible = diagnostics_screen_recently_visible(last_visible_at, now);
+        if refresh || (visible && now >= next_due) {
             // Refresh Tailscale IP periodically (not every cycle).
             if now.duration_since(tailscale_checked_at) >= TAILSCALE_CACHE_TTL {
                 cached_tailscale_ip = crate::detect_tailscale_ip();
@@ -1331,6 +1366,13 @@ fn diagnostics_worker_loop(
         }
         thread::sleep(WORKER_SLEEP);
     }
+}
+
+fn diagnostics_screen_recently_visible(last_visible_at: &Mutex<Instant>, now: Instant) -> bool {
+    last_visible_at
+        .lock()
+        .ok()
+        .is_some_and(|last| now.duration_since(*last) <= DIAG_ACTIVE_GRACE)
 }
 
 fn emit_screen_diagnostic(state: &TuiSharedState, snap: &DiagnosticsSnapshot) {
@@ -1796,6 +1838,7 @@ mod tests {
         SystemHealthScreen {
             snapshot: Arc::new(Mutex::new(snapshot)),
             refresh_requested: Arc::new(AtomicBool::new(false)),
+            last_visible_at: Arc::new(Mutex::new(Instant::now())),
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
             view_mode: ViewMode::Dashboard,
@@ -2667,6 +2710,27 @@ mod tests {
         ));
         assert!(diagnostics_probe_in_progress(&checked, true));
         assert!(!diagnostics_probe_in_progress(&checked, false));
+    }
+
+    #[test]
+    fn diagnostics_screen_recently_visible_true_within_grace() {
+        let now = Instant::now();
+        let marker_ts = now
+            .checked_sub(DIAG_ACTIVE_GRACE)
+            .and_then(|ts| ts.checked_add(Duration::from_millis(100)))
+            .unwrap_or(now);
+        let marker = Mutex::new(marker_ts);
+        assert!(diagnostics_screen_recently_visible(&marker, now));
+    }
+
+    #[test]
+    fn diagnostics_screen_recently_visible_false_after_grace() {
+        let now = Instant::now();
+        let marker_ts = now
+            .checked_sub(DIAG_ACTIVE_GRACE + Duration::from_millis(100))
+            .unwrap_or(now);
+        let marker = Mutex::new(marker_ts);
+        assert!(!diagnostics_screen_recently_visible(&marker, now));
     }
 
     #[test]

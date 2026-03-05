@@ -2327,6 +2327,7 @@ impl SearchCockpitScreen {
         area.width > 0 && area.height > 0
     }
 
+    #[allow(dead_code)]
     fn detail_content_wrap_width(area: Rect) -> usize {
         if area.width == 0 {
             return 80;
@@ -2345,6 +2346,7 @@ impl SearchCockpitScreen {
         usize::from(content_width.max(1))
     }
 
+    #[allow(dead_code)]
     fn detail_visible_rows(area: Rect) -> usize {
         if area.height == 0 {
             return 8;
@@ -2359,6 +2361,7 @@ impl SearchCockpitScreen {
         usize::from(paragraph_height.max(1))
     }
 
+    #[allow(dead_code)]
     fn detail_max_scroll(&self) -> usize {
         let Some(entry) = self.results.get(self.cursor) else {
             return 0;
@@ -2601,11 +2604,8 @@ impl SearchCockpitScreen {
     }
 
     fn bump_preview_markdown_render_count(&self) {
-        self.preview_markdown_render_count.set(
-            self.preview_markdown_render_count
-                .get()
-                .saturating_add(1),
-        );
+        self.preview_markdown_render_count
+            .set(self.preview_markdown_render_count.get().saturating_add(1));
     }
 
     fn route_string(&self) -> String {

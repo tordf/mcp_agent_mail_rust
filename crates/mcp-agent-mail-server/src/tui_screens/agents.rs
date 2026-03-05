@@ -218,6 +218,8 @@ pub struct AgentsScreen {
     last_detail_max_scroll: std::cell::Cell<usize>,
     /// Last observed data-channel generation for dirty-state gating.
     last_data_gen: super::DataGeneration,
+    /// Latched when new data arrives; consumed on the next cadence rebuild.
+    pending_rebuild: bool,
     /// True when the DB poller has not yet delivered any data.
     db_context_unavailable: bool,
     // ── Cached derived data (computed once per rebuild, reused in render) ──
@@ -264,6 +266,7 @@ impl AgentsScreen {
             detail_scroll: 0,
             last_detail_max_scroll: std::cell::Cell::new(0),
             last_data_gen: super::DataGeneration::stale(),
+            pending_rebuild: false,
             db_context_unavailable: false,
             cached_status_counts: (0, 0, 0),
             cached_total_msgs: 0,
@@ -692,24 +695,27 @@ impl MailScreen for AgentsScreen {
         if dirty.events {
             self.ingest_events(state);
         }
+        if dirty.db_stats || dirty.events {
+            self.pending_rebuild = true;
+        }
         if !self.reduced_motion {
             self.advance_status_fades();
             self.advance_message_flashes();
             self.advance_stagger_reveals();
         }
-        // Rebuild every second (10 ticks), but only when data changed.
-        if tick_count.is_multiple_of(10) && (dirty.db_stats || dirty.events) {
+        // Rebuild every second, consuming a latched refresh request so updates
+        // are never missed due to tick-phase misalignment.
+        if tick_count.is_multiple_of(10) && self.pending_rebuild {
             let total: u64 = self.msg_counts.values().sum();
             self.prev_total_msgs = total;
             self.record_sparkline_sample();
             self.rebuild_from_state(state);
+            self.pending_rebuild = false;
         }
 
         // Only recompute focused_synthetic when selection or agent list changed.
         let current_sel = self.table_state.selected;
-        if current_sel != self.last_selection
-            || (dirty.db_stats && self.last_selection.is_some())
-        {
+        if current_sel != self.last_selection || (dirty.db_stats && self.last_selection.is_some()) {
             self.sync_focused_event();
             self.last_selection = current_sel;
         }
@@ -1976,6 +1982,28 @@ mod tests {
             !screen.db_context_unavailable,
             "should not show banner when poller has delivered data"
         );
+        assert_eq!(screen.agents.len(), 1);
+    }
+
+    #[test]
+    fn cadence_rebuild_uses_latched_dirty_signal() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 1,
+            agents_list: vec![crate::tui_events::AgentSummary {
+                name: "TickLatch".to_string(),
+                program: "codex".to_string(),
+                last_active_ts: 100,
+            }],
+            ..Default::default()
+        });
+
+        // Dirty on a non-cadence tick should still rebuild on the next cadence tick.
+        screen.tick(9, &state);
+        assert_eq!(screen.agents.len(), 0);
+        screen.tick(10, &state);
         assert_eq!(screen.agents.len(), 1);
     }
 

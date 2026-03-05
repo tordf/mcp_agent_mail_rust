@@ -248,6 +248,8 @@ pub struct ArchiveBrowserScreen {
     detail_visible: bool,
     /// Generation snapshot from last tick (for dirty-state gating).
     last_data_gen: super::DataGeneration,
+    /// Latched when data changes; consumed on next periodic refresh window.
+    pending_periodic_refresh: bool,
 }
 
 impl ArchiveBrowserScreen {
@@ -268,6 +270,7 @@ impl ArchiveBrowserScreen {
             last_refresh_tick: 0,
             detail_visible: true,
             last_data_gen: super::DataGeneration::stale(),
+            pending_periodic_refresh: false,
         }
     }
 
@@ -1030,14 +1033,19 @@ impl MailScreen for ArchiveBrowserScreen {
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+        if dirty.any() {
+            self.pending_periodic_refresh = true;
+        }
 
         // First tick: always initialize (ungated).
         let is_first = self.last_refresh_tick == 0;
         // Periodic refresh every 50 ticks (~5 s), but only when data changed.
-        let is_periodic = tick_count.saturating_sub(self.last_refresh_tick) > 50 && dirty.any();
+        let is_periodic =
+            tick_count.saturating_sub(self.last_refresh_tick) > 50 && self.pending_periodic_refresh;
 
         if is_first || is_periodic {
             self.last_refresh_tick = tick_count;
+            self.pending_periodic_refresh = false;
             // Preserve expansion state across refreshes
             let expanded_state: Vec<(PathBuf, bool)> = self
                 .entries
@@ -1286,6 +1294,26 @@ mod tests {
         assert!(screen.preview_content.is_none());
         assert_eq!(screen.title(), "Archive Browser");
         assert_eq!(screen.tab_label(), "Archive");
+    }
+
+    #[test]
+    fn periodic_refresh_uses_latched_dirty_signal() {
+        let mut screen = ArchiveBrowserScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        // Skip first-tick bootstrap path so this test isolates periodic behavior.
+        screen.last_refresh_tick = 1;
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            ..Default::default()
+        });
+        screen.tick(20, &state);
+        assert_eq!(screen.last_refresh_tick, 1);
+
+        // Dirty edge happened earlier; next periodic window should still refresh.
+        screen.tick(60, &state);
+        assert_eq!(screen.last_refresh_tick, 60);
     }
 
     #[test]

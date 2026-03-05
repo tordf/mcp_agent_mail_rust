@@ -1138,7 +1138,14 @@ impl ContactsScreen {
         );
         lines.push(("Expires".into(), expires_str, None));
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
     }
 
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {

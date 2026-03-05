@@ -3986,6 +3986,7 @@ fn render_results_list(
 
 /// Returns `true` if `body` (after trimming whitespace) starts with `{` or `[`,
 /// indicating it is likely a JSON payload.
+#[cfg(test)]
 fn looks_like_json(body: &str) -> bool {
     let trimmed = body.trim_start();
     trimmed.starts_with('{') || trimmed.starts_with('[')
@@ -4263,6 +4264,41 @@ fn estimate_wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
         .max(1)
 }
 
+fn wrap_markdown_for_message_panel<'a>(text: &Text<'a>, width: u16) -> Text<'a> {
+    let width = usize::from(width.max(1));
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let plain = line.to_plain_text();
+        if is_rendered_markdown_table_line(&plain) {
+            // Preserve table geometry; wrapped tables become visually broken.
+            out.push(line.clone());
+            continue;
+        }
+        if line.width() <= width {
+            out.push(line.clone());
+            continue;
+        }
+        out.extend(line.wrap(width, ftui::text::WrapMode::Word));
+    }
+    Text::from_lines(out)
+}
+
+fn is_rendered_markdown_table_line(plain: &str) -> bool {
+    let trimmed = plain.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' | '─'))
+    {
+        return true;
+    }
+    trimmed.starts_with('│')
+        && trimmed.ends_with('│')
+        && trimmed.chars().filter(|&c| c == '│').count() >= 2
+}
+
 fn stable_hash<T: Hash>(value: T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
@@ -4299,7 +4335,10 @@ fn render_detail_panel(
                     .borrow()
                     .as_ref()
                     .filter(|c| c.message_id == msg.id && c.width == width)
-                    .map_or_else(|| estimate_message_detail_lines(msg, width), |c| c.estimated_lines);
+                    .map_or_else(
+                        || estimate_message_detail_lines(msg, width),
+                        |c| c.estimated_lines,
+                    );
                 let max_scroll = total.saturating_sub(viewport);
                 let clamped = scroll.min(max_scroll);
                 format!("Detail {importance} [{clamped}/{max_scroll}]")
@@ -4452,13 +4491,11 @@ fn render_detail_panel(
                     body_md.push_str("\n\n");
                     body_md.push_str(&image_block);
                 }
-                let markdown_body = if looks_like_json(&body_md) {
-                    format!("```json\n{}\n```", body_md.trim_end())
-                } else {
-                    body_md
-                };
                 let md_theme = crate::tui_theme::markdown_theme();
-                let rendered = crate::tui_markdown::render_body(&markdown_body, &md_theme);
+                let rendered = crate::tui_markdown::render_message_body(&body_md, &md_theme)
+                    .map_or_else(Text::default, |text| {
+                        wrap_markdown_for_message_panel(&text, width)
+                    });
                 let estimated_lines = estimate_message_detail_lines(msg, width);
                 *cached = Some(MessageDetailRenderCache {
                     message_id: msg.id,
@@ -4487,7 +4524,7 @@ fn render_detail_panel(
     let clamped_scroll = scroll.min(max_scroll);
 
     Paragraph::new(combined_text)
-        .wrap(ftui::text::WrapMode::Word)
+        .wrap(ftui::text::WrapMode::None)
         .scroll((clamped_scroll as u16, 0))
         .render(content_inner, frame);
 
@@ -5071,8 +5108,13 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
                 });
                 if miss {
                     let md_theme = crate::tui_theme::markdown_theme();
-                    let rendered =
-                        crate::tui_markdown::render_body(&form.context.original_body_md, &md_theme);
+                    let rendered = crate::tui_markdown::render_message_body(
+                        &form.context.original_body_md,
+                        &md_theme,
+                    )
+                    .map_or_else(Text::default, |text| {
+                        wrap_markdown_for_message_panel(&text, width)
+                    });
                     *cache = Some(QuickReplyPreviewCache {
                         body_hash,
                         width,
@@ -5099,7 +5141,7 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
             } else {
                 let height = u16::try_from(preview_lines.len()).unwrap_or(preview_rows);
                 Paragraph::new(Text::from_lines(preview_lines))
-                    .wrap(ftui::text::WrapMode::Word)
+                    .wrap(ftui::text::WrapMode::None)
                     .render(Rect::new(inner.x, cursor_y, inner.width, height), frame);
                 cursor_y = cursor_y.saturating_add(height);
             }
@@ -6293,6 +6335,38 @@ mod tests {
     fn looks_like_json_rejects_fenced_json_code_block() {
         let fenced = "```json\n{\"ok\":true}\n```";
         assert!(!looks_like_json(fenced));
+    }
+
+    #[test]
+    fn table_line_detection_matches_rendered_box_drawing_rows() {
+        assert!(is_rendered_markdown_table_line("│ Name │ Status │"));
+        assert!(is_rendered_markdown_table_line("┌──────┬────────┐"));
+        assert!(!is_rendered_markdown_table_line("plain paragraph text"));
+    }
+
+    #[test]
+    fn wrap_markdown_for_message_panel_preserves_table_rows() {
+        let rendered = Text::from_lines(vec![
+            Line::raw("│ LongHeader │ AnotherLongHeader │"),
+            Line::raw("regular prose line that should wrap"),
+        ]);
+        let wrapped = wrap_markdown_for_message_panel(&rendered, 12);
+        let plain: Vec<String> = wrapped
+            .lines()
+            .iter()
+            .map(Line::to_plain_text)
+            .collect();
+
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("LongHeader │ AnotherLongHeader")),
+            "table row should remain intact"
+        );
+        assert!(
+            wrapped.lines().len() >= 3,
+            "non-table prose should still wrap across multiple lines"
+        );
     }
 
     #[test]
