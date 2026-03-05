@@ -1192,6 +1192,7 @@ pub struct SearchCockpitScreen {
     result_rows: Vec<SearchResultRow>,
     cursor: usize,
     detail_scroll: Cell<usize>,
+    last_detail_max_scroll: Cell<usize>,
     detail_view_mode: Cell<DetailViewMode>,
     total_sql_rows: usize,
 
@@ -1310,6 +1311,7 @@ impl SearchCockpitScreen {
             result_rows: Vec::new(),
             cursor: 0,
             detail_scroll: Cell::new(0),
+            last_detail_max_scroll: Cell::new(0),
             detail_view_mode: Cell::new(DetailViewMode::Markdown),
             total_sql_rows: 0,
             focus: Focus::ResultList,
@@ -2400,7 +2402,7 @@ impl SearchCockpitScreen {
     }
 
     fn scroll_detail_by(&self, delta: isize) {
-        let max = self.detail_max_scroll();
+        let max = self.last_detail_max_scroll.get();
         if delta.is_negative() {
             self.detail_scroll.set(
                 self.detail_scroll
@@ -3435,6 +3437,7 @@ impl MailScreen for SearchCockpitScreen {
                 self.detail_view_mode.get(),
                 json_rows.as_deref(),
                 self.json_tree_state.borrow().cursor(),
+                &self.last_detail_max_scroll,
             );
         }
 
@@ -5345,6 +5348,7 @@ fn render_detail(
     detail_view_mode: DetailViewMode,
     json_rows: Option<&[crate::tui_markdown::JsonTreeRow]>,
     json_cursor: usize,
+    max_scroll_cell: &Cell<usize>,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::bordered()
@@ -5460,6 +5464,7 @@ fn render_detail(
         estimate_wrapped_text_lines(&detail_text, usize::from(content_area.width.max(1)))
     };
     let max_scroll = total_estimated.saturating_sub(visible);
+    max_scroll_cell.set(max_scroll);
     let clamped_scroll = scroll.min(max_scroll);
     let scroll_rows = u16::try_from(clamped_scroll).unwrap_or(u16::MAX);
 

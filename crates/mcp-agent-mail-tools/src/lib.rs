@@ -1105,6 +1105,8 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("register_agent", clusters::IDENTITY),
     ("create_agent_identity", clusters::IDENTITY),
     ("whois", clusters::IDENTITY),
+    ("resolve_pane_identity", clusters::IDENTITY),
+    ("cleanup_pane_identities", clusters::IDENTITY),
     // Messaging
     ("send_message", clusters::MESSAGING),
     ("reply_message", clusters::MESSAGING),
@@ -1162,6 +1164,14 @@ mod tests {
     fn tool_cluster_known_tools() {
         assert_eq!(tool_cluster("health_check"), Some(clusters::INFRASTRUCTURE));
         assert_eq!(tool_cluster("register_agent"), Some(clusters::IDENTITY));
+        assert_eq!(
+            tool_cluster("resolve_pane_identity"),
+            Some(clusters::IDENTITY)
+        );
+        assert_eq!(
+            tool_cluster("cleanup_pane_identities"),
+            Some(clusters::IDENTITY)
+        );
         assert_eq!(tool_cluster("send_message"), Some(clusters::MESSAGING));
         assert_eq!(tool_cluster("request_contact"), Some(clusters::CONTACT));
         assert_eq!(

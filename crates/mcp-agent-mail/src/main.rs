@@ -42,6 +42,27 @@ fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {
     parse_am_interface_mode(env::var("AM_INTERFACE_MODE").ok().as_deref())
 }
 
+fn invocation_file_name(arg0: Option<&str>) -> Option<String> {
+    let arg0 = arg0?;
+    Path::new(arg0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(std::string::ToString::to_string)
+}
+
+fn invocation_is_am(arg0: Option<&str>) -> bool {
+    invocation_file_name(arg0).is_some_and(|name| {
+        let lowered = name.to_ascii_lowercase();
+        lowered == "am" || lowered == "am.exe"
+    })
+}
+
+fn interface_mode_env_is_explicit() -> bool {
+    env::var("AM_INTERFACE_MODE")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 const fn default_mcp_log_filter() -> &'static str {
     concat!(
         "warn,",
@@ -401,6 +422,19 @@ fn main() {
         }
     };
 
+    let invoked_as_am = invocation_is_am(env::args().next().as_deref());
+    let explicit_mode_override = interface_mode_env_is_explicit();
+
+    // If this process is invoked as `am`, prefer the CLI surface by default.
+    //
+    // This guards against packaging/path regressions where `am` points at the
+    // `mcp-agent-mail` binary instead of the dedicated CLI binary.
+    //
+    // Explicit `AM_INTERFACE_MODE=mcp` still wins for advanced users.
+    if invoked_as_am && (!explicit_mode_override || mode.is_cli()) {
+        std::process::exit(mcp_agent_mail_cli::run_with_invocation_name("am"));
+    }
+
     if mode.is_cli() {
         let Some(cmd) = env::args().nth(1) else {
             render_cli_mode_missing_command();
@@ -611,6 +645,39 @@ fn render_cli_mode_denial(command: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invocation_is_am_variants() {
+        assert!(invocation_is_am(Some("am")));
+        assert!(invocation_is_am(Some("/usr/local/bin/am")));
+        assert!(invocation_is_am(Some(r"C:\tools\am.exe")));
+        assert!(!invocation_is_am(Some("mcp-agent-mail")));
+        assert!(!invocation_is_am(Some("/usr/local/bin/mcp-agent-mail")));
+        assert!(!invocation_is_am(None));
+    }
+
+    #[test]
+    fn interface_mode_env_explicit_detection() {
+        // SAFETY: tests in this module are not marked parallel and restore env state.
+        let old = env::var("AM_INTERFACE_MODE").ok();
+
+        env::remove_var("AM_INTERFACE_MODE");
+        assert!(!interface_mode_env_is_explicit());
+
+        env::set_var("AM_INTERFACE_MODE", "");
+        assert!(!interface_mode_env_is_explicit());
+
+        env::set_var("AM_INTERFACE_MODE", "   ");
+        assert!(!interface_mode_env_is_explicit());
+
+        env::set_var("AM_INTERFACE_MODE", "cli");
+        assert!(interface_mode_env_is_explicit());
+
+        match old {
+            Some(value) => env::set_var("AM_INTERFACE_MODE", value),
+            None => env::remove_var("AM_INTERFACE_MODE"),
+        }
+    }
 
     #[test]
     fn default_mcp_log_filter_includes_fsqlite_noise_suppressors() {
