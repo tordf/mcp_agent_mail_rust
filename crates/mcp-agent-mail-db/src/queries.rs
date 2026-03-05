@@ -3144,7 +3144,7 @@ async fn run_like_fallback(
          FROM messages m \
          JOIN agents a ON a.id = m.sender_id \
          WHERE m.project_id = ? AND ({where_clause}) \
-         ORDER BY m.id ASC \
+         ORDER BY m.id DESC \
          LIMIT ?"
     );
     map_sql_outcome(traw_query(cx, conn, &sql, &params).await)
@@ -3179,7 +3179,7 @@ async fn run_like_fallback_product(
          JOIN agents a ON a.id = m.sender_id \
          JOIN product_project_links ppl ON ppl.project_id = m.project_id \
          WHERE ppl.product_id = ? AND ({where_clause}) \
-         ORDER BY m.id ASC \
+         ORDER BY m.id DESC \
          LIMIT ?"
     );
     map_sql_outcome(traw_query(cx, conn, &sql, &params).await)
@@ -7382,6 +7382,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn durability_probe_for_message_recipients_ignores_uncommitted_writer_state() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;

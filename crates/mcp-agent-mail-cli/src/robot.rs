@@ -767,7 +767,7 @@ fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliEr
 fn find_project_for_cwd(conn: &DbConn) -> Result<(i64, String), CliError> {
     let cwd =
         std::env::current_dir().map_err(|e| CliError::Other(format!("cannot get CWD: {e}")))?;
-    let cwd_str = cwd.to_string_lossy().to_string();
+    let cwd_str = cwd.to_string_lossy().replace('\\', "/");
     resolve_project_sync(conn, &cwd_str)
 }
 

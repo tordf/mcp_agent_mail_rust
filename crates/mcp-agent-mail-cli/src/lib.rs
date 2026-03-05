@@ -3334,7 +3334,7 @@ fn handle_check_inbox(
         .or_else(|| std::env::var("AGENT_MAIL_PROJECT").ok())
         .unwrap_or_else(|| {
             std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default()
         });
 
@@ -3636,9 +3636,9 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             // Read paths from stdin (null-separated or line-separated)
             let input = {
                 use std::io::Read;
-                let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf).unwrap_or(0);
-                buf
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf).map_err(|e| CliError::Other(format!("Failed to read stdin: {e}")))?;
+                String::from_utf8_lossy(&buf).into_owned()
             };
             let paths: Vec<String> = if stdin_nul {
                 input
@@ -5307,7 +5307,7 @@ fn handle_golden_verify(
     });
     output::emit_output(&payload, fmt, || {
         output::section("Golden output verification");
-        let width = rows.iter().map(|row| row.filename.len()).max().unwrap_or(0);
+        let width = rows.iter().map(|row| row.filename.chars().count()).max().unwrap_or(0);
         for row in &rows {
             let status = match row.status.as_str() {
                 "ok" => "OK",
@@ -5419,7 +5419,7 @@ fn handle_golden_list(
     });
     output::emit_output(&payload, fmt, || {
         output::section("Golden files");
-        let width = rows.iter().map(|row| row.filename.len()).max().unwrap_or(0);
+        let width = rows.iter().map(|row| row.filename.chars().count()).max().unwrap_or(0);
         for row in &rows {
             ftui_runtime::ftui_println!(
                 "  {:<width$}  {}",
@@ -7959,8 +7959,11 @@ fn extract_zip(archive_data: &[u8], dest_dir: &Path) -> Result<(), String> {
         let mut file = archive
             .by_index(i)
             .map_err(|e| format!("zip entry error: {e}"))?;
-        let name = file.name().to_string();
-        let outpath = dest_dir.join(&name);
+        let Some(enclosed_name) = file.enclosed_name() else {
+            continue;
+        };
+        let name = file.name().to_string(); // Keep original name for executable checks
+        let outpath = dest_dir.join(enclosed_name);
         if file.is_dir() {
             std::fs::create_dir_all(&outpath)
                 .map_err(|e| format!("mkdir {}: {e}", outpath.display()))?;
@@ -9183,8 +9186,8 @@ struct ProjectsAdoptRecord {
 }
 
 fn git_output_text(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = std::process::Command::new("timeout");
-    cmd.arg("5s").arg("git").arg("-C").arg(cwd).args(args);
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(cwd).args(args);
     let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;

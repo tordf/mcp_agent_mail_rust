@@ -457,7 +457,7 @@ pub async fn fetch_inbox_product(
     let max_messages = if raw_limit == 0 {
         usize::try_from(i64::MAX).unwrap_or(usize::MAX)
     } else {
-        usize::try_from(raw_limit).unwrap_or(20)
+        usize::try_from(raw_limit.abs()).unwrap_or(20)
     };
     let urgent = urgent_only.unwrap_or(false);
     let with_bodies = include_bodies.unwrap_or(false);
@@ -466,7 +466,7 @@ pub async fn fetch_inbox_product(
         .and_then(mcp_agent_mail_db::iso_to_micros);
 
     let mut items: Vec<(i64, i64, InboxMessage)> =
-        Vec::with_capacity(usize::try_from(limit.unwrap_or(20)).unwrap_or(20)); // (created_ts, id, msg)
+        Vec::with_capacity(usize::try_from(limit.unwrap_or(20).abs()).unwrap_or(20)); // (created_ts, id, msg)
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         // Skip if agent doesn't exist in this project.
@@ -559,10 +559,10 @@ pub async fn summarize_thread_product(
     )?;
 
     let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> =
-        Vec::with_capacity(usize::try_from(per_thread_limit.unwrap_or(50)).unwrap_or(50));
+        Vec::with_capacity(usize::try_from(per_thread_limit.unwrap_or(50).abs()).unwrap_or(50));
     for p in projects {
         let project_id = p.id.unwrap_or(0);
-        let limit = per_thread_limit.and_then(|v| usize::try_from(v).ok());
+        let limit = per_thread_limit.and_then(|v| usize::try_from(v.abs()).ok());
         let msgs = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::list_thread_messages(
                 ctx.cx(),
@@ -586,9 +586,9 @@ pub async fn summarize_thread_product(
 
     // Optional LLM refinement (legacy parity: same merge semantics as summarize_thread).
     if use_llm && config.llm_enabled {
-        let msg_tuples: Vec<(i64, String, String, String)> = rows
+        let start_idx = rows.len().saturating_sub(llm::MAX_MESSAGES_FOR_LLM);
+        let msg_tuples: Vec<(i64, String, String, String)> = rows[start_idx..]
             .iter()
-            .take(llm::MAX_MESSAGES_FOR_LLM)
             .map(|m| (m.id, m.from.clone(), m.subject.clone(), m.body_md.clone()))
             .collect();
 
@@ -622,7 +622,8 @@ pub async fn summarize_thread_product(
     let with_examples = include_examples.unwrap_or(false);
     let mut examples = Vec::with_capacity(if with_examples { 10 } else { 0 });
     if with_examples {
-        for row in rows.iter().take(10) {
+        let start_idx = rows.len().saturating_sub(10);
+        for row in &rows[start_idx..] {
             examples.push(ExampleMessage {
                 id: row.id,
                 from: row.from.clone(),

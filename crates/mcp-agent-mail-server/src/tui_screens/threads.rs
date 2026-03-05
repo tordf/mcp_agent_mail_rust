@@ -4586,7 +4586,7 @@ mod tests {
 
         // Once interval elapses, the latched signal should trigger refresh even
         // if this tick has no fresh dirty edge.
-        screen.last_refresh = Some(Instant::now() - Duration::from_secs(REFRESH_INTERVAL_SECS + 1));
+        screen.last_refresh = Instant::now().checked_sub(Duration::from_secs(REFRESH_INTERVAL_SECS + 1));
         screen.tick(2, &state);
         assert!(screen.list_dirty);
     }

@@ -219,6 +219,7 @@ const fn file_type_color(ct: ContentType, is_dir: bool, tp: &TuiThemePalette) ->
 }
 
 /// Two-pane archive browser: directory tree (left) + file preview (right).
+#[allow(clippy::struct_excessive_bools)]
 pub struct ArchiveBrowserScreen {
     /// Flattened visible tree entries.
     entries: Vec<ArchiveEntry>,
@@ -440,6 +441,7 @@ impl ArchiveBrowserScreen {
 
         // Read file content with size limit (max 512 KB)
         if entry.size > MAX_PREVIEW_BYTES {
+            use std::io::Read;
             self.preview_content = Some(format!(
                 "[File too large for preview: {} — {}]\n\nShowing first {} of content...",
                 entry.name,
@@ -447,10 +449,13 @@ impl ArchiveBrowserScreen {
                 format_file_size(MAX_PREVIEW_BYTES)
             ));
             // Read partial
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                let max_chars = usize::try_from(MAX_PREVIEW_BYTES).unwrap_or(usize::MAX);
-                let truncated: String = content.chars().take(max_chars).collect();
-                self.preview_content = Some(truncated);
+            if let Ok(mut file) = std::fs::File::open(&full_path) {
+                let max_bytes = usize::try_from(MAX_PREVIEW_BYTES).unwrap_or(512 * 1024);
+                let mut buf = vec![0; max_bytes];
+                if let Ok(n) = file.read(&mut buf) {
+                    buf.truncate(n);
+                    self.preview_content = Some(String::from_utf8_lossy(&buf).into_owned());
+                }
             }
             return;
         }

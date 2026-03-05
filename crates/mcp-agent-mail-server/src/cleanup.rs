@@ -460,10 +460,8 @@ fn check_filesystem_activity(
         // Fast path: use `git ls-files -c -o --exclude-standard -- pattern` to get matching files.
         // This leverages git's index and ignores `.gitignore`d folders like `target/` which would
         // otherwise cause insane CPU usage during synchronous directory traversal.
-        let git_ls = std::process::Command::new("timeout")
+        let git_ls = std::process::Command::new("git")
             .args([
-                "5s",
-                "git",
                 "-C",
                 &workspace.to_string_lossy(),
                 "ls-files",
@@ -479,7 +477,7 @@ fn check_filesystem_activity(
             && output.status.success()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
+            for line in stdout.lines().take(5000) {
                 let file_path = workspace.join(line);
                 if let Ok(metadata) = file_path.metadata()
                     && let Ok(modified) = metadata.modified()
@@ -496,11 +494,11 @@ fn check_filesystem_activity(
         }
 
         // Fallback: unbounded glob (slow, but works outside git repos)
-        let base_str = workspace.to_string_lossy();
+        let base_str = workspace.to_string_lossy().replace('\\', "/");
         let base_escaped = glob::Pattern::escape(&base_str);
         // We use format! instead of Path::join because base_escaped is a string
         // that may contain glob escape sequences that Path::join could mishandle.
-        let full_pattern = if base_str.ends_with('/') || base_str.ends_with('\\') {
+        let full_pattern = if base_str.ends_with('/') {
             format!("{base_escaped}{pattern}")
         } else {
             format!("{base_escaped}/{pattern}")
@@ -550,10 +548,8 @@ fn git_head_oid_for_workspace(workspace: &Path) -> Option<String> {
     if !workspace.exists() {
         return None;
     }
-    let output = std::process::Command::new("timeout")
+    let output = std::process::Command::new("git")
         .args([
-            "5s",
-            "git",
             "-C",
             &workspace.to_string_lossy(),
             "rev-parse",
@@ -579,10 +575,8 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
     }
 
     // Use git log with the path pattern directly (git handles pathspecs including globs).
-    let output = std::process::Command::new("timeout")
+    let output = std::process::Command::new("git")
         .args([
-            "5s",
-            "git",
             "-C",
             &workspace.to_string_lossy(),
             "log",

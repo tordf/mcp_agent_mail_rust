@@ -1965,7 +1965,11 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
     {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, out)
+    
+    // Write atomically to prevent partial writes/corruption
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, out)?;
+    fs::rename(&tmp_path, path)
 }
 
 fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {

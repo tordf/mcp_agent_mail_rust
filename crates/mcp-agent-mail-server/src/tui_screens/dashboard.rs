@@ -7176,14 +7176,14 @@ mod tests {
         screen.tick(STAT_REFRESH_TICKS, &state);
         assert_eq!(screen.current_db_stats.messages, 3);
         assert_eq!(screen.throughput_history.len(), 1);
-        assert_eq!(screen.throughput_history[0], 1.0);
+        assert!((screen.throughput_history[0] - 1.0).abs() < f64::EPSILON);
         assert_eq!(screen.percentile_history.len(), 1);
 
         // Subsequent cadence ticks continue to emit samples even when no new
         // requests arrived, so throughput trends show an idle baseline.
         screen.tick(STAT_REFRESH_TICKS * 2, &state);
         assert_eq!(screen.throughput_history.len(), 2);
-        assert_eq!(screen.throughput_history[1], 0.0);
+        assert!((screen.throughput_history[1] - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]

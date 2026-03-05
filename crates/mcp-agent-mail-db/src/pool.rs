@@ -3290,7 +3290,9 @@ mod tests {
         assert!(is_index_only_integrity_issue(
             "rowid 42 missing from index some_idx"
         ));
-        assert!(!is_index_only_integrity_issue("database disk image is malformed"));
+        assert!(!is_index_only_integrity_issue(
+            "database disk image is malformed"
+        ));
         assert!(!is_index_only_integrity_issue("file is not a database"));
     }
 
@@ -3323,15 +3325,20 @@ mod tests {
             "CREATE INDEX idx_agents_last_active_id_desc ON agents(last_active_ts DESC, id DESC)",
         )
         .expect("index");
-        conn.execute_raw("INSERT INTO agents(id, project_id, name, last_active_ts) VALUES (1, 1, 'agent', 1)")
-            .expect("insert");
+        conn.execute_raw(
+            "INSERT INTO agents(id, project_id, name, last_active_ts) VALUES (1, 1, 'agent', 1)",
+        )
+        .expect("insert");
         drop(conn);
 
         let repaired = try_repair_index_only_corruption(&path).expect("repair probe");
-        assert!(!repaired, "healthy DB should not trigger in-place REINDEX repair");
         assert!(
-            sqlite_file_is_healthy(&path).expect("health check"),
-            "healthy DB should remain healthy after no-op repair probe"
+            !repaired,
+            "healthy DB should not trigger in-place REINDEX repair"
+        );
+        assert!(
+            sqlite_file_is_healthy_canonical(&path).expect("canonical health check"),
+            "healthy DB should remain canonically healthy after no-op repair probe"
         );
     }
 

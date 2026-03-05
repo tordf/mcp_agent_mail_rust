@@ -109,7 +109,11 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
     }
     let text =
         serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(path, text)
+    
+    // Write atomically to prevent race conditions during read_active_leases
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, text)?;
+    std::fs::rename(&tmp_path, path)
 }
 
 fn collect_slot_conflicts(

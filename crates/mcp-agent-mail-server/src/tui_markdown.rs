@@ -150,8 +150,14 @@ pub fn render_message_body_blockquote(
 /// in json code fences for syntax highlighting.
 #[must_use]
 pub fn looks_like_json(body: &str) -> bool {
-    let trimmed = body.trim_start();
-    (trimmed.starts_with('{') || trimmed.starts_with('[')) && !trimmed.starts_with("```")
+    let trimmed = body.trim();
+    if trimmed.starts_with("```") {
+        return false;
+    }
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return false;
+    }
+    serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok()
 }
 
 /// Prepare body for rendering: apply JSON auto-wrapping if needed.
@@ -1351,6 +1357,7 @@ Thanks!";
         assert!(!looks_like_json("# heading"));
         assert!(!looks_like_json("plain text"));
         assert!(!looks_like_json("- list item"));
+        assert!(!looks_like_json("[Link](https://example.com)"));
     }
 
     #[test]

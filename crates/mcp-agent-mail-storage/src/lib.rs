@@ -2773,8 +2773,7 @@ fn commit_paths_lockfree(
         let path = validate_repo_relative_path("lockfree commit path", path)?;
         let full = workdir.join(path);
         if full.exists() {
-            let content = fs::read(&full)?;
-            let blob_oid = repo.blob(&content)?;
+            let blob_oid = repo.blob_path(&full)?;
             updates.push((path.to_string(), Some(blob_oid)));
         } else {
             // File does not exist, so we record a deletion (None OID)
@@ -4190,7 +4189,7 @@ pub fn store_attachment(
         .encode(&rgba, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| StorageError::InvalidPath(format!("WebP encode error: {e}")))?;
 
-    fs::write(&webp_path, &webp_bytes)?;
+    atomic_write_bytes(&webp_path, &webp_bytes)?;
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, &webp_path)?;
     rel_paths.push(webp_rel.clone());
 
@@ -4199,7 +4198,7 @@ pub fn store_attachment(
         let orig_dir = attach_dir.join("originals").join(prefix);
         ensure_dir(&orig_dir)?;
         let orig_path = orig_dir.join(format!("{digest}{original_ext}"));
-        fs::write(&orig_path, &original_bytes)?;
+        atomic_write_bytes(&orig_path, &original_bytes)?;
         let rel = rel_path_cached(&archive.canonical_repo_root, &orig_path)?;
         rel_paths.push(rel.clone());
         Some(rel)
@@ -4327,7 +4326,7 @@ pub fn store_raw_attachment(
     let target_path = file_dir.join(&filename);
 
     if !target_path.exists() {
-        fs::write(&target_path, &bytes)?;
+        atomic_write_bytes(&target_path, &bytes)?;
     }
 
     let rel_path = rel_path_cached(&archive.canonical_repo_root, &target_path)?;

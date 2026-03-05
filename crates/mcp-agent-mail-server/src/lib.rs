@@ -3533,7 +3533,7 @@ fn render_dashboard_frame(
         .fg(ftui::PackedRgba::rgb(hdr_r, hdr_g, hdr_b))
         .bold();
 
-    Table::new(
+    let table = Table::new(
         db_rows,
         [
             Constraint::FitContentBounded { min: 8, max: 18 },
@@ -3547,8 +3547,8 @@ fn render_dashboard_frame(
             .border_type(BorderType::Rounded)
             .title(" Database "),
     )
-    .style(card_style)
-    .render(cols[1], frame);
+    .style(card_style);
+    <Table as Widget>::render(&table, cols[1], frame);
 
     // Render agents panel (when agents exist)
     let traffic_col = if has_agents {
@@ -3588,7 +3588,7 @@ fn render_dashboard_frame(
                 })
                 .collect();
             let dim_style = ftui::Style::default().fg(ftui_extras::theme::fg::MUTED.resolve());
-            Table::new(
+            let table = Table::new(
                 agent_rows,
                 [
                     Constraint::FitContentBounded { min: 6, max: 16 },
@@ -3599,8 +3599,8 @@ fn render_dashboard_frame(
             .header(Row::new(vec!["Agent", "Program", "Active"]).style(title_style.bold()))
             .column_spacing(1)
             .block(agent_block)
-            .style(dim_style)
-            .render(cols[2], frame);
+            .style(dim_style);
+            <Table as Widget>::render(&table, cols[2], frame);
         }
         3
     } else {

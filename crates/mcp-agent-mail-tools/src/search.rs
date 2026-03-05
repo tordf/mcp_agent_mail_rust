@@ -1102,9 +1102,9 @@ pub async fn summarize_thread(
         // LLM refinement (if enabled)
         let config = &mcp_agent_mail_core::Config::get();
         if use_llm && config.llm_enabled {
-            let msg_tuples: Vec<(i64, String, String, String)> = messages
+            let start_idx = messages.len().saturating_sub(llm::MAX_MESSAGES_FOR_LLM);
+            let msg_tuples: Vec<(i64, String, String, String)> = messages[start_idx..]
                 .iter()
-                .take(llm::MAX_MESSAGES_FOR_LLM)
                 .map(|m| (m.id, m.from.clone(), m.subject.clone(), m.body_md.clone()))
                 .collect();
 
@@ -1134,9 +1134,9 @@ pub async fn summarize_thread(
         }
 
         let examples = if with_examples {
-            messages
+            let start_idx = messages.len().saturating_sub(3);
+            messages[start_idx..]
                 .iter()
-                .take(3)
                 .map(|m| ExampleMessage {
                     id: m.id,
                     from: m.from.clone(),

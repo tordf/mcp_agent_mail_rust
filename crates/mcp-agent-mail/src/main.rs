@@ -44,7 +44,8 @@ fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {
 
 fn invocation_file_name(arg0: Option<&str>) -> Option<String> {
     let arg0 = arg0?;
-    Path::new(arg0)
+    let normalized = arg0.replace('\\', "/");
+    Path::new(&normalized)
         .file_name()
         .and_then(|name| name.to_str())
         .map(std::string::ToString::to_string)
@@ -57,7 +58,7 @@ fn invocation_is_am(arg0: Option<&str>) -> bool {
     })
 }
 
-fn should_dispatch_to_cli_surface(invoked_as_am: bool, mode: InterfaceMode) -> bool {
+const fn should_dispatch_to_cli_surface(invoked_as_am: bool, mode: InterfaceMode) -> bool {
     invoked_as_am || mode.is_cli()
 }
 

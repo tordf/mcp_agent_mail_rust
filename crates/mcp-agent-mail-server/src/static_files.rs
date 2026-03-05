@@ -52,7 +52,16 @@ impl WebRoot {
 
     fn read_file(path: &Path) -> Option<(&'static str, Vec<u8>)> {
         let content_type = mime_type_for_path(path);
-        let body = std::fs::read(path).ok()?;
+        
+        let max_bytes = 100 * 1024 * 1024; // 100 MB limit
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut body = Vec::new();
+        use std::io::Read;
+        file.by_ref().take(max_bytes + 1).read_to_end(&mut body).ok()?;
+        if body.len() > max_bytes as usize {
+            return None;
+        }
+        
         Some((content_type, body))
     }
 }

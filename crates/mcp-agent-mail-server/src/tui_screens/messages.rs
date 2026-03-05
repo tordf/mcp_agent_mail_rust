@@ -4146,7 +4146,22 @@ fn build_inline_image_block_with_hints(
             image_protocol_name(protocol)
         ));
 
-        match std::fs::read(&image_ref.source) {
+        let max_bytes = 5 * 1024 * 1024; // 5 MB limit
+        let read_result = std::fs::File::open(&image_ref.source).and_then(|mut f| {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            f.by_ref().take(max_bytes + 1).read_to_end(&mut buf)?;
+            if buf.len() > usize::try_from(max_bytes).unwrap_or(usize::MAX) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "image too large",
+                ))
+            } else {
+                Ok(buf)
+            }
+        });
+
+        match read_result {
             Ok(bytes) => match Image::from_bytes(&bytes) {
                 Ok(image) => {
                     match protocol {
