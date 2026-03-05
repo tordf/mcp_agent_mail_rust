@@ -962,7 +962,6 @@ impl DbPool {
                 // Idle connections hold FDs to the old (corrupted/unlinked) inode.
                 // test_on_checkout(true) ensures stale connections fail health checks
                 // and get evicted on next acquire, so explicit draining is not required.
-                // TODO(br-10090): call self.pool.clear_idle() once sqlmodel_rust is deployed to workers
                 Ok(true)
             }
             Err(e) => {

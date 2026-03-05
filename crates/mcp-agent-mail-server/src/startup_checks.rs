@@ -100,11 +100,17 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
 
     // Step 2: Port is in use - try to identify if it's Agent Mail via health check
     if is_agent_mail_health_check(host, port) {
-        PortStatus::AgentMailServer
-    } else {
-        PortStatus::OtherProcess {
-            description: format!("Unknown process listening on {addr}"),
-        }
+        return PortStatus::AgentMailServer;
+    }
+
+    // Step 3: Health check failed (timeout, server busy, etc.) — fall back to
+    // process-level identification via fuser + /proc/{pid}/cmdline.
+    if is_agent_mail_by_pid(port) {
+        return PortStatus::AgentMailServer;
+    }
+
+    PortStatus::OtherProcess {
+        description: format!("Unknown process listening on {addr}"),
     }
 }
 
@@ -217,6 +223,81 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
             && (combined.contains("ready") || combined.contains("healthy")))
         || combined.contains("\"ok\":true")
         || combined.contains("\"ok\": true")
+}
+
+/// Fallback: identify the process holding `port` by PID.
+///
+/// Uses `fuser {port}/tcp` to find the PID, then reads `/proc/{pid}/cmdline`
+/// (Linux) or `/proc/{pid}/exe` to check if it's an Agent Mail binary.
+/// This catches cases where the HTTP health check times out or the server
+/// is temporarily unresponsive but IS an `am` process.
+fn is_agent_mail_by_pid(port: u16) -> bool {
+    // Try fuser to get the PID(s) holding the port
+    let output = match std::process::Command::new("fuser")
+        .arg(format!("{port}/tcp"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // fuser outputs PIDs separated by whitespace (sometimes with leading spaces)
+    for token in stdout.split_whitespace() {
+        let pid: u32 = match token.trim().parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid_is_agent_mail(pid) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a PID belongs to an Agent Mail process by inspecting its
+/// command line or executable path via /proc.
+fn pid_is_agent_mail(pid: u32) -> bool {
+    // Check /proc/{pid}/cmdline (null-separated argv)
+    if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let cmdline_str = String::from_utf8_lossy(&cmdline).to_lowercase();
+        // The binary is typically "am" or contains "mcp-agent-mail" / "mcp_agent_mail"
+        if cmdline_str.contains("mcp-agent-mail")
+            || cmdline_str.contains("mcp_agent_mail")
+            || cmdline_str.contains("agent-mail")
+        {
+            return true;
+        }
+        // Check if argv[0] is "am" (the binary name)
+        if let Some(argv0) = cmdline.split(|&b| b == 0).next() {
+            let argv0_str = String::from_utf8_lossy(argv0);
+            // Extract just the filename from the path
+            let basename = argv0_str.rsplit('/').next().unwrap_or(&argv0_str);
+            if basename == "am" {
+                return true;
+            }
+        }
+    }
+
+    // Fallback: check /proc/{pid}/exe symlink target
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        let exe_str = exe.to_string_lossy().to_lowercase();
+        if exe_str.contains("mcp-agent-mail")
+            || exe_str.contains("mcp_agent_mail")
+            || exe_str.contains("agent-mail")
+        {
+            return true;
+        }
+        if let Some(basename) = exe.file_name() {
+            if basename == "am" {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 // ──────────────────────────────────────────────────────────────────────

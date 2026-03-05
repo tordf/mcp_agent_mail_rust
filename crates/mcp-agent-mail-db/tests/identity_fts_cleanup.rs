@@ -86,11 +86,10 @@ fn pool_startup_produces_clean_fts_state() {
     };
     let pool = DbPool::new(&config).expect("create pool");
 
-    let cx = Cx::for_testing();
-    common::spin_poll(async {
+    common::block_on(|cx| async move {
         let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
     });
-    drop(pool);
+    // pool moved into the closure and dropped there
 
     let parsed_path = config
         .sqlite_path()

@@ -572,6 +572,11 @@ static CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock:
         .is_none_or(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 });
 
+fn should_fallback_begin_concurrent(err_msg: &str) -> bool {
+    let lower = err_msg.to_ascii_lowercase();
+    lower.contains("near \"concurrent\"") || crate::pool::is_sqlite_recovery_error_message(&lower)
+}
+
 /// Begin a concurrent write transaction (MVCC page-level concurrent writes).
 ///
 /// Falls back to `BEGIN IMMEDIATE` on backends that do not support
@@ -581,9 +586,7 @@ async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcom
         return begin_immediate_tx(cx, tracked).await;
     }
     match map_sql_outcome(tracked.execute(cx, "BEGIN CONCURRENT", &[]).await).map(|_| ()) {
-        Outcome::Err(DbError::Sqlite(msg))
-            if msg.to_ascii_lowercase().contains("near \"concurrent\"") =>
-        {
+        Outcome::Err(DbError::Sqlite(msg)) if should_fallback_begin_concurrent(&msg) => {
             begin_immediate_tx(cx, tracked).await
         }
         out => out,
@@ -5888,6 +5891,29 @@ pub async fn insert_system_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn begin_concurrent_fallback_detects_parser_error() {
+        assert!(should_fallback_begin_concurrent(
+            "near \"CONCURRENT\": syntax error"
+        ));
+    }
+
+    #[test]
+    fn begin_concurrent_fallback_detects_recovery_error_signatures() {
+        assert!(should_fallback_begin_concurrent(
+            "Query error: out of memory"
+        ));
+        assert!(should_fallback_begin_concurrent(
+            "internal error: cursor stack is empty"
+        ));
+    }
+
+    #[test]
+    fn begin_concurrent_fallback_rejects_non_recovery_errors() {
+        assert!(!should_fallback_begin_concurrent("database is locked"));
+        assert!(!should_fallback_begin_concurrent("no such table: agents"));
+    }
 
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {
         let cx = Cx::for_testing();

@@ -6822,6 +6822,7 @@ mod tests {
             DetailViewMode::Markdown,
             None,
             0,
+            &Cell::new(0),
         );
         let text = buffer_to_text(&frame.buffer);
         // Should contain the body header
@@ -6858,6 +6859,7 @@ mod tests {
             DetailViewMode::Markdown,
             None,
             0,
+            &Cell::new(0),
         );
         let text = buffer_to_text(&frame.buffer);
         assert!(
@@ -6883,6 +6885,7 @@ mod tests {
             DetailViewMode::Markdown,
             None,
             0,
+            &Cell::new(0),
         );
         let text = buffer_to_text(&frame.buffer);
         assert!(
@@ -7339,6 +7342,7 @@ mod tests {
             DetailViewMode::Markdown,
             None,
             0,
+            &Cell::new(0),
         );
         let text = buffer_to_text(&frame.buffer);
         // Should show "Message" not "Message" from Debug format
@@ -7370,6 +7374,7 @@ mod tests {
             DetailViewMode::Markdown,
             None,
             0,
+            &Cell::new(0),
         );
         let text = buffer_to_text(&frame.buffer);
         assert!(text.contains("Title:"), "detail text: {text}");

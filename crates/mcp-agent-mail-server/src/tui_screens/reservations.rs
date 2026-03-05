@@ -331,6 +331,8 @@ pub struct ReservationsScreen {
     detail_visible: bool,
     /// Scroll offset inside the detail panel.
     detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
     /// Last observed data-channel generation for dirty-state gating.
     last_data_gen: super::DataGeneration,
 }
@@ -369,6 +371,7 @@ impl ReservationsScreen {
             load_preset_cursor: 0,
             detail_visible: true,
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             last_data_gen: super::DataGeneration::stale(),
         }
     }
@@ -859,7 +862,7 @@ impl ReservationsScreen {
             lines.push(("Status".into(), "Active".into(), Some(tp.activity_active)));
         }
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
     }
 
     fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1504,7 +1507,8 @@ impl MailScreen for ReservationsScreen {
                     self.detail_visible = !self.detail_visible;
                 }
                 KeyCode::Char('J') => {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    let max = self.last_detail_max_scroll.get();
+                    self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
                 }
                 KeyCode::Char('K') => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
@@ -2558,11 +2562,13 @@ fn render_kv_lines(
     inner: Rect,
     lines: &[(String, String, Option<PackedRgba>)],
     scroll: usize,
+    max_scroll_cell: &std::cell::Cell<usize>,
     tp: &crate::tui_theme::TuiThemePalette,
 ) {
     let visible_height = usize::from(inner.height);
     let total_lines = lines.len();
     let max_scroll = total_lines.saturating_sub(visible_height);
+    max_scroll_cell.set(max_scroll);
     let scroll = scroll.min(max_scroll);
     let label_w = 12u16;
 

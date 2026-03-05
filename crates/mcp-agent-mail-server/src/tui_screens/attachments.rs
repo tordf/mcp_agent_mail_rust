@@ -178,6 +178,8 @@ pub struct AttachmentExplorerScreen {
     text_filter_active: bool,
     /// Detail panel scroll offset.
     detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
 
     // DB state
     db_conn: Option<DbConn>,
@@ -209,6 +211,7 @@ impl AttachmentExplorerScreen {
             text_filter: String::new(),
             text_filter_active: false,
             detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
             db_conn: None,
             db_conn_attempted: false,
             db_context_unavailable: false,
@@ -789,7 +792,7 @@ impl AttachmentExplorerScreen {
         lines.push(("Date".into(), micros_to_iso(entry.created_ts), None));
         lines.push(("Project".into(), entry.project_slug.clone(), None));
 
-        render_kv_lines(frame, inner, &lines, self.detail_scroll, &tp);
+        render_kv_lines(frame, inner, &lines, self.detail_scroll, &self.last_detail_max_scroll, &tp);
     }
 
     /// Render the detail panel for the selected attachment.
@@ -821,11 +824,17 @@ impl AttachmentExplorerScreen {
         lines.push(format!("Date: {}", micros_to_iso(entry.created_ts)));
         lines.push(format!("Project: {}", entry.project_slug));
 
+        let visible_height = usize::from(area.height.saturating_sub(2)); // Account for borders
+        let total_lines = lines.len();
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        self.last_detail_max_scroll.set(max_scroll);
+        let clamped_scroll = self.detail_scroll.min(max_scroll);
+
         // Apply scroll offset
         let visible: Vec<String> = lines
             .into_iter()
-            .skip(self.detail_scroll)
-            .take(area.height as usize)
+            .skip(clamped_scroll)
+            .take(visible_height)
             .collect();
         let text = visible.join("\n");
 
@@ -1012,7 +1021,8 @@ impl MailScreen for AttachmentExplorerScreen {
                     self.data_dirty = true;
                 }
                 KeyCode::Char('J') => {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    let max = self.last_detail_max_scroll.get();
+                    self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
                 }
                 KeyCode::Char('K') => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
@@ -1210,11 +1220,13 @@ fn render_kv_lines(
     inner: Rect,
     lines: &[(String, String, Option<PackedRgba>)],
     scroll: usize,
+    max_scroll_cell: &std::cell::Cell<usize>,
     tp: &crate::tui_theme::TuiThemePalette,
 ) {
     let visible_height = usize::from(inner.height);
     let total_lines = lines.len();
     let max_scroll = total_lines.saturating_sub(visible_height);
+    max_scroll_cell.set(max_scroll);
     let scroll = scroll.min(max_scroll);
     let label_w = 12u16;
 

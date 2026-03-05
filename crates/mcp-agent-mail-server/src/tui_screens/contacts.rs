@@ -477,7 +477,8 @@ impl ContactsScreen {
                 self.detail_visible = !self.detail_visible;
             }
             KeyCode::Char('J') => {
-                self.detail_scroll = self.detail_scroll.saturating_add(1);
+                let max = self.last_detail_max_scroll.get();
+                self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
             }
             KeyCode::Char('K') => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(1);
