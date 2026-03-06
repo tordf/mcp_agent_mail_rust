@@ -311,9 +311,17 @@ struct TickEventBatch {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DbWarmupState {
+    #[default]
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct StartupSignalState {
     first_paint: bool,
-    db_ready: bool,
+    db_warmup: DbWarmupState,
 }
 
 #[derive(Debug)]
@@ -572,24 +580,48 @@ impl TuiSharedState {
         let mut signals = signals_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !signals.db_ready {
-            signals.db_ready = true;
+        if signals.db_warmup != DbWarmupState::Ready {
+            signals.db_warmup = DbWarmupState::Ready;
             signals_cv.notify_all();
         }
     }
 
     #[must_use]
     pub fn db_ready(&self) -> bool {
+        self.db_warmup_state() == DbWarmupState::Ready
+    }
+
+    pub fn mark_db_warmup_failed(&self) {
+        let (signals_lock, signals_cv) = &self.startup_signals;
+        let mut signals = signals_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if signals.db_warmup == DbWarmupState::Pending {
+            signals.db_warmup = DbWarmupState::Failed;
+            signals_cv.notify_all();
+        }
+    }
+
+    #[must_use]
+    pub fn db_warmup_state(&self) -> DbWarmupState {
         self.startup_signals
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .db_ready
+            .db_warmup
+    }
+
+    #[must_use]
+    pub fn wait_for_db_warmup(&self, timeout: Duration) -> DbWarmupState {
+        self.wait_for_startup_state(timeout, |signals| {
+            signals.db_warmup != DbWarmupState::Pending
+        })
+        .db_warmup
     }
 
     #[must_use]
     pub fn wait_for_db_ready(&self, timeout: Duration) -> bool {
-        self.wait_for_startup_signal(timeout, |signals| signals.db_ready)
+        self.wait_for_db_warmup(timeout) == DbWarmupState::Ready
     }
 
     pub fn request_headless_detach(&self) {
@@ -637,29 +669,33 @@ impl TuiSharedState {
     }
 
     #[must_use]
-    fn wait_for_startup_signal(
-        &self,
-        timeout: Duration,
-        predicate: impl Fn(StartupSignalState) -> bool,
-    ) -> bool {
-        if self.is_shutdown_requested() {
-            return false;
-        }
+    fn wait_for_startup_signal<P>(&self, timeout: Duration, predicate: P) -> bool
+    where
+        P: Fn(StartupSignalState) -> bool + Copy,
+    {
+        predicate(self.wait_for_startup_state(timeout, predicate))
+    }
+
+    #[must_use]
+    fn wait_for_startup_state<P>(&self, timeout: Duration, predicate: P) -> StartupSignalState
+    where
+        P: Fn(StartupSignalState) -> bool + Copy,
+    {
         let (signals_lock, signals_cv) = &self.startup_signals;
         let mut signals = signals_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if predicate(*signals) {
-            return true;
+        if predicate(*signals) || self.is_shutdown_requested() {
+            return *signals;
         }
         if timeout.is_zero() {
-            return false;
+            return *signals;
         }
         let deadline = Instant::now() + timeout;
         loop {
             let now = Instant::now();
             if now >= deadline || self.is_shutdown_requested() {
-                return predicate(*signals);
+                return *signals;
             }
             let remaining = deadline.saturating_duration_since(now);
             let (next_signals, _) = signals_cv
@@ -667,7 +703,7 @@ impl TuiSharedState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             signals = next_signals;
             if predicate(*signals) {
-                return true;
+                return *signals;
             }
         }
     }
@@ -1145,25 +1181,54 @@ mod tests {
         let state = TuiSharedState::new(&config);
         assert!(!state.first_paint_seen());
         assert!(!state.db_ready());
+        assert_eq!(state.db_warmup_state(), DbWarmupState::Pending);
         assert!(!state.wait_for_first_paint(Duration::ZERO));
         assert!(!state.wait_for_db_ready(Duration::ZERO));
+        assert_eq!(
+            state.wait_for_db_warmup(Duration::ZERO),
+            DbWarmupState::Pending
+        );
 
         let state_clone = Arc::clone(&state);
         let waiter = thread::spawn(move || {
             let first_paint = state_clone.wait_for_first_paint(Duration::from_millis(250));
-            let db_ready = state_clone.wait_for_db_ready(Duration::from_millis(250));
-            (first_paint, db_ready)
+            let db_state = state_clone.wait_for_db_warmup(Duration::from_millis(250));
+            (first_paint, db_state)
         });
 
         thread::sleep(Duration::from_millis(10));
         state.mark_first_paint();
         state.mark_db_ready();
 
-        let (first_paint, db_ready) = waiter.join().expect("join startup waiter");
+        let (first_paint, db_state) = waiter.join().expect("join startup waiter");
         assert!(first_paint);
-        assert!(db_ready);
+        assert_eq!(db_state, DbWarmupState::Ready);
         assert!(state.first_paint_seen());
         assert!(state.db_ready());
+        assert_eq!(state.db_warmup_state(), DbWarmupState::Ready);
+    }
+
+    #[test]
+    fn startup_db_warmup_failure_unblocks_waiters_and_ready_can_promote_later() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let state_clone = Arc::clone(&state);
+        let waiter = thread::spawn(move || state_clone.wait_for_db_warmup(Duration::from_millis(250)));
+
+        thread::sleep(Duration::from_millis(10));
+        state.mark_db_warmup_failed();
+
+        let db_state = waiter.join().expect("join warmup waiter");
+        assert_eq!(db_state, DbWarmupState::Failed);
+        assert_eq!(state.db_warmup_state(), DbWarmupState::Failed);
+        assert!(!state.db_ready());
+        assert!(!state.wait_for_db_ready(Duration::ZERO));
+
+        state.mark_db_ready();
+
+        assert_eq!(state.db_warmup_state(), DbWarmupState::Ready);
+        assert!(state.db_ready());
+        assert!(state.wait_for_db_ready(Duration::ZERO));
     }
 
     #[test]
