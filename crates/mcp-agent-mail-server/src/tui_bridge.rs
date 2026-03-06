@@ -552,11 +552,18 @@ impl TuiSharedState {
 
     pub fn mark_first_paint(&self) {
         let (signals_lock, signals_cv) = &self.startup_signals;
-        let mut signals = signals_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !signals.first_paint {
-            signals.first_paint = true;
+        let should_notify = {
+            let mut signals = signals_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if signals.first_paint {
+                false
+            } else {
+                signals.first_paint = true;
+                true
+            }
+        };
+        if should_notify {
             signals_cv.notify_all();
         }
     }
@@ -577,11 +584,18 @@ impl TuiSharedState {
 
     pub fn mark_db_ready(&self) {
         let (signals_lock, signals_cv) = &self.startup_signals;
-        let mut signals = signals_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if signals.db_warmup != DbWarmupState::Ready {
-            signals.db_warmup = DbWarmupState::Ready;
+        let should_notify = {
+            let mut signals = signals_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if signals.db_warmup == DbWarmupState::Ready {
+                false
+            } else {
+                signals.db_warmup = DbWarmupState::Ready;
+                true
+            }
+        };
+        if should_notify {
             signals_cv.notify_all();
         }
     }
@@ -593,11 +607,18 @@ impl TuiSharedState {
 
     pub fn mark_db_warmup_failed(&self) {
         let (signals_lock, signals_cv) = &self.startup_signals;
-        let mut signals = signals_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if signals.db_warmup == DbWarmupState::Pending {
-            signals.db_warmup = DbWarmupState::Failed;
+        let should_notify = {
+            let mut signals = signals_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if signals.db_warmup == DbWarmupState::Pending {
+                signals.db_warmup = DbWarmupState::Failed;
+                true
+            } else {
+                false
+            }
+        };
+        if should_notify {
             signals_cv.notify_all();
         }
     }
@@ -1213,7 +1234,8 @@ mod tests {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         let state_clone = Arc::clone(&state);
-        let waiter = thread::spawn(move || state_clone.wait_for_db_warmup(Duration::from_millis(250)));
+        let waiter =
+            thread::spawn(move || state_clone.wait_for_db_warmup(Duration::from_millis(250)));
 
         thread::sleep(Duration::from_millis(10));
         state.mark_db_warmup_failed();

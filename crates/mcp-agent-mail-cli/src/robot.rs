@@ -944,6 +944,9 @@ fn parse_since_micros(s: &str) -> Result<i64, CliError> {
         .ok_or_else(|| CliError::InvalidArgument(format!("invalid --since timestamp: {s}")))
 }
 
+const ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
+const ACK_SLA_VIOLATION_THRESHOLD_US: i64 = 60 * 60 * 1_000_000;
+
 // ── Status command implementation ───────────────────────────────────────────
 
 fn build_status(
@@ -968,8 +971,7 @@ fn build_status(
             JOIN messages m ON m.id = mr.message_id
             WHERE mr.agent_id = ? AND m.project_id = ?
         ";
-        // ack_overdue threshold: 30 minutes = 30*60*1_000_000 micros
-        let threshold = now_us - 30 * 60 * 1_000_000;
+        let threshold = now_us - ACK_OVERDUE_THRESHOLD_US;
         let rows = conn
             .query_sync(
                 inbox_sql,
@@ -1212,7 +1214,7 @@ fn build_inbox(
 ) -> Result<InboxResult, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     // ack_overdue threshold: 30 minutes
-    let ack_threshold = now_us - 30 * 60 * 1_000_000;
+    let ack_threshold = now_us - ACK_OVERDUE_THRESHOLD_US;
 
     // Build WHERE filter based on flags
     let bucket_filter = if ack_overdue_only {
@@ -2516,13 +2518,17 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
             .and_then(|r| r.get_named("cnt").ok())
             .unwrap_or(0);
 
-        // Count ack-overdue
+        // Count actionable ack-overdue items using the same 30m threshold as status/inbox.
         let ack_overdue: i64 = conn
             .query_sync(
                 "SELECT COUNT(*) AS cnt FROM message_recipients mr
                  JOIN messages m ON m.id = mr.message_id
-                 WHERE m.project_id = ? AND m.ack_required = 1 AND mr.ack_ts IS NULL",
-                &[Value::BigInt(pid)],
+                 WHERE m.project_id = ? AND m.ack_required = 1 AND mr.ack_ts IS NULL
+                   AND m.created_ts < ?",
+                &[
+                    Value::BigInt(pid),
+                    Value::BigInt(now_us - ACK_OVERDUE_THRESHOLD_US),
+                ],
             )
             .unwrap_or_default()
             .first()
@@ -2572,7 +2578,7 @@ fn build_analytics(
                AND m.created_ts < ?",
             &[
                 Value::BigInt(project_id),
-                Value::BigInt(now_us - 3600 * 1_000_000),
+                Value::BigInt(now_us - ACK_SLA_VIOLATION_THRESHOLD_US),
             ],
         )
         .unwrap_or_default()
@@ -5140,6 +5146,104 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["project_count"], 0);
         assert!(v["projects"].as_array().unwrap().is_empty());
+    }
+
+    fn setup_robot_overview_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_overview_test.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                importance TEXT NOT NULL,
+                ack_required INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                released_ts INTEGER,
+                expires_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create reservations");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
+            &empty,
+        )
+        .expect("insert project");
+
+        (temp_dir, conn)
+    }
+
+    #[test]
+    fn test_build_overview_counts_only_actionable_ack_overdue_messages() {
+        let (_temp_dir, conn) = setup_robot_overview_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let old_message_ts = now_us - ACK_OVERDUE_THRESHOLD_US - 1;
+        let recent_message_ts = now_us - ACK_OVERDUE_THRESHOLD_US + 60 * 1_000_000;
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, importance, ack_required, created_ts)
+             VALUES
+                (10, 1, 'normal', 1, ?),
+                (20, 1, 'normal', 1, ?),
+                (30, 1, 'normal', 1, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(old_message_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(recent_message_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(old_message_ts),
+            ],
+        )
+        .expect("insert messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts)
+             VALUES
+                (1, 10, 1, NULL, NULL),
+                (2, 20, 1, NULL, NULL),
+                (3, 30, 1, NULL, 12345)",
+            &empty,
+        )
+        .expect("insert recipients");
+
+        let projects = build_overview(&conn).expect("build overview");
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].slug, "proj");
+        assert_eq!(
+            projects[0].ack_overdue, 1,
+            "only unacked messages older than the overdue threshold should count"
+        );
     }
 
     // ── Track 3: Context & Discovery Unit Tests ──────────────────────────────

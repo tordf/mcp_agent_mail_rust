@@ -38,6 +38,7 @@ use ftui_extras::visual_fx::effects::DoomFireFx;
 use ftui_extras::visual_fx::effects::metaballs::{MetaballsFx, MetaballsPalette, MetaballsParams};
 use ftui_extras::visual_fx::effects::plasma::{PlasmaFx, PlasmaPalette};
 use ftui_extras::visual_fx::{BackdropFx, FxContext, FxQuality, ThemeInputs};
+use ftui_render::budget::DegradationLevel;
 use ftui_widgets::progress::ProgressBar;
 use ftui_widgets::sparkline::Sparkline;
 use ftui_widgets::tree::TreeNode;
@@ -2027,6 +2028,7 @@ pub struct AmbientEffectRenderer {
     cached_bg_buffer: Vec<PackedRgba>,
     cached_draw_width: u16,
     cached_draw_height: u16,
+    cached_base_bg: PackedRgba,
     frame_counter: u64,
     resolution_mode: Mode,
     last_telemetry: AmbientRenderTelemetry,
@@ -2043,6 +2045,7 @@ impl AmbientEffectRenderer {
             cached_bg_buffer: Vec::new(),
             cached_draw_width: 0,
             cached_draw_height: 0,
+            cached_base_bg: PackedRgba::TRANSPARENT,
             frame_counter: 0,
             resolution_mode: Mode::HalfBlock,
             last_telemetry: AmbientRenderTelemetry::default(),
@@ -2060,14 +2063,32 @@ impl AmbientEffectRenderer {
     }
 
     #[must_use]
-    pub fn can_replay_cached(&self, area: Rect, mode: AmbientMode) -> bool {
+    pub fn can_replay_cached(
+        &self,
+        area: Rect,
+        mode: AmbientMode,
+        base_bg: PackedRgba,
+        degradation: DegradationLevel,
+    ) -> bool {
+        let subpixel_width = area
+            .width
+            .saturating_mul(self.resolution_mode.cols_per_cell());
+        let subpixel_height = area
+            .height
+            .saturating_mul(self.resolution_mode.rows_per_cell());
+        let len = usize::from(subpixel_width) * usize::from(subpixel_height);
         mode.is_enabled()
             && self.last_telemetry.mode == mode
-            && self.last_telemetry.effect_opacity == mode.effect_opacity()
             && self.last_telemetry.quality.is_enabled()
+            && FxQuality::from_degradation_with_area(degradation, len).is_enabled()
             && self.cached_draw_width >= area.width
             && self.cached_draw_height >= area.height
+            && self.cached_base_bg == base_bg
             && !self.cached_bg_buffer.is_empty()
+    }
+
+    pub fn invalidate_cached(&mut self) {
+        self.clear_cached_composite();
     }
 
     /// Render ambient background effect into z-layer 0 (background colors only).
@@ -2226,9 +2247,10 @@ impl AmbientEffectRenderer {
         area: Rect,
         frame: &mut Frame,
         mode: AmbientMode,
-        _base_bg: PackedRgba,
+        base_bg: PackedRgba,
     ) {
-        if area.is_empty() || !self.can_replay_cached(area, mode) {
+        if area.is_empty() || !self.can_replay_cached(area, mode, base_bg, frame.buffer.degradation)
+        {
             return;
         }
 
@@ -2385,6 +2407,7 @@ impl AmbientEffectRenderer {
         self.cached_bg_buffer[..draw_len].fill(base_bg);
         self.cached_draw_width = draw_width;
         self.cached_draw_height = draw_height;
+        self.cached_base_bg = base_bg;
 
         let stride = usize::from(subpixel_width);
         let max_sub_y = usize::from(subpixel_height.saturating_sub(1));
@@ -2428,6 +2451,7 @@ impl AmbientEffectRenderer {
         self.cached_bg_buffer.clear();
         self.cached_draw_width = 0;
         self.cached_draw_height = 0;
+        self.cached_base_bg = PackedRgba::TRANSPARENT;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8982,7 +9006,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_renderer_cached_replay_overwrites_current_frame_background() {
+    fn ambient_renderer_cached_replay_skips_when_base_background_changes() {
         let mut renderer = AmbientEffectRenderer::new();
         let width = 40;
         let height = 12;
@@ -9005,17 +9029,17 @@ mod tests {
             10.0,
             original_base,
         );
-        let rendered_snapshot = extract_buffer_snapshot(&rendered_frame, width, height);
 
         let mut replay_pool = GraphemePool::new();
         let mut replay_frame = Frame::new(width, height, &mut replay_pool);
         fill_bg(&mut replay_frame, width, height, replay_base);
+        let replay_base_snapshot = extract_buffer_snapshot(&replay_frame, width, height);
         renderer.render_cached(area, &mut replay_frame, AmbientMode::Subtle, replay_base);
         let replay_snapshot = extract_buffer_snapshot(&replay_frame, width, height);
 
         assert_eq!(
-            rendered_snapshot, replay_snapshot,
-            "cached ambient replay must not depend on the frame's current background"
+            replay_base_snapshot, replay_snapshot,
+            "cached ambient replay must skip when the base background changes"
         );
     }
 
@@ -9066,6 +9090,44 @@ mod tests {
         assert_eq!(
             base_snapshot, cached_snapshot,
             "cached ambient replay must not reuse stale pixels after a no-effect render"
+        );
+    }
+
+    #[test]
+    fn ambient_renderer_cached_replay_respects_current_frame_budget() {
+        let mut renderer = AmbientEffectRenderer::new();
+        let width = 40;
+        let height = 12;
+        let area = Rect::new(0, 0, width, height);
+        let base = PackedRgba::rgb(12, 18, 24);
+        let health = AmbientHealthInput {
+            event_buffer_utilization: 0.82,
+            ..AmbientHealthInput::default()
+        };
+
+        let mut rendered_pool = GraphemePool::new();
+        let mut rendered_frame = Frame::new(width, height, &mut rendered_pool);
+        fill_bg(&mut rendered_frame, width, height, base);
+        renderer.render(
+            area,
+            &mut rendered_frame,
+            AmbientMode::Subtle,
+            health,
+            10.0,
+            base,
+        );
+
+        let mut replay_pool = GraphemePool::new();
+        let mut replay_frame = Frame::new(width, height, &mut replay_pool);
+        replay_frame.buffer.degradation = ftui_render::budget::DegradationLevel::EssentialOnly;
+        fill_bg(&mut replay_frame, width, height, base);
+        let base_snapshot = extract_buffer_snapshot(&replay_frame, width, height);
+        renderer.render_cached(area, &mut replay_frame, AmbientMode::Subtle, base);
+        let replay_snapshot = extract_buffer_snapshot(&replay_frame, width, height);
+
+        assert_eq!(
+            base_snapshot, replay_snapshot,
+            "cached ambient replay must respect the current frame degradation budget"
         );
     }
 

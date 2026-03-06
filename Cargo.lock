@@ -4648,6 +4648,7 @@ dependencies = [
  "mcp-agent-mail-share",
  "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",
+ "nix 0.31.1",
  "regex",
  "serde",
  "serde_json",

@@ -630,6 +630,14 @@ fn lexical_backfill_database_url(pool: &DbPool) -> String {
     }
 }
 
+fn sqlite_key_from_database_url(database_url: &str) -> Option<String> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return Some(":memory:".to_string());
+    }
+    mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 fn has_run_lexical_backfill(sqlite_key: &str) -> Result<bool, DbError> {
     let backfill_state = lexical_backfill_state();
     let state = backfill_state
@@ -644,6 +652,32 @@ fn mark_lexical_backfill_ran(sqlite_key: &str) -> Result<(), DbError> {
         .map_err(|_| DbError::Sqlite("search backfill state lock poisoned".to_string()))?
         .insert(sqlite_key.to_string());
     Ok(())
+}
+
+fn record_lexical_bootstrap_success(sqlite_key: &str) -> Result<(), DbError> {
+    lexical_bootstrap_state()
+        .lock()
+        .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
+        .insert(sqlite_key.to_string(), Ok(()));
+    *lexical_active_db_key()
+        .lock()
+        .map_err(|_| DbError::Sqlite("search active DB key lock poisoned".to_string()))? =
+        Some(sqlite_key.to_string());
+    mark_lexical_backfill_ran(sqlite_key)?;
+    Ok(())
+}
+
+pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(), DbError> {
+    let Some(sqlite_key) = sqlite_key_from_database_url(database_url) else {
+        return Ok(());
+    };
+    if crate::search_v3::get_bridge().is_none() {
+        return Ok(());
+    }
+    let _guard = lexical_init_guard()
+        .lock()
+        .map_err(|_| DbError::Sqlite("search bootstrap init guard lock poisoned".to_string()))?;
+    record_lexical_bootstrap_success(&sqlite_key)
 }
 
 fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
@@ -675,6 +709,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     // per-DB backfill marker is present.
     if matches!(cached_state, Some(Ok(())))
         && active_key.as_deref() == Some(sqlite_key.as_str())
+        && crate::search_v3::get_bridge().is_some()
         && has_run_lexical_backfill(&sqlite_key)?
     {
         return Ok(());
@@ -699,14 +734,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     })();
 
     if result.is_ok() {
-        state_lock
-            .lock()
-            .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
-            .insert(sqlite_key.clone(), Ok(()));
-        *lexical_active_db_key()
-            .lock()
-            .map_err(|_| DbError::Sqlite("search active DB key lock poisoned".to_string()))? =
-            Some(sqlite_key);
+        record_lexical_bootstrap_success(&sqlite_key)?;
     } else {
         // Do not permanently cache failures; allow retry on next query.
         state_lock
@@ -3391,8 +3419,61 @@ mod tests {
     use super::*;
     use crate::search_planner::{Importance, RankingMode, SearchCursor};
     use mcp_agent_mail_core::metrics::global_metrics;
+    use std::sync::{LazyLock, Mutex};
     #[cfg(feature = "hybrid")]
     use std::time::Duration;
+
+    static SEARCH_BOOTSTRAP_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn reset_lexical_bootstrap_tracking() {
+        lexical_bootstrap_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        lexical_backfill_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        *lexical_active_db_key()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    #[test]
+    fn startup_lexical_backfill_completion_requires_live_bridge() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+
+        let db_url = "sqlite:////tmp/startup-lexical-bootstrap.db";
+        let sqlite_key = sqlite_key_from_database_url(db_url).expect("sqlite key");
+        let bridge_ready = crate::search_v3::get_bridge().is_some();
+
+        note_startup_lexical_backfill_completed(db_url).expect("record startup bootstrap");
+
+        let cached = lexical_bootstrap_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&sqlite_key)
+            .cloned();
+        let active_key = lexical_active_db_key()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        if bridge_ready {
+            assert!(matches!(cached, Some(Ok(()))));
+            assert_eq!(active_key.as_deref(), Some(sqlite_key.as_str()));
+            assert!(has_run_lexical_backfill(&sqlite_key).expect("backfill marker"));
+        } else {
+            assert!(cached.is_none());
+            assert!(active_key.is_none());
+            assert!(!has_run_lexical_backfill(&sqlite_key).expect("backfill marker"));
+        }
+
+        reset_lexical_bootstrap_tracking();
+    }
 
     #[test]
     fn next_cursor_none_when_underfull() {

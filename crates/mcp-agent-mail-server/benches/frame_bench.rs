@@ -16,7 +16,7 @@ use std::sync::Arc;
 use criterion::{Criterion, criterion_group, criterion_main};
 use ftui::layout::Rect;
 use ftui::widgets::Widget;
-use ftui::{Event, Frame, GraphemePool, KeyCode, KeyEvent, Model};
+use ftui::{Event, Frame, GraphemePool, KeyCode, KeyEvent, Model, PackedRgba};
 use ftui_extras::theme::ThemeId;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::DbConn;
@@ -436,8 +436,14 @@ fn bench_ambient_renderer(c: &mut Criterion) {
         b.iter(|| {
             let mut pool = GraphemePool::new();
             let mut frame = Frame::new(area.width, area.height, &mut pool);
-            let telemetry =
-                renderer.render(area, &mut frame, AmbientMode::Subtle, health, uptime_s);
+            let telemetry = renderer.render(
+                area,
+                &mut frame,
+                AmbientMode::Subtle,
+                health,
+                uptime_s,
+                PackedRgba::rgb(12, 18, 24),
+            );
             uptime_s += 0.016;
             black_box(telemetry.render_duration);
         });

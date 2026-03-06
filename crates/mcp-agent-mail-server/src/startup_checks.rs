@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::time::Duration;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -60,6 +61,7 @@ impl PortStatus {
 /// occupied by an unrelated process that accepts TCP but does not speak HTTP.
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_HEALTH_BODY_BYTES: usize = 4096;
+const LISTENER_PID_HINT_DIR: &str = "mcp-agent-mail-port-pids";
 
 /// Check the status of a port: free, occupied by Agent Mail, or occupied by another process.
 ///
@@ -107,7 +109,7 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
 
     // Step 3: Health check failed (timeout, server busy, etc.) — fall back to
     // process-level identification via listener PID lookup + /proc/{pid}/cmdline.
-    if is_agent_mail_by_pid(port) {
+    if is_agent_mail_by_pid(host, port) {
         return PortStatus::AgentMailServer;
     }
 
@@ -248,8 +250,18 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 /// reads `/proc/{pid}/cmdline` or `/proc/{pid}/exe` to check if it's an Agent
 /// Mail binary. This catches cases where the HTTP health check times out or the
 /// server is temporarily unresponsive but IS an `am` process.
-fn is_agent_mail_by_pid(port: u16) -> bool {
-    !agent_mail_port_holder_pids(port).is_empty()
+fn is_agent_mail_by_pid(host: &str, port: u16) -> bool {
+    !agent_mail_port_holder_pids_with_hint(host, port).is_empty()
+}
+
+#[must_use]
+pub fn write_listener_pid_hint(host: &str, port: u16) -> PathBuf {
+    let path = listener_pid_hint_path(host, port);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, std::process::id().to_string());
+    path
 }
 
 /// Return Agent Mail PIDs currently listening on `port`.
@@ -259,6 +271,145 @@ pub fn agent_mail_port_holder_pids(port: u16) -> Vec<u32> {
         .into_iter()
         .filter(|pid| pid_is_agent_mail(*pid))
         .collect()
+}
+
+/// Return Agent Mail PIDs currently listening on `host:port`, preferring a
+/// previously recorded PID hint before falling back to system-wide listener
+/// discovery.
+#[must_use]
+pub fn agent_mail_port_holder_pids_with_hint(host: &str, port: u16) -> Vec<u32> {
+    if let Some(pid) = hinted_agent_mail_pid(host, port) {
+        return vec![pid];
+    }
+    agent_mail_port_holder_pids(port)
+}
+
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn agent_mail_pids_all_stopped(pids: &[u32]) -> bool {
+    !pids.is_empty() && pids.iter().all(|pid| pid_is_stopped(*pid))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn agent_mail_pids_all_stopped(_pids: &[u32]) -> bool {
+    false
+}
+
+fn listener_pid_hint_path(host: &str, port: u16) -> PathBuf {
+    std::env::temp_dir()
+        .join(LISTENER_PID_HINT_DIR)
+        .join(format!("{}-{port}.pid", sanitize_pid_hint_component(host)))
+}
+
+fn sanitize_pid_hint_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    if sanitized.is_empty() {
+        "host".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn read_listener_pid_hint(host: &str, port: u16) -> Option<u32> {
+    let content = std::fs::read_to_string(listener_pid_hint_path(host, port)).ok()?;
+    content.trim().parse::<u32>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn hinted_agent_mail_pid(host: &str, port: u16) -> Option<u32> {
+    let pid = read_listener_pid_hint(host, port)?;
+    if pid_is_agent_mail(pid) && pid_listens_on_port(pid, port) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hinted_agent_mail_pid(host: &str, port: u16) -> Option<u32> {
+    let _ = (host, port);
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn pid_listens_on_port(pid: u32, port: u16) -> bool {
+    let inodes = listener_socket_inodes(port);
+    if inodes.is_empty() {
+        return false;
+    }
+
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+            && inodes.contains(inode)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn pid_is_stopped(pid: u32) -> bool {
+    matches!(pid_process_state(pid), Some('T' | 't'))
+}
+
+#[cfg(target_os = "linux")]
+fn pid_process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_proc_stat_state(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_state(stat: &str) -> Option<char> {
+    let close_paren = stat.rfind(')')?;
+    stat.get(close_paren + 2..)?.chars().next()
+}
+
+#[cfg(target_os = "linux")]
+fn listener_socket_inodes(port: u16) -> BTreeSet<String> {
+    let mut inodes = BTreeSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        collect_listener_socket_inodes(path, port, &mut inodes);
+    }
+    inodes
+}
+
+#[cfg(target_os = "linux")]
+fn collect_listener_socket_inodes(path: &str, port: u16, inodes: &mut BTreeSet<String>) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in content.lines().skip(1) {
+        if let Some(inode) = parse_proc_net_listener_inode(line, port) {
+            inodes.insert(inode);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_net_listener_inode(line: &str, port: u16) -> Option<String> {
+    let columns: Vec<&str> = line.split_whitespace().collect();
+    if columns.len() <= 10 || columns[3] != "0A" {
+        return None;
+    }
+    let (_, raw_port) = columns[1].rsplit_once(':')?;
+    if u16::from_str_radix(raw_port, 16).ok()? != port {
+        return None;
+    }
+    Some(columns[9].to_string())
 }
 
 fn port_holder_pids(port: u16) -> Vec<u32> {
@@ -1345,6 +1496,34 @@ mod tests {
     fn parse_lsof_port_holder_pids_extracts_unique_pids() {
         let output = "1234\n5678\n1234\n";
         assert_eq!(parse_lsof_port_holder_pids(output), vec![1234, 5678]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_listener_inode_extracts_listening_inode() {
+        let line = "0: 3500007F:223D 00000000:0000 0A 00000000:00000000 00:00000000 00000000 990 0 74834 1 0000000000000000 100 0 0 10 5";
+        assert_eq!(
+            parse_proc_net_listener_inode(line, 8765),
+            Some("74834".to_string())
+        );
+        assert_eq!(parse_proc_net_listener_inode(line, 9000), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_stat_state_extracts_state_after_command_name() {
+        assert_eq!(parse_proc_stat_state("123 (am) T 1 2 3 4"), Some('T'));
+        assert_eq!(
+            parse_proc_stat_state("124 (am worker) t 1 2 3 4"),
+            Some('t')
+        );
+    }
+
+    #[test]
+    fn listener_pid_hint_path_sanitizes_host() {
+        let path = listener_pid_hint_path("::1", 8765);
+        let file_name = path.file_name().expect("file name");
+        assert_eq!(file_name.to_string_lossy(), "__1-8765.pid");
     }
 
     #[test]

@@ -2277,7 +2277,27 @@ fn env_var_is_truthy(name: &str) -> bool {
 ///
 /// Refuses to terminate non-Agent-Mail processes.
 fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
-    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+    use mcp_agent_mail_server::startup_checks::{
+        PortStatus, agent_mail_port_holder_pids_with_hint, check_port_status,
+    };
+    use std::net::TcpListener;
+
+    match TcpListener::bind(format!("{host}:{port}")) {
+        Ok(_listener) => return Ok(()),
+        Err(error) if error.kind() != std::io::ErrorKind::AddrInUse => {
+            eprintln!("[warn] Could not check port {port}: {error} — proceeding anyway");
+            return Ok(());
+        }
+        Err(_) => {}
+    }
+
+    let hinted_pids = agent_mail_port_holder_pids_with_hint(host, port);
+    if !hinted_pids.is_empty() {
+        eprintln!(
+            "[info] Existing Agent Mail server on {host}:{port} — stopping it to start fresh"
+        );
+        return kill_port_holder_with_pids(host, port, hinted_pids);
+    }
 
     let status = check_port_status(host, port);
     match status {
@@ -2302,32 +2322,102 @@ fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
 /// Kill Agent Mail processes holding `port` using bounded listener PID lookup.
 /// Attempts graceful termination (SIGTERM) before forceful kill (SIGKILL).
 fn kill_port_holder(host: &str, port: u16) -> CliResult<()> {
+    use mcp_agent_mail_server::startup_checks::agent_mail_port_holder_pids_with_hint;
+
+    kill_port_holder_with_pids(
+        host,
+        port,
+        agent_mail_port_holder_pids_with_hint(host, port),
+    )
+}
+
+#[cfg(unix)]
+fn send_unix_signal(pid: u32, signal: nix::sys::signal::Signal) {
+    if let Ok(raw_pid) = i32::try_from(pid) {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw_pid), signal);
+    }
+}
+
+#[cfg(unix)]
+fn send_sigterm(pid: u32) {
+    send_unix_signal(pid, nix::sys::signal::Signal::SIGTERM);
+}
+
+#[cfg(unix)]
+fn send_sigkill(pid: u32) {
+    send_unix_signal(pid, nix::sys::signal::Signal::SIGKILL);
+}
+
+#[cfg(not(unix))]
+fn send_sigterm(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-15", &pid.to_string()])
+        .status();
+}
+
+#[cfg(not(unix))]
+fn send_sigkill(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
+}
+
+/// Kill Agent Mail processes holding `port`, starting with a caller-provided PID set.
+fn kill_port_holder_with_pids(host: &str, port: u16, pids: Vec<u32>) -> CliResult<()> {
     use mcp_agent_mail_server::startup_checks::{
-        PortStatus, agent_mail_port_holder_pids, check_port_status,
+        PortStatus, agent_mail_pids_all_stopped, agent_mail_port_holder_pids_with_hint,
+        check_port_status,
     };
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    const TERM_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
+    const KILL_GRACE_TIMEOUT: Duration = Duration::from_millis(300);
+    const PORT_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    fn port_is_free(host: &str, port: u16) -> bool {
+        TcpListener::bind(format!("{host}:{port}")).is_ok()
+    }
+
+    fn wait_for_port_release(host: &str, port: u16, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if port_is_free(host, port) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            std::thread::sleep(PORT_RELEASE_POLL_INTERVAL.min(deadline - now));
+        }
+    }
 
     let mut has_kill_tool = false;
-    let pids = agent_mail_port_holder_pids(port);
     if !pids.is_empty() {
         has_kill_tool = true;
         for pid in &pids {
-            let _ = std::process::Command::new("kill")
-                .args(["-15", &pid.to_string()])
-                .status();
+            send_sigterm(*pid);
         }
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        if matches!(check_port_status(host, port), PortStatus::Free) {
+        // A stopped process cannot run TERM handlers until it is continued, so
+        // the fixed grace sleep only adds latency before the inevitable KILL.
+        let skip_term_grace = agent_mail_pids_all_stopped(&pids);
+        if (!skip_term_grace && wait_for_port_release(host, port, TERM_GRACE_TIMEOUT))
+            || (skip_term_grace && port_is_free(host, port))
+        {
             return Ok(());
         }
 
-        let remaining_pids = agent_mail_port_holder_pids(port);
+        let remaining_pids = if skip_term_grace {
+            pids.clone()
+        } else {
+            agent_mail_port_holder_pids_with_hint(host, port)
+        };
         for pid in &remaining_pids {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
+            send_sigkill(*pid);
         }
-        if !remaining_pids.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+        if !remaining_pids.is_empty() && wait_for_port_release(host, port, KILL_GRACE_TIMEOUT) {
+            return Ok(());
         }
     }
 

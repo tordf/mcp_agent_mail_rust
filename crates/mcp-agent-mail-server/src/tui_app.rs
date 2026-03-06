@@ -2484,6 +2484,11 @@ impl MailAppModel {
         self.command_palette = palette.with_style(command_palette_theme_style());
     }
 
+    fn invalidate_ambient_cache(&self) {
+        self.ambient_renderer.borrow_mut().invalidate_cached();
+        self.ambient_last_render_tick.set(None);
+    }
+
     fn theme_id_for_named_config(cfg: &str) -> ThemeId {
         crate::tui_theme::theme_id_for_config_name(cfg)
     }
@@ -2506,6 +2511,7 @@ impl MailAppModel {
         *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
         self.request_contrast_guard_pass();
         self.sync_theme_snapshot();
+        self.invalidate_ambient_cache();
         self.persist_appearance_settings();
         name
     }
@@ -2522,6 +2528,7 @@ impl MailAppModel {
         *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
         self.request_contrast_guard_pass();
         self.sync_theme_snapshot();
+        self.invalidate_ambient_cache();
         self.persist_appearance_settings();
         display
     }
@@ -3238,6 +3245,7 @@ impl MailAppModel {
                 *self.contrast_guard_cache.borrow_mut() = ContrastGuardCache::default();
                 self.request_contrast_guard_pass();
                 self.sync_theme_snapshot();
+                self.invalidate_ambient_cache();
                 self.persist_appearance_settings();
                 self.notifications.notify(
                     Toast::new(format!("Theme: {display}"))
@@ -4335,10 +4343,12 @@ impl Model for MailAppModel {
             .is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES)
             && self.ambient_last_render_tick.get() != Some(self.tick_count);
         let can_replay_cached = !should_render_ambient
-            && self
-                .ambient_renderer
-                .borrow()
-                .can_replay_cached(ambient_area, ambient_mode);
+            && self.ambient_renderer.borrow().can_replay_cached(
+                ambient_area,
+                ambient_mode,
+                tp.bg_deep,
+                frame.buffer.degradation,
+            );
         if !can_replay_cached {
             Paragraph::new("")
                 .style(Style::default().bg(tp.bg_deep))
@@ -4358,9 +4368,12 @@ impl Model for MailAppModel {
             self.ambient_render_invocations
                 .set(self.ambient_render_invocations.get().saturating_add(1));
         } else if can_replay_cached {
-            self.ambient_renderer
-                .borrow()
-                .render_cached(ambient_area, frame, ambient_mode, tp.bg_deep);
+            self.ambient_renderer.borrow().render_cached(
+                ambient_area,
+                frame,
+                ambient_mode,
+                tp.bg_deep,
+            );
         }
         let active_screen = self.screen_manager.active_screen();
         *self.last_content_area.borrow_mut() = chrome.content;

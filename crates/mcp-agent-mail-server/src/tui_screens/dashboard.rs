@@ -507,14 +507,15 @@ impl DashboardScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn ingest_db_delta_events(&mut self, state: &TuiSharedState) {
+    fn ingest_db_delta_events(&mut self, state: &TuiSharedState) -> bool {
         let Some(snapshot) = state.db_stats_snapshot() else {
-            return;
+            return false;
         };
         if snapshot.timestamp_micros <= self.last_db_snapshot_micros {
-            return;
+            return false;
         }
 
+        let mut changed = false;
         if !self.db_delta_baseline_ready {
             self.db_delta_baseline_ready = true;
             self.last_db_messages = snapshot.messages;
@@ -539,6 +540,7 @@ impl DashboardScreen {
                         self.recent_message_preview = Some(preview);
                     }
                     self.push_event_entry(format_event(&synthetic));
+                    changed = true;
                 }
                 if snapshot.file_reservations > 0 {
                     let mut path = if snapshot.file_reservations == 1 {
@@ -561,10 +563,11 @@ impl DashboardScreen {
                         "all-projects",
                     );
                     self.push_event_entry(format_event(&synthetic));
+                    changed = true;
                 }
                 self.trim_event_log();
             }
-            return;
+            return changed;
         }
 
         if snapshot.messages > self.last_db_messages {
@@ -590,6 +593,7 @@ impl DashboardScreen {
                 self.recent_message_preview = Some(preview);
             }
             self.push_event_entry(format_event(&synthetic));
+            changed = true;
         }
 
         if snapshot.file_reservations > self.last_db_reservations {
@@ -608,6 +612,7 @@ impl DashboardScreen {
             let synthetic =
                 MailEvent::reservation_granted("db-poller", vec![path], false, 0, "all-projects");
             self.push_event_entry(format_event(&synthetic));
+            changed = true;
         } else if snapshot.file_reservations < self.last_db_reservations {
             let delta = self
                 .last_db_reservations
@@ -624,12 +629,14 @@ impl DashboardScreen {
             let synthetic =
                 MailEvent::reservation_released("db-poller", vec![path], "all-projects");
             self.push_event_entry(format_event(&synthetic));
+            changed = true;
         }
 
         self.last_db_messages = snapshot.messages;
         self.last_db_reservations = snapshot.file_reservations;
         self.last_db_snapshot_micros = snapshot.timestamp_micros;
         self.trim_event_log();
+        changed
     }
 
     fn trim_event_log(&mut self) {
@@ -1311,7 +1318,9 @@ impl MailScreen for DashboardScreen {
             // Synthesize dashboard-friendly deltas from polled DB counters so
             // message/reservation movement remains visible even when no matching
             // domain events were emitted into the ring buffer.
-            self.ingest_db_delta_events(state);
+            if self.ingest_db_delta_events(state) {
+                self.invalidate_visible_cache();
+            }
             // Keep scroll offset in-bounds.
             self.clamp_scroll_offset();
         }
@@ -7076,6 +7085,28 @@ mod tests {
                 .iter()
                 .any(|entry| entry.summary.contains("top lock project beta (2)")),
             "baseline reservation summary should include top reservation project hint"
+        );
+    }
+
+    #[test]
+    fn dashboard_db_delta_events_invalidate_visible_cache() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+
+        assert_eq!(screen.visible_entries().len(), 0, "prime visible cache");
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 1,
+            timestamp_micros: 10,
+            ..Default::default()
+        });
+        screen.tick(1, &state);
+
+        assert_eq!(
+            screen.visible_entries().len(),
+            1,
+            "db-only synthetic deltas must become visible immediately"
         );
     }
 

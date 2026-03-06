@@ -24,7 +24,7 @@ use mcp_agent_mail_db::{
     is_sqlite_recovery_error_message, open_sqlite_file_with_recovery,
 };
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{DbWarmupState, TuiSharedState};
 use crate::tui_events::{
     AgentSummary, ContactSummary, DbStatSnapshot, MailEvent, ProjectSummary, ReservationSnapshot,
 };
@@ -36,7 +36,10 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Manual/test overrides are allowed to go below `MIN_POLL_INTERVAL`, but never to zero.
 const MIN_OVERRIDE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Retry snapshot-gap recovery occasionally, not every poll cycle forever.
-const RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
+/// After readiness warmup fails, let the poller retry opening `SQLite` only
+/// occasionally so degraded startup does not turn into repeated DB hammering.
+const DB_WARMUP_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum agents to fetch per poll cycle.  Raised from 50 to 500 to avoid
 /// silently truncating the agent list in large deployments (B4 truthfulness).
@@ -389,19 +392,38 @@ impl DbPoller {
             .unwrap_or(now);
         let mut panic_recovery_active = false;
         let mut connection_state: Option<PollerConnectionState> = None;
-        let mut startup_wait_applied = false;
+        let mut last_warmup_failure_retry = now
+            .checked_sub(DB_WARMUP_FAILURE_RETRY_INTERVAL)
+            .unwrap_or(now);
 
         while !self.stop.load(Ordering::Relaxed) {
-            if !startup_wait_applied && connection_state.is_none() && prev.timestamp_micros == 0 {
-                startup_wait_applied = true;
-                let _ = self.state.wait_for_db_ready(self.interval);
+            let mut allow_poll = true;
+            if connection_state.is_none() && prev.timestamp_micros == 0 {
+                match self.state.wait_for_db_warmup(self.interval) {
+                    DbWarmupState::Ready => {}
+                    DbWarmupState::Pending => {
+                        allow_poll = false;
+                    }
+                    DbWarmupState::Failed => {
+                        let now = Instant::now();
+                        if warmup_failure_retry_due(
+                            last_warmup_failure_retry,
+                            now,
+                            DB_WARMUP_FAILURE_RETRY_INTERVAL,
+                        ) {
+                            last_warmup_failure_retry = now;
+                        } else {
+                            allow_poll = false;
+                        }
+                    }
+                }
                 if self.stop.load(Ordering::Relaxed) {
                     break;
                 }
             }
             // Fetch fresh snapshot
-            let snapshot = if let Ok(snapshot) =
-                catch_optional_panic(std::panic::AssertUnwindSafe(|| {
+            let snapshot = if allow_poll {
+                if let Ok(snapshot) = catch_optional_panic(std::panic::AssertUnwindSafe(|| {
                     if connection_state.is_none() {
                         connection_state = open_poller_connection_state(&self.database_url);
                     }
@@ -409,23 +431,27 @@ impl DbPoller {
                         .as_mut()
                         .map(|state| fetch_db_stats_with_connection(state, &prev))
                 })) {
-                if panic_recovery_active {
-                    tracing::info!(
-                        "tui-db-poller recovered after a panic; resuming normal polling"
-                    );
-                    panic_recovery_active = false;
+                    if panic_recovery_active {
+                        tracing::info!(
+                            "tui-db-poller recovered after a panic; resuming normal polling"
+                        );
+                        panic_recovery_active = false;
+                    }
+                    snapshot
+                } else {
+                    if !panic_recovery_active {
+                        tracing::warn!(
+                            "tui-db-poller recovered from a panic while polling DB; keeping UI alive"
+                        );
+                        panic_recovery_active = true;
+                    }
+                    None
                 }
-                snapshot
             } else {
-                if !panic_recovery_active {
-                    tracing::warn!(
-                        "tui-db-poller recovered from a panic while polling DB; keeping UI alive"
-                    );
-                    panic_recovery_active = true;
-                }
                 None
             };
             if let Some(snapshot) = snapshot {
+                self.state.mark_db_ready();
                 let changed = snapshot_delta(&prev, &snapshot).any_changed();
                 // Always refresh shared DB stats so timestamp/list snapshots
                 // stay current even when aggregate counters are steady.
@@ -436,8 +462,11 @@ impl DbPoller {
                         .push_event(MailEvent::health_pulse(snapshot.clone()));
                     last_health_emit = Instant::now();
                 }
+                last_warmup_failure_retry = Instant::now()
+                    .checked_sub(DB_WARMUP_FAILURE_RETRY_INTERVAL)
+                    .unwrap_or_else(Instant::now);
                 prev = snapshot;
-            } else {
+            } else if allow_poll {
                 connection_state = None;
             }
 
@@ -588,23 +617,85 @@ fn fetch_db_stats_with_connection(
         && state
             .last_data_version
             .is_some_and(|previous_version| previous_version == version)
-        && !must_refresh_for_expiry
-        && !must_refresh_for_snapshot_gap
         && previous.timestamp_micros > 0
     {
-        let mut snapshot = previous.clone();
-        snapshot.timestamp_micros = now;
+        let snapshot = if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
+            refresh_reservation_time_sensitive_snapshot(state, previous, now)
+        } else {
+            let mut snapshot = previous.clone();
+            snapshot.timestamp_micros = now;
+            snapshot
+        };
+        state.last_data_version = data_version;
+        update_reservation_snapshot_gap_refresh_state(
+            state,
+            must_refresh_for_snapshot_gap,
+            &snapshot,
+            now,
+        );
         return snapshot;
     }
     let snapshot =
         DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot();
     state.last_data_version = data_version;
+    update_reservation_snapshot_gap_refresh_state(
+        state,
+        must_refresh_for_snapshot_gap,
+        &snapshot,
+        now,
+    );
+    snapshot
+}
+
+fn refresh_reservation_time_sensitive_snapshot(
+    state: &PollerConnectionState,
+    previous: &DbStatSnapshot,
+    now_micros: i64,
+) -> DbStatSnapshot {
+    let Some(bundle) =
+        try_fetch_reservation_snapshot_bundle(&state.conn, now_micros, Some(&state.sqlite_path))
+    else {
+        let mut snapshot = previous.clone();
+        snapshot.timestamp_micros = now_micros;
+        return snapshot;
+    };
+    apply_reservation_bundle_to_snapshot(previous, bundle, now_micros)
+}
+
+fn apply_reservation_bundle_to_snapshot(
+    previous: &DbStatSnapshot,
+    bundle: ReservationSnapshotBundle,
+    now_micros: i64,
+) -> DbStatSnapshot {
+    let mut snapshot = previous.clone();
+    snapshot.file_reservations = bundle.active_count;
+    for project in &mut snapshot.projects_list {
+        project.reservation_count = bundle
+            .active_counts_by_project
+            .get(&project.id)
+            .copied()
+            .unwrap_or(0);
+    }
+    snapshot.reservation_snapshots = bundle.snapshots;
+    snapshot.timestamp_micros = now_micros;
+    snapshot
+}
+
+const fn update_reservation_snapshot_gap_refresh_state(
+    state: &mut PollerConnectionState,
+    must_refresh_for_snapshot_gap: bool,
+    snapshot: &DbStatSnapshot,
+    now_micros: i64,
+) {
     if must_refresh_for_snapshot_gap {
-        state.last_reservation_snapshot_gap_refresh_micros = now;
+        state.last_reservation_snapshot_gap_refresh_micros = now_micros;
     } else if snapshot.file_reservations == 0 || !snapshot.reservation_snapshots.is_empty() {
         state.last_reservation_snapshot_gap_refresh_micros = 0;
     }
-    snapshot
+}
+
+fn warmup_failure_retry_due(last_attempt: Instant, now: Instant, retry_interval: Duration) -> bool {
+    now.duration_since(last_attempt) >= retry_interval
 }
 
 fn reservation_expiry_requires_time_refresh(previous: &DbStatSnapshot, now_micros: i64) -> bool {
@@ -1226,9 +1317,17 @@ fn fetch_reservation_snapshot_bundle(
     now: i64,
     sqlite_path: Option<&str>,
 ) -> ReservationSnapshotBundle {
+    try_fetch_reservation_snapshot_bundle(conn, now, sqlite_path).unwrap_or_default()
+}
+
+fn try_fetch_reservation_snapshot_bundle(
+    conn: &DbConn,
+    now: i64,
+    sqlite_path: Option<&str>,
+) -> Option<ReservationSnapshotBundle> {
     let scan_mode = reservation_scan_mode(conn, sqlite_path);
     if scan_mode == ReservationScanMode::ActiveFast {
-        return fetch_reservation_snapshot_bundle_fast(conn, now);
+        return try_fetch_reservation_snapshot_bundle_fast(conn, now);
     }
     let rows = match scan_mode {
         ReservationScanMode::ActiveFast => unreachable!("handled by fast-path early return"),
@@ -1242,7 +1341,7 @@ fn fetch_reservation_snapshot_bundle(
                 error = ?err,
                 "tui_poller.fetch_reservation_snapshots query failed"
             );
-            return ReservationSnapshotBundle::default();
+            return None;
         }
     };
     #[cfg(test)]
@@ -1313,14 +1412,17 @@ fn fetch_reservation_snapshot_bundle(
 
     let mut snapshots: Vec<_> = snapshots.into_iter().map(|entry| entry.snapshot).collect();
     snapshots.sort_by_key(|snapshot| (snapshot.expires_ts, snapshot.id));
-    ReservationSnapshotBundle {
+    Some(ReservationSnapshotBundle {
         active_count,
         active_counts_by_project,
         snapshots,
-    }
+    })
 }
 
-fn fetch_reservation_snapshot_bundle_fast(conn: &DbConn, now: i64) -> ReservationSnapshotBundle {
+fn try_fetch_reservation_snapshot_bundle_fast(
+    conn: &DbConn,
+    now: i64,
+) -> Option<ReservationSnapshotBundle> {
     let count_rows =
         match conn.query_sync(reservation_active_fast_counts_sql(), &[Value::BigInt(now)]) {
             Ok(rows) => rows,
@@ -1330,7 +1432,7 @@ fn fetch_reservation_snapshot_bundle_fast(conn: &DbConn, now: i64) -> Reservatio
                     error = ?err,
                     "tui_poller.fetch_reservation_snapshots count query failed"
                 );
-                return ReservationSnapshotBundle::default();
+                return None;
             }
         };
 
@@ -1353,11 +1455,11 @@ fn fetch_reservation_snapshot_bundle_fast(conn: &DbConn, now: i64) -> Reservatio
     }
 
     if MAX_RESERVATIONS == 0 || active_count == 0 {
-        return ReservationSnapshotBundle {
+        return Some(ReservationSnapshotBundle {
             active_count,
             active_counts_by_project,
             snapshots: Vec::new(),
-        };
+        });
     }
 
     let snapshot_rows = match conn.query_sync(
@@ -1371,11 +1473,11 @@ fn fetch_reservation_snapshot_bundle_fast(conn: &DbConn, now: i64) -> Reservatio
                 error = ?err,
                 "tui_poller.fetch_reservation_snapshots snapshot query failed"
             );
-            return ReservationSnapshotBundle {
+            return Some(ReservationSnapshotBundle {
                 active_count,
                 active_counts_by_project,
                 snapshots: Vec::new(),
-            };
+            });
         }
     };
 
@@ -1408,11 +1510,11 @@ fn fetch_reservation_snapshot_bundle_fast(conn: &DbConn, now: i64) -> Reservatio
         });
     }
 
-    ReservationSnapshotBundle {
+    Some(ReservationSnapshotBundle {
         active_count,
         active_counts_by_project,
         snapshots,
-    }
+    })
 }
 
 /// Fetch active file reservations with project and agent names.
@@ -2078,6 +2180,154 @@ mod tests {
             ),
             "missing-row retry should resume after the cooldown"
         );
+    }
+
+    #[test]
+    fn reservation_time_refresh_updates_only_reservation_fields() {
+        let previous = DbStatSnapshot {
+            projects: 2,
+            agents: 3,
+            messages: 5,
+            file_reservations: 2,
+            contact_links: 7,
+            ack_pending: 11,
+            agents_list: vec![AgentSummary {
+                name: "BlueLake".to_string(),
+                program: "codex".to_string(),
+                last_active_ts: 10,
+            }],
+            projects_list: vec![
+                ProjectSummary {
+                    id: 1,
+                    slug: "alpha".to_string(),
+                    human_key: "/tmp/alpha".to_string(),
+                    agent_count: 1,
+                    message_count: 3,
+                    reservation_count: 2,
+                    created_at: 10,
+                },
+                ProjectSummary {
+                    id: 2,
+                    slug: "beta".to_string(),
+                    human_key: "/tmp/beta".to_string(),
+                    agent_count: 2,
+                    message_count: 2,
+                    reservation_count: 0,
+                    created_at: 9,
+                },
+            ],
+            contacts_list: vec![ContactSummary {
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedStone".to_string(),
+                from_project_slug: "alpha".to_string(),
+                to_project_slug: "beta".to_string(),
+                status: "accepted".to_string(),
+                reason: String::new(),
+                updated_ts: 10,
+                expires_ts: None,
+            }],
+            reservation_snapshots: vec![ReservationSnapshot {
+                id: 1,
+                project_slug: "alpha".to_string(),
+                agent_name: "BlueLake".to_string(),
+                path_pattern: "src/**".to_string(),
+                exclusive: true,
+                granted_ts: 10,
+                expires_ts: 20,
+                released_ts: None,
+            }],
+            timestamp_micros: 100,
+        };
+        let bundle = ReservationSnapshotBundle {
+            active_count: 1,
+            active_counts_by_project: HashMap::from([(2, 1)]),
+            snapshots: vec![ReservationSnapshot {
+                id: 2,
+                project_slug: "beta".to_string(),
+                agent_name: "RedStone".to_string(),
+                path_pattern: "tests/**".to_string(),
+                exclusive: false,
+                granted_ts: 30,
+                expires_ts: 40,
+                released_ts: None,
+            }],
+        };
+
+        let refreshed = apply_reservation_bundle_to_snapshot(&previous, bundle, 250);
+
+        assert_eq!(refreshed.projects, previous.projects);
+        assert_eq!(refreshed.agents, previous.agents);
+        assert_eq!(refreshed.messages, previous.messages);
+        assert_eq!(refreshed.contact_links, previous.contact_links);
+        assert_eq!(refreshed.ack_pending, previous.ack_pending);
+        assert_eq!(refreshed.agents_list, previous.agents_list);
+        assert_eq!(refreshed.contacts_list, previous.contacts_list);
+        assert_eq!(refreshed.file_reservations, 1);
+        assert_eq!(refreshed.projects_list[0].reservation_count, 0);
+        assert_eq!(refreshed.projects_list[1].reservation_count, 1);
+        assert_eq!(refreshed.reservation_snapshots.len(), 1);
+        assert_eq!(refreshed.reservation_snapshots[0].id, 2);
+        assert_eq!(refreshed.timestamp_micros, 250);
+    }
+
+    #[test]
+    fn reservation_time_refresh_keeps_previous_snapshot_on_query_failure() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        let state = PollerConnectionState {
+            conn,
+            sqlite_path: ":memory:".to_string(),
+            last_data_version: None,
+            last_reservation_snapshot_gap_refresh_micros: 0,
+        };
+        let previous = DbStatSnapshot {
+            file_reservations: 2,
+            projects_list: vec![ProjectSummary {
+                id: 1,
+                slug: "alpha".to_string(),
+                human_key: "/tmp/alpha".to_string(),
+                agent_count: 1,
+                message_count: 0,
+                reservation_count: 2,
+                created_at: 10,
+            }],
+            reservation_snapshots: vec![ReservationSnapshot {
+                id: 7,
+                project_slug: "alpha".to_string(),
+                agent_name: "BlueLake".to_string(),
+                path_pattern: "src/**".to_string(),
+                exclusive: true,
+                granted_ts: 10,
+                expires_ts: 20,
+                released_ts: None,
+            }],
+            timestamp_micros: 100,
+            ..DbStatSnapshot::default()
+        };
+
+        let refreshed = refresh_reservation_time_sensitive_snapshot(&state, &previous, 250);
+
+        assert_eq!(refreshed.file_reservations, previous.file_reservations);
+        assert_eq!(refreshed.projects_list, previous.projects_list);
+        assert_eq!(
+            refreshed.reservation_snapshots,
+            previous.reservation_snapshots
+        );
+        assert_eq!(refreshed.timestamp_micros, 250);
+    }
+
+    #[test]
+    fn warmup_failure_retry_due_honors_cooldown() {
+        let base = Instant::now();
+        assert!(!warmup_failure_retry_due(
+            base,
+            base + Duration::from_secs(4),
+            Duration::from_secs(5),
+        ));
+        assert!(warmup_failure_retry_due(
+            base,
+            base + Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
     }
 
     #[test]

@@ -100,6 +100,7 @@ fs2 = "0.4"
 walkdir = "2"
 tantivy = "0.25"
 indexmap = "2"
+nix = "0.31.1"
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank
 frankensearch = { version = "0.1.0", path = "../frankensearch/frankensearch", features = ["hybrid", "rerank"] }

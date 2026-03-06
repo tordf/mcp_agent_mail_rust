@@ -757,26 +757,42 @@ impl Drop for StartupSearchBackfillResetGuard {
     }
 }
 
+fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Config) {
+    if let Err(error) = mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed(
+        &config.database_url,
+    ) {
+        tracing::warn!(
+            error = %error,
+            "[startup-search] failed to record lexical bootstrap completion"
+        );
+    }
+}
+
 fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
         Ok((indexed, _skipped)) if indexed > 0 => {
+            record_startup_search_backfill_completion(config);
             tracing::info!(
                 indexed,
                 "[startup-search] backfilled messages into Tantivy index"
             );
         }
-        Ok(_) => {} // nothing to backfill or already up-to-date
+        Ok(_) => {
+            record_startup_search_backfill_completion(config);
+        } // nothing to backfill or already up-to-date
         Err(err) => {
             tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
             if recover_startup_search_backfill_db(config, &err) {
                 match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
                     Ok((indexed, _)) if indexed > 0 => {
+                        record_startup_search_backfill_completion(config);
                         tracing::warn!(
                             indexed,
                             "[startup-search] backfill succeeded after sqlite auto-recovery"
                         );
                     }
                     Ok(_) => {
+                        record_startup_search_backfill_completion(config);
                         tracing::warn!(
                             "[startup-search] backfill completed after sqlite auto-recovery"
                         );
@@ -850,6 +866,14 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
                 "[startup-search] initialized search v3 bridge at {}",
                 index_dir.display()
             );
+            if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+                // In-memory SQLite URLs create a fresh isolated DB per connection, so
+                // startup lexical backfill cannot see the live migrated server state.
+                // Shared lexical bootstrap markers are also invalid for `:memory:`,
+                // because a later in-process memory DB would reuse the same key.
+                // Keep the bridge initialized but skip the guaranteed-failing worker.
+                return;
+            }
             // Backfill on a dedicated worker to keep first-render startup latency low.
             // Search tool semantics remain robust: this is idempotent and retries with
             // auto-recovery on recoverable sqlite failures.
@@ -962,7 +986,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
 }
 
 const HTTP_RUNTIME_MIN_WORKERS: usize = 4;
-const HTTP_RUNTIME_DEFAULT_WORKERS_CAP: usize = 32;
+const HTTP_RUNTIME_DEFAULT_WORKERS_CAP: usize = 4;
 const HTTP_RUNTIME_MAX_WORKERS: usize = 64;
 const HTTP_LISTENER_MAX_CONNECTIONS: usize = 4096;
 const HTTP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1220,8 +1244,8 @@ fn process_cpu_pct_x100(
 }
 
 fn resolve_http_runtime_worker_threads() -> usize {
-    // Use a real worker pool by default so partial/incomplete client sockets
-    // cannot monopolize a single worker and starve all MCP traffic.
+    // Use a small real worker pool by default so startup stays cheap while
+    // partial/incomplete client sockets still cannot monopolize a single worker.
     let default = std::thread::available_parallelism()
         .map_or(HTTP_RUNTIME_MIN_WORKERS, std::num::NonZeroUsize::get)
         .clamp(HTTP_RUNTIME_MIN_WORKERS, HTTP_RUNTIME_DEFAULT_WORKERS_CAP);
@@ -1416,6 +1440,35 @@ fn note_startup_integrity_probe_if_enabled(config: &mcp_agent_mail_core::Config)
     }
 }
 
+const STARTUP_READINESS_FAST_PATH_GRACE: Duration = Duration::from_secs(1);
+static STARTUP_READINESS_FAST_PATH_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+fn startup_readiness_fast_path_handle() -> &'static Mutex<Option<Instant>> {
+    STARTUP_READINESS_FAST_PATH_UNTIL.get_or_init(|| Mutex::new(None))
+}
+
+fn arm_startup_readiness_fast_path() {
+    *lock_mutex(startup_readiness_fast_path_handle()) =
+        Some(Instant::now() + STARTUP_READINESS_FAST_PATH_GRACE);
+}
+
+fn clear_startup_readiness_fast_path() {
+    *lock_mutex(startup_readiness_fast_path_handle()) = None;
+}
+
+fn startup_readiness_fast_path_active() -> bool {
+    let now = Instant::now();
+    let mut until = lock_mutex(startup_readiness_fast_path_handle());
+    match *until {
+        Some(deadline) if now <= deadline => true,
+        Some(_) => {
+            *until = None;
+            false
+        }
+        None => false,
+    }
+}
+
 fn tui_readiness_warmup_failure_message(error: &str) -> String {
     format!("TUI startup: background DB readiness warmup failed ({error})")
 }
@@ -1436,6 +1489,7 @@ fn handle_tui_readiness_warmup_result(
                 "tui readiness warmup failed; continuing with degraded DB-unavailable startup"
             );
             if let Some(state) = tui_state {
+                state.mark_db_warmup_failed();
                 state.push_console_log(tui_readiness_warmup_failure_message(&error));
             }
         }
@@ -1444,8 +1498,14 @@ fn handle_tui_readiness_warmup_result(
 
 const TUI_DEFERRED_WORKER_FIRST_PAINT_WAIT: Duration = Duration::from_millis(500);
 const TUI_DEFERRED_WORKER_DB_GRACE: Duration = Duration::from_secs(2);
+const TUI_DEFERRED_WORKER_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+const TUI_ADVISORY_CONSISTENCY_IDLE_GRACE: Duration = Duration::from_secs(15);
 
-fn start_tui_deferred_background_workers(config: &mcp_agent_mail_core::Config) {
+fn start_tui_non_db_background_workers(config: &mcp_agent_mail_core::Config) {
+    disk_monitor::start(config);
+}
+
+fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config) {
     init_search_bridge(config);
     cleanup::start(config);
     ack_ttl::start(config);
@@ -1455,36 +1515,104 @@ fn start_tui_deferred_background_workers(config: &mcp_agent_mail_core::Config) {
         integrity_guard::defer_next_proactive_backup();
     }
     integrity_guard::start(config);
-    disk_monitor::start(config);
-    start_advisory_consistency_probe(config);
+}
+
+fn wait_for_tui_first_paint(tui_state: &Arc<tui_bridge::TuiSharedState>) -> bool {
+    if tui_state.wait_for_first_paint(TUI_DEFERRED_WORKER_FIRST_PAINT_WAIT) {
+        return true;
+    }
+    tracing::debug!("TUI deferred workers still waiting for first paint");
+    while !tui_state.is_shutdown_requested() {
+        if tui_state.wait_for_first_paint(TUI_DEFERRED_WORKER_RECHECK_INTERVAL) {
+            return true;
+        }
+    }
+    false
+}
+
+fn wait_for_tui_db_readiness(tui_state: &Arc<tui_bridge::TuiSharedState>) -> bool {
+    let mut state = tui_state.wait_for_db_warmup(TUI_DEFERRED_WORKER_DB_GRACE);
+    if state == tui_bridge::DbWarmupState::Ready {
+        return true;
+    }
+    tracing::info!(
+        db_warmup = ?state,
+        "TUI deferred DB workers are waiting for a real DB-ready outcome"
+    );
+    while !tui_state.is_shutdown_requested() {
+        match state {
+            tui_bridge::DbWarmupState::Ready => return true,
+            tui_bridge::DbWarmupState::Pending => {
+                if tui_state.wait_for_db_ready(TUI_DEFERRED_WORKER_RECHECK_INTERVAL) {
+                    return true;
+                }
+            }
+            tui_bridge::DbWarmupState::Failed => {
+                if sleep_with_tui_shutdown(tui_state, TUI_DEFERRED_WORKER_RECHECK_INTERVAL) {
+                    return false;
+                }
+            }
+        }
+        state = tui_state.db_warmup_state();
+    }
+    false
+}
+
+fn sleep_with_tui_shutdown(
+    tui_state: &Arc<tui_bridge::TuiSharedState>,
+    duration: Duration,
+) -> bool {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if tui_state.is_shutdown_requested() {
+            return true;
+        }
+        let chunk = remaining.min(Duration::from_secs(1));
+        std::thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    tui_state.is_shutdown_requested()
 }
 
 fn spawn_tui_deferred_background_workers(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    let config = config.clone();
-    let tui_state = Arc::clone(tui_state);
+    let inline_config = config.clone();
+    let inline_tui_state = Arc::clone(tui_state);
+    let worker_config = inline_config.clone();
+    let worker_tui_state = Arc::clone(&inline_tui_state);
     match std::thread::Builder::new()
         .name("tui-deferred-workers".into())
         .spawn(move || {
-            let _ = tui_state.wait_for_first_paint(TUI_DEFERRED_WORKER_FIRST_PAINT_WAIT);
-            if tui_state.is_shutdown_requested() {
+            if !wait_for_tui_first_paint(&worker_tui_state) {
                 return;
             }
-            let _ = tui_state.wait_for_db_ready(TUI_DEFERRED_WORKER_DB_GRACE);
-            if tui_state.is_shutdown_requested() {
+            start_tui_non_db_background_workers(&worker_config);
+            if !wait_for_tui_db_readiness(&worker_tui_state) {
                 return;
             }
-            start_tui_deferred_background_workers(&config);
+            start_tui_db_background_workers(&worker_config);
+            if sleep_with_tui_shutdown(&worker_tui_state, TUI_ADVISORY_CONSISTENCY_IDLE_GRACE) {
+                return;
+            }
+            start_advisory_consistency_probe(&worker_config);
         }) {
         Ok(handle) => Some(handle),
         Err(error) => {
             tracing::warn!(
                 error = %error,
-                "failed to spawn deferred TUI worker starter; starting background workers inline"
+                "failed to spawn deferred TUI worker starter; starting deferred workers inline"
             );
-            start_tui_deferred_background_workers(&config);
+            start_tui_non_db_background_workers(&inline_config);
+            if !inline_tui_state.db_ready() {
+                tracing::warn!(
+                    db_warmup = ?inline_tui_state.db_warmup_state(),
+                    "deferred TUI worker thread unavailable; starting DB workers without startup gating"
+                );
+            }
+            start_tui_db_background_workers(&inline_config);
+            start_advisory_consistency_probe(&inline_config);
             None
         }
     }
@@ -1496,13 +1624,17 @@ fn spawn_tui_readiness_warmup(
 ) {
     let config = config.clone();
     let tui_state = Arc::clone(tui_state);
+    let failure_tui_state = Arc::clone(&tui_state);
     if let Err(error) = std::thread::Builder::new()
         .name("tui-readiness-warmup".into())
         .spawn(move || {
             handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check_quick(&config));
         })
     {
-        handle_tui_readiness_warmup_result(None, Err(format!("spawn failed: {error}")));
+        handle_tui_readiness_warmup_result(
+            Some(&failure_tui_state),
+            Err(format!("spawn failed: {error}")),
+        );
     }
 }
 
@@ -1513,6 +1645,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     mcp_agent_mail_core::pre_intern_policies();
 
     prepare_http_runtime_startup(config)?;
+    let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     heal_storage_lock_artifacts(config);
     init_search_bridge(config);
     mcp_agent_mail_storage::wbq_start();
@@ -1528,11 +1661,13 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     start_advisory_consistency_probe(config);
     let dashboard = StartupDashboard::maybe_start(config);
     set_dashboard_handle(dashboard.clone());
+    arm_startup_readiness_fast_path();
 
     // Keep headless HTTP (`serve --no-tui`) under the same supervised restart
     // policy as the TUI path so long-lived operator sessions self-heal from
     // transport starvation or listener crashes.
     let result = run_http_headless_supervisor(config.clone());
+    clear_startup_readiness_fast_path();
 
     retention::shutdown();
     tool_metrics::shutdown();
@@ -1581,6 +1716,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
+    let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
 
     // ── 2. Pre-paint essentials only ────────────────────────────────
     heal_storage_lock_artifacts(config);
@@ -4494,6 +4630,16 @@ impl HttpState {
             "/health" | "/health/readiness" => {
                 if !matches!(req.method, Http1Method::Get) {
                     return Some(self.error_response(req, 405, "Method Not Allowed"));
+                }
+                // Headless HTTP startup already completed full readiness preflight
+                // before binding. During the first startup second, avoid rebuilding
+                // a fresh one-connection readiness pool on every probe.
+                if startup_readiness_fast_path_active() {
+                    return Some(self.json_response(
+                        req,
+                        200,
+                        &serde_json::json!({"status":"ready"}),
+                    ));
                 }
                 if let Err(err) = readiness_check_quick(&self.config) {
                     return Some(self.error_response(req, 503, &err));
@@ -7592,6 +7738,43 @@ mod tests {
         handle_tui_readiness_warmup_result(Some(&state), Ok(()));
 
         assert!(state.console_log_since(0).is_empty());
+        assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Ready);
+    }
+
+    #[test]
+    fn tui_readiness_warmup_failure_marks_failed_state() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+
+        handle_tui_readiness_warmup_result(Some(&state), Err("boom".to_string()));
+
+        assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Failed);
+    }
+
+    #[test]
+    fn init_search_bridge_skips_startup_backfill_for_memory_db() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: temp.path().join("storage"),
+            ..mcp_agent_mail_core::Config::default()
+        };
+
+        init_search_bridge(&config);
+
+        assert!(config.storage_root.join("search_index").exists());
+        assert!(
+            !STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire),
+            "memory-backed startup should not spawn lexical backfill worker"
+        );
     }
 
     #[test]
