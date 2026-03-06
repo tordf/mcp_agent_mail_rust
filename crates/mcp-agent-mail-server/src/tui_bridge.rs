@@ -339,7 +339,7 @@ pub struct TuiSharedState {
     /// Per-screen diagnostics snapshots, keyed by insertion sequence.
     screen_diagnostics: Mutex<VecDeque<(u64, ScreenDiagnosticSnapshot)>>,
     screen_diagnostic_seq: AtomicU64,
-    /// Generation counter bumped on each `update_db_stats` call.
+    /// Generation counter bumped when `update_db_stats` changes semantic DB content.
     db_stats_gen: AtomicU64,
     /// Generation counter bumped on each `record_request` call.
     request_gen: AtomicU64,
@@ -514,9 +514,12 @@ impl TuiSharedState {
             .db_stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let semantic_change = db_stats_semantically_changed(&current, &stats);
         *current = stats;
         drop(current);
-        self.db_stats_gen.fetch_add(1, Ordering::Relaxed);
+        if semantic_change {
+            self.db_stats_gen.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn request_shutdown(&self) {
@@ -553,6 +556,23 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[must_use]
+    pub fn tui_effects_enabled(&self) -> bool {
+        self.config_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tui_effects
+    }
+
+    #[must_use]
+    pub fn transport_mode_label(&self) -> &'static str {
+        let guard = self
+            .config_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.transport_mode()
     }
 
     pub fn update_config_snapshot(&self, snapshot: ConfigSnapshot) {
@@ -863,6 +883,19 @@ impl TuiSharedState {
         drop(diagnostics);
         result
     }
+}
+
+fn db_stats_semantically_changed(previous: &DbStatSnapshot, next: &DbStatSnapshot) -> bool {
+    previous.projects != next.projects
+        || previous.agents != next.agents
+        || previous.messages != next.messages
+        || previous.file_reservations != next.file_reservations
+        || previous.contact_links != next.contact_links
+        || previous.ack_pending != next.ack_pending
+        || previous.agents_list != next.agents_list
+        || previous.projects_list != next.projects_list
+        || previous.contacts_list != next.contacts_list
+        || previous.reservation_snapshots != next.reservation_snapshots
 }
 
 #[cfg(test)]
@@ -1779,13 +1812,35 @@ mod tests {
     }
 
     #[test]
-    fn data_generation_db_stats_bumps_counter() {
+    fn data_generation_db_stats_bumps_counter_on_semantic_change() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         let gen_before = state.data_generation();
-        state.update_db_stats(crate::tui_bridge::DbStatSnapshot::default());
+        state.update_db_stats(crate::tui_bridge::DbStatSnapshot {
+            projects: 1,
+            ..crate::tui_bridge::DbStatSnapshot::default()
+        });
         let gen_after = state.data_generation();
         assert!(gen_after.db_stats_gen > gen_before.db_stats_gen);
+    }
+
+    #[test]
+    fn data_generation_db_stats_ignores_timestamp_only_refresh() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_bridge::DbStatSnapshot {
+            projects: 1,
+            timestamp_micros: 10,
+            ..crate::tui_bridge::DbStatSnapshot::default()
+        });
+        let gen_before = state.data_generation();
+        state.update_db_stats(crate::tui_bridge::DbStatSnapshot {
+            projects: 1,
+            timestamp_micros: 20,
+            ..crate::tui_bridge::DbStatSnapshot::default()
+        });
+        let gen_after = state.data_generation();
+        assert_eq!(gen_after.db_stats_gen, gen_before.db_stats_gen);
     }
 
     #[test]

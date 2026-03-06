@@ -1187,6 +1187,11 @@ impl ScreenManager {
         Some(screen.as_mut())
     }
 
+    fn existing_mut(&mut self, id: MailScreenId) -> Option<&mut (dyn MailScreen + '_)> {
+        let screen = self.screens.get_mut(&id)?;
+        Some(screen.as_mut())
+    }
+
     fn active_screen_ref(&self) -> Option<&dyn MailScreen> {
         self.get(self.active_screen)
     }
@@ -1206,6 +1211,15 @@ impl ScreenManager {
     #[cfg(test)]
     fn has_screen(&self, id: MailScreenId) -> bool {
         self.screens.contains_key(&id)
+    }
+
+    #[must_use]
+    fn materialized_screen_ids(&self) -> Vec<MailScreenId> {
+        ALL_SCREEN_IDS
+            .iter()
+            .copied()
+            .filter(|id| self.screens.contains_key(id))
+            .collect()
     }
 }
 
@@ -3552,7 +3566,7 @@ impl MailAppModel {
             return;
         }
         let tick_state = &self.state;
-        let result = self.screen_manager.get_mut(id).map(|screen| {
+        let result = self.screen_manager.existing_mut(id).map(|screen| {
             catch_unwind(AssertUnwindSafe(|| {
                 screen.tick(tick_count, tick_state);
             }))
@@ -4316,7 +4330,7 @@ impl Model for MailAppModel {
         Paragraph::new("")
             .style(Style::default().bg(tp.bg_deep))
             .render(area, frame);
-        let effects_enabled = self.state.config_snapshot().tui_effects;
+        let effects_enabled = self.state.tui_effects_enabled();
         // Throttle ambient effects to every Nth frame.  At 10fps with N=2
         // the animation updates at ~5 fps.  On intervening frames,
         // render_cached replays the previous buffer so the diff engine only
@@ -4702,9 +4716,14 @@ fn spawn_browser_for_url(url: &str) -> std::io::Result<()> {
 
 impl ScreenTickDispatch for MailAppModel {
     fn screen_ids(&self) -> Vec<String> {
-        ALL_SCREEN_IDS
-            .iter()
-            .map(|&id| screen_tick_key(id).to_string())
+        // Expose only materialized screens to the runtime tick strategy.
+        // Otherwise periodic background ticks instantiate hidden screens,
+        // which can start workers and side effects before the operator ever
+        // visits them.
+        self.screen_manager
+            .materialized_screen_ids()
+            .into_iter()
+            .map(|id| screen_tick_key(id).to_string())
             .collect()
     }
 
@@ -11287,6 +11306,40 @@ mod tests {
         let mut model = test_model();
         ftui_runtime::tick_strategy::ScreenTickDispatch::tick_screen(&mut model, "unknown", 7);
         assert!(model.screen_panics.borrow().is_empty());
+    }
+
+    #[test]
+    fn screen_tick_dispatch_only_reports_materialized_screens() {
+        let mut model = test_model();
+        let screen_ids = ftui_runtime::tick_strategy::ScreenTickDispatch::screen_ids(&model);
+        assert_eq!(
+            screen_ids,
+            vec![screen_tick_key(MailScreenId::Dashboard).to_string()]
+        );
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
+        let screen_ids = ftui_runtime::tick_strategy::ScreenTickDispatch::screen_ids(&model);
+        assert_eq!(
+            screen_ids,
+            vec![
+                screen_tick_key(MailScreenId::Dashboard).to_string(),
+                screen_tick_key(MailScreenId::Messages).to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn screen_tick_dispatch_does_not_materialize_hidden_screens() {
+        let mut model = test_model();
+        assert!(!model.screen_manager.has_screen(MailScreenId::Messages));
+
+        ftui_runtime::tick_strategy::ScreenTickDispatch::tick_screen(
+            &mut model,
+            screen_tick_key(MailScreenId::Messages),
+            5,
+        );
+
+        assert!(!model.screen_manager.has_screen(MailScreenId::Messages));
     }
 
     #[test]

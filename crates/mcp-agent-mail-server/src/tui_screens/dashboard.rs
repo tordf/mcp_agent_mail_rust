@@ -3,7 +3,7 @@
 //! Displays real-time stats, a live event log, and health alarms in a
 //! responsive layout that adapts from 80×24 to 200×50+.
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -737,18 +737,20 @@ impl DashboardScreen {
     /// Return cached tool latency aggregation. Only recomputes when visible
     /// entries change (event count) or query terms change. Avoids 10+
     /// redundant O(N log N) aggregation+sort passes per frame.
-    fn cached_tool_latency_rows(&self, entries: &[&EventEntry]) -> Vec<ToolLatencyRow> {
-        let query_terms = self.cached_parsed_query_terms();
+    fn cached_tool_latency_rows(&self, entries: &[&EventEntry]) -> Ref<'_, [ToolLatencyRow]> {
         let entry_count = entries.len();
-        {
+        let needs_refresh = {
             let cache = self.cached_tool_latency.borrow();
-            if cache.0 == entry_count {
-                return cache.1.clone();
-            }
+            cache.0 != entry_count
+        };
+        if needs_refresh {
+            let query_terms = self.cached_parsed_query_terms();
+            let rows = compute_tool_latency_rows(entries, &query_terms);
+            *self.cached_tool_latency.borrow_mut() = (entry_count, rows);
         }
-        let rows = compute_tool_latency_rows(entries, &query_terms);
-        *self.cached_tool_latency.borrow_mut() = (entry_count, rows.clone());
-        rows
+        Ref::map(self.cached_tool_latency.borrow(), |cache| {
+            cache.1.as_slice()
+        })
     }
 
     fn quick_query(&self) -> &str {
@@ -827,12 +829,13 @@ impl DashboardScreen {
     }
 
     /// Detect anomalies from current state.
-    #[allow(clippy::cast_precision_loss, clippy::unused_self)]
-    fn detect_anomalies(&self, state: &TuiSharedState) -> Vec<DetectedAnomaly> {
+    fn detect_anomalies_from_samples(
+        &self,
+        counters: crate::tui_bridge::RequestCounters,
+        db: &DbStatSnapshot,
+        ring: crate::tui_events::EventRingStats,
+    ) -> Vec<DetectedAnomaly> {
         let mut out = Vec::new();
-        let counters = state.request_counters();
-        let db = state.db_stats_snapshot().unwrap_or_default();
-        let ring = state.event_ring_stats();
 
         // Ack pending anomaly.
         if db.ack_pending >= ACK_PENDING_HIGH {
@@ -899,6 +902,14 @@ impl DashboardScreen {
         }
 
         out
+    }
+
+    #[allow(clippy::cast_precision_loss, clippy::unused_self)]
+    fn detect_anomalies(&self, state: &TuiSharedState) -> Vec<DetectedAnomaly> {
+        let counters = state.request_counters();
+        let db = state.db_stats_snapshot().unwrap_or_default();
+        let ring = state.event_ring_stats();
+        self.detect_anomalies_from_samples(counters, &db, ring)
     }
 
     /// Compute approximate percentiles from sparkline data.
@@ -1342,8 +1353,14 @@ impl MailScreen for DashboardScreen {
                 }
             }
 
-            // Compute anomalies
-            self.anomalies = self.detect_anomalies(state);
+            // Compute anomalies from the live in-memory snapshot to avoid
+            // cloning the full DB summary on every stat tick.
+            let counters = state.request_counters();
+            self.anomalies = self.detect_anomalies_from_samples(
+                counters,
+                &self.current_db_stats,
+                state.event_ring_stats(),
+            );
 
             // Track latency percentiles
             if !self.sparkline_data.is_empty() {
@@ -1356,7 +1373,6 @@ impl MailScreen for DashboardScreen {
             }
 
             // Track throughput (delta requests since last stat tick)
-            let counters = state.request_counters();
             let delta = counters.total.saturating_sub(self.prev_req_total);
             self.throughput_history.push(delta as f64);
             if self.throughput_history.len() > THROUGHPUT_HISTORY_CAP {
@@ -1380,12 +1396,9 @@ impl MailScreen for DashboardScreen {
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         let tp = crate::tui_theme::TuiThemePalette::current();
-        // Hard clear every frame to prevent stale border/text artifacts when
-        // switching layouts, resizing, or toggling dense 6k panel compositions.
-        fill_rect(frame, area, tp.bg_deep);
         let tc = TerminalClass::from_rect(area);
         let density = DensityHint::from_terminal_class(tc);
-        let effects_enabled = state.config_snapshot().tui_effects;
+        let effects_enabled = state.tui_effects_enabled();
         let visible_entries = self.visible_entries();
         self.emit_screen_diagnostic(state, visible_entries.len());
         let quick_query = self.quick_query();
@@ -1453,10 +1466,12 @@ impl MailScreen for DashboardScreen {
         }
 
         // Main: dense adaptive dashboard composition.
+        let default_db_snapshot;
         let db_snapshot = if self.current_db_stats.timestamp_micros > 0 {
-            self.current_db_stats.clone()
+            &self.current_db_stats
         } else {
-            state.db_stats_snapshot().unwrap_or_default()
+            default_db_snapshot = state.db_stats_snapshot().unwrap_or_default();
+            &default_db_snapshot
         };
         let force_dense_surface = mega_dense_surface
             || (should_force_dense_dashboard_surface(main_area) && dense_activity);
@@ -1492,7 +1507,7 @@ impl MailScreen for DashboardScreen {
             &self.quick_query_input,
             self.quick_query_active,
             quick_query,
-            &db_snapshot,
+            db_snapshot,
             &visible_entries,
             self.scroll_offset,
             self.auto_follow,
@@ -1509,7 +1524,7 @@ impl MailScreen for DashboardScreen {
             render_insight_rail(
                 frame,
                 trend_rect,
-                &db_snapshot,
+                db_snapshot,
                 quick_query,
                 &self.anomalies,
                 &visible_entries,
@@ -1525,7 +1540,7 @@ impl MailScreen for DashboardScreen {
                 frame,
                 preview_rect,
                 quick_query,
-                &db_snapshot,
+                db_snapshot,
                 &visible_entries,
                 preview,
                 &latency_rows,
@@ -2109,22 +2124,6 @@ const fn event_log_columns_for_width(width: u16) -> usize {
         2
     } else {
         1
-    }
-}
-
-fn fill_rect(frame: &mut Frame<'_>, area: Rect, bg: PackedRgba) {
-    if area.is_empty() {
-        return;
-    }
-    let fg = crate::tui_theme::TuiThemePalette::current().text_primary;
-    for y in area.y..area.y.saturating_add(area.height) {
-        for x in area.x..area.x.saturating_add(area.width) {
-            if let Some(cell) = frame.buffer.get_mut(x, y) {
-                *cell = ftui::Cell::from_char(' ');
-                cell.fg = fg;
-                cell.bg = bg;
-            }
-        }
     }
 }
 
@@ -5674,8 +5673,8 @@ fn render_event_log(
 
     if event_cols > 1 {
         let lines = rendered_lines
-            .iter()
-            .map(|line| Line::styled(line.clone(), Style::default().fg(tp.text_primary)))
+            .into_iter()
+            .map(|line| Line::styled(line, Style::default().fg(tp.text_primary)))
             .collect::<Vec<_>>();
         render_lines_with_columns(frame, viewer_area, &lines, 48, event_cols);
         return;
@@ -5684,13 +5683,8 @@ fn render_event_log(
     let mut pane = viewer.borrow_mut();
     pane.clear();
     let styled_lines = rendered_lines
-        .iter()
-        .map(|line| {
-            Text::from_line(Line::styled(
-                line.clone(),
-                Style::default().fg(tp.text_primary),
-            ))
-        })
+        .into_iter()
+        .map(|line| Text::from_line(Line::styled(line, Style::default().fg(tp.text_primary))))
         .collect::<Vec<_>>();
     pane.push_many(styled_lines);
     pane.scroll_to_bottom();

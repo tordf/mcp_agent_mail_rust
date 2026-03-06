@@ -611,7 +611,7 @@ fn plan_status_segments(
     let counters = state.request_counters();
     let uptime = state.uptime();
     let meta = screen_meta(active);
-    let transport_mode = state.config_snapshot().transport_mode();
+    let transport_mode = state.transport_mode_label();
     let tp = crate::tui_theme::TuiThemePalette::current();
 
     // Uptime formatting
@@ -745,7 +745,7 @@ fn plan_status_segments(
     }
 
     // Effects-off indicator (High priority — user-activated toggle)
-    if !state.config_snapshot().tui_effects {
+    if !state.tui_effects_enabled() {
         right.push(StatusSegment {
             priority: StatusPriority::High,
             role: StatusRole::Normal,
@@ -897,7 +897,7 @@ pub fn render_status_line(
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(16);
     let mut effect_overlays: Vec<(u16, u16, StatusEffect, PackedRgba, String)> = Vec::new();
     let mut cursor_x = area.x;
-    let effects_enabled = state.config_snapshot().tui_effects && !accessibility.reduced_motion;
+    let effects_enabled = state.tui_effects_enabled() && !accessibility.reduced_motion;
     let animation_time = state.uptime().as_secs_f64();
 
     // Left segments
