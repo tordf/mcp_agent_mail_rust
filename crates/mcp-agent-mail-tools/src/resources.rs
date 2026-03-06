@@ -143,12 +143,47 @@ async fn resolve_resource_agent(
     project_id: i64,
     agent_name: &str,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
-    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await {
-        Outcome::Ok(agent) => Ok(agent),
-        Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => Err(McpError::new(
+    let conn = match pool.acquire(ctx.cx()).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(err) => return Err(McpError::internal_error(err.to_string())),
+        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+        Outcome::Panicked(panic) => {
+            return Err(McpError::internal_error(format!(
+                "Internal panic: {}",
+                panic.message()
+            )));
+        }
+    };
+    let rows = conn
+        .query_sync(
+            "SELECT id FROM agents \
+             WHERE project_id = ? AND name = ? COLLATE NOCASE \
+             ORDER BY id ASC LIMIT 2",
+            &[
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id),
+                mcp_agent_mail_db::sqlmodel::Value::Text(agent_name.to_string()),
+            ],
+        )
+        .map_err(|err| McpError::internal_error(err.to_string()))?;
+
+    if rows.len() > 1 {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!(
+                "Ambiguous agent name '{agent_name}' in project {project_id}; run `am migrate` to deduplicate legacy case-duplicate rows"
+            ),
+        ));
+    }
+
+    let Some(agent_id) = rows.first().and_then(|row| row.get_named::<i64>("id").ok()) else {
+        return Err(McpError::new(
             McpErrorCode::InvalidParams,
             "Agent not found",
-        )),
+        ));
+    };
+
+    match mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), pool, agent_id).await {
+        Outcome::Ok(agent) => Ok(agent),
         Outcome::Err(err) => Err(McpError::internal_error(err.to_string())),
         Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
         Outcome::Panicked(p) => Err(McpError::internal_error(format!(

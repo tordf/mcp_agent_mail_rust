@@ -790,6 +790,70 @@ fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), C
     }
 }
 
+fn split_resource_path_and_query(
+    uri: &str,
+) -> Result<(String, std::collections::HashMap<String, String>), CliError> {
+    let path = uri.strip_prefix("resource://").ok_or_else(|| {
+        CliError::InvalidArgument(format!("invalid URI scheme: {uri} (expected resource://)"))
+    })?;
+    if let Some((base, query)) = path.split_once('?') {
+        Ok((
+            percent_decode_resource_component(base),
+            parse_resource_query(query),
+        ))
+    } else {
+        Ok((
+            percent_decode_resource_component(path),
+            std::collections::HashMap::new(),
+        ))
+    }
+}
+
+fn parse_resource_query(query: &str) -> std::collections::HashMap<String, String> {
+    let mut params = std::collections::HashMap::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        params.insert(
+            percent_decode_resource_component(key),
+            percent_decode_resource_component(value),
+        );
+    }
+    params
+}
+
+fn percent_decode_resource_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    && let Ok(value) = u8::from_str_radix(hex, 16)
+                {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Resolve agent ID from --agent flag or AGENT_MAIL_AGENT/AGENT_NAME env vars.
 fn resolve_agent_id(
     conn: &DbConn,
@@ -2839,9 +2903,14 @@ fn build_navigate(
     project_slug: &str,
     _agent: Option<(i64, String)>,
 ) -> Result<(NavigateResult, Option<String>), CliError> {
-    let path = uri.strip_prefix("resource://").ok_or_else(|| {
-        CliError::InvalidArgument(format!("invalid URI scheme: {uri} (expected resource://)"))
-    })?;
+    let (path, query) = split_resource_path_and_query(uri)?;
+    let (effective_project_id, effective_project_slug) = query
+        .get("project")
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(
+            || Ok((project_id, project_slug.to_string())),
+            |project| resolve_project_sync(conn, project),
+        )?;
 
     let parts: Vec<&str> = path.split('/').collect();
 
@@ -2893,12 +2962,12 @@ fn build_navigate(
         }
         ["inbox", agent_name] => {
             // Resolve agent and get inbox using simplified direct query
-            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name))?;
+            let agent_opt = resolve_agent_id(conn, effective_project_id, Some(agent_name))?;
             if let Some((agent_id, name)) = agent_opt {
                 let result = build_inbox(
                     conn,
-                    project_id,
-                    project_slug,
+                    effective_project_id,
+                    &effective_project_slug,
                     agent_id,
                     &name,
                     false,
@@ -2922,11 +2991,18 @@ fn build_navigate(
             let msg_id: i64 = id_str
                 .parse()
                 .map_err(|_| CliError::InvalidArgument(format!("invalid message id: {id_str}")))?;
-            let message = build_message(conn, project_id, msg_id)?;
+            let message = build_message(conn, effective_project_id, msg_id)?;
             Ok((NavigateResult::Message { message }, None))
         }
         ["thread", thread_id] => {
-            let thread = build_thread(conn, project_id, thread_id, Some(100), None, false)?;
+            let thread = build_thread(
+                conn,
+                effective_project_id,
+                thread_id,
+                Some(100),
+                None,
+                false,
+            )?;
             Ok((NavigateResult::Thread { thread }, None))
         }
         ["file_reservations", slug] => {
@@ -2974,12 +3050,12 @@ fn build_navigate(
             ))
         }
         ["mailbox", agent_name] => {
-            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name))?;
+            let agent_opt = resolve_agent_id(conn, effective_project_id, Some(agent_name))?;
             if let Some((agent_id, name)) = agent_opt {
                 let result = build_inbox(
                     conn,
-                    project_id,
-                    project_slug,
+                    effective_project_id,
+                    &effective_project_slug,
                     agent_id,
                     &name,
                     false,
@@ -3000,9 +3076,10 @@ fn build_navigate(
             }
         }
         ["outbox", agent_name] => {
-            let agent_opt = resolve_agent_id(conn, project_id, Some(agent_name))?;
+            let agent_opt = resolve_agent_id(conn, effective_project_id, Some(agent_name))?;
             if let Some((agent_id, _name)) = agent_opt {
-                let entries = build_outbox_entries(conn, project_id, agent_id, 50, false)?;
+                let entries =
+                    build_outbox_entries(conn, effective_project_id, agent_id, 50, false)?;
                 Ok((NavigateResult::Inbox { entries }, None))
             } else {
                 Ok((NavigateResult::Inbox { entries: vec![] }, None))
@@ -5447,6 +5524,104 @@ mod tests {
                     entries[0].ack_status, "partial (1/2)",
                     "partial ack should show fractional status"
                 );
+            }
+            other => panic!("unexpected navigate result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_navigate_honors_project_query_parameter() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_navigate_project_query.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                thread_id TEXT,
+                importance TEXT NOT NULL,
+                ack_required INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                body_md TEXT
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create message_recipients");
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES \
+             (1, 'wrong', '/tmp/wrong'), \
+             (2, 'proj', '/tmp/proj')",
+            &empty,
+        )
+        .expect("insert projects");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 2, 'Sender'), (2, 2, 'Recipient')",
+            &empty,
+        )
+        .expect("insert agents");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md)
+             VALUES (10, 2, 1, 'sent by sender', 'th-1', 'normal', 0, 1000, 'body a')",
+            &empty,
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (1, 10, 2, 'to', NULL, NULL)",
+            &empty,
+        )
+        .expect("insert recipient");
+
+        let (result, _action) = build_navigate(
+            &conn,
+            "resource://outbox/Sender?project=/tmp/proj",
+            1,
+            "wrong",
+            None,
+        )
+        .expect("navigate");
+
+        match result {
+            NavigateResult::Inbox { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].id, 10);
+                assert_eq!(entries[0].subject, "sent by sender");
             }
             other => panic!("unexpected navigate result: {other:?}"),
         }

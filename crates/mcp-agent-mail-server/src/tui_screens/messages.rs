@@ -2644,13 +2644,16 @@ impl MessageBrowserScreen {
                     _ => return None,
                 };
 
-                // If there's a query, filter by it
-                if !query_lower.is_empty() {
-                    let haystack =
-                        format!("{from} {subject} {} {body_md}", to.join(" ")).to_lowercase();
-                    if !haystack.contains(&query_lower) {
-                        return None;
-                    }
+                if !live_message_event_matches_query(
+                    from,
+                    to,
+                    subject,
+                    thread_id,
+                    project,
+                    body_md,
+                    &query_lower,
+                ) {
+                    return None;
                 }
 
                 Some(MessageEntry {
@@ -3006,6 +3009,15 @@ impl MailScreen for MessageBrowserScreen {
                 self.debounce_remaining -= 1;
             } else {
                 self.execute_search(state);
+            }
+        }
+
+        if self.search_method == SearchMethod::Live {
+            let should_retry_db = self.last_refresh.is_none_or(|t| t.elapsed().as_secs() >= 5);
+            if should_retry_db {
+                self.db_conn_attempted = false;
+                self.search_dirty = true;
+                self.debounce_remaining = 0;
             }
         }
 
@@ -4346,6 +4358,32 @@ fn stable_hash<T: Hash>(value: T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn contains_case_insensitive(text: &str, query_lower: &str) -> bool {
+    text.to_lowercase().contains(query_lower)
+}
+
+fn live_message_event_matches_query(
+    from: &str,
+    to: &[String],
+    subject: &str,
+    thread_id: &str,
+    project: &str,
+    body_md: &str,
+    query_lower: &str,
+) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    contains_case_insensitive(from, query_lower)
+        || contains_case_insensitive(subject, query_lower)
+        || contains_case_insensitive(thread_id, query_lower)
+        || contains_case_insensitive(project, query_lower)
+        || to
+            .iter()
+            .any(|recipient| contains_case_insensitive(recipient, query_lower))
+        || contains_case_insensitive(body_md, query_lower)
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
@@ -7761,6 +7799,27 @@ mod tests {
         // show_project flag propagates
         let with_proj = MessageBrowserScreen::search_live_events(&state, "", true);
         assert!(with_proj.iter().all(|r| r.show_project));
+    }
+
+    #[test]
+    fn live_search_retry_marks_degraded_search_dirty_after_interval() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_input.set_value("stuck");
+        screen.search_dirty = false;
+        screen.search_method = SearchMethod::Live;
+        screen.db_conn_attempted = true;
+        screen.last_refresh = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(6))
+                .unwrap_or_else(Instant::now),
+        );
+
+        screen.tick(1, &state);
+
+        assert!(screen.search_dirty);
+        assert_eq!(screen.debounce_remaining, 0);
+        assert!(!screen.db_conn_attempted);
     }
 
     #[test]

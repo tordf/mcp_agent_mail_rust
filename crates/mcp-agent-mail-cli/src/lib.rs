@@ -9436,7 +9436,7 @@ fn handle_projects_adopt_with_conn(
     let duplicate_agent_rows = conn
         .query_sync(
             "SELECT s.name AS name FROM agents s \
-             INNER JOIN agents d ON s.name = d.name \
+             INNER JOIN agents d ON s.name = d.name COLLATE NOCASE \
              WHERE s.project_id = ? AND d.project_id = ? \
              ORDER BY s.name",
             &[
