@@ -4726,6 +4726,79 @@ mod resource_shape_tests {
     }
 
     #[test]
+    fn resolve_resource_agent_rejects_ambiguous_case_duplicates() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let db_path = dir.path().join("resources-ambiguous-agent.sqlite3");
+                let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                    .expect("open sqlite db");
+                init_conn
+                    .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+                    .expect("apply init pragmas");
+                init_conn
+                    .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("initialize base schema");
+                drop(init_conn);
+
+                let cfg = mcp_agent_mail_db::pool::DbPoolConfig {
+                    database_url: format!("sqlite:///{}", db_path.display()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                };
+                let pool = mcp_agent_mail_db::create_pool(&cfg).expect("create pool");
+                let project = ensure_project(
+                    &cx,
+                    &pool,
+                    &format!("/tmp/resources-ambiguous-{}", unique_suffix()),
+                )
+                .await;
+                let project_id = project.id.unwrap_or(0);
+                let primary = register_agent(&cx, &pool, project_id, "BlueLake").await;
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                let now = mcp_agent_mail_db::now_micros();
+                conn.execute_sync(
+                    "INSERT INTO agents (
+                        project_id, name, program, model, task_description,
+                        inception_ts, last_active_ts, attachments_policy, contact_policy
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id),
+                        mcp_agent_mail_db::sqlmodel::Value::Text("bluelake".to_string()),
+                        mcp_agent_mail_db::sqlmodel::Value::Text(primary.program.clone()),
+                        mcp_agent_mail_db::sqlmodel::Value::Text(primary.model.clone()),
+                        mcp_agent_mail_db::sqlmodel::Value::Text(String::new()),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(now),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(now),
+                        mcp_agent_mail_db::sqlmodel::Value::Text("auto".to_string()),
+                        mcp_agent_mail_db::sqlmodel::Value::Text("auto".to_string()),
+                    ],
+                )
+                .expect("insert legacy duplicate agent row");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let err = resolve_resource_agent(&ctx, &pool, project_id, "BlueLake")
+                    .await
+                    .expect_err("ambiguous agent lookup should fail");
+                let message = err.to_string();
+                assert!(
+                    message.contains("Ambiguous agent name"),
+                    "unexpected error: {message}"
+                );
+            });
+        });
+    }
+
+    #[test]
     fn thread_details_respects_include_bodies_toggle() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
