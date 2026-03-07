@@ -274,8 +274,6 @@ pub struct DashboardScreen {
     show_trend_panel: bool,
     /// Metadata for the most recent message event, rendered as markdown.
     recent_message_preview: Option<RecentMessagePreview>,
-    /// Animation phase for pulse effects.
-    pulse_phase: f32,
     /// Reduced-motion mode disables pulse animation.
     reduced_motion: bool,
     /// Whether chart transitions are enabled (`AM_TUI_CHART_ANIMATIONS`).
@@ -292,8 +290,8 @@ pub struct DashboardScreen {
     console_log_last_seq: u64,
     /// Dashboard event stream rendered via `LogViewer`.
     event_log_viewer: RefCell<crate::console::LogPane>,
-    /// Last DB snapshot timestamp used for synthetic delta events.
-    last_db_snapshot_micros: i64,
+    /// Last DB stats generation used for synthetic delta events.
+    last_db_stats_gen: u64,
     /// Last observed message counter for DB-delta synthesis.
     last_db_messages: u64,
     /// Last observed reservation counter for DB-delta synthesis.
@@ -304,6 +302,8 @@ pub struct DashboardScreen {
     last_diagnostic_signature: RefCell<Option<String>>,
     /// Last observed data generation for dirty-state tracking.
     last_data_gen: super::DataGeneration,
+    /// Last DB stats generation applied to `current_db_stats`.
+    last_applied_db_stats_gen: u64,
     // ── Memoization caches (br-legjy.5.1) ────────────────────────
     /// Cached visible entries (indices into `event_log`). Invalidated when events,
     /// filters, query, or verbosity change.
@@ -467,7 +467,6 @@ impl DashboardScreen {
             prev_req_total: 0,
             show_trend_panel: true,
             recent_message_preview: None,
-            pulse_phase: 0.0,
             reduced_motion: reduced_motion_enabled(),
             chart_animations_enabled: chart_animations_enabled(),
             show_log_panel: false,
@@ -478,12 +477,13 @@ impl DashboardScreen {
             console_log: RefCell::new(crate::console::LogPane::new()),
             console_log_last_seq: 0,
             event_log_viewer: RefCell::new(crate::console::LogPane::new()),
-            last_db_snapshot_micros: 0,
+            last_db_stats_gen: 0,
             last_db_messages: 0,
             last_db_reservations: 0,
             db_delta_baseline_ready: false,
             last_diagnostic_signature: RefCell::new(None),
             last_data_gen: super::DataGeneration::stale(),
+            last_applied_db_stats_gen: 0,
             cached_visible_indices: RefCell::new(Vec::new()),
             visible_cache_filter_sig: RefCell::new(VisibleCacheKey::default()),
             cached_heatmap: RefCell::new(None),
@@ -507,11 +507,11 @@ impl DashboardScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn ingest_db_delta_events(&mut self, state: &TuiSharedState) -> bool {
+    fn ingest_db_delta_events(&mut self, state: &TuiSharedState, db_stats_gen: u64) -> bool {
         let Some(snapshot) = state.db_stats_snapshot() else {
             return false;
         };
-        if snapshot.timestamp_micros <= self.last_db_snapshot_micros {
+        if self.db_delta_baseline_ready && db_stats_gen <= self.last_db_stats_gen {
             return false;
         }
 
@@ -520,7 +520,7 @@ impl DashboardScreen {
             self.db_delta_baseline_ready = true;
             self.last_db_messages = snapshot.messages;
             self.last_db_reservations = snapshot.file_reservations;
-            self.last_db_snapshot_micros = snapshot.timestamp_micros;
+            self.last_db_stats_gen = db_stats_gen;
             if self.event_log.is_empty() {
                 if snapshot.messages > 0 {
                     let mut summary = format!("DB baseline: {} total messages", snapshot.messages);
@@ -634,7 +634,7 @@ impl DashboardScreen {
 
         self.last_db_messages = snapshot.messages;
         self.last_db_reservations = snapshot.file_reservations;
-        self.last_db_snapshot_micros = snapshot.timestamp_micros;
+        self.last_db_stats_gen = db_stats_gen;
         self.trim_event_log();
         changed
     }
@@ -1294,16 +1294,6 @@ impl MailScreen for DashboardScreen {
 
     #[allow(clippy::cast_precision_loss)]
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
-        // Update animation phase (always — visual, no data dependency).
-        if self.reduced_motion {
-            self.pulse_phase = 0.0;
-        } else {
-            self.pulse_phase += 0.2;
-            if self.pulse_phase > std::f32::consts::PI * 2.0 {
-                self.pulse_phase -= std::f32::consts::PI * 2.0;
-            }
-        }
-
         // ── Dirty-state gated data ingestion ────────────────────────
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
@@ -1314,11 +1304,11 @@ impl MailScreen for DashboardScreen {
             // Invalidate visible-entries and heatmap caches.
             self.invalidate_visible_cache();
         }
-        if dirty.events || dirty.db_stats {
+        if dirty.db_stats || !self.db_delta_baseline_ready {
             // Synthesize dashboard-friendly deltas from polled DB counters so
             // message/reservation movement remains visible even when no matching
             // domain events were emitted into the ring buffer.
-            if self.ingest_db_delta_events(state) {
+            if self.ingest_db_delta_events(state, current_gen.db_stats_gen) {
                 self.invalidate_visible_cache();
             }
             // Keep scroll offset in-bounds.
@@ -1355,13 +1345,17 @@ impl MailScreen for DashboardScreen {
         // changes are edge-triggered; cadence ticks are phase-based. If those
         // phases do not align, gating on both can miss refresh forever.
         if tick_count.is_multiple_of(STAT_REFRESH_TICKS) {
-            if let Some(stats) = state.db_stats_snapshot() {
-                if self.current_db_stats.timestamp_micros == 0 {
+            if self.current_db_stats.timestamp_micros == 0 {
+                if let Some(stats) = state.db_stats_snapshot() {
                     self.current_db_stats = stats.clone();
                     self.prev_db_stats = stats;
-                } else if stats.timestamp_micros > self.current_db_stats.timestamp_micros {
-                    self.prev_db_stats = std::mem::replace(&mut self.current_db_stats, stats);
+                    self.last_applied_db_stats_gen = current_gen.db_stats_gen;
                 }
+            } else if current_gen.db_stats_gen > self.last_applied_db_stats_gen
+                && let Some(stats) = state.db_stats_snapshot()
+            {
+                self.prev_db_stats = std::mem::replace(&mut self.current_db_stats, stats);
+                self.last_applied_db_stats_gen = current_gen.db_stats_gen;
             }
 
             // Compute anomalies from the live in-memory snapshot to avoid
@@ -1468,7 +1462,6 @@ impl MailScreen for DashboardScreen {
             &self.current_db_stats,
             &self.prev_db_stats,
             density,
-            self.pulse_phase,
         );
 
         if anomaly_h > 0 {
@@ -2278,7 +2271,6 @@ fn render_summary_band(
     current_stats: &DbStatSnapshot,
     prev_stats: &DbStatSnapshot,
     density: DensityHint,
-    pulse_phase: f32,
 ) {
     let counters = state.request_counters();
     let db = current_stats;
@@ -2321,10 +2313,8 @@ fn render_summary_band(
         std::cmp::Ordering::Equal => MetricTrend::Flat,
     };
 
-    // Calculate pulse color for Requests
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let pulse = f32::midpoint(pulse_phase.sin(), 1.0); // 0.0 to 1.0
-    let req_color = crate::tui_theme::lerp_color(tp.metric_requests, tp.sparkline_hi, pulse);
+    let req_color = tp.metric_requests;
 
     // Build tiles based on density.
     //
@@ -5761,7 +5751,8 @@ fn shimmer_progress_for_timestamp(now_micros: i64, timestamp_micros: i64) -> Opt
     if !(0..=SHIMMER_WINDOW_MICROS).contains(&age) {
         return None;
     }
-    Some((age as f64 / SHIMMER_WINDOW_MICROS as f64).clamp(0.0, 1.0))
+    // Keep recent-event emphasis static so the dashboard does not repaint on a timer.
+    Some(0.5)
 }
 
 fn dashboard_shimmer_progresses(
@@ -6137,6 +6128,16 @@ mod tests {
         let now = 1_700_000_000_000_000_i64;
         assert!(shimmer_progress_for_timestamp(now, now).is_some());
         assert!(shimmer_progress_for_timestamp(now, now - SHIMMER_WINDOW_MICROS - 1).is_none());
+    }
+
+    #[test]
+    fn dashboard_shimmer_progress_is_static_for_recent_entries() {
+        let now = 1_700_000_000_000_000_i64;
+        assert_eq!(shimmer_progress_for_timestamp(now, now), Some(0.5));
+        assert_eq!(
+            shimmer_progress_for_timestamp(now, now - (SHIMMER_WINDOW_MICROS / 2)),
+            Some(0.5)
+        );
     }
 
     #[test]

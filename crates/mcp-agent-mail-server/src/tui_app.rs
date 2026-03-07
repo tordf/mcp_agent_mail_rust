@@ -54,6 +54,7 @@ use crate::tui_screens::{
 };
 use crate::tui_widgets::{
     AmbientEffectRenderer, AmbientHealthInput, AmbientMode, AmbientRenderTelemetry,
+    determine_ambient_health_state,
 };
 
 /// How often the TUI ticks (100 ms ≈ 10 fps).
@@ -84,10 +85,6 @@ const MAX_DEFERRED_ACTIONS_PER_TICK: usize = 64;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const QUIT_CONFIRM_TOAST_SECS: u64 = 3;
 const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
-/// Ambient effects re-render every Nth frame. At 10 fps with N=2 the
-/// animation updates at ~5 fps. The diff engine's dirty-span tracking
-/// ensures unchanged cells produce no terminal writes.
-const AMBIENT_RENDER_EVERY_N_FRAMES: u64 = 2;
 /// Safety-net cadence for full-frame contrast scans when no explicit repaint
 /// trigger (theme/resize/screen change) requests one.
 const CONTRAST_GUARD_SAFETY_SCAN_TICK_DIVISOR: u64 = 20;
@@ -1147,6 +1144,10 @@ pub struct MailAppModel {
     ambient_last_render_tick: Cell<Option<u64>>,
     /// Total ambient render invocations for regression diagnostics.
     ambient_render_invocations: Cell<u64>,
+    /// Cached summary of recent event severities for ambient health heuristics.
+    ambient_signal_summary: Cell<AmbientEventSignalSummary>,
+    /// Total events seen when `ambient_signal_summary` was last refreshed.
+    ambient_signal_total_pushed: Cell<u64>,
     hint_ranker: HintRanker,
     palette_hint_ids: HashMap<String, usize>,
     palette_usage_path: Option<PathBuf>,
@@ -1292,6 +1293,8 @@ impl MailAppModel {
             ambient_last_telemetry: Cell::new(AmbientRenderTelemetry::default()),
             ambient_last_render_tick: Cell::new(None),
             ambient_render_invocations: Cell::new(0),
+            ambient_signal_summary: Cell::new(AmbientEventSignalSummary::default()),
+            ambient_signal_total_pushed: Cell::new(0),
             hint_ranker,
             palette_hint_ids,
             palette_usage_path: None,
@@ -2268,7 +2271,7 @@ impl MailAppModel {
     }
 
     const fn ambient_mode_for_frame(&self, effects_enabled: bool) -> AmbientMode {
-        if effects_enabled {
+        if effects_enabled && !self.accessibility.reduced_motion {
             self.ambient_mode
         } else {
             AmbientMode::Off
@@ -2278,37 +2281,42 @@ impl MailAppModel {
     fn ambient_health_input(&self, now_micros: i64) -> AmbientHealthInput {
         let ring_stats = self.state.event_ring_stats();
         let event_buffer_utilization = f64::from(ring_stats.fill_pct()) / 100.0;
-        let recent_signals = self
-            .state
-            .recent_event_signals(AMBIENT_HEALTH_LOOKBACK_EVENTS);
-
-        let mut critical_alerts_active = false;
-        let mut warning_events = 0_u32;
-        let mut last_event_ts = 0_i64;
-        for (timestamp_micros, severity) in recent_signals {
-            last_event_ts = last_event_ts.max(timestamp_micros);
-            match severity {
-                EventSeverity::Error => critical_alerts_active = true,
-                EventSeverity::Warn => warning_events = warning_events.saturating_add(1),
-                _ => {}
+        if ring_stats.total_pushed != self.ambient_signal_total_pushed.get() {
+            let mut summary = AmbientEventSignalSummary::default();
+            for (timestamp_micros, severity) in self
+                .state
+                .recent_event_signals(AMBIENT_HEALTH_LOOKBACK_EVENTS)
+            {
+                summary.last_event_ts = summary.last_event_ts.max(timestamp_micros);
+                match severity {
+                    EventSeverity::Error => summary.critical_alerts_active = true,
+                    EventSeverity::Warn => {
+                        summary.warning_events = summary.warning_events.saturating_add(1);
+                    }
+                    _ => {}
+                }
             }
+            self.ambient_signal_summary.set(summary);
+            self.ambient_signal_total_pushed
+                .set(ring_stats.total_pushed);
         }
+        let summary = self.ambient_signal_summary.get();
 
-        let seconds_since_last_event = if last_event_ts > 0 {
-            let delta_micros = now_micros.saturating_sub(last_event_ts).max(0);
+        let seconds_since_last_event = if summary.last_event_ts > 0 {
+            let delta_micros = now_micros.saturating_sub(summary.last_event_ts).max(0);
             u64::try_from(delta_micros / 1_000_000).unwrap_or(u64::MAX)
         } else {
             self.state.uptime().as_secs()
         };
 
-        let failed_probe_count = if critical_alerts_active {
+        let failed_probe_count = if summary.critical_alerts_active {
             2
         } else {
-            u32::from(warning_events > 0)
+            u32::from(summary.warning_events > 0)
         };
 
         AmbientHealthInput {
-            critical_alerts_active,
+            critical_alerts_active: summary.critical_alerts_active,
             failed_probe_count,
             total_probe_count: if failed_probe_count > 0 { 2 } else { 0 },
             event_buffer_utilization,
@@ -4235,31 +4243,32 @@ impl Model for MailAppModel {
         let effects_enabled = self.state.tui_effects_enabled();
         let ambient_mode = self.ambient_mode_for_frame(effects_enabled);
         let tp = crate::tui_theme::TuiThemePalette::current();
-        // Throttle ambient effects to every Nth frame.  At 10fps with N=2
-        // the animation updates at ~5 fps. On intervening frames, replay the
-        // cached cell background instead of rerunning the ambient simulation.
-        let should_render_ambient = self
-            .tick_count
-            .is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES)
-            && self.ambient_last_render_tick.get() != Some(self.tick_count);
-        let can_replay_cached = !should_render_ambient
-            && self.ambient_renderer.borrow().can_replay_cached(
-                ambient_area,
-                ambient_mode,
-                tp.bg_deep,
-                frame.buffer.degradation,
-            );
+        let ambient_health = self.ambient_health_input(now_micros());
+        let ambient_state = determine_ambient_health_state(ambient_health);
+        let ambient_renderer = self.ambient_renderer.borrow();
+        let can_replay_cached = ambient_renderer.can_replay_cached(
+            ambient_area,
+            ambient_mode,
+            tp.bg_deep,
+            frame.buffer.degradation,
+        );
+        let should_render_ambient = if ambient_mode.is_enabled() {
+            !can_replay_cached || ambient_renderer.last_telemetry().state != ambient_state
+        } else {
+            self.ambient_last_telemetry.get().mode != AmbientMode::Off
+        };
+        drop(ambient_renderer);
         if !can_replay_cached {
             Paragraph::new("")
                 .style(Style::default().bg(tp.bg_deep))
                 .render(ambient_area, frame);
         }
-        if should_render_ambient || (ambient_mode.is_enabled() && !can_replay_cached) {
+        if should_render_ambient {
             let ambient_telemetry = self.ambient_renderer.borrow_mut().render(
                 ambient_area,
                 frame,
                 ambient_mode,
-                self.ambient_health_input(now_micros()),
+                ambient_health,
                 self.state.uptime().as_secs_f64(),
                 tp.bg_deep,
             );
@@ -5076,8 +5085,7 @@ struct PaletteMessageSummary {
 struct PaletteDbCache {
     database_url: String,
     fetched_at_micros: i64,
-    source_snapshot_micros: i64,
-    source_message_count: u64,
+    source_db_stats_gen: u64,
     agent_metadata: HashMap<String, (String, String)>,
     messages: Vec<PaletteMessageSummary>,
 }
@@ -5100,19 +5108,20 @@ static PALETTE_DB_CACHE: OnceLock<Mutex<PaletteDbCache>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PaletteCacheBridgeState {
-    snapshot_micros: i64,
-    message_count: u64,
+    db_stats_gen: u64,
 }
 
 fn palette_cache_bridge_state(state: &TuiSharedState) -> PaletteCacheBridgeState {
-    state
-        .db_stats_snapshot()
-        .map_or_else(PaletteCacheBridgeState::default, |snap| {
-            PaletteCacheBridgeState {
-                snapshot_micros: snap.timestamp_micros,
-                message_count: snap.messages,
-            }
-        })
+    PaletteCacheBridgeState {
+        db_stats_gen: state.data_generation().db_stats_gen,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AmbientEventSignalSummary {
+    critical_alerts_active: bool,
+    warning_events: u32,
+    last_event_ts: i64,
 }
 
 fn query_palette_agent_metadata(
@@ -5238,8 +5247,7 @@ fn fetch_palette_db_data(
     if let Ok(guard) = cache.lock() {
         let fresh_enough =
             now.saturating_sub(guard.fetched_at_micros) <= PALETTE_DB_CACHE_TTL_MICROS;
-        let bridge_matches = guard.source_snapshot_micros == bridge_state.snapshot_micros
-            && guard.source_message_count == bridge_state.message_count;
+        let bridge_matches = guard.source_db_stats_gen == bridge_state.db_stats_gen;
         if guard.database_url == database_url && fresh_enough && bridge_matches {
             return (
                 guard
@@ -5258,8 +5266,7 @@ fn fetch_palette_db_data(
     if let Ok(mut guard) = cache.lock() {
         guard.database_url = database_url;
         guard.fetched_at_micros = now;
-        guard.source_snapshot_micros = bridge_state.snapshot_micros;
-        guard.source_message_count = bridge_state.message_count;
+        guard.source_db_stats_gen = bridge_state.db_stats_gen;
         guard.agent_metadata.clone_from(&agent_metadata);
         guard.messages.clone_from(&messages);
     }
@@ -6848,20 +6855,11 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(80, 24, &mut pool);
 
-        for _ in 0..AMBIENT_RENDER_EVERY_N_FRAMES {
-            let _ = model.update(MailMsg::Terminal(Event::Tick));
-        }
-        assert!(
-            model
-                .tick_count
-                .is_multiple_of(AMBIENT_RENDER_EVERY_N_FRAMES)
-        );
-
         model.view(&mut frame);
         let first_count = model.ambient_render_invocations.get();
         assert!(
             first_count >= 1,
-            "ambient renderer should run on bucket tick"
+            "ambient renderer should run on first paint"
         );
         assert_eq!(model.ambient_last_render_tick.get(), Some(model.tick_count));
 
@@ -6869,7 +6867,7 @@ mod tests {
         assert_eq!(
             model.ambient_render_invocations.get(),
             first_count,
-            "ambient renderer must not run multiple times in one tick bucket"
+            "ambient renderer must not rerun when the cached background is still valid"
         );
 
         let _ = model.update(MailMsg::Terminal(Event::Tick));
@@ -6877,17 +6875,7 @@ mod tests {
         assert_eq!(
             model.ambient_render_invocations.get(),
             first_count,
-            "non-bucket tick should skip ambient rendering"
-        );
-
-        for _ in 1..AMBIENT_RENDER_EVERY_N_FRAMES {
-            let _ = model.update(MailMsg::Terminal(Event::Tick));
-        }
-        model.view(&mut frame);
-        assert_eq!(
-            model.ambient_render_invocations.get(),
-            first_count + 1,
-            "next bucket tick should render ambient exactly once"
+            "tick cadence alone should not force a new ambient render"
         );
     }
 
@@ -6897,9 +6885,6 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut initial_frame = Frame::new(80, 24, &mut pool);
 
-        for _ in 0..AMBIENT_RENDER_EVERY_N_FRAMES {
-            let _ = model.update(MailMsg::Terminal(Event::Tick));
-        }
         model.view(&mut initial_frame);
         let first_count = model.ambient_render_invocations.get();
         assert!(first_count >= 1, "expected an initial ambient render");
@@ -6913,6 +6898,47 @@ mod tests {
             model.ambient_render_invocations.get(),
             first_count + 1,
             "cache miss from a larger frame should force an immediate ambient rerender"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_disables_ambient_effects_in_view() {
+        let mut model = test_model();
+        model.dispatch_palette_action(palette_action_ids::A11Y_TOGGLE_REDUCED_MOTION);
+        assert!(model.accessibility().reduced_motion);
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+
+        let telemetry = model.ambient_last_telemetry();
+        assert_eq!(telemetry.mode, AmbientMode::Off);
+        assert_eq!(
+            telemetry.effect,
+            crate::tui_widgets::AmbientEffectKind::None
+        );
+    }
+
+    #[test]
+    fn ambient_health_state_change_forces_rerender() {
+        let model = test_model();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+
+        model.view(&mut frame);
+        let first_count = model.ambient_render_invocations.get();
+        assert!(first_count >= 1, "expected an initial ambient render");
+
+        let _ =
+            model
+                .state
+                .push_event(MailEvent::http_request("GET", "/mcp/", 503, 4, "127.0.0.1"));
+
+        model.view(&mut frame);
+        assert_eq!(
+            model.ambient_render_invocations.get(),
+            first_count + 1,
+            "ambient renderer should rerender immediately when the health state changes"
         );
     }
 
@@ -8912,8 +8938,7 @@ mod tests {
             let mut guard = cache.lock().expect("cache lock");
             guard.database_url = db_url;
             guard.fetched_at_micros = now_micros();
-            guard.source_snapshot_micros = bridge_state.snapshot_micros;
-            guard.source_message_count = bridge_state.message_count;
+            guard.source_db_stats_gen = bridge_state.db_stats_gen;
             guard.agent_metadata.insert(
                 "BlueLake".to_string(),
                 ("gpt-5".to_string(), "proj-a".to_string()),
@@ -8936,7 +8961,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_db_cache_invalidates_when_bridge_snapshot_changes() {
+    fn palette_db_cache_invalidates_when_db_stats_generation_changes() {
         let _serial = PALETTE_CACHE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -8965,14 +8990,13 @@ mod tests {
             let mut guard = cache.lock().expect("cache lock");
             guard.database_url = db_url;
             guard.fetched_at_micros = now_micros();
-            guard.source_snapshot_micros = bridge_state.snapshot_micros;
-            guard.source_message_count = bridge_state.message_count;
+            guard.source_db_stats_gen = bridge_state.db_stats_gen;
             guard.messages = vec![expected];
         }
 
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
-            messages: bridge_state.message_count.saturating_add(1),
-            timestamp_micros: bridge_state.snapshot_micros.saturating_add(1),
+            messages: 1,
+            timestamp_micros: now_micros(),
             ..Default::default()
         });
 

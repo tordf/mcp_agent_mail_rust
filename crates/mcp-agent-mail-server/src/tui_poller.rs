@@ -370,17 +370,20 @@ impl DbPoller {
     pub fn start(self) -> DbPollerHandle {
         let stop = Arc::clone(&self.stop);
         let wake = Arc::clone(&self.wake);
+        let state = Arc::clone(&self.state);
         let join = thread::Builder::new()
             .name("tui-db-poller".into())
             .spawn(move || {
                 self.run();
-            })
-            .unwrap_or_else(|_| unreachable!());
-        DbPollerHandle {
-            join: Some(join),
-            stop,
-            wake,
-        }
+            });
+        let join = match join {
+            Ok(join) => Some(join),
+            Err(error) => {
+                handle_poller_spawn_failure(&state, &error);
+                None
+            }
+        };
+        DbPollerHandle { join, stop, wake }
     }
 
     /// Main polling loop.
@@ -424,7 +427,7 @@ impl DbPoller {
                 }
             }
             // Fetch fresh snapshot
-            let snapshot = if allow_poll {
+            let snapshot_update = if allow_poll {
                 if let Ok(snapshot) = catch_optional_panic(std::panic::AssertUnwindSafe(|| {
                     if connection_state.is_none() {
                         connection_state = open_poller_connection_state(&self.database_url);
@@ -452,22 +455,33 @@ impl DbPoller {
             } else {
                 None
             };
-            if let Some(snapshot) = snapshot {
+            if let Some(update) = snapshot_update {
                 self.state.mark_db_ready();
-                let changed = snapshot_delta(&prev, &snapshot).any_changed();
-                // Always refresh shared DB stats so timestamp/list snapshots
-                // stay current even when aggregate counters are steady.
-                self.state.update_db_stats(snapshot.clone());
-                if changed || last_health_emit.elapsed() >= HEALTH_PULSE_HEARTBEAT_INTERVAL {
-                    let _ = self
-                        .state
-                        .push_event(MailEvent::health_pulse(snapshot.clone()));
-                    last_health_emit = Instant::now();
+                match update {
+                    DbPollSnapshotUpdate::Snapshot(snapshot) => {
+                        let changed = snapshot_delta(&prev, &snapshot).any_changed();
+                        self.state.update_db_stats(snapshot.clone());
+                        if changed || last_health_emit.elapsed() >= HEALTH_PULSE_HEARTBEAT_INTERVAL
+                        {
+                            let _ = self
+                                .state
+                                .push_event(MailEvent::health_pulse(snapshot.clone()));
+                            last_health_emit = Instant::now();
+                        }
+                        prev = snapshot;
+                    }
+                    DbPollSnapshotUpdate::TimestampOnly(now_micros) => {
+                        self.state.refresh_db_stats_timestamp(now_micros);
+                        prev.timestamp_micros = now_micros;
+                        if last_health_emit.elapsed() >= HEALTH_PULSE_HEARTBEAT_INTERVAL {
+                            let _ = self.state.push_event(MailEvent::health_pulse(prev.clone()));
+                            last_health_emit = Instant::now();
+                        }
+                    }
                 }
                 last_warmup_failure_retry = Instant::now()
                     .checked_sub(DB_WARMUP_FAILURE_RETRY_INTERVAL)
                     .unwrap_or_else(Instant::now);
-                prev = snapshot;
             } else if allow_poll {
                 connection_state = None;
             }
@@ -524,6 +538,19 @@ impl Drop for DbPollerHandle {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn tui_poller_spawn_failure_message(error: &std::io::Error) -> String {
+    format!("TUI startup: DB poller failed to start ({error})")
+}
+
+fn handle_poller_spawn_failure(state: &Arc<TuiSharedState>, error: &std::io::Error) {
+    tracing::warn!(
+        error = %error,
+        "failed to spawn tui db poller; continuing without live DB polling"
+    );
+    state.mark_db_warmup_failed();
+    state.push_console_log(tui_poller_spawn_failure_message(error));
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -607,10 +634,15 @@ fn open_poller_connection_state(database_url: &str) -> Option<PollerConnectionSt
     })
 }
 
+enum DbPollSnapshotUpdate {
+    Snapshot(DbStatSnapshot),
+    TimestampOnly(i64),
+}
+
 fn fetch_db_stats_with_connection(
     state: &mut PollerConnectionState,
     previous: &DbStatSnapshot,
-) -> DbStatSnapshot {
+) -> DbPollSnapshotUpdate {
     let now = now_micros();
     let data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
     let must_refresh_for_expiry = reservation_expiry_requires_time_refresh(previous, now);
@@ -625,21 +657,26 @@ fn fetch_db_stats_with_connection(
             .is_some_and(|previous_version| previous_version == version)
         && previous.timestamp_micros > 0
     {
-        let snapshot = if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
+        let update = if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
             refresh_reservation_time_sensitive_snapshot(state, previous, now)
         } else {
-            let mut snapshot = previous.clone();
-            snapshot.timestamp_micros = now;
-            snapshot
+            state.last_data_version = data_version;
+            update_reservation_snapshot_gap_refresh_state(
+                state,
+                must_refresh_for_snapshot_gap,
+                previous,
+                now,
+            );
+            return DbPollSnapshotUpdate::TimestampOnly(now);
         };
         state.last_data_version = data_version;
         update_reservation_snapshot_gap_refresh_state(
             state,
             must_refresh_for_snapshot_gap,
-            &snapshot,
+            &update,
             now,
         );
-        return snapshot;
+        return DbPollSnapshotUpdate::Snapshot(update);
     }
     let snapshot =
         DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot();
@@ -650,7 +687,7 @@ fn fetch_db_stats_with_connection(
         &snapshot,
         now,
     );
-    snapshot
+    DbPollSnapshotUpdate::Snapshot(snapshot)
 }
 
 fn refresh_reservation_time_sensitive_snapshot(
@@ -1821,6 +1858,19 @@ mod tests {
         let poller = DbPoller::new(Arc::clone(&state), "sqlite:///test.db".into())
             .with_interval(Duration::ZERO);
         assert_eq!(poller.interval, MIN_OVERRIDE_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn poller_spawn_failure_marks_failed_state_and_logs_console_message() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+
+        handle_poller_spawn_failure(&state, &std::io::Error::other("boom"));
+
+        assert_eq!(state.db_warmup_state(), DbWarmupState::Failed);
+        let logs = state.console_log_since(0);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].1, "TUI startup: DB poller failed to start (boom)");
     }
 
     // ── Handle stop semantics ────────────────────────────────────────

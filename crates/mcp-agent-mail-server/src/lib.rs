@@ -775,7 +775,9 @@ fn startup_search_backfill_spawn_failure_message(error: &std::io::Error) -> Stri
 }
 
 fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
-    match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
+    let backfill_database_url =
+        normalized_startup_search_backfill_database_url(&config.database_url);
+    match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
         Ok((indexed, _skipped)) if indexed > 0 => {
             record_startup_search_backfill_completion(config);
             tracing::info!(
@@ -789,7 +791,7 @@ fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
         Err(err) => {
             tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
             if recover_startup_search_backfill_db(config, &err) {
-                match mcp_agent_mail_db::search_v3::backfill_from_db(&config.database_url) {
+                match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
                     Ok((indexed, _)) if indexed > 0 => {
                         record_startup_search_backfill_completion(config);
                         tracing::warn!(
@@ -893,6 +895,21 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
     }
 }
 
+fn normalized_startup_search_backfill_database_url(database_url: &str) -> String {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return database_url.to_string();
+    }
+    let Some(sqlite_path) =
+        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
+    else {
+        return database_url.to_string();
+    };
+    let normalized = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
+        sqlite_path.to_string_lossy().as_ref(),
+    );
+    format!("sqlite:///{normalized}")
+}
+
 fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, error: &str) -> bool {
     let recoverable = mcp_agent_mail_db::is_sqlite_recovery_error_message(error)
         || mcp_agent_mail_db::is_corruption_error_message(error);
@@ -912,6 +929,10 @@ fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, erro
         );
         return false;
     };
+    let sqlite_path =
+        std::path::PathBuf::from(mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
+            sqlite_path.to_string_lossy().as_ref(),
+        ));
 
     let recovery = if config.storage_root.is_dir() {
         mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
@@ -7992,6 +8013,32 @@ mod tests {
             &config,
             "database disk image is malformed"
         ));
+    }
+
+    #[test]
+    fn normalized_startup_search_backfill_database_url_prefers_healthy_absolute_path() {
+        let absolute_dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = absolute_dir.path().join("storage.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let relative_path = std::path::PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        if let Some(parent) = relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create relative parent");
+        }
+        std::fs::write(&relative_path, b"not-a-database").expect("write malformed relative db");
+
+        let database_url = format!("sqlite:///{}", relative_path.display());
+        let normalized = normalized_startup_search_backfill_database_url(&database_url);
+        assert_eq!(normalized, format!("sqlite:///{absolute_db_str}"));
+
+        let _ = std::fs::remove_file(&relative_path);
+        if let Some(parent) = relative_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     #[cfg(target_os = "linux")]

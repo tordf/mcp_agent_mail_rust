@@ -888,7 +888,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         ":memory:".to_string()
     } else if let Some(path) = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)
     {
-        path.to_string_lossy().into_owned()
+        crate::pool::normalize_sqlite_path_for_pool_key(path.to_string_lossy().as_ref())
     } else {
         db_url.to_string()
     };

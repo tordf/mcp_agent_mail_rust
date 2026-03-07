@@ -723,17 +723,13 @@ fn sqlite_key_from_database_url(database_url: &str) -> Option<String> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return None;
     }
-    mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
-        .map(|path| path.to_string_lossy().into_owned())
+    mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url).map(|path| {
+        crate::pool::normalize_sqlite_path_for_pool_key(path.to_string_lossy().as_ref())
+    })
 }
 
 fn sqlite_key_for_pool(pool: &DbPool) -> String {
-    let sqlite_path = pool.sqlite_path();
-    if sqlite_path == ":memory:" {
-        format!(":memory:@{pool:p}")
-    } else {
-        sqlite_path.to_string()
-    }
+    pool.sqlite_identity_key()
 }
 
 fn has_run_lexical_backfill(sqlite_key: &str) -> Result<bool, DbError> {
@@ -752,15 +748,20 @@ fn mark_lexical_backfill_ran(sqlite_key: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+fn set_lexical_active_db_key(sqlite_key: &str) -> Result<(), DbError> {
+    *lexical_active_db_key()
+        .lock()
+        .map_err(|_| DbError::Sqlite("search active DB key lock poisoned".to_string()))? =
+        Some(sqlite_key.to_string());
+    Ok(())
+}
+
 fn record_lexical_bootstrap_success(sqlite_key: &str) -> Result<(), DbError> {
     lexical_bootstrap_state()
         .lock()
         .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
         .insert(sqlite_key.to_string(), Ok(()));
-    *lexical_active_db_key()
-        .lock()
-        .map_err(|_| DbError::Sqlite("search active DB key lock poisoned".to_string()))? =
-        Some(sqlite_key.to_string());
+    set_lexical_active_db_key(sqlite_key)?;
     mark_lexical_backfill_ran(sqlite_key)?;
     Ok(())
 }
@@ -779,6 +780,9 @@ pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(),
 }
 
 fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
     let sqlite_key = sqlite_key_for_pool(pool);
     let db_url = lexical_backfill_database_url(pool);
     crate::search_v3::backfill_from_db(&db_url).map_err(|err| map_bridge_bootstrap_error(&err))?;
@@ -815,7 +819,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
 
     let config = mcp_agent_mail_core::Config::get();
     let index_dir = config.storage_root.join("search_index");
-    let result: Result<(), String> = (|| {
+    let result: Result<bool, String> = (|| {
         if crate::search_v3::get_bridge().is_none() {
             crate::search_v3::init_bridge(&index_dir)?;
         }
@@ -830,8 +834,9 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
             if active_key.as_deref() != Some(sqlite_key.as_str()) {
                 crate::search_v3::backfill_from_db("sqlite:///:memory:")
                     .map_err(|err| map_bridge_bootstrap_error(&err).to_string())?;
+                set_lexical_active_db_key(&sqlite_key).map_err(|err| err.to_string())?;
             }
-            return Ok(());
+            return Ok(false);
         }
 
         // The lexical bridge is process-global. Re-run backfill whenever a
@@ -842,20 +847,25 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         if should_backfill {
             run_lexical_backfill_for_pool(pool).map_err(|err| err.to_string())?;
         }
-        Ok(())
+        Ok(true)
     })();
 
-    if result.is_ok() {
-        record_lexical_bootstrap_success(&sqlite_key)?;
-    } else {
-        // Do not permanently cache failures; allow retry on next query.
-        state_lock
-            .lock()
-            .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
-            .remove(&sqlite_key);
+    match result {
+        Ok(should_record_success) => {
+            if should_record_success {
+                record_lexical_bootstrap_success(&sqlite_key)?;
+            }
+            Ok(())
+        }
+        Err(err) => {
+            // Do not permanently cache failures; allow retry on next query.
+            state_lock
+                .lock()
+                .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
+                .remove(&sqlite_key);
+            Err(map_bridge_bootstrap_error(&err))
+        }
     }
-
-    result.map_err(|err| map_bridge_bootstrap_error(&err))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -3268,7 +3278,7 @@ pub async fn execute_search(
         lexical_query.limit = Some(lexical_candidate_limit(query));
 
         if let Some(mut raw_results) = try_tantivy_search(&lexical_query) {
-            if raw_results.is_empty() && !explicit_lexical {
+            if raw_results.is_empty() && !explicit_lexical && pool.sqlite_path() != ":memory:" {
                 let sqlite_key = sqlite_key_for_pool(pool);
                 let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
                     Ok(v) => v,
@@ -3691,6 +3701,32 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_key_from_database_url_normalizes_malformed_relative_paths() {
+        let absolute_dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = absolute_dir.path().join("storage.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let conn = crate::DbConn::open_file(&absolute_db_str).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let relative_path = std::path::PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        if let Some(parent) = relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create relative parent");
+        }
+        std::fs::write(&relative_path, b"not-a-database").expect("write malformed relative db");
+
+        let db_url = format!("sqlite:///{}", relative_path.display());
+        let sqlite_key = sqlite_key_from_database_url(&db_url).expect("sqlite key");
+        assert_eq!(sqlite_key, absolute_db_str);
+
+        let _ = std::fs::remove_file(&relative_path);
+        if let Some(parent) = relative_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
     fn sqlite_key_for_pool_distinguishes_memory_pools() {
         let config = crate::pool::DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -3705,6 +3741,36 @@ mod tests {
         assert!(key_a.starts_with(":memory:@"));
         assert!(key_b.starts_with(":memory:@"));
         assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn sqlite_key_for_pool_is_stable_across_memory_pool_clones() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+        let clone = pool.clone();
+
+        assert_eq!(sqlite_key_for_pool(&pool), sqlite_key_for_pool(&clone));
+    }
+
+    #[test]
+    fn run_lexical_backfill_for_memory_pool_does_not_mark_backfill_ran() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+        let sqlite_key = sqlite_key_for_pool(&pool);
+
+        run_lexical_backfill_for_pool(&pool).expect("memory no-op");
+
+        assert!(!has_run_lexical_backfill(&sqlite_key).expect("backfill marker"));
     }
 
     #[test]

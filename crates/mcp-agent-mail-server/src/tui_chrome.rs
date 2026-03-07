@@ -470,7 +470,6 @@ enum StatusPriority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusEffect {
     None,
-    LivePulse,
     RecordingPulse,
 }
 
@@ -718,7 +717,7 @@ fn plan_status_segments(
         text: "LIVE ".to_string(),
         fg: tp.status_good,
         bold: true,
-        effect: StatusEffect::LivePulse,
+        effect: StatusEffect::None,
     });
 
     if recording_active {
@@ -980,10 +979,6 @@ pub fn render_status_line(
                 .unwrap_or(u16::MAX)
                 .min(width);
             let effect = match effect {
-                StatusEffect::LivePulse => TextEffect::Pulse {
-                    speed: 2.0 / 3.0,
-                    min_alpha: 0.35,
-                },
                 StatusEffect::RecordingPulse => TextEffect::Pulse {
                     speed: 2.0 / 3.0,
                     min_alpha: 0.20,

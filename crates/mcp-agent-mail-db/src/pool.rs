@@ -334,6 +334,15 @@ impl DbPool {
         &self.sqlite_path
     }
 
+    #[must_use]
+    pub fn sqlite_identity_key(&self) -> String {
+        if self.sqlite_path == ":memory:" {
+            format!(":memory:@{:p}", Arc::as_ptr(&self.pool))
+        } else {
+            self.sqlite_path.clone()
+        }
+    }
+
     pub fn sample_pool_stats_now(&self) {
         self.stats_sampler.sample_now(&self.pool);
     }
@@ -1808,6 +1817,11 @@ fn resolve_sqlite_path_with_absolute_fallback(sqlite_path: &str) -> String {
     }
 
     sqlite_path.to_string()
+}
+
+#[must_use]
+pub fn normalize_sqlite_path_for_pool_key(sqlite_path: &str) -> String {
+    resolve_sqlite_path_with_absolute_fallback(sqlite_path)
 }
 
 #[allow(clippy::result_large_err)]
@@ -3499,6 +3513,18 @@ mod tests {
         if let Some(parent) = explicit_relative_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn sqlite_identity_key_is_stable_across_pool_clones() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+        let clone = pool.clone();
+
+        assert_eq!(pool.sqlite_identity_key(), clone.sqlite_identity_key());
     }
 
     /// Verify `quarantine_sidecar` renames WAL/SHM files with corrupt- prefix.
