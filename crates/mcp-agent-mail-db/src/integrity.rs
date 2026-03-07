@@ -65,6 +65,8 @@ struct IntegrityCheckState {
     last_ok_ts: AtomicI64,
     /// Timestamp (microseconds since epoch) of the last check (success or fail).
     last_check_ts: AtomicI64,
+    /// Timestamp (microseconds since epoch) of the last completed full check.
+    last_full_check_ts: AtomicI64,
     /// Total number of checks run.
     checks_total: AtomicU64,
     /// Total number of failures detected.
@@ -76,6 +78,7 @@ impl IntegrityCheckState {
         Self {
             last_ok_ts: AtomicI64::new(0),
             last_check_ts: AtomicI64::new(0),
+            last_full_check_ts: AtomicI64::new(0),
             checks_total: AtomicU64::new(0),
             failures_total: AtomicU64::new(0),
         }
@@ -99,11 +102,18 @@ pub struct IntegrityMetrics {
 #[must_use]
 pub fn integrity_metrics() -> IntegrityMetrics {
     let s = state();
+    let runtime_failures = mcp_agent_mail_core::global_metrics()
+        .db
+        .integrity_failures_total
+        .load();
     IntegrityMetrics {
         last_ok_ts: s.last_ok_ts.load(Ordering::Relaxed),
         last_check_ts: s.last_check_ts.load(Ordering::Relaxed),
         checks_total: s.checks_total.load(Ordering::Relaxed),
-        failures_total: s.failures_total.load(Ordering::Relaxed),
+        failures_total: s
+            .failures_total
+            .load(Ordering::Relaxed)
+            .saturating_add(runtime_failures),
     }
 }
 
@@ -182,6 +192,9 @@ pub fn evaluate_check_rows(
     let s = state();
     let now = crate::now_micros();
     s.last_check_ts.store(now, Ordering::Relaxed);
+    if kind == CheckKind::Full {
+        s.last_full_check_ts.store(now, Ordering::Relaxed);
+    }
     s.checks_total.fetch_add(1, Ordering::Relaxed);
     if ok {
         s.last_ok_ts.store(now, Ordering::Relaxed);
@@ -219,8 +232,10 @@ pub fn attempt_vacuum_recovery(conn: &DbConn, original_path: &str) -> DbResult<S
     let _ = std::fs::remove_file(&recovery_path);
 
     // Ensure latest committed state is in the main DB file before copying.
-    let _ = conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[]);
-    let _ = conn.execute_raw("VACUUM");
+    conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+        .map_err(|e| DbError::Sqlite(format!("wal checkpoint before recovery failed: {e}")))?;
+    conn.execute_raw("VACUUM")
+        .map_err(|e| DbError::Sqlite(format!("vacuum before recovery failed: {e}")))?;
     std::fs::copy(original_path, &recovery_path)
         .map_err(|e| DbError::Sqlite(format!("copy recovery failed: {e}")))?;
 
@@ -242,15 +257,15 @@ pub fn attempt_vacuum_recovery(conn: &DbConn, original_path: &str) -> DbResult<S
 /// Check whether enough time has elapsed since the last full check
 /// to warrant running another one.
 ///
-/// Returns `true` if `interval_hours` have elapsed since the last check,
-/// or if no check has ever been run.
+/// Returns `true` if `interval_hours` have elapsed since the last full check,
+/// or if no full check has ever been run.
 #[must_use]
 pub fn is_full_check_due(interval_hours: u64) -> bool {
     if interval_hours == 0 {
         return false;
     }
     let s = state();
-    let last = s.last_check_ts.load(Ordering::Relaxed);
+    let last = s.last_full_check_ts.load(Ordering::Relaxed);
     if last == 0 {
         return true;
     }
@@ -262,12 +277,31 @@ pub fn is_full_check_due(interval_hours: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static TEST_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn open_test_db() -> DbConn {
         let conn = DbConn::open_memory().expect("open memory db");
         conn.execute_raw("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)")
             .expect("create table");
         conn
+    }
+
+    fn set_state_for_tests(
+        last_ok_ts: i64,
+        last_check_ts: i64,
+        last_full_check_ts: i64,
+        checks_total: u64,
+        failures_total: u64,
+    ) {
+        let s = state();
+        s.last_ok_ts.store(last_ok_ts, Ordering::Relaxed);
+        s.last_check_ts.store(last_check_ts, Ordering::Relaxed);
+        s.last_full_check_ts
+            .store(last_full_check_ts, Ordering::Relaxed);
+        s.checks_total.store(checks_total, Ordering::Relaxed);
+        s.failures_total.store(failures_total, Ordering::Relaxed);
     }
 
     #[test]
@@ -484,11 +518,96 @@ mod tests {
 
     #[test]
     fn is_full_check_due_with_large_interval_is_false_after_recent_check() {
-        // Run a check to update last_check_ts to now
+        // Run a full check to update last_full_check_ts to now.
         let conn = open_test_db();
-        let _ = quick_check(&conn);
+        let _ = full_check(&conn);
         // interval of 1 billion hours should NOT be due
         assert!(!is_full_check_due(1_000_000_000));
+    }
+
+    #[test]
+    fn is_full_check_due_ignores_recent_non_full_checks() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap();
+        let now = crate::now_micros();
+        set_state_for_tests(now, now, now - 25 * 3_600 * 1_000_000, 10, 0);
+        assert!(
+            is_full_check_due(24),
+            "recent quick/incremental checks must not hide an overdue full scan"
+        );
+    }
+
+    #[test]
+    fn integrity_metrics_include_runtime_corruption_failures() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap();
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let runtime_before = metrics.db.integrity_failures_total.load();
+        let s = state();
+        let state_before = (
+            s.last_ok_ts.load(Ordering::Relaxed),
+            s.last_check_ts.load(Ordering::Relaxed),
+            s.last_full_check_ts.load(Ordering::Relaxed),
+            s.checks_total.load(Ordering::Relaxed),
+            s.failures_total.load(Ordering::Relaxed),
+        );
+
+        set_state_for_tests(0, 0, 0, 0, 0);
+        metrics
+            .db
+            .integrity_failures_total
+            .store(runtime_before.saturating_add(1));
+
+        let snapshot = integrity_metrics();
+        assert_eq!(
+            snapshot.failures_total,
+            runtime_before.saturating_add(1),
+            "runtime corruption failures should surface in integrity metrics"
+        );
+
+        metrics.db.integrity_failures_total.store(runtime_before);
+        set_state_for_tests(
+            state_before.0,
+            state_before.1,
+            state_before.2,
+            state_before.3,
+            state_before.4,
+        );
+    }
+
+    #[test]
+    fn integrity_metrics_add_runtime_and_pragma_failures() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap();
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let runtime_before = metrics.db.integrity_failures_total.load();
+        let s = state();
+        let state_before = (
+            s.last_ok_ts.load(Ordering::Relaxed),
+            s.last_check_ts.load(Ordering::Relaxed),
+            s.last_full_check_ts.load(Ordering::Relaxed),
+            s.checks_total.load(Ordering::Relaxed),
+            s.failures_total.load(Ordering::Relaxed),
+        );
+
+        set_state_for_tests(0, 0, 0, 0, 3);
+        metrics
+            .db
+            .integrity_failures_total
+            .store(runtime_before.saturating_add(7));
+
+        let snapshot = integrity_metrics();
+        assert_eq!(
+            snapshot.failures_total,
+            runtime_before.saturating_add(10),
+            "integrity metrics should include both PRAGMA-detected and runtime failures"
+        );
+
+        metrics.db.integrity_failures_total.store(runtime_before);
+        set_state_for_tests(
+            state_before.0,
+            state_before.1,
+            state_before.2,
+            state_before.3,
+            state_before.4,
+        );
     }
 
     #[test]
@@ -541,5 +660,36 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(cnt, 1, "recovery copy should have the data");
+    }
+
+    #[test]
+    fn vacuum_recovery_errors_when_vacuum_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().expect("path str");
+
+        let conn = DbConn::open_file(db_str).expect("open db");
+        conn.execute_raw("CREATE TABLE foo (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+        conn.execute_raw("BEGIN IMMEDIATE")
+            .expect("begin immediate transaction");
+
+        let err = attempt_vacuum_recovery(&conn, db_str).expect_err("vacuum must fail in tx");
+        assert!(
+            err.to_string()
+                .contains("checkpoint before recovery failed")
+                || err.to_string().contains("vacuum before recovery failed")
+                || err
+                    .to_string()
+                    .contains("wal checkpoint before recovery failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{db_str}.recovery")).exists(),
+            "failed recovery must not leave a recovery copy behind"
+        );
+
+        conn.execute_raw("ROLLBACK")
+            .expect("rollback immediate transaction");
     }
 }

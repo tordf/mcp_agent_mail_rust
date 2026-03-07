@@ -12,8 +12,8 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    DocKind, RankingMode, RecoverySuggestion, ScopePolicy, SearchCursor, SearchQuery,
-    SearchResponse, SearchResult, ZeroResultGuidance,
+    Direction, DocKind, Importance, RankingMode, RecoverySuggestion, ScopePolicy, SearchCursor,
+    SearchQuery, SearchResponse, SearchResult, ZeroResultGuidance,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -378,9 +378,87 @@ fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
     Some(bridge.search(query))
 }
 
+fn query_needs_recipient_filter(query: &SearchQuery) -> bool {
+    query.doc_kind == DocKind::Message
+        && query.agent_name.is_some()
+        && !matches!(query.direction, Some(Direction::Outbox))
+}
+
+fn lexical_candidate_limit(query: &SearchQuery) -> usize {
+    let limit = query.effective_limit();
+    let needs_extra_candidates = query.product_id.is_some()
+        || query.ack_required.is_some()
+        || query_needs_recipient_filter(query);
+    if needs_extra_candidates {
+        limit.saturating_mul(16).clamp(64, 10_000)
+    } else {
+        limit
+    }
+}
+
+fn legacy_candidate_limit(query: &SearchQuery) -> usize {
+    let limit = query.effective_limit();
+    let needs_extra_candidates = query.product_id.is_some()
+        || !query.importance.is_empty()
+        || query.direction.is_some()
+        || query.agent_name.is_some()
+        || query.thread_id.is_some()
+        || query.ack_required.is_some()
+        || !query.time_range.is_empty();
+    if needs_extra_candidates {
+        limit.saturating_mul(16).clamp(64, 10_000)
+    } else {
+        limit
+    }
+}
+
+fn trim_search_results_to_limit(mut results: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
+    results.truncate(limit);
+    results
+}
+
+fn detail_matches_agent_filter(
+    query: &SearchQuery,
+    sender_name: &str,
+    recipient_names: Option<&[String]>,
+) -> bool {
+    let Some(agent_name) = query.agent_name.as_deref() else {
+        return true;
+    };
+
+    let sender_matches = sender_name.eq_ignore_ascii_case(agent_name);
+    let recipient_matches = recipient_names.is_some_and(|names| {
+        names
+            .iter()
+            .any(|recipient| recipient.eq_ignore_ascii_case(agent_name))
+    });
+
+    match query.direction {
+        Some(Direction::Outbox) => sender_matches,
+        Some(Direction::Inbox) => recipient_matches,
+        None => sender_matches || recipient_matches,
+    }
+}
+
+fn unresolved_result_matches_agent_filter(query: &SearchQuery, result: &SearchResult) -> bool {
+    let Some(agent_name) = query.agent_name.as_deref() else {
+        return true;
+    };
+    let Some(from_agent) = result.from_agent.as_deref() else {
+        return false;
+    };
+    let sender_matches = from_agent.eq_ignore_ascii_case(agent_name);
+
+    match query.direction {
+        Some(Direction::Inbox) => false,
+        Some(Direction::Outbox) | None => sender_matches,
+    }
+}
+
 fn detail_matches_query_filters(
     query: &SearchQuery,
     detail: &crate::queries::ThreadMessageRow,
+    recipient_names: Option<&[String]>,
     product_project_ids: Option<&HashSet<i64>>,
 ) -> bool {
     if let Some(project_id) = query.project_id
@@ -393,9 +471,7 @@ fn detail_matches_query_filters(
     {
         return false;
     }
-    if let Some(agent_name) = query.agent_name.as_deref()
-        && !detail.from.eq_ignore_ascii_case(agent_name)
-    {
+    if !detail_matches_agent_filter(query, &detail.from, recipient_names) {
         return false;
     }
     if let Some(thread_id) = query.thread_id.as_deref()
@@ -447,13 +523,8 @@ fn raw_result_matches_query_filters(
             return false;
         }
     }
-    if let Some(agent_name) = query.agent_name.as_deref() {
-        let Some(from_agent) = result.from_agent.as_deref() else {
-            return false;
-        };
-        if !from_agent.eq_ignore_ascii_case(agent_name) {
-            return false;
-        }
+    if !unresolved_result_matches_agent_filter(query, result) {
+        return false;
     }
     if let Some(thread_id) = query.thread_id.as_deref()
         && result.thread_id.as_deref() != Some(thread_id)
@@ -526,6 +597,16 @@ async fn canonicalize_message_results(
     };
     let details_by_id: HashMap<i64, crate::queries::ThreadMessageRow> =
         details.into_iter().map(|row| (row.id, row)).collect();
+    let recipient_names_by_message = if query_needs_recipient_filter(query) {
+        match crate::queries::list_message_recipient_names_by_message(cx, pool, &ids).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    } else {
+        HashMap::new()
+    };
 
     let product_project_ids = if let Some(product_id) = query.product_id {
         let projects = match crate::queries::list_product_projects(cx, pool, product_id).await {
@@ -558,7 +639,15 @@ async fn canonicalize_message_results(
             }
             continue;
         };
-        if !detail_matches_query_filters(query, detail, product_project_ids.as_ref()) {
+        let recipient_names = recipient_names_by_message
+            .get(&result.id)
+            .map(Vec::as_slice);
+        if !detail_matches_query_filters(
+            query,
+            detail,
+            recipient_names,
+            product_project_ids.as_ref(),
+        ) {
             dropped_filter_mismatch += 1;
             continue;
         }
@@ -632,10 +721,19 @@ fn lexical_backfill_database_url(pool: &DbPool) -> String {
 
 fn sqlite_key_from_database_url(database_url: &str) -> Option<String> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
-        return Some(":memory:".to_string());
+        return None;
     }
     mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn sqlite_key_for_pool(pool: &DbPool) -> String {
+    let sqlite_path = pool.sqlite_path();
+    if sqlite_path == ":memory:" {
+        format!(":memory:@{pool:p}")
+    } else {
+        sqlite_path.to_string()
+    }
 }
 
 fn has_run_lexical_backfill(sqlite_key: &str) -> Result<bool, DbError> {
@@ -681,7 +779,7 @@ pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(),
 }
 
 fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
-    let sqlite_key = pool.sqlite_path().to_string();
+    let sqlite_key = sqlite_key_for_pool(pool);
     let db_url = lexical_backfill_database_url(pool);
     crate::search_v3::backfill_from_db(&db_url).map_err(|err| map_bridge_bootstrap_error(&err))?;
     mark_lexical_backfill_ran(&sqlite_key)?;
@@ -689,7 +787,7 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
 }
 
 fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
-    let sqlite_key = pool.sqlite_path().to_string();
+    let sqlite_key = sqlite_key_for_pool(pool);
     let _guard = lexical_init_guard()
         .lock()
         .map_err(|_| DbError::Sqlite("search bootstrap init guard lock poisoned".to_string()))?;
@@ -720,6 +818,20 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     let result: Result<(), String> = (|| {
         if crate::search_v3::get_bridge().is_none() {
             crate::search_v3::init_bridge(&index_dir)?;
+        }
+
+        if pool.sqlite_path() == ":memory:" {
+            // A fresh sqlite:///:memory: connection cannot observe the live pooled
+            // in-memory DB, so lexical backfill cannot recover existing rows.
+            // We still need to clear any stale docs left by a previous DB/pool
+            // because the Tantivy bridge is process-global. Backfilling against
+            // a fresh empty memory DB forces a full rebuild to an empty index
+            // whenever the active in-memory pool changes.
+            if active_key.as_deref() != Some(sqlite_key.as_str()) {
+                crate::search_v3::backfill_from_db("sqlite:///:memory:")
+                    .map_err(|err| map_bridge_bootstrap_error(&err).to_string())?;
+            }
+            return Ok(());
         }
 
         // The lexical bridge is process-global. Re-run backfill whenever a
@@ -2886,6 +2998,29 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
     query.product_id.hash(&mut hasher);
     query.project_id.hash(&mut hasher);
     query.doc_kind.hash(&mut hasher);
+    query.ack_required.hash(&mut hasher);
+
+    match query.direction {
+        Some(Direction::Inbox) => "inbox".hash(&mut hasher),
+        Some(Direction::Outbox) => "outbox".hash(&mut hasher),
+        None => "any_direction".hash(&mut hasher),
+    }
+
+    match query.ranking {
+        RankingMode::Relevance => "relevance".hash(&mut hasher),
+        RankingMode::Recency => "recency".hash(&mut hasher),
+    }
+
+    let mut importance_levels: Vec<&'static str> = query
+        .importance
+        .iter()
+        .copied()
+        .map(Importance::as_str)
+        .collect();
+    importance_levels.sort_unstable();
+    for level in importance_levels {
+        level.hash(&mut hasher);
+    }
 
     match &query.scope {
         ScopePolicy::Unrestricted => {
@@ -2997,7 +3132,7 @@ pub async fn execute_search(
 
     #[allow(deprecated)]
     if matches!(engine, SearchEngine::Legacy | SearchEngine::Shadow) {
-        let limit = query.effective_limit();
+        let limit = legacy_candidate_limit(query);
         let raw_results = if let Some(project_id) = query.project_id {
             match crate::queries::search_messages(cx, pool, project_id, &query.text, limit).await {
                 Outcome::Ok(rows) => rows
@@ -3006,6 +3141,40 @@ pub async fn execute_search(
                         doc_kind: DocKind::Message,
                         id: row.id,
                         project_id: Some(project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                    })
+                    .collect(),
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
+        } else if let Some(product_id) = query.product_id {
+            match crate::queries::search_messages_for_product(
+                cx,
+                pool,
+                product_id,
+                &query.text,
+                limit,
+            )
+            .await
+            {
+                Outcome::Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(row.project_id),
                         title: row.subject,
                         body: row.body_md,
                         score: None,
@@ -3051,6 +3220,14 @@ pub async fn execute_search(
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             }
         };
+        let raw_results =
+            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+        let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
         let explain = if query.explain {
             Some(build_v3_query_explain(query, engine, None))
         } else {
@@ -3087,9 +3264,12 @@ pub async fn execute_search(
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
         let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
-        if let Some(mut raw_results) = try_tantivy_search(query) {
+        let mut lexical_query = query.clone();
+        lexical_query.limit = Some(lexical_candidate_limit(query));
+
+        if let Some(mut raw_results) = try_tantivy_search(&lexical_query) {
             if raw_results.is_empty() && !explicit_lexical {
-                let sqlite_key = pool.sqlite_path().to_string();
+                let sqlite_key = sqlite_key_for_pool(pool);
                 let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
                     Ok(v) => v,
                     Err(err) => return Outcome::Err(err),
@@ -3105,7 +3285,7 @@ pub async fn execute_search(
                         );
                         return Outcome::Err(err);
                     }
-                    if let Some(rerun_results) = try_tantivy_search(query) {
+                    if let Some(rerun_results) = try_tantivy_search(&lexical_query) {
                         raw_results = rerun_results;
                     }
                 }
@@ -3119,6 +3299,7 @@ pub async fn execute_search(
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                     Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 };
+            let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
             } else {
@@ -3149,13 +3330,14 @@ pub async fn execute_search(
     if engine == SearchEngine::Semantic {
         #[cfg(feature = "hybrid")]
         {
-            let mut raw_results = try_two_tier_search_with_cx(cx, query, query.effective_limit())
+            let candidate_limit = legacy_candidate_limit(query);
+            let mut raw_results = try_two_tier_search_with_cx(cx, query, candidate_limit)
                 .map_or_else(Vec::new, |outcome| outcome.results);
 
             if raw_results.is_empty()
                 && let Some(bridge) = get_or_init_semantic_bridge()
             {
-                raw_results = bridge.search(query, query.effective_limit());
+                raw_results = bridge.search(query, candidate_limit);
             }
             raw_results =
                 match canonicalize_message_results(cx, pool, query, raw_results, false).await {
@@ -3164,6 +3346,7 @@ pub async fn execute_search(
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                     Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 };
+            raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
 
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
@@ -3204,8 +3387,10 @@ pub async fn execute_search(
     // 3) deterministic dedupe + merge prep (mode-aware budgets)
     // 4) optional rerank refinement with graceful fallback.
     if matches!(engine, SearchEngine::Hybrid | SearchEngine::Auto) {
-        let plan = derive_hybrid_execution_plan(cx, query, engine);
-        let mut lexical_query = query.clone();
+        let mut candidate_query = query.clone();
+        candidate_query.limit = Some(legacy_candidate_limit(query));
+        let plan = derive_hybrid_execution_plan(cx, &candidate_query, engine);
+        let mut lexical_query = candidate_query.clone();
         lexical_query.limit = Some(plan.derivation.budget.lexical_limit);
 
         if let Some(lexical_results) = try_tantivy_search(&lexical_query) {
@@ -3216,10 +3401,14 @@ pub async fn execute_search(
                 if plan.derivation.budget.semantic_limit == 0 {
                     (Vec::new(), None)
                 } else {
-                    try_two_tier_search_with_cx(cx, query, plan.derivation.budget.semantic_limit)
-                        .map_or((Vec::new(), None), |outcome| {
-                            (outcome.results, Some(outcome.telemetry))
-                        })
+                    try_two_tier_search_with_cx(
+                        cx,
+                        &candidate_query,
+                        plan.derivation.budget.semantic_limit,
+                    )
+                    .map_or((Vec::new(), None), |outcome| {
+                        (outcome.results, Some(outcome.telemetry))
+                    })
                 };
             #[cfg(not(feature = "hybrid"))]
             let semantic_results = Vec::new();
@@ -3227,7 +3416,7 @@ pub async fn execute_search(
             let (mut raw_results, mut rerank_audit) =
                 orchestrate_hybrid_results_with_optional_rerank(
                     cx,
-                    query,
+                    &candidate_query,
                     &plan,
                     lexical_results,
                     semantic_results,
@@ -3250,6 +3439,7 @@ pub async fn execute_search(
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                     Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 };
+            raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, rerank_audit.as_ref()))
             } else {
@@ -3476,6 +3666,48 @@ mod tests {
     }
 
     #[test]
+    fn startup_lexical_backfill_completion_ignores_memory_db() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+
+        note_startup_lexical_backfill_completed("sqlite:///:memory:")
+            .expect("memory db startup bootstrap should be ignored");
+
+        {
+            let cached = lexical_bootstrap_state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(cached.is_empty());
+            drop(cached);
+        }
+        let active_key = lexical_active_db_key()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        assert!(active_key.is_none());
+    }
+
+    #[test]
+    fn sqlite_key_for_pool_distinguishes_memory_pools() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool_a = DbPool::new(&config).expect("pool a");
+        let pool_b = DbPool::new(&config).expect("pool b");
+
+        let key_a = sqlite_key_for_pool(&pool_a);
+        let key_b = sqlite_key_for_pool(&pool_b);
+
+        assert!(key_a.starts_with(":memory:@"));
+        assert!(key_b.starts_with(":memory:@"));
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
     fn next_cursor_none_when_underfull() {
         let results = vec![SearchResult {
             doc_kind: DocKind::Message,
@@ -3634,6 +3866,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_scope_discriminator_differs_by_ack_required() {
+        let q1 = SearchQuery {
+            text: "shared".to_string(),
+            ack_required: Some(true),
+            ..Default::default()
+        };
+        let q2 = SearchQuery {
+            text: "shared".to_string(),
+            ack_required: Some(false),
+            ..Default::default()
+        };
+        assert_ne!(
+            cache_scope_discriminator(&q1),
+            cache_scope_discriminator(&q2)
+        );
+    }
+
+    #[test]
+    fn cache_scope_discriminator_differs_by_direction() {
+        let q1 = SearchQuery {
+            text: "shared".to_string(),
+            direction: Some(Direction::Inbox),
+            ..Default::default()
+        };
+        let q2 = SearchQuery {
+            text: "shared".to_string(),
+            direction: Some(Direction::Outbox),
+            ..Default::default()
+        };
+        assert_ne!(
+            cache_scope_discriminator(&q1),
+            cache_scope_discriminator(&q2)
+        );
+    }
+
+    #[test]
+    fn cache_scope_discriminator_importance_is_order_invariant() {
+        let q1 = SearchQuery {
+            text: "shared".to_string(),
+            importance: vec![Importance::High, Importance::Urgent],
+            ..Default::default()
+        };
+        let q2 = SearchQuery {
+            text: "shared".to_string(),
+            importance: vec![Importance::Urgent, Importance::High],
+            ..Default::default()
+        };
+        assert_eq!(
+            cache_scope_discriminator(&q1),
+            cache_scope_discriminator(&q2)
+        );
+    }
+
     fn detail_row(
         id: i64,
         project_id: i64,
@@ -3672,6 +3958,7 @@ mod tests {
         assert!(detail_matches_query_filters(
             &query,
             &detail,
+            None,
             Some(&allowed)
         ));
 
@@ -3680,6 +3967,7 @@ mod tests {
         assert!(!detail_matches_query_filters(
             &query,
             &detail,
+            None,
             Some(&disallowed)
         ));
 
@@ -3690,6 +3978,7 @@ mod tests {
         assert!(!detail_matches_query_filters(
             &wrong_project_query,
             &detail,
+            None,
             None
         ));
     }
@@ -3699,11 +3988,12 @@ mod tests {
         let detail = detail_row(2, 1, "BlueLake", Some("br-200"), "high", 1, 2_000);
         let query = SearchQuery {
             agent_name: Some("bluelake".to_string()),
+            direction: Some(Direction::Outbox),
             thread_id: Some("br-200".to_string()),
             ack_required: Some(true),
             ..Default::default()
         };
-        assert!(detail_matches_query_filters(&query, &detail, None));
+        assert!(detail_matches_query_filters(&query, &detail, None, None));
 
         let wrong_thread_query = SearchQuery {
             thread_id: Some("br-201".to_string()),
@@ -3712,6 +4002,7 @@ mod tests {
         assert!(!detail_matches_query_filters(
             &wrong_thread_query,
             &detail,
+            None,
             None
         ));
 
@@ -3722,6 +4013,40 @@ mod tests {
         assert!(!detail_matches_query_filters(
             &ack_mismatch_query,
             &detail,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn detail_filter_matches_inbox_agent_against_recipients() {
+        let detail = detail_row(22, 1, "RedPeak", Some("br-220"), "normal", 0, 2_200);
+        let query = SearchQuery {
+            agent_name: Some("BlueLake".to_string()),
+            direction: Some(Direction::Inbox),
+            ..Default::default()
+        };
+        let recipients = vec!["BlueLake".to_string(), "GreenCastle".to_string()];
+        assert!(detail_matches_query_filters(
+            &query,
+            &detail,
+            Some(recipients.as_slice()),
+            None
+        ));
+    }
+
+    #[test]
+    fn detail_filter_without_direction_matches_sender_or_recipient() {
+        let detail = detail_row(23, 1, "RedPeak", Some("br-230"), "normal", 0, 2_300);
+        let query = SearchQuery {
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
+        let recipients = vec!["BlueLake".to_string()];
+        assert!(detail_matches_query_filters(
+            &query,
+            &detail,
+            Some(recipients.as_slice()),
             None
         ));
     }
@@ -3737,7 +4062,7 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(detail_matches_query_filters(&query, &detail, None));
+        assert!(detail_matches_query_filters(&query, &detail, None, None));
 
         let wrong_importance_query = SearchQuery {
             importance: vec![Importance::Urgent],
@@ -3746,6 +4071,7 @@ mod tests {
         assert!(!detail_matches_query_filters(
             &wrong_importance_query,
             &detail,
+            None,
             None
         ));
 
@@ -3759,8 +4085,68 @@ mod tests {
         assert!(!detail_matches_query_filters(
             &outside_time_query,
             &detail,
+            None,
             None
         ));
+    }
+
+    #[test]
+    fn unresolved_inbox_results_require_recipient_metadata() {
+        let query = SearchQuery {
+            agent_name: Some("BlueLake".to_string()),
+            direction: Some(Direction::Inbox),
+            ..Default::default()
+        };
+        let result = SearchResult {
+            doc_kind: DocKind::Message,
+            id: 24,
+            project_id: Some(1),
+            title: "subject".to_string(),
+            body: String::new(),
+            score: Some(0.5),
+            importance: Some("normal".to_string()),
+            ack_required: Some(false),
+            created_ts: Some(2_400),
+            thread_id: Some("br-240".to_string()),
+            from_agent: Some("RedPeak".to_string()),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+            redacted: false,
+            redaction_reason: None,
+        };
+        assert!(!raw_result_matches_query_filters(&query, &result, None));
+    }
+
+    #[test]
+    fn lexical_candidate_limit_expands_for_inbox_agent_filter() {
+        let query = SearchQuery {
+            agent_name: Some("BlueLake".to_string()),
+            direction: Some(Direction::Inbox),
+            limit: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(lexical_candidate_limit(&query), 64);
+    }
+
+    #[test]
+    fn lexical_candidate_limit_expands_for_ack_required_filter() {
+        let query = SearchQuery {
+            ack_required: Some(true),
+            limit: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(lexical_candidate_limit(&query), 80);
+    }
+
+    #[test]
+    fn lexical_candidate_limit_keeps_exact_outbox_sender_queries_tight() {
+        let query = SearchQuery {
+            agent_name: Some("BlueLake".to_string()),
+            direction: Some(Direction::Outbox),
+            limit: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(lexical_candidate_limit(&query), 7);
     }
 
     // ── Zero-result guidance tests ──────────────────────────────────

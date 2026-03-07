@@ -411,6 +411,7 @@ fn discover_messages(
 }
 
 /// Parse a single archive `.md` file and insert the message into the database.
+#[allow(clippy::too_many_lines)]
 fn parse_and_insert_message(
     conn: &DbConn,
     file_path: &Path,
@@ -438,7 +439,7 @@ fn parse_and_insert_message(
 
     let subject = json_str(&msg, "subject").unwrap_or("");
     let body_md = extract_body_after_frontmatter(&content).unwrap_or("");
-    let thread_id = json_str(&msg, "thread_id");
+    let raw_thread_id = json_str(&msg, "thread_id");
     let importance = json_str(&msg, "importance").unwrap_or("normal");
     let ack_required = msg
         .get("ack_required")
@@ -465,11 +466,35 @@ fn parse_and_insert_message(
     // DB primary key so that archive filenames (which embed `__{id}.md`)
     // remain consistent with DB row IDs.
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/9
-    let thread_id_val = thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
     let canonical_id = msg
         .get("id")
         .and_then(serde_json::Value::as_i64)
         .filter(|&id| id > 0);
+
+    if let Some(cid) = canonical_id
+        && message_id_exists(conn, cid)?
+    {
+        stats.warnings.push(format!(
+            "Duplicate canonical message id {cid} in {}; keeping the first archive artifact and skipping the duplicate",
+            file_path.display()
+        ));
+        return Ok(());
+    }
+
+    let thread_id = raw_thread_id.and_then(|raw| {
+        let normalized = sanitize_reconstructed_thread_id(raw);
+        if normalized.as_deref() != Some(raw) {
+            stats.warnings.push(format!(
+                "Sanitized invalid thread_id {:?} in {} during reconstruction",
+                raw,
+                file_path.display()
+            ));
+        }
+        normalized
+    });
+    let thread_id_val = thread_id
+        .as_deref()
+        .map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
 
     let message_id = if let Some(cid) = canonical_id {
         conn.execute_sync(
@@ -587,6 +612,30 @@ fn insert_recipient(conn: &DbConn, message_id: i64, agent_id: i64, kind: &str) -
     .map_err(|e| DbError::Sqlite(format!("insert recipient: {e}")))
 }
 
+fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
+    let sanitized: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .take(128)
+        .collect();
+    if sanitized.is_empty() || !sanitized.as_bytes()[0].is_ascii_alphanumeric() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn message_id_exists(conn: &DbConn, message_id: i64) -> DbResult<bool> {
+    let rows = conn
+        .query_sync(
+            "SELECT 1 AS exists_flag FROM messages WHERE id = ? LIMIT 1",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| DbError::Sqlite(format!("check message {message_id} existence: {e}")))?;
+    Ok(!rows.is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -679,15 +728,46 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
     human_key.to_string()
 }
 
+fn frontmatter_bounds(content: &str) -> Option<(usize, usize, usize)> {
+    let start = content.find("---json")?;
+    let after_start = &content[start..];
+    let json_start = if after_start.starts_with("---json\r\n") {
+        start + "---json\r\n".len()
+    } else if after_start.starts_with("---json\n") {
+        start + "---json\n".len()
+    } else {
+        return None;
+    };
+
+    let mut search_from = json_start;
+    while let Some(relative) = content[search_from..].find("---") {
+        let marker_start = search_from + relative;
+        if marker_start == 0 || !content[..marker_start].ends_with('\n') {
+            search_from = marker_start + 3;
+            continue;
+        }
+
+        let after_marker = marker_start + 3;
+        if after_marker == content.len() {
+            return Some((json_start, marker_start, after_marker));
+        }
+        if content[after_marker..].starts_with("\r\n") {
+            return Some((json_start, marker_start, after_marker + 2));
+        }
+        if content[after_marker..].starts_with('\n') {
+            return Some((json_start, marker_start, after_marker + 1));
+        }
+
+        search_from = marker_start + 3;
+    }
+
+    None
+}
+
 /// Extract JSON frontmatter from a `---json\n...\n---` block.
 fn extract_json_frontmatter(content: &str) -> Option<&str> {
-    let start_marker = "---json\n";
-    let end_marker = "\n---\n";
-
-    let start = content.find(start_marker)?;
-    let json_start = start + start_marker.len();
-    let json_end = content[json_start..].find(end_marker)?;
-    Some(&content[json_start..json_start + json_end])
+    let (json_start, json_end, _) = frontmatter_bounds(content)?;
+    Some(&content[json_start..json_end])
 }
 
 /// Extract the body text after the frontmatter block.
@@ -695,9 +775,8 @@ fn extract_json_frontmatter(content: &str) -> Option<&str> {
 /// Only strips leading blank lines; trailing whitespace is preserved
 /// so reconstructed bodies match the original archive content.
 fn extract_body_after_frontmatter(content: &str) -> Option<&str> {
-    let end_marker = "\n---\n";
-    let idx = content.find(end_marker)?;
-    let after = &content[idx + end_marker.len()..];
+    let (_, _, body_start) = frontmatter_bounds(content)?;
+    let after = &content[body_start..];
     // Skip leading blank lines only — preserve trailing whitespace
     Some(after.trim_start_matches(['\n', '\r']))
 }
@@ -773,7 +852,7 @@ fn query_last_insert_or_existing_id_composite(
 ) -> DbResult<i64> {
     let rows = conn
         .query_sync(
-            &format!("SELECT id FROM {table} WHERE {col1} = ? AND {col2} = ?"),
+            &format!("SELECT id FROM {table} WHERE {col1} = ? AND {col2} = ? COLLATE NOCASE"),
             &[Value::BigInt(val1), Value::Text(val2.to_string())],
         )
         .map_err(|e| DbError::Sqlite(format!("query {table}.id composite: {e}")))?;
@@ -847,6 +926,22 @@ mod tests {
     fn extract_json_frontmatter_missing() {
         assert!(extract_json_frontmatter("no frontmatter here").is_none());
         assert!(extract_json_frontmatter("---json\nno end marker").is_none());
+    }
+
+    #[test]
+    fn extract_json_frontmatter_accepts_crlf_delimiters() {
+        let content = "---json\r\n{\"id\": 7}\r\n---\r\n\r\nBody\r\n";
+        let fm = extract_json_frontmatter(content).expect("should extract");
+        assert_eq!(fm, "{\"id\": 7}\r\n");
+    }
+
+    #[test]
+    fn extract_json_frontmatter_accepts_eof_after_closing_marker() {
+        let content = "---json\n{\"id\": 9}\n---";
+        let fm = extract_json_frontmatter(content).expect("should extract");
+        assert_eq!(fm, "{\"id\": 9}\n");
+        let body = extract_body_after_frontmatter(content).expect("should extract body");
+        assert_eq!(body, "");
     }
 
     #[test]
@@ -936,6 +1031,36 @@ mod tests {
         assert!(display.contains("5 agents"));
         assert!(display.contains("100 messages"));
         assert!(display.contains("3 parse errors"));
+    }
+
+    #[test]
+    fn query_last_insert_or_existing_id_composite_matches_case_insensitively() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY,\
+                project_id INTEGER NOT NULL,\
+                name TEXT NOT NULL\
+            )",
+        )
+        .expect("create agents table");
+        conn.query_sync(
+            "INSERT INTO agents (project_id, name) VALUES (1, 'BlueLake')",
+            &[],
+        )
+        .expect("insert agent");
+
+        let id = query_last_insert_or_existing_id_composite(
+            &conn,
+            "agents",
+            "project_id",
+            1,
+            "name",
+            "bluelake",
+        )
+        .expect("find agent id case-insensitively");
+
+        assert_eq!(id, 1);
     }
 
     #[test]
@@ -1176,5 +1301,169 @@ Hello Bob, this is a test message.
         assert_eq!(stats.messages, 0);
         assert_eq!(stats.parse_errors, 2, "both bad files should be counted");
         assert_eq!(stats.warnings.len(), 2);
+    }
+
+    #[test]
+    fn reconstruct_skips_duplicate_canonical_message_id_without_merging_recipients() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("dup-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"dup-project","human_key":"/dup-project","created_at":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-02-22T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__first__7.md"),
+            r#"---json
+{
+  "id": 7,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-01-00Z__second__7.md"),
+            r#"---json
+{
+  "id": 7,
+  "from": "Alice",
+  "to": ["Carol"],
+  "subject": "Second copy",
+  "importance": "urgent",
+  "created_ts": "2026-02-22T12:01:00Z"
+}
+---
+
+second body
+"#,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.messages, 1, "duplicate canonical id must be skipped");
+        assert_eq!(
+            stats.recipients, 1,
+            "duplicate recipient rows must not merge"
+        );
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate canonical message id 7")),
+            "expected duplicate-id warning, got {:?}",
+            stats.warnings
+        );
+
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let subject_rows = conn
+            .query_sync("SELECT subject FROM messages WHERE id = 7", &[])
+            .unwrap();
+        assert_eq!(subject_rows.len(), 1);
+        assert_eq!(
+            subject_rows[0]
+                .get_named::<String>("subject")
+                .expect("subject"),
+            "First copy"
+        );
+
+        let recipient_rows = conn
+            .query_sync(
+                "SELECT a.name AS name \
+                 FROM message_recipients mr \
+                 JOIN agents a ON a.id = mr.agent_id \
+                 WHERE mr.message_id = 7 \
+                 ORDER BY a.name",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(recipient_rows.len(), 1);
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("name")
+                .expect("recipient name"),
+            "Bob"
+        );
+    }
+
+    #[test]
+    fn reconstruct_sanitizes_invalid_thread_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("thread-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"thread-project","human_key":"/thread-project","created_at":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-02-22T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__thread__9.md"),
+            r#"---json
+{
+  "id": 9,
+  "from": "Alice",
+  "to": ["Bob"],
+  "thread_id": "  !!br:123??  ",
+  "subject": "Thread sanitize",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z"
+}
+---
+
+thread body
+"#,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Sanitized invalid thread_id")),
+            "expected thread-id warning, got {:?}",
+            stats.warnings
+        );
+
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT thread_id FROM messages WHERE id = 9", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("thread_id").expect("thread_id"),
+            "br123"
+        );
     }
 }

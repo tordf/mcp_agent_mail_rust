@@ -21,6 +21,7 @@ use sqlmodel::prelude::*;
 use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
 use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
 use sqlmodel_query::{raw_execute, raw_query};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -2870,6 +2871,66 @@ pub async fn list_message_recipient_names_for_messages(
     Outcome::Ok(out)
 }
 
+/// List recipient agent names keyed by message id for a set of messages.
+pub async fn list_message_recipient_names_by_message(
+    cx: &Cx,
+    pool: &DbPool,
+    message_ids: &[i64],
+) -> Outcome<HashMap<i64, Vec<String>>, DbError> {
+    if message_ids.is_empty() {
+        return Outcome::Ok(HashMap::new());
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    let mut out: HashMap<i64, Vec<String>> = HashMap::new();
+
+    for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT r.message_id, a.name \
+             FROM message_recipients r \
+             JOIN agents a ON a.id = r.agent_id \
+             WHERE r.message_id IN ({placeholders}) \
+             ORDER BY r.message_id ASC, a.name COLLATE NOCASE ASC"
+        );
+
+        let params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
+
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let message_id: i64 = match row.get_as(0) {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let name: String = match row.get_as(1) {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.entry(message_id).or_default().push(name);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+
+    for names in out.values_mut() {
+        names.sort_by_key(|name| name.to_ascii_lowercase());
+        names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    }
+
+    Outcome::Ok(out)
+}
+
 /// Get message by ID
 pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<MessageRow, DbError> {
     let conn = match acquire_conn(cx, pool).await {
@@ -4148,6 +4209,52 @@ pub async fn mark_message_read(
     Outcome::Ok(ts)
 }
 
+/// Mark every unread message in a project inbox as read for a specific agent.
+pub async fn mark_all_messages_read_in_project(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+) -> Outcome<i64, DbError> {
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+    let sql = "UPDATE message_recipients \
+               SET read_ts = ? \
+               WHERE agent_id = ? AND read_ts IS NULL \
+               AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
+    let params = [
+        Value::BigInt(now),
+        Value::BigInt(agent_id),
+        Value::BigInt(project_id),
+    ];
+    let rows_affected = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+    );
+
+    crate::cache::read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
+
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+
+    let Ok(rows_affected_i64) = i64::try_from(rows_affected) else {
+        return Outcome::Err(DbError::Internal(
+            "rows_affected exceeded i64::MAX while marking project inbox read".to_string(),
+        ));
+    };
+    Outcome::Ok(rows_affected_i64)
+}
+
 /// Acknowledge message
 pub async fn acknowledge_message(
     cx: &Cx,
@@ -4868,20 +4975,23 @@ pub async fn list_file_reservations(
         (
             // Legacy Python schema stored released_ts as TEXT (e.g. "2026-02-05 02:21:37.212634").
             // Coerce it to INTEGER microseconds so listing historical reservations can't crash.
+            // Prefer the sidecar release ledger when present because it is the
+            // authoritative release source for modern reservations.
             "SELECT \
-                 id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, \
-                 CASE \
-                     WHEN released_ts IS NULL THEN NULL \
-                     WHEN typeof(released_ts) = 'text' THEN CAST(strftime('%s', released_ts) AS INTEGER) * 1000000 + \
-                         CASE WHEN instr(released_ts, '.') > 0 \
-                              THEN CAST(substr(released_ts || '000000', instr(released_ts, '.') + 1, 6) AS INTEGER) \
+                 fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, fr.created_ts, fr.expires_ts, \
+                 COALESCE(rr.released_ts, CASE \
+                     WHEN fr.released_ts IS NULL THEN NULL \
+                     WHEN typeof(fr.released_ts) = 'text' THEN CAST(strftime('%s', fr.released_ts) AS INTEGER) * 1000000 + \
+                         CASE WHEN instr(fr.released_ts, '.') > 0 \
+                              THEN CAST(substr(fr.released_ts || '000000', instr(fr.released_ts, '.') + 1, 6) AS INTEGER) \
                               ELSE 0 \
                          END \
-                     ELSE released_ts \
-                 END AS released_ts \
-             FROM file_reservations \
-             WHERE project_id = ? \
-             ORDER BY id"
+                     ELSE fr.released_ts \
+                 END) AS released_ts \
+             FROM file_reservations fr \
+             LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+             WHERE fr.project_id = ? \
+             ORDER BY fr.id"
                 .to_string(),
             vec![Value::BigInt(project_id)],
         )
@@ -5977,9 +6087,10 @@ pub async fn get_reservations_by_ids(
         let placeholders = placeholders(chunk.len());
         let sql = format!(
             "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
-                    created_ts, expires_ts, released_ts \
-             FROM file_reservations \
-             WHERE id IN ({placeholders})"
+                    created_ts, expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
+             FROM file_reservations fr \
+             LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+             WHERE fr.id IN ({placeholders})"
         );
 
         let mut params = Vec::with_capacity(chunk.len());
@@ -10136,6 +10247,163 @@ mod tests {
                 refetched.last_active_ts > 0,
                 "last_active_ts should be updated after touch flush"
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mark_all_messages_read_in_project_marks_large_inboxes_without_touching_other_projects() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("mark_all_messages_read_in_project_large.db");
+
+        rt.block_on(async {
+            let project_a = ensure_project(&cx, &pool, "/tmp/am-mark-all-read-large-a")
+                .await
+                .into_result()
+                .expect("ensure project A");
+            let project_b = ensure_project(&cx, &pool, "/tmp/am-mark-all-read-large-b")
+                .await
+                .into_result()
+                .expect("ensure project B");
+
+            let sender_a = register_agent(
+                &cx,
+                &pool,
+                project_a.id.unwrap_or(0),
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender A");
+            let recipient_a = register_agent(
+                &cx,
+                &pool,
+                project_a.id.unwrap_or(0),
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient A");
+            let sender_b = register_agent(
+                &cx,
+                &pool,
+                project_b.id.unwrap_or(0),
+                "RedField",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender B");
+            let recipient_b = register_agent(
+                &cx,
+                &pool,
+                project_b.id.unwrap_or(0),
+                "AmberHill",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient B");
+
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection");
+            conn.execute_raw("BEGIN IMMEDIATE")
+                .expect("begin insert transaction");
+            for idx in 0_i64..10_050 {
+                let message_id = idx + 1;
+                let created_ts = 1_700_000_000_000_000_i64 + idx;
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages \
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                     VALUES ({message_id}, {}, {}, 'bulk-thread', 'bulk-{message_id}', 'body', 'normal', 0, {created_ts}, '[]')",
+                    project_a.id.unwrap_or(0),
+                    sender_a.id.unwrap_or(0),
+                ))
+                .expect("insert project A message");
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES ({message_id}, {}, 'to', NULL, NULL)",
+                    recipient_a.id.unwrap_or(0),
+                ))
+                .expect("insert project A recipient");
+            }
+            conn.execute_raw(&format!(
+                "INSERT INTO messages \
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                 VALUES (20001, {}, {}, 'other-thread', 'other', 'body', 'normal', 0, 1800000000000000, '[]')",
+                project_b.id.unwrap_or(0),
+                sender_b.id.unwrap_or(0),
+            ))
+            .expect("insert project B message");
+            conn.execute_raw(&format!(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (20001, {}, 'to', NULL, NULL)",
+                recipient_b.id.unwrap_or(0),
+            ))
+            .expect("insert project B recipient");
+            conn.execute_raw("COMMIT").expect("commit seed transaction");
+            drop(conn);
+
+            let marked_count = mark_all_messages_read_in_project(
+                &cx,
+                &pool,
+                project_a.id.unwrap_or(0),
+                recipient_a.id.unwrap_or(0),
+            )
+            .await
+            .into_result()
+            .expect("mark large project inbox read");
+
+            assert_eq!(marked_count, 10_050);
+
+            let unread_a = fetch_inbox_unread(
+                &cx,
+                &pool,
+                project_a.id.unwrap_or(0),
+                recipient_a.id.unwrap_or(0),
+                false,
+                None,
+                10_100,
+            )
+            .await
+            .into_result()
+            .expect("fetch unread project A");
+            assert!(
+                unread_a.is_empty(),
+                "project A inbox should be fully marked read"
+            );
+
+            let unread_b = fetch_inbox_unread(
+                &cx,
+                &pool,
+                project_b.id.unwrap_or(0),
+                recipient_b.id.unwrap_or(0),
+                false,
+                None,
+                10,
+            )
+            .await
+            .into_result()
+            .expect("fetch unread project B");
+            assert_eq!(unread_b.len(), 1, "other project inbox must stay unread");
         });
     }
 

@@ -4,7 +4,7 @@
 //! (FTS5-based `search_planner` + `search_service`) and the Tantivy-based
 //! search engine in `mcp-agent-mail-search-core`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -17,13 +17,13 @@ use mcp_agent_mail_core::search_types::{DateRange, ImportanceFilter, SearchFilte
 use sqlmodel_core::Value;
 use tantivy::Order;
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::TermQuery;
+use tantivy::query::{AllQuery, Query, TermQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::{Index, Term};
 
 use crate::DbConn;
 use crate::search_planner::{
-    DocKind, Importance, SearchQuery as PlannerQuery, SearchResult as PlannerResult,
+    Direction, DocKind, Importance, SearchQuery as PlannerQuery, SearchResult as PlannerResult,
 };
 
 /// Bridge between the Tantivy search engine and the planner query/result types.
@@ -105,18 +105,24 @@ impl TantivyBridge {
     /// executes the search, and converts results back to `SearchResult`.
     #[must_use]
     pub fn search(&self, query: &PlannerQuery) -> Vec<PlannerResult> {
+        let importance_plan = build_importance_filter_plan(query);
+        let filter = build_search_filter(query, &importance_plan);
+        let compiled = compile_filters(&filter, &self.handles);
+
         // Build text query
         let parser = LexicalParser::with_defaults(self.handles.subject, self.handles.body);
         let outcome = parser.parse(&self.index, &query.text);
 
-        let text_query = match outcome {
+        let text_query: Box<dyn Query> = match outcome {
             ParseOutcome::Parsed(q) | ParseOutcome::Fallback { query: q, .. } => q,
-            ParseOutcome::Empty => return Vec::new(),
+            ParseOutcome::Empty => {
+                if compiled.is_empty() {
+                    return Vec::new();
+                }
+                Box::new(AllQuery)
+            }
         };
 
-        // Build filters
-        let filter = build_search_filter(query);
-        let compiled = compile_filters(&filter, &self.handles);
         let final_query = compiled.apply_to(text_query);
 
         // Extract terms for snippets
@@ -125,19 +131,44 @@ impl TantivyBridge {
         // Execute
         let limit = query.effective_limit();
         let config = ResponseConfig::default();
-        let results = lexical_response::execute_search(
-            &self.index,
-            &*final_query,
-            &self.handles,
-            &terms,
-            limit,
-            0, // offset handled externally via cursor
-            query.explain,
-            &config,
-        );
+        let mut fetch_limit = if importance_plan.needs_post_filter {
+            limit.saturating_mul(4).max(limit).max(16)
+        } else {
+            limit
+        };
+        let max_fetch_limit = limit.saturating_mul(16).max(fetch_limit).max(64);
 
-        // Convert to planner results
-        convert_results(&results, query.doc_kind)
+        loop {
+            let results = lexical_response::execute_search(
+                &self.index,
+                &*final_query,
+                &self.handles,
+                &terms,
+                fetch_limit,
+                0, // offset handled externally via cursor
+                query.explain,
+                &config,
+            );
+
+            let mut planner_results = convert_results(&results, query.doc_kind);
+            if let Some(allowed) = importance_plan.exact_importances.as_ref() {
+                planner_results.retain(|result| {
+                    result
+                        .importance
+                        .as_deref()
+                        .is_some_and(|importance| allowed.contains(importance))
+                });
+            }
+            if planner_results.len() >= limit
+                || !importance_plan.needs_post_filter
+                || results.hits.len() < fetch_limit
+                || fetch_limit >= max_fetch_limit
+            {
+                planner_results.truncate(limit);
+                return planner_results;
+            }
+            fetch_limit = fetch_limit.saturating_mul(2).min(max_fetch_limit);
+        }
     }
 }
 
@@ -172,8 +203,62 @@ fn measure_index_dir_bytes(index_dir: &Path) -> u64 {
     total
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportanceFilterPlan {
+    filter: Option<ImportanceFilter>,
+    exact_importances: Option<BTreeSet<&'static str>>,
+    needs_post_filter: bool,
+}
+
+fn build_importance_filter_plan(query: &PlannerQuery) -> ImportanceFilterPlan {
+    if query.importance.is_empty() {
+        return ImportanceFilterPlan {
+            filter: None,
+            exact_importances: None,
+            needs_post_filter: false,
+        };
+    }
+
+    let exact_importances: BTreeSet<&'static str> = query
+        .importance
+        .iter()
+        .copied()
+        .map(Importance::as_str)
+        .collect();
+    let has_urgent = exact_importances.contains("urgent");
+    let has_high = exact_importances.contains("high");
+    let has_normal = exact_importances.contains("normal");
+    let has_low = exact_importances.contains("low");
+
+    let filter = if has_urgent && !has_high && !has_normal && !has_low {
+        Some(ImportanceFilter::Urgent)
+    } else if has_high && !has_normal && !has_low {
+        Some(ImportanceFilter::High)
+    } else if has_normal && !has_high && !has_urgent && !has_low {
+        Some(ImportanceFilter::Normal)
+    } else if has_low && !has_high && !has_urgent && !has_normal {
+        Some(ImportanceFilter::Low)
+    } else {
+        None
+    };
+    let needs_post_filter = match filter {
+        Some(ImportanceFilter::Urgent | ImportanceFilter::Normal | ImportanceFilter::Low) => false,
+        Some(ImportanceFilter::High) => !has_high || has_normal || has_low,
+        Some(ImportanceFilter::Any) | None => true,
+    };
+
+    ImportanceFilterPlan {
+        filter,
+        exact_importances: Some(exact_importances),
+        needs_post_filter,
+    }
+}
+
 /// Convert a planner `SearchQuery` to search-core `SearchFilter`.
-fn build_search_filter(query: &PlannerQuery) -> SearchFilter {
+fn build_search_filter(
+    query: &PlannerQuery,
+    importance_plan: &ImportanceFilterPlan,
+) -> SearchFilter {
     let mut filter = SearchFilter::default();
 
     // Project scope
@@ -181,8 +266,11 @@ fn build_search_filter(query: &PlannerQuery) -> SearchFilter {
         filter.project_id = Some(pid);
     }
 
-    // Agent name → sender filter
-    if let Some(ref agent) = query.agent_name {
+    // Only pure outbox queries can enforce agent_name at lexical-filter time.
+    if let Some(ref agent) = query.agent_name
+        && query.doc_kind == DocKind::Message
+        && matches!(query.direction, Some(Direction::Outbox))
+    {
         filter.sender = Some(agent.clone());
     }
 
@@ -192,25 +280,7 @@ fn build_search_filter(query: &PlannerQuery) -> SearchFilter {
     }
 
     // Importance levels → filter
-    if !query.importance.is_empty() {
-        // Map planner importance levels to search-core filter
-        let has_urgent = query.importance.contains(&Importance::Urgent);
-        let has_high = query.importance.contains(&Importance::High);
-        let has_normal = query.importance.contains(&Importance::Normal);
-        let has_low = query.importance.contains(&Importance::Low);
-
-        if has_urgent && !has_high && !has_normal && !has_low {
-            filter.importance = Some(ImportanceFilter::Urgent);
-        } else if (has_high || has_urgent) && !has_normal && !has_low {
-            filter.importance = Some(ImportanceFilter::High);
-        } else if has_normal && !has_high && !has_urgent && !has_low {
-            filter.importance = Some(ImportanceFilter::Normal);
-        } else if has_low && !has_high && !has_urgent && !has_normal {
-            filter.importance = Some(ImportanceFilter::Low);
-        }
-        // If multiple non-adjacent levels, we can't express it as a single filter;
-        // leave importance filter as None (accept all) and post-filter if needed
-    }
+    filter.importance = importance_plan.filter;
 
     // Doc kind
     let doc_kind = match query.doc_kind {
@@ -329,7 +399,27 @@ pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
             return Err(e);
         }
     };
-    let _ = BRIDGE.set(Some(Arc::new(bridge)));
+    if BRIDGE.set(Some(Arc::new(bridge))).is_err() {
+        if let Some(existing) = get_bridge() {
+            if same_index_dir(existing.index_dir(), index_dir) {
+                record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
+                return Ok(());
+            }
+            let error = format!(
+                "search bridge already initialized for {}; refusing to reinitialize for {}",
+                existing.index_dir().display(),
+                index_dir.display()
+            );
+            record_warmup_failure(WarmResource::LexicalIndex, &error);
+            return Err(error);
+        }
+        let error = format!(
+            "search bridge initialization raced for {}; global state unavailable afterward",
+            index_dir.display()
+        );
+        record_warmup_failure(WarmResource::LexicalIndex, &error);
+        return Err(error);
+    }
     record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
     Ok(())
 }
@@ -1103,6 +1193,7 @@ mod tests {
         let query = PlannerQuery {
             text: "plan fix".to_string(),
             doc_kind: DocKind::Message,
+            direction: Some(Direction::Outbox),
             agent_name: Some("BlueLake".to_string()),
             ..Default::default()
         };
@@ -1187,7 +1278,7 @@ mod tests {
     #[test]
     fn filter_default_query_has_message_doc_kind() {
         let query = PlannerQuery::messages("test", 1);
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Message));
         assert_eq!(filter.project_id, Some(1));
         assert!(filter.sender.is_none());
@@ -1203,7 +1294,7 @@ mod tests {
             doc_kind: DocKind::Agent,
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Agent));
     }
 
@@ -1214,7 +1305,7 @@ mod tests {
             doc_kind: DocKind::Project,
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Project));
     }
 
@@ -1225,7 +1316,7 @@ mod tests {
             doc_kind: DocKind::Thread,
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Thread));
     }
 
@@ -1234,11 +1325,37 @@ mod tests {
         let query = PlannerQuery {
             text: "test".to_string(),
             doc_kind: DocKind::Message,
+            direction: Some(Direction::Outbox),
             agent_name: Some("BlueLake".to_string()),
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.sender.as_deref(), Some("BlueLake"));
+    }
+
+    #[test]
+    fn filter_with_agent_name_without_direction_requires_post_filter() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
+        assert!(filter.sender.is_none());
+    }
+
+    #[test]
+    fn filter_with_agent_name_inbox_requires_post_filter() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            direction: Some(Direction::Inbox),
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
+        assert!(filter.sender.is_none());
     }
 
     #[test]
@@ -1249,7 +1366,7 @@ mod tests {
             thread_id: Some("br-42".to_string()),
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.thread_id.as_deref(), Some("br-42"));
     }
 
@@ -1261,7 +1378,7 @@ mod tests {
             importance: vec![Importance::Urgent],
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.importance, Some(ImportanceFilter::Urgent));
     }
 
@@ -1273,7 +1390,7 @@ mod tests {
             importance: vec![Importance::High],
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.importance, Some(ImportanceFilter::High));
     }
 
@@ -1285,7 +1402,7 @@ mod tests {
             importance: vec![Importance::Normal],
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.importance, Some(ImportanceFilter::Normal));
     }
 
@@ -1297,7 +1414,7 @@ mod tests {
             importance: vec![Importance::Low],
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert_eq!(filter.importance, Some(ImportanceFilter::Low));
     }
 
@@ -1309,7 +1426,7 @@ mod tests {
             importance: vec![Importance::High, Importance::Urgent],
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         // High + Urgent without Normal/Low maps to ImportanceFilter::High.
         assert_eq!(filter.importance, Some(ImportanceFilter::High));
     }
@@ -1322,7 +1439,7 @@ mod tests {
             importance: vec![Importance::High, Importance::Low],
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         // Non-adjacent levels can't be expressed as a single filter → None.
         assert!(filter.importance.is_none());
     }
@@ -1339,7 +1456,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         let date_range = filter.date_range.expect("should have date_range");
         assert_eq!(date_range.start, Some(1_000_000));
         assert_eq!(date_range.end, Some(2_000_000));
@@ -1357,8 +1474,25 @@ mod tests {
             },
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         assert!(filter.date_range.is_none());
+    }
+
+    #[test]
+    fn importance_plan_high_only_requires_post_filter() {
+        let query = PlannerQuery {
+            text: "test".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::High],
+            ..Default::default()
+        };
+        let plan = build_importance_filter_plan(&query);
+        assert_eq!(plan.filter, Some(ImportanceFilter::High));
+        assert!(plan.needs_post_filter);
+        assert_eq!(
+            plan.exact_importances.expect("importance set"),
+            BTreeSet::from(["high"])
+        );
     }
 
     #[test]
@@ -1373,7 +1507,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let filter = build_search_filter(&query);
+        let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
         let date_range = filter.date_range.expect("should have date_range");
         assert_eq!(date_range.start, Some(1_000_000));
         assert!(date_range.end.is_none());
@@ -1570,7 +1704,9 @@ mod tests {
 
         assert!(err.contains("already initialized"));
         assert_eq!(
-            get_bridge().expect("bridge should stay initialized").index_dir(),
+            get_bridge()
+                .expect("bridge should stay initialized")
+                .index_dir(),
             temp_a.path()
         );
     }
@@ -1743,6 +1879,53 @@ mod tests {
         let results = bridge.search(&query);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn search_with_empty_text_and_project_filter_returns_filtered_results() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let project_one = make_indexable(1, "Alpha subject", "first body");
+        let mut project_two = make_indexable(2, "Beta subject", "second body");
+        project_two.project_id = 2;
+        project_two.project_slug = "other-project".to_string();
+        project_two.thread_id = Some("thread-2".to_string());
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        for msg in [&project_one, &project_two] {
+            #[allow(clippy::cast_sign_loss)]
+            let id_u64 = msg.id as u64;
+            #[allow(clippy::cast_sign_loss)]
+            let project_id_u64 = msg.project_id as u64;
+            writer
+                .add_document(doc!(
+                    handles.id => id_u64,
+                    handles.doc_kind => "message",
+                    handles.subject => msg.subject.as_str(),
+                    handles.body => msg.body_md.as_str(),
+                    handles.sender => msg.sender_name.as_str(),
+                    handles.project_slug => msg.project_slug.as_str(),
+                    handles.project_id => project_id_u64,
+                    handles.thread_id => msg.thread_id.as_deref().unwrap_or(""),
+                    handles.importance => msg.importance.as_str(),
+                    handles.created_ts => msg.created_ts
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let query = PlannerQuery {
+            text: String::new(),
+            doc_kind: DocKind::Message,
+            project_id: Some(2),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 2);
+        assert_eq!(results[0].project_id, Some(2));
     }
 
     #[test]
@@ -2168,6 +2351,94 @@ mod tests {
     }
 
     #[test]
+    fn batch_index_high_only_filter_excludes_urgent_matches() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        for (id, importance) in [(1_u64, "high"), (2_u64, "urgent"), (3_u64, "high")] {
+            writer
+                .add_document(doc!(
+                    handles.id => id,
+                    handles.doc_kind => "message",
+                    handles.subject => "importance exactness",
+                    handles.body => "importance exactness body",
+                    handles.sender => "Agent",
+                    handles.project_slug => "proj",
+                    handles.project_id => 1u64,
+                    handles.thread_id => "",
+                    handles.importance => importance,
+                    handles.created_ts => 0i64
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let query = PlannerQuery {
+            text: "importance".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::High],
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        assert_eq!(
+            results.len(),
+            2,
+            "only high-importance documents should remain"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.importance.as_deref() == Some("high"))
+        );
+    }
+
+    #[test]
+    fn batch_index_mixed_importance_filter_returns_exact_requested_set() {
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let mut writer = bridge.index().writer(15_000_000).unwrap();
+        for (id, importance) in [
+            (1_u64, "normal"),
+            (2_u64, "high"),
+            (3_u64, "urgent"),
+            (4_u64, "low"),
+        ] {
+            writer
+                .add_document(doc!(
+                    handles.id => id,
+                    handles.doc_kind => "message",
+                    handles.subject => "importance mixed",
+                    handles.body => "importance mixed body",
+                    handles.sender => "Agent",
+                    handles.project_slug => "proj",
+                    handles.project_id => 1u64,
+                    handles.thread_id => "",
+                    handles.importance => importance,
+                    handles.created_ts => 0i64
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+
+        let query = PlannerQuery {
+            text: "importance".to_string(),
+            doc_kind: DocKind::Message,
+            importance: vec![Importance::High, Importance::Low],
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let results = bridge.search(&query);
+        let returned: BTreeSet<&str> = results
+            .iter()
+            .map(|result| result.importance.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(returned, BTreeSet::from(["high", "low"]));
+    }
+
+    #[test]
     fn batch_index_sender_filter_after_indexing() {
         let bridge = TantivyBridge::in_memory();
         let handles = bridge.handles();
@@ -2198,6 +2469,7 @@ mod tests {
         let query = PlannerQuery {
             text: "search engine".to_string(),
             doc_kind: DocKind::Message,
+            direction: Some(Direction::Outbox),
             agent_name: Some("AlphaAgent".to_string()),
             project_id: Some(1),
             ..Default::default()
