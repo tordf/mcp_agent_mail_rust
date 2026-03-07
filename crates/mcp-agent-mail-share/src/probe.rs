@@ -383,13 +383,15 @@ fn probe_single_get(
 fn send_and_receive<S: io::Read + io::Write>(
     mut stream: S,
     parsed: &ParsedUrl,
-    _config: &ProbeConfig,
+    config: &ProbeConfig,
     capture_body: bool,
 ) -> Result<RawResponse, ProbeError> {
+    let user_agent = sanitized_header_value(&config.user_agent);
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail/probe\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
         parsed.path,
-        parsed.authority()
+        parsed.authority(),
+        user_agent,
     );
 
     stream
@@ -484,17 +486,19 @@ fn probe_via_curl(
     let url = parsed.to_url();
     #[allow(clippy::cast_possible_truncation)]
     let timeout_secs = config.timeout.as_secs().max(1);
+    let user_agent = sanitized_header_value(&config.user_agent);
 
     let mut command = std::process::Command::new("curl");
-    command.args([
-        "-sS",
-        "-D",
-        "-", // dump headers to stdout
-        "--max-time",
-        &timeout_secs.to_string(),
-        // Do not follow redirects — we handle them ourselves
-        &url,
-    ]);
+    command
+        .arg("-sS")
+        .arg("-D")
+        .arg("-")
+        .arg("--max-time")
+        .arg(timeout_secs.to_string())
+        .arg("-A")
+        .arg(user_agent)
+        // Do not follow redirects — we handle them ourselves.
+        .arg(&url);
     if !capture_body {
         let discard_target = if cfg!(windows) { "NUL" } else { "/dev/null" };
         command.args(["--output", discard_target]);
@@ -693,10 +697,34 @@ fn categorize_connect_error(err: io::Error, timeout: Duration) -> ProbeError {
     }
 }
 
+fn sanitized_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_control() || c == '\u{7f}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn resolve_redirect(base: &ParsedUrl, location: &str) -> String {
+    let location = location.trim();
+    let location = location.split('#').next().unwrap_or_default();
+    if location.is_empty() {
+        return base.to_url();
+    }
     if location.starts_with("http://") || location.starts_with("https://") {
         // Absolute URL
         location.to_string()
+    } else if location.starts_with("//") {
+        let scheme = match base.scheme {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        };
+        format!("{scheme}:{location}")
     } else if location.starts_with('/') {
         // Absolute path
         let scheme = match base.scheme {
@@ -704,28 +732,76 @@ fn resolve_redirect(base: &ParsedUrl, location: &str) -> String {
             Scheme::Https => "https",
         };
         format!("{}://{}{}", scheme, base.authority(), location)
-    } else {
-        // Relative path
-        let base_dir = base
-            .path
-            .rsplit_once('/')
-            .map_or("", |(p, _)| p.trim_start_matches('/'));
+    } else if location.starts_with('?') {
         let scheme = match base.scheme {
             Scheme::Http => "http",
             Scheme::Https => "https",
         };
-        if base_dir.is_empty() {
-            format!("{}://{}/{}", scheme, base.authority(), location)
+        let base_path = base
+            .path
+            .split_once('?')
+            .map_or(base.path.as_str(), |(path, _)| path);
+        format!("{scheme}://{}{}{}", base.authority(), base_path, location)
+    } else {
+        // Relative path
+        let scheme = match base.scheme {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        };
+        let (location_path, location_query) = location
+            .split_once('?')
+            .map_or((location, None), |(path, query)| (path, Some(query)));
+        let base_path = base
+            .path
+            .split_once('?')
+            .map_or(base.path.as_str(), |(path, _)| path);
+        let base_dir = if base_path.ends_with('/') {
+            base_path
         } else {
-            format!(
-                "{}://{}/{}/{}",
-                scheme,
-                base.authority(),
-                base_dir,
-                location
+            base_path.rsplit_once('/').map_or(
+                "/",
+                |(dir, _)| {
+                    if dir.is_empty() { "/" } else { dir }
+                },
             )
+        };
+        let joined = if base_dir.ends_with('/') {
+            format!("{base_dir}{location_path}")
+        } else {
+            format!("{base_dir}/{location_path}")
+        };
+        let normalized = normalize_redirect_path(&joined);
+        if let Some(query) = location_query {
+            format!("{scheme}://{}{}?{query}", base.authority(), normalized)
+        } else {
+            format!("{scheme}://{}{}", base.authority(), normalized)
         }
     }
+}
+
+fn normalize_redirect_path(path: &str) -> String {
+    let mut segments = Vec::new();
+    let trailing_slash = path.ends_with('/');
+
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+
+    let mut normalized = if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    };
+    if trailing_slash && normalized != "/" && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
 }
 
 // ── Multi-probe runner ──────────────────────────────────────────────────
@@ -879,6 +955,7 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
 
     fn spawn_http_sequence_server(responses: Vec<String>) -> (u16, thread::JoinHandle<()>) {
@@ -896,6 +973,26 @@ mod tests {
             }
         });
         (port, handle)
+    }
+
+    fn spawn_http_request_capture_server(
+        response: String,
+    ) -> (u16, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let port = listener.local_addr().expect("local addr").port();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).expect("read request");
+            tx.send(String::from_utf8_lossy(&buf[..read]).into_owned())
+                .expect("send request");
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        });
+        (port, rx, handle)
     }
 
     // ── URL parsing ─────────────────────────────────────────────────
@@ -1025,6 +1122,34 @@ mod tests {
     }
 
     #[test]
+    fn redirect_query_only_preserves_current_path() {
+        let base = ParsedUrl::parse("https://a.com/dir/old?x=1").unwrap();
+        let resolved = resolve_redirect(&base, "?page=2");
+        assert_eq!(resolved, "https://a.com/dir/old?page=2");
+    }
+
+    #[test]
+    fn redirect_fragment_only_preserves_current_url() {
+        let base = ParsedUrl::parse("https://a.com/dir/old?x=1").unwrap();
+        let resolved = resolve_redirect(&base, "#next");
+        assert_eq!(resolved, "https://a.com/dir/old?x=1");
+    }
+
+    #[test]
+    fn redirect_parent_dir_normalizes_dot_segments() {
+        let base = ParsedUrl::parse("https://a.com/dir/sub/old").unwrap();
+        let resolved = resolve_redirect(&base, "../next");
+        assert_eq!(resolved, "https://a.com/dir/next");
+    }
+
+    #[test]
+    fn redirect_scheme_relative_url_keeps_current_scheme() {
+        let base = ParsedUrl::parse("https://a.com/dir/old").unwrap();
+        let resolved = resolve_redirect(&base, "//b.com/new");
+        assert_eq!(resolved, "https://b.com/new");
+    }
+
+    #[test]
     fn parse_curl_http_response_preserves_binary_body_bytes() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n\xff\x00\x80";
         let response = parse_curl_http_response(raw, true).expect("parse curl response");
@@ -1123,6 +1248,19 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_header_value_replaces_crlf() {
+        assert_eq!(
+            sanitized_header_value("agent\r\nInjected: nope"),
+            "agent  Injected: nope"
+        );
+    }
+
+    #[test]
+    fn sanitize_header_value_replaces_other_control_bytes() {
+        assert_eq!(sanitized_header_value("agent\x00\x7f\tok"), "agent   ok");
+    }
+
+    #[test]
     fn probe_get_retries_server_error_and_follows_redirect() {
         let responses = vec![
             "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1146,6 +1284,24 @@ mod tests {
         assert_eq!(resp.final_url, format!("http://127.0.0.1:{port}/final"));
         assert_eq!(resp.redirects, 1);
         assert_eq!(resp.body_text(), "done");
+    }
+
+    #[test]
+    fn probe_get_uses_configured_user_agent() {
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string();
+        let (port, requests, handle) = spawn_http_request_capture_server(response);
+        let config = ProbeConfig {
+            user_agent: "custom-agent/1.0".to_string(),
+            ..ProbeConfig::default()
+        };
+
+        let resp = probe_get(&format!("http://127.0.0.1:{port}/ua"), &config).unwrap();
+        let request = requests.recv().expect("receive request");
+        handle.join().expect("join server");
+
+        assert_eq!(resp.status, 200);
+        assert!(request.contains("User-Agent: custom-agent/1.0\r\n"));
     }
 
     // ── ProbeResponse helpers ───────────────────────────────────────

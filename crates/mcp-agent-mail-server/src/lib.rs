@@ -1517,12 +1517,16 @@ fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config) {
     integrity_guard::start(config);
 }
 
+fn tui_startup_should_stop(tui_state: &Arc<tui_bridge::TuiSharedState>) -> bool {
+    tui_state.is_shutdown_requested() || tui_state.is_headless_detach_requested()
+}
+
 fn wait_for_tui_first_paint(tui_state: &Arc<tui_bridge::TuiSharedState>) -> bool {
     if tui_state.wait_for_first_paint(TUI_DEFERRED_WORKER_FIRST_PAINT_WAIT) {
         return true;
     }
     tracing::debug!("TUI deferred workers still waiting for first paint");
-    while !tui_state.is_shutdown_requested() {
+    while !tui_startup_should_stop(tui_state) {
         if tui_state.wait_for_first_paint(TUI_DEFERRED_WORKER_RECHECK_INTERVAL) {
             return true;
         }
@@ -1539,7 +1543,7 @@ fn wait_for_tui_db_readiness(tui_state: &Arc<tui_bridge::TuiSharedState>) -> boo
         db_warmup = ?state,
         "TUI deferred DB workers are waiting for a real DB-ready outcome"
     );
-    while !tui_state.is_shutdown_requested() {
+    while !tui_startup_should_stop(tui_state) {
         match state {
             tui_bridge::DbWarmupState::Ready => return true,
             tui_bridge::DbWarmupState::Pending => {
@@ -1564,14 +1568,14 @@ fn sleep_with_tui_shutdown(
 ) -> bool {
     let mut remaining = duration;
     while !remaining.is_zero() {
-        if tui_state.is_shutdown_requested() {
+        if tui_startup_should_stop(tui_state) {
             return true;
         }
         let chunk = remaining.min(Duration::from_secs(1));
         std::thread::sleep(chunk);
         remaining = remaining.saturating_sub(chunk);
     }
-    tui_state.is_shutdown_requested()
+    tui_startup_should_stop(tui_state)
 }
 
 fn spawn_tui_deferred_background_workers(
@@ -1763,11 +1767,18 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 
     if detach_headless {
         // TUI detached intentionally: keep HTTP server running headless.
-        set_tui_state_handle(None);
-        db_poller.stop();
+        //
+        // Any startup-gated worker thread must stop waiting on TUI-only latches
+        // before we join it; otherwise a detach that happens before DB-ready can
+        // leave the thread parked forever while the poller is being stopped.
         if let Some(handle) = deferred_workers.take() {
             let _ = handle.join();
         }
+        start_tui_non_db_background_workers(config);
+        start_tui_db_background_workers(config);
+        start_advisory_consistency_probe(config);
+        set_tui_state_handle(None);
+        db_poller.stop();
 
         let supervisor_result = supervisor_thread
             .join()
@@ -7774,6 +7785,28 @@ mod tests {
         handle_tui_readiness_warmup_result(Some(&state), Err("boom".to_string()));
 
         assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Failed);
+    }
+
+    #[test]
+    fn tui_deferred_wait_helpers_stop_on_headless_detach() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+        let first_paint_state = Arc::clone(&state);
+        let db_ready_state = Arc::clone(&state);
+
+        let first_paint_waiter =
+            std::thread::spawn(move || wait_for_tui_first_paint(&first_paint_state));
+        let db_ready_waiter =
+            std::thread::spawn(move || wait_for_tui_db_readiness(&db_ready_state));
+
+        std::thread::sleep(Duration::from_millis(20));
+        state.request_headless_detach();
+
+        assert!(!first_paint_waiter.join().expect("join first-paint waiter"));
+        assert!(!db_ready_waiter.join().expect("join db-ready waiter"));
     }
 
     #[test]

@@ -4329,7 +4329,6 @@ impl Model for MailAppModel {
         frame.cursor_visible = false;
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
-        self.state.mark_first_paint();
         let chrome = tui_chrome::chrome_layout(area);
         let ambient_area = chrome.content;
         let effects_enabled = self.state.tui_effects_enabled();
@@ -4658,6 +4657,11 @@ impl Model for MailAppModel {
                 });
             self.export_snapshot_refresh_pending.set(false);
         }
+
+        // Signal first paint only after the full frame has rendered successfully.
+        // Waking deferred workers at view-start lets heavy startup work contend
+        // with the initial frame instead of staging behind it.
+        self.state.mark_first_paint();
     }
 
     fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
@@ -6810,6 +6814,7 @@ mod tests {
     use ftui_widgets::NotificationPriority;
     use mcp_agent_mail_core::Config;
     use serde::Serialize;
+    use std::cell::Cell;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::mpsc;
@@ -6864,6 +6869,25 @@ mod tests {
         }
     }
 
+    struct FirstPaintProbeScreen {
+        observed_during_view: Rc<Cell<Option<bool>>>,
+    }
+
+    impl MailScreen for FirstPaintProbeScreen {
+        fn update(&mut self, _event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+            Cmd::None
+        }
+
+        fn view(&self, _frame: &mut Frame<'_>, _area: Rect, state: &TuiSharedState) {
+            self.observed_during_view
+                .set(Some(state.first_paint_seen()));
+        }
+
+        fn title(&self) -> &'static str {
+            "First Paint Probe"
+        }
+    }
+
     #[test]
     fn ambient_mode_off_disables_renderer_in_view() {
         let config = Config {
@@ -6883,6 +6907,33 @@ mod tests {
             telemetry.effect,
             crate::tui_widgets::AmbientEffectKind::None
         );
+    }
+
+    #[test]
+    fn first_paint_latch_sets_after_screen_render_finishes() {
+        let mut model = test_model();
+        let observed = Rc::new(Cell::new(None));
+        model.screen_manager.set_screen(
+            MailScreenId::Dashboard,
+            Box::new(FirstPaintProbeScreen {
+                observed_during_view: Rc::clone(&observed),
+            }),
+        );
+        model
+            .screen_manager
+            .set_active_screen(MailScreenId::Dashboard);
+        assert!(!model.state.first_paint_seen());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+
+        assert_eq!(
+            observed.get(),
+            Some(false),
+            "screen render should not observe first-paint latch before render completes"
+        );
+        assert!(model.state.first_paint_seen());
     }
 
     #[test]

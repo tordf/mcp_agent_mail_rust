@@ -196,6 +196,11 @@ pub fn build_materialized_views(
              )), \
              '' \
          ) AS recipients";
+    let attachments_expr = "CASE \
+             WHEN json_valid(COALESCE(m.attachments, '[]')) \
+             THEN json_array_length(COALESCE(m.attachments, '[]')) \
+             ELSE 0 \
+         END AS attachment_count";
 
     let overview_sql = format!(
         "CREATE TABLE message_overview_mv AS \
@@ -209,7 +214,7 @@ pub fn build_materialized_views(
              m.created_ts, \
              {sender_expr}, \
              LENGTH(m.body_md) AS body_length, \
-             json_array_length(COALESCE(m.attachments, '[]')) AS attachment_count, \
+             {attachments_expr}, \
              SUBSTR(COALESCE(m.body_md, ''), 1, 280) AS latest_snippet, \
              {recipients_expr} \
          FROM messages m \
@@ -236,6 +241,11 @@ pub fn build_materialized_views(
     } else {
         "NULL"
     };
+    let attachments_source_expr = "CASE \
+             WHEN json_valid(COALESCE(m.attachments, '[]')) \
+             THEN COALESCE(m.attachments, '[]') \
+             ELSE '[]' \
+         END";
     let attach_sql = format!(
         "CREATE TABLE attachments_by_message_mv AS \
          SELECT \
@@ -248,8 +258,8 @@ pub fn build_materialized_views(
              json_extract(value, '$.path') AS path, \
              CAST(json_extract(value, '$.bytes') AS INTEGER) AS size_bytes \
          FROM messages m, \
-              json_each(COALESCE(m.attachments, '[]')) \
-         WHERE COALESCE(m.attachments, '[]') != '[]'"
+              json_each({attachments_source_expr}) \
+         WHERE {attachments_source_expr} != '[]'"
     );
     if let Err(e) = conn.execute_raw(&attach_sql) {
         let msg = e.to_string();
@@ -712,6 +722,31 @@ mod tests {
             .unwrap();
         let recipients: String = rows[0].get_named("recipients").unwrap();
         assert_eq!(recipients, "AlphaAgent, BetaAgent");
+    }
+
+    #[test]
+    fn materialized_views_tolerate_malformed_attachment_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET attachments = ? WHERE id = 1",
+            &[sqlmodel_core::Value::Text("not valid json {".to_string())],
+        )
+        .unwrap();
+        drop(conn);
+
+        build_materialized_views(&db, false).unwrap();
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT attachment_count FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let attachment_count: i64 = rows[0].get_named("attachment_count").unwrap();
+        assert_eq!(attachment_count, 0);
     }
 
     #[test]

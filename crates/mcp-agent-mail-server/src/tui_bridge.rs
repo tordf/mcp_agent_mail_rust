@@ -647,6 +647,7 @@ impl TuiSharedState {
 
     pub fn request_headless_detach(&self) {
         self.detach_headless.store(true, Ordering::Relaxed);
+        self.startup_signals.1.notify_all();
     }
 
     #[must_use]
@@ -706,7 +707,10 @@ impl TuiSharedState {
         let mut signals = signals_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if predicate(*signals) || self.is_shutdown_requested() {
+        if predicate(*signals)
+            || self.is_shutdown_requested()
+            || self.is_headless_detach_requested()
+        {
             return *signals;
         }
         if timeout.is_zero() {
@@ -715,7 +719,10 @@ impl TuiSharedState {
         let deadline = Instant::now() + timeout;
         loop {
             let now = Instant::now();
-            if now >= deadline || self.is_shutdown_requested() {
+            if now >= deadline
+                || self.is_shutdown_requested()
+                || self.is_headless_detach_requested()
+            {
                 return *signals;
             }
             let remaining = deadline.saturating_duration_since(now);
@@ -1251,6 +1258,26 @@ mod tests {
         assert_eq!(state.db_warmup_state(), DbWarmupState::Ready);
         assert!(state.db_ready());
         assert!(state.wait_for_db_ready(Duration::ZERO));
+    }
+
+    #[test]
+    fn headless_detach_unblocks_startup_waiters() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let state_clone = Arc::clone(&state);
+        let waiter = thread::spawn(move || {
+            let first_paint = state_clone.wait_for_first_paint(Duration::from_secs(5));
+            let db_state = state_clone.wait_for_db_warmup(Duration::from_secs(5));
+            (first_paint, db_state)
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        state.request_headless_detach();
+
+        let (first_paint, db_state) = waiter.join().expect("join startup waiter");
+        assert!(!first_paint);
+        assert_eq!(db_state, DbWarmupState::Pending);
+        assert!(state.is_headless_detach_requested());
     }
 
     #[test]

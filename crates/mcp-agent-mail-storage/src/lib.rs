@@ -199,8 +199,9 @@ struct WbqOpEnvelope {
 }
 
 struct WriteBehindQueue {
-    sender: std::sync::mpsc::SyncSender<WbqMsg>,
+    sender: Mutex<Option<std::sync::mpsc::SyncSender<WbqMsg>>>,
     drain_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
+    lifecycle: Mutex<()>,
     op_depth: Arc<AtomicU64>,
 }
 
@@ -212,28 +213,60 @@ const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
 
 static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 
+fn new_write_behind_queue() -> WriteBehindQueue {
+    let op_depth = Arc::new(AtomicU64::new(0));
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .wbq_capacity
+        .set(u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX));
+
+    WriteBehindQueue {
+        sender: Mutex::new(None),
+        drain_handle: OrderedMutex::new(LockLevel::StorageWbqDrainHandle, None),
+        lifecycle: Mutex::new(()),
+        op_depth,
+    }
+}
+
+fn wbq_start_inner(wbq: &WriteBehindQueue) {
+    let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+
+    let should_spawn = {
+        let handle = wbq.drain_handle.lock();
+        handle
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    };
+    if !should_spawn {
+        return;
+    }
+
+    if let Some(old_handle) = {
+        let mut handle = wbq.drain_handle.lock();
+        handle.take()
+    } {
+        let _ = old_handle.join();
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(WBQ_CHANNEL_CAPACITY);
+    let op_depth_worker = Arc::clone(&wbq.op_depth);
+    let handle = std::thread::Builder::new()
+        .name("wbq-drain".into())
+        .spawn(move || wbq_drain_loop(rx, op_depth_worker))
+        .unwrap_or_else(|_| unreachable!());
+
+    *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    *wbq.drain_handle.lock() = Some(handle);
+}
+
+fn wbq_sender_clone(wbq: &WriteBehindQueue) -> Option<std::sync::mpsc::SyncSender<WbqMsg>> {
+    wbq.sender.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Spawn the WBQ drain thread. Safe to call multiple times.
 pub fn wbq_start() {
-    WBQ.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(WBQ_CHANNEL_CAPACITY);
-        let op_depth = Arc::new(AtomicU64::new(0));
-        let op_depth_worker = Arc::clone(&op_depth);
-        let handle = std::thread::Builder::new()
-            .name("wbq-drain".into())
-            .spawn(move || wbq_drain_loop(rx, op_depth_worker))
-            .unwrap_or_else(|_| unreachable!());
-
-        mcp_agent_mail_core::global_metrics()
-            .storage
-            .wbq_capacity
-            .set(u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX));
-
-        WriteBehindQueue {
-            sender: tx,
-            drain_handle: OrderedMutex::new(LockLevel::StorageWbqDrainHandle, Some(handle)),
-            op_depth,
-        }
-    });
+    let wbq = WBQ.get_or_init(new_write_behind_queue);
+    wbq_start_inner(wbq);
 }
 
 fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
@@ -334,9 +367,12 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
         .disk_pressure_level
         .load();
 
-    wbq_start();
-    let wbq = WBQ.get().unwrap_or_else(|| unreachable!());
-    wbq_enqueue_with_sender_and_pressure(&wbq.sender, wbq.op_depth.as_ref(), op, disk_pressure)
+    let wbq = WBQ.get_or_init(new_write_behind_queue);
+    wbq_start_inner(wbq);
+    let Some(sender) = wbq_sender_clone(wbq) else {
+        return WbqEnqueueResult::QueueUnavailable;
+    };
+    wbq_enqueue_with_sender_and_pressure(&sender, wbq.op_depth.as_ref(), op, disk_pressure)
 }
 
 /// Block until all pending write ops have been drained.
@@ -347,8 +383,11 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
 /// deadlock risk.
 pub fn wbq_flush() {
     if let Some(wbq) = WBQ.get() {
+        let Some(sender) = wbq_sender_clone(wbq) else {
+            return;
+        };
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        if wbq.sender.send(WbqMsg::Flush(done_tx)).is_ok() {
+        if sender.send(WbqMsg::Flush(done_tx)).is_ok() {
             match done_rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(()) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -370,10 +409,25 @@ pub fn wbq_flush() {
 /// never dropped.
 pub fn wbq_shutdown() {
     if let Some(wbq) = WBQ.get() {
-        wbq_flush();
-        // Tell the drain thread to exit.  Use blocking `send` so it is
-        // guaranteed to be delivered (same rationale as wbq_flush).
-        let _ = wbq.sender.send(WbqMsg::Shutdown);
+        let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sender) = wbq_sender_clone(wbq) {
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            if sender.send(WbqMsg::Flush(done_tx)).is_ok() {
+                match done_rx.recv_timeout(Duration::from_secs(30)) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        tracing::warn!("wbq_flush timed out after 30s; drain thread may be stuck");
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::warn!("wbq_flush: drain thread channel disconnected");
+                    }
+                }
+            }
+            // Tell the drain thread to exit.  Use blocking `send` so it is
+            // guaranteed to be delivered (same rationale as wbq_flush).
+            let _ = sender.send(WbqMsg::Shutdown);
+        }
+        *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let handle = {
             let mut guard = wbq.drain_handle.lock();
             guard.take()
@@ -4716,9 +4770,7 @@ pub fn process_markdown_images(
     let mut all_rel_paths = Vec::new();
 
     for (full_match, alt, stored_result) in converted {
-        let Ok(stored) = stored_result else {
-            continue; // Skip failed conversions
-        };
+        let stored = stored_result?;
         let replacement = if let Some(ref b64) = stored.meta.data_base64 {
             format!("![{alt}](data:image/webp;base64,{b64})")
         } else if let Some(ref file_path) = stored.meta.path {
@@ -4737,6 +4789,23 @@ pub fn process_markdown_images(
     }
 
     Ok((result, all_meta, all_rel_paths))
+}
+
+/// Return `true` when the Markdown body contains at least one local image
+/// reference that would be materialized into the archive.
+pub fn markdown_has_processable_local_images(
+    config: &Config,
+    base_dir: &Path,
+    body_md: &str,
+) -> bool {
+    image_pattern_re().captures_iter(body_md).any(|cap| {
+        let path = cap.name("path").unwrap_or_else(|| unreachable!()).as_str();
+        if path.starts_with("data:") || path.starts_with("http://") || path.starts_with("https://")
+        {
+            return false;
+        }
+        resolve_source_attachment_path_opt(base_dir, config, path).is_some()
+    })
 }
 
 /// Resolve an attachment source path from a user-provided string.
@@ -10209,6 +10278,84 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn wbq_can_restart_after_shutdown() {
+        let wbq = new_write_behind_queue();
+
+        wbq_start_inner(&wbq);
+        let first_sender = wbq_sender_clone(&wbq).expect("sender should exist after start");
+        assert_eq!(
+            wbq_enqueue_with_sender(
+                &first_sender,
+                wbq.op_depth.as_ref(),
+                wbq_test_clear_signal_op("wbq-restart-first"),
+            ),
+            WbqEnqueueResult::Enqueued
+        );
+
+        {
+            let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            first_sender
+                .send(WbqMsg::Flush(done_tx))
+                .expect("flush request should be delivered");
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("flush should complete");
+            first_sender
+                .send(WbqMsg::Shutdown)
+                .expect("shutdown should be delivered");
+            *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            let handle = {
+                let mut guard = wbq.drain_handle.lock();
+                guard.take()
+            };
+            if let Some(handle) = handle {
+                handle.join().expect("drain thread should join cleanly");
+            }
+        }
+
+        wbq_start_inner(&wbq);
+        let second_sender = wbq_sender_clone(&wbq).expect("sender should exist after restart");
+        assert_eq!(
+            wbq_enqueue_with_sender(
+                &second_sender,
+                wbq.op_depth.as_ref(),
+                wbq_test_clear_signal_op("wbq-restart-second"),
+            ),
+            WbqEnqueueResult::Enqueued
+        );
+        assert!(
+            first_sender.send(WbqMsg::Shutdown).is_err(),
+            "sender from the stopped worker must be disconnected after restart"
+        );
+    }
+
+    #[test]
+    fn test_process_markdown_images_rejects_invalid_local_image() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "md-invalid-proj").unwrap();
+
+        let invalid_path = archive.root.join("broken.png");
+        std::fs::write(&invalid_path, b"not a real image").unwrap();
+
+        let err = process_markdown_images(
+            &archive,
+            &config,
+            &archive.root,
+            "Broken image: ![broken](broken.png)",
+            EmbedPolicy::File,
+        )
+        .expect_err("invalid local markdown image should fail");
+
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+        assert!(
+            err.to_string().contains("decode image"),
+            "expected decode failure, got {err}"
+        );
     }
 
     // ── Lock-free commit tests ────────────────────────────────────────

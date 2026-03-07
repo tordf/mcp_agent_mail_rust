@@ -134,8 +134,7 @@ fn execute_step(
         "create_output_dir" => {
             if let Some(ref cmd) = step.command {
                 // Extract path from "mkdir -p <path>"
-                if let Some(path) = cmd.strip_prefix("mkdir -p ") {
-                    let path = PathBuf::from(path.trim());
+                if let Some(path) = path_from_simple_shell_command(cmd, "mkdir -p ") {
                     std::fs::create_dir_all(&path).map_err(|e| {
                         WizardError::new(
                             WizardErrorCode::FileOperationFailed,
@@ -161,8 +160,7 @@ fn execute_step(
         "create_nojekyll" => {
             if let Some(ref cmd) = step.command {
                 // Extract path from "touch <path>"
-                if let Some(path) = cmd.strip_prefix("touch ") {
-                    let path = PathBuf::from(path.trim());
+                if let Some(path) = path_from_simple_shell_command(cmd, "touch ") {
                     std::fs::write(&path, "").map_err(|e| {
                         WizardError::new(
                             WizardErrorCode::FileOperationFailed,
@@ -277,6 +275,58 @@ fn execute_shell_command(command: &str) -> Result<String, WizardError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn path_from_simple_shell_command(command: &str, prefix: &str) -> Option<PathBuf> {
+    let raw = command.strip_prefix(prefix)?.trim();
+    decode_shell_single_argument(raw).map(PathBuf::from)
+}
+
+fn decode_shell_single_argument(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    let chars: Vec<char> = raw.chars().collect();
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        match chars[idx] {
+            '\'' => {
+                idx += 1;
+                while idx < chars.len() && chars[idx] != '\'' {
+                    out.push(chars[idx]);
+                    idx += 1;
+                }
+                if idx >= chars.len() {
+                    return None;
+                }
+                idx += 1;
+            }
+            '\\' => {
+                idx += 1;
+                if idx >= chars.len() {
+                    return None;
+                }
+                out.push(chars[idx]);
+                idx += 1;
+            }
+            c if c.is_whitespace() => {
+                if chars[idx..].iter().all(|ch| ch.is_whitespace()) {
+                    return Some(out);
+                }
+                return None;
+            }
+            c => {
+                out.push(c);
+                idx += 1;
+            }
+        }
+    }
+
+    Some(out)
+}
+
 /// Generate headers file content for a provider.
 fn generate_headers_content(provider: HostingProvider) -> String {
     // COOP/COEP headers required for SharedArrayBuffer (used by SQLite WASM)
@@ -340,6 +390,24 @@ fn prompt_step_confirm(step: &PlanStep) -> Result<bool, WizardError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shell_quote(path: &std::path::Path) -> String {
+        let raw = path.to_string_lossy();
+        if !raw.contains([' ', '\'', '\t', '\n']) {
+            return raw.into_owned();
+        }
+
+        let mut out = String::from("'");
+        for ch in raw.chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
+    }
 
     #[test]
     fn headers_content_github_includes_coop_coep() {
@@ -412,6 +480,32 @@ mod tests {
     }
 
     #[test]
+    fn execute_step_creates_directory_from_quoted_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let new_dir = temp.path().join("docs with space").join("o'hare");
+        let plan = DeploymentPlan {
+            provider: HostingProvider::GithubPages,
+            bundle_path: temp.path().to_path_buf(),
+            steps: vec![],
+            expected_url: None,
+            generated_files: vec![],
+            warnings: vec![],
+        };
+
+        let step = PlanStep {
+            index: 1,
+            id: "create_output_dir".to_string(),
+            description: "Create output directory".to_string(),
+            command: Some(format!("mkdir -p {}", shell_quote(&new_dir))),
+            optional: false,
+            requires_confirm: false,
+        };
+
+        execute_step(&step, &plan, false).unwrap();
+        assert!(new_dir.exists());
+    }
+
+    #[test]
     fn execute_step_creates_nojekyll() {
         let temp = tempfile::tempdir().unwrap();
         let nojekyll = temp.path().join(".nojekyll");
@@ -429,6 +523,34 @@ mod tests {
             id: "create_nojekyll".to_string(),
             description: "Create .nojekyll".to_string(),
             command: Some(format!("touch {}", nojekyll.display())),
+            optional: false,
+            requires_confirm: false,
+        };
+
+        execute_step(&step, &plan, false).unwrap();
+        assert!(nojekyll.exists());
+    }
+
+    #[test]
+    fn execute_step_creates_nojekyll_from_quoted_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("site with space");
+        std::fs::create_dir_all(&dir).unwrap();
+        let nojekyll = dir.join(".nojekyll");
+        let plan = DeploymentPlan {
+            provider: HostingProvider::GithubPages,
+            bundle_path: temp.path().to_path_buf(),
+            steps: vec![],
+            expected_url: None,
+            generated_files: vec![],
+            warnings: vec![],
+        };
+
+        let step = PlanStep {
+            index: 1,
+            id: "create_nojekyll".to_string(),
+            description: "Create .nojekyll".to_string(),
+            command: Some(format!("touch {}", shell_quote(&nojekyll))),
             optional: false,
             requires_confirm: false,
         };

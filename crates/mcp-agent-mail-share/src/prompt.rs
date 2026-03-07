@@ -23,7 +23,9 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::detection::detect_environment;
-use crate::planner::{format_plan_human, generate_plan, validate_inputs};
+use crate::planner::{
+    format_plan_human, generate_plan, infer_provider_from_inputs, validate_inputs,
+};
 use crate::wizard::{
     DeploymentPlan, DetectedEnvironment, HostingProvider, WIZARD_VERSION, WizardError,
     WizardErrorCode, WizardInputs, WizardJsonOutput, WizardMetadata, WizardMode, WizardResult,
@@ -146,6 +148,9 @@ fn prompt_missing_inputs(
 
     // Prompt for provider if not specified
     if inputs.provider.is_none() {
+        inputs.provider = infer_provider_from_inputs(&inputs)?;
+    }
+    if inputs.provider.is_none() {
         inputs.provider = Some(prompt_provider_selection(env)?);
     }
 
@@ -169,8 +174,13 @@ fn validate_non_interactive(
     inputs: WizardInputs,
     env: &DetectedEnvironment,
 ) -> Result<WizardInputs, WizardError> {
+    let inferred_provider = infer_provider_from_inputs(&inputs)?;
+
     // Provider is required
-    if inputs.provider.is_none() && env.recommended_provider.is_none() {
+    if inputs.provider.is_none()
+        && inferred_provider.is_none()
+        && env.recommended_provider.is_none()
+    {
         return Err(WizardError::new(
             WizardErrorCode::MissingRequiredOption,
             "Provider not specified and could not be auto-detected",
@@ -190,7 +200,7 @@ fn validate_non_interactive(
     // Fill in defaults from environment
     let mut inputs = inputs;
     if inputs.provider.is_none() {
-        inputs.provider = env.recommended_provider;
+        inputs.provider = inferred_provider.or(env.recommended_provider);
     }
     if inputs.bundle_path.is_none() {
         inputs.bundle_path = env.existing_bundle.clone();
@@ -703,6 +713,33 @@ mod tests {
         let result = validate_non_interactive(inputs, &env);
         // Will fail on bundle validation, but not on provider
         assert!(result.is_ok() || !result.unwrap_err().message.contains("Provider"));
+    }
+
+    #[test]
+    fn validate_non_interactive_infers_provider_from_explicit_flags() {
+        let inputs = WizardInputs {
+            bundle_path: Some(PathBuf::from("/tmp/bundle")),
+            s3_bucket: Some("my-bucket".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let result = validate_non_interactive(inputs, &env).unwrap();
+        assert_eq!(result.provider, Some(HostingProvider::S3));
+    }
+
+    #[test]
+    fn validate_non_interactive_rejects_conflicting_provider_flags() {
+        let inputs = WizardInputs {
+            bundle_path: Some(PathBuf::from("/tmp/bundle")),
+            cloudflare_project: Some("edge".to_string()),
+            s3_bucket: Some("my-bucket".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let err = validate_non_interactive(inputs, &env).unwrap_err();
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
     }
 
     #[test]

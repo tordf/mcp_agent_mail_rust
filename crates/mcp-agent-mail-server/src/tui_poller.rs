@@ -398,11 +398,13 @@ impl DbPoller {
 
         while !self.stop.load(Ordering::Relaxed) {
             let mut allow_poll = true;
+            let mut warmup_wait_consumed_interval = false;
             if connection_state.is_none() && prev.timestamp_micros == 0 {
                 match self.state.wait_for_db_warmup(self.interval) {
                     DbWarmupState::Ready => {}
                     DbWarmupState::Pending => {
                         allow_poll = false;
+                        warmup_wait_consumed_interval = true;
                     }
                     DbWarmupState::Failed => {
                         let now = Instant::now();
@@ -472,6 +474,10 @@ impl DbPoller {
 
             if self.stop.load(Ordering::Relaxed) {
                 break;
+            }
+
+            if warmup_wait_consumed_interval {
+                continue;
             }
 
             // Block until the next interval or an explicit stop wakeup.
@@ -2007,6 +2013,79 @@ mod tests {
         assert!(
             woke,
             "db-ready signal should wake the poller before the full interval elapses"
+        );
+    }
+
+    #[test]
+    fn poller_pending_warmup_timeout_does_not_pay_interval_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_poller_pending_timeout.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            &[],
+        )
+        .expect("create file_reservations");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agent_links (id INTEGER PRIMARY KEY)",
+            &[],
+        )
+        .expect("create agent_links");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
+            &[],
+        )
+        .expect("create message_recipients");
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj1', 'hk1', 100)",
+            &[],
+        )
+        .expect("insert project");
+        drop(conn);
+
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let poller =
+            DbPoller::new(Arc::clone(&state), db_url).with_interval(Duration::from_millis(250));
+        let mut handle = poller.start();
+
+        thread::sleep(Duration::from_millis(300));
+        state.mark_db_ready();
+
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let mut woke = false;
+        while Instant::now() < deadline {
+            if state
+                .db_stats_snapshot()
+                .is_some_and(|snapshot| snapshot.timestamp_micros > 0 && snapshot.projects == 1)
+            {
+                woke = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        handle.stop();
+        assert!(
+            woke,
+            "poller should retry immediately after a pending warmup timeout instead of sleeping a second full interval"
         );
     }
 

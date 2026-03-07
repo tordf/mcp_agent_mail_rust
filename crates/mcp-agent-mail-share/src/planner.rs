@@ -199,8 +199,27 @@ fn resolve_provider(
     inputs: &WizardInputs,
     env: &DetectedEnvironment,
 ) -> PlanResult<HostingProvider> {
+    let inferred = infer_provider_from_inputs(inputs)?;
+
     // User explicitly specified provider
     if let Some(provider) = inputs.provider {
+        if let Some(inferred_provider) = inferred
+            && inferred_provider != provider
+        {
+            return Err(WizardError::new(
+                WizardErrorCode::InvalidOption,
+                format!(
+                    "Provider-specific options conflict with --provider {}",
+                    provider.id()
+                ),
+            )
+            .with_hint("Remove flags for other providers or choose a matching --provider"));
+        }
+        return Ok(provider);
+    }
+
+    // Provider-specific flags are an explicit signal and should beat auto-detection.
+    if let Some(provider) = inferred {
         return Ok(provider);
     }
 
@@ -221,6 +240,54 @@ fn resolve_provider(
     )
     .with_context("No provider specified and no strong detection signals")
     .with_hint("Specify --provider (github, cloudflare, netlify, s3, custom)"))
+}
+
+pub(crate) fn infer_provider_from_inputs(
+    inputs: &WizardInputs,
+) -> PlanResult<Option<HostingProvider>> {
+    let mut inferred = Vec::new();
+
+    if inputs.github_repo.is_some() {
+        inferred.push((HostingProvider::GithubPages, "--github-repo"));
+    }
+    if inputs.cloudflare_project.is_some() {
+        inferred.push((HostingProvider::CloudflarePages, "--cloudflare-project"));
+    }
+    if inputs.netlify_site.is_some() {
+        inferred.push((HostingProvider::Netlify, "--netlify-site"));
+    }
+    if inputs.s3_bucket.is_some() {
+        inferred.push((HostingProvider::S3, "--s3-bucket"));
+    }
+    if inputs.cloudfront_id.is_some()
+        && !inferred
+            .iter()
+            .any(|(provider, _)| *provider == HostingProvider::S3)
+    {
+        inferred.push((HostingProvider::S3, "--cloudfront-id"));
+    }
+
+    let mut distinct = Vec::new();
+    let mut flags = Vec::new();
+    for (provider, flag) in inferred {
+        flags.push(flag);
+        if !distinct.contains(&provider) {
+            distinct.push(provider);
+        }
+    }
+
+    if distinct.len() > 1 {
+        return Err(WizardError::new(
+            WizardErrorCode::InvalidOption,
+            "Conflicting provider-specific options were supplied",
+        )
+        .with_context(flags.join(", "))
+        .with_hint(
+            "Remove flags for the other providers or specify a single matching --provider",
+        ));
+    }
+
+    Ok(distinct.into_iter().next())
 }
 
 fn validate_provider_options(provider: HostingProvider, inputs: &WizardInputs) -> PlanResult<()> {
@@ -773,6 +840,45 @@ mod tests {
         };
         let provider = resolve_provider(&inputs, &env).unwrap();
         assert_eq!(provider, HostingProvider::GithubPages);
+    }
+
+    #[test]
+    fn resolve_provider_prefers_explicit_provider_specific_flags() {
+        let inputs = WizardInputs {
+            netlify_site: Some("my-site".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            github_repo: Some("owner/repo".to_string()),
+            recommended_provider: Some(HostingProvider::GithubPages),
+            ..Default::default()
+        };
+        let provider = resolve_provider(&inputs, &env).unwrap();
+        assert_eq!(provider, HostingProvider::Netlify);
+    }
+
+    #[test]
+    fn resolve_provider_rejects_conflicting_explicit_provider_specific_flags() {
+        let inputs = WizardInputs {
+            cloudflare_project: Some("edge".to_string()),
+            s3_bucket: Some("bucket".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+        let err = resolve_provider(&inputs, &env).unwrap_err();
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+    }
+
+    #[test]
+    fn resolve_provider_rejects_conflict_with_explicit_provider() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::GithubPages),
+            s3_bucket: Some("bucket".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+        let err = resolve_provider(&inputs, &env).unwrap_err();
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
     }
 
     #[test]

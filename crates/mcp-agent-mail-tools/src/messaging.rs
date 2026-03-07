@@ -862,11 +862,14 @@ fn process_message_attachments(
     let mut final_body = body_md.to_string();
     let mut all_attachment_meta: Vec<serde_json::Value> = Vec::with_capacity(attachment_count + 4);
     let mut all_attachment_rel_paths: Vec<String> = Vec::with_capacity(attachment_count + 4);
+    let has_explicit_attachments = attachment_paths.is_some_and(|paths| !paths.is_empty());
+    let has_local_markdown_images = do_convert
+        && mcp_agent_mail_storage::markdown_has_processable_local_images(config, base_dir, body_md);
 
-    if do_convert {
+    if do_convert && (has_explicit_attachments || has_local_markdown_images) {
         match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
             Ok(archive) => {
-                if let Ok((updated_body, md_meta, rel_paths)) =
+                let (updated_body, md_meta, rel_paths) =
                     mcp_agent_mail_storage::process_markdown_images(
                         &archive,
                         config,
@@ -874,13 +877,33 @@ fn process_message_attachments(
                         body_md,
                         embed_policy,
                     )
-                {
-                    final_body = updated_body;
-                    all_attachment_rel_paths.extend(rel_paths);
-                    for meta in &md_meta {
-                        if let Ok(value) = serde_json::to_value(meta) {
-                            all_attachment_meta.push(value);
-                        }
+                    .map_err(|e| {
+                        let (code, message) = match &e {
+                            mcp_agent_mail_storage::StorageError::InvalidPath(_) => (
+                                "INVALID_ARGUMENT",
+                                format!("Invalid Markdown image reference in body: {e}"),
+                            ),
+                            _ => (
+                                "ARCHIVE_ERROR",
+                                format!("Failed to process Markdown image references: {e}"),
+                            ),
+                        };
+                        legacy_tool_error(
+                            code,
+                            message,
+                            true,
+                            json!({
+                                "field": "body_md",
+                                "project_slug": project_slug,
+                                "project_root": project_human_key,
+                            }),
+                        )
+                    })?;
+                final_body = updated_body;
+                all_attachment_rel_paths.extend(rel_paths);
+                for meta in &md_meta {
+                    if let Ok(value) = serde_json::to_value(meta) {
+                        all_attachment_meta.push(value);
                     }
                 }
 
@@ -895,9 +918,18 @@ fn process_message_attachments(
                         embed_policy,
                     )
                     .map_err(|e| {
+                        let (code, message) = match &e {
+                            mcp_agent_mail_storage::StorageError::InvalidPath(_) => {
+                                ("INVALID_ARGUMENT", format!("Invalid attachment_paths: {e}"))
+                            }
+                            _ => (
+                                "ARCHIVE_ERROR",
+                                format!("Failed to process attachment_paths: {e}"),
+                            ),
+                        };
                         legacy_tool_error(
-                            "INVALID_ARGUMENT",
-                            format!("Invalid attachment_paths: {e}"),
+                            code,
+                            message,
                             true,
                             json!({
                                 "field": "attachment_paths",
@@ -914,22 +946,27 @@ fn process_message_attachments(
                 }
             }
             Err(e) => {
-                if attachment_paths.is_some_and(|paths| !paths.is_empty()) {
-                    return Err(legacy_tool_error(
-                        "ARCHIVE_ERROR",
-                        format!(
-                            "Failed to initialize git archive for project '{project_slug}'. This prevents storing attachments: {e}"
-                        ),
-                        true,
-                        json!({
-                            "project_slug": project_slug,
-                            "project_root": project_human_key,
-                        }),
-                    ));
-                }
+                return Err(legacy_tool_error(
+                    "ARCHIVE_ERROR",
+                    format!(
+                        "Failed to initialize git archive for project '{project_slug}'. This prevents storing attachments or rewriting local Markdown image references: {e}"
+                    ),
+                    true,
+                    json!({
+                        "project_slug": project_slug,
+                        "project_root": project_human_key,
+                        "field": if has_explicit_attachments && !has_local_markdown_images {
+                            "attachment_paths"
+                        } else {
+                            "body_md"
+                        },
+                    }),
+                ));
             }
         }
-    } else if let Some(paths) = attachment_paths {
+    } else if let Some(paths) = attachment_paths
+        && !paths.is_empty()
+    {
         match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
             Ok(archive) => {
                 for path in paths {
@@ -950,11 +987,21 @@ fn process_message_attachments(
 
                     let stored = mcp_agent_mail_storage::store_raw_attachment(&archive, &resolved)
                         .map_err(|e| {
+                            let (code, message) = match &e {
+                                mcp_agent_mail_storage::StorageError::InvalidPath(_) => {
+                                    ("INVALID_ARGUMENT", format!("Invalid attachment_paths: {e}"))
+                                }
+                                _ => (
+                                    "ARCHIVE_ERROR",
+                                    format!("Failed to store raw attachment: {e}"),
+                                ),
+                            };
                             legacy_tool_error(
-                                "ARCHIVE_ERROR",
-                                format!("Failed to store raw attachment: {e}"),
+                                code,
+                                message,
                                 true,
                                 json!({
+                                    "field": "attachment_paths",
                                     "path": path,
                                 }),
                             )
@@ -4330,6 +4377,170 @@ mod tests {
     fn reply_body_limit_empty_body_passes() {
         let cfg = config_with_limits(1, 0, 0, 0);
         assert!(validate_reply_body_limit(&cfg, "").is_ok());
+    }
+
+    #[test]
+    fn process_message_attachments_rejects_invalid_markdown_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            storage_root: tmp.path().join("storage"),
+            ..Config::default()
+        };
+
+        let broken = project_dir.path().join("broken.png");
+        std::fs::write(&broken, b"not an image").unwrap();
+
+        let err = process_message_attachments(
+            &cfg,
+            "bad-markdown-image",
+            project_dir.path().to_str().unwrap(),
+            project_dir.path(),
+            "Subject",
+            "Broken image: ![broken](broken.png)",
+            None,
+            true,
+            mcp_agent_mail_storage::EmbedPolicy::File,
+        )
+        .expect_err("invalid markdown image should fail");
+
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("Markdown image reference"),
+            "expected markdown-image validation error, got {err_str}"
+        );
+    }
+
+    #[test]
+    fn process_message_attachments_rejects_archive_failure_for_local_markdown_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        let bad_storage_root = tmp.path().join("storage-root-file");
+        std::fs::write(&bad_storage_root, b"not a directory").unwrap();
+        cfg.storage_root = bad_storage_root;
+
+        let image = project_dir.path().join("ok.png");
+        let png = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0x1d, 0x63, 0xf8, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x09, 0xfb, 0x03, 0xfd, 0x2a, 0x86,
+            0xe3, 0x8a, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&image, png).unwrap();
+
+        let err = process_message_attachments(
+            &cfg,
+            "archive-init-failure",
+            project_dir.path().to_str().unwrap(),
+            project_dir.path(),
+            "Subject",
+            "Needs rewrite: ![ok](ok.png)",
+            None,
+            true,
+            mcp_agent_mail_storage::EmbedPolicy::File,
+        )
+        .expect_err("archive init failure for local markdown images should fail");
+
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("rewriting local Markdown image references"),
+            "expected archive-init markdown error, got {err_str}"
+        );
+    }
+
+    #[test]
+    fn process_message_attachments_skips_archive_init_for_remote_markdown_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        let bad_storage_root = tmp.path().join("storage-root-file");
+        std::fs::write(&bad_storage_root, b"not a directory").unwrap();
+        cfg.storage_root = bad_storage_root;
+
+        let body = "Remote image: ![ok](https://example.com/ok.png)";
+        let (final_body, attachment_meta, rel_paths) = process_message_attachments(
+            &cfg,
+            "remote-markdown-image",
+            project_dir.path().to_str().unwrap(),
+            project_dir.path(),
+            "Subject",
+            body,
+            None,
+            true,
+            mcp_agent_mail_storage::EmbedPolicy::File,
+        )
+        .expect("remote markdown images should not require archive init");
+
+        assert_eq!(final_body, body);
+        assert!(attachment_meta.is_empty());
+        assert!(rel_paths.is_empty());
+    }
+
+    #[test]
+    fn process_message_attachments_ignores_empty_attachment_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        let bad_storage_root = tmp.path().join("storage-root-file");
+        std::fs::write(&bad_storage_root, b"not a directory").unwrap();
+        cfg.storage_root = bad_storage_root;
+
+        let body = "No attachments";
+        let empty_paths: Vec<String> = Vec::new();
+        let (final_body, attachment_meta, rel_paths) = process_message_attachments(
+            &cfg,
+            "empty-attachment-list",
+            project_dir.path().to_str().unwrap(),
+            project_dir.path(),
+            "Subject",
+            body,
+            Some(&empty_paths),
+            false,
+            mcp_agent_mail_storage::EmbedPolicy::File,
+        )
+        .expect("empty attachment list should be treated as no attachments");
+
+        assert_eq!(final_body, body);
+        assert!(attachment_meta.is_empty());
+        assert!(rel_paths.is_empty());
+    }
+
+    #[test]
+    fn process_message_attachments_rejects_empty_raw_attachment_as_invalid_argument() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            storage_root: tmp.path().join("storage"),
+            ..Config::default()
+        };
+
+        let empty = project_dir.path().join("empty.bin");
+        std::fs::write(&empty, []).unwrap();
+        let attachment_paths = vec!["empty.bin".to_string()];
+
+        let err = process_message_attachments(
+            &cfg,
+            "empty-raw-attachment",
+            project_dir.path().to_str().unwrap(),
+            project_dir.path(),
+            "Subject",
+            "Body",
+            Some(&attachment_paths),
+            false,
+            mcp_agent_mail_storage::EmbedPolicy::File,
+        )
+        .expect_err("empty raw attachment should fail");
+
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert!(
+            err.message.contains("Attachment file is empty"),
+            "expected empty-file validation message, got {}",
+            err.message
+        );
     }
 
     // -----------------------------------------------------------------------
