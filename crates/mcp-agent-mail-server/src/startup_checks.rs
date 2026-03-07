@@ -12,7 +12,7 @@ use mcp_agent_mail_db::DbPoolConfig;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -62,6 +62,8 @@ impl PortStatus {
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_HEALTH_BODY_BYTES: usize = 4096;
 const LISTENER_PID_HINT_DIR: &str = "mcp-agent-mail-port-pids";
+pub(crate) const HEALTH_SIGNATURE_HEADER_NAME: &str = "x-agent-mail-health";
+pub(crate) const HEALTH_SIGNATURE_HEADER_VALUE: &str = "1";
 
 /// Check the status of a port: free, occupied by Agent Mail, or occupied by another process.
 ///
@@ -149,88 +151,85 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
     );
 
     let mut stream = stream;
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
+    let result = (|| -> bool {
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
 
-    // Read response
-    let mut reader = BufReader::new(&stream);
-    let mut status_line = String::new();
-    if reader.read_line(&mut status_line).is_err() {
-        return false;
-    }
+        // Read response
+        let mut reader = BufReader::new(&stream);
+        let mut status_line = String::new();
+        if reader.read_line(&mut status_line).is_err() {
+            return false;
+        }
 
-    // Check for valid HTTP response (2xx or 3xx status codes are acceptable)
-    // Agent Mail returns 200 OK for /health
-    if !status_line.starts_with("HTTP/1.") {
-        return false;
-    }
+        // Check for valid HTTP response (2xx or 3xx status codes are acceptable)
+        // Agent Mail returns 200 OK for /health
+        if !status_line.starts_with("HTTP/1.") {
+            return false;
+        }
 
-    // Parse status code
-    let parts: Vec<&str> = status_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return false;
-    }
+        // Parse status code
+        let parts: Vec<&str> = status_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return false;
+        }
 
-    let status_code: u16 = match parts[1].parse() {
-        Ok(code) => code,
-        Err(_) => return false,
-    };
+        let status_code: u16 = match parts[1].parse() {
+            Ok(code) => code,
+            Err(_) => return false,
+        };
 
-    // 2xx responses indicate a healthy server
-    if !(200..300).contains(&status_code) {
-        return false;
-    }
+        // 2xx responses indicate a healthy server
+        if !(200..300).contains(&status_code) {
+            return false;
+        }
 
-    // Read headers and body to look for Agent Mail signature
-    let mut headers = String::new();
-    let mut header_bytes_read = 0;
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if line.trim().is_empty() {
-                    break; // End of headers
+        // Read headers and body to look for Agent Mail signature
+        let mut headers = String::new();
+        let mut header_bytes_read = 0;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if line.trim().is_empty() {
+                        break; // End of headers
+                    }
+                    header_bytes_read += n;
+                    if header_bytes_read > 8192 {
+                        break;
+                    }
+                    headers.push_str(&line);
                 }
-                header_bytes_read += n;
-                if header_bytes_read > 8192 {
-                    break;
-                }
-                headers.push_str(&line);
             }
         }
-    }
 
-    // Read body with a bounded length. Prefer `Content-Length` so we do not
-    // wait for EOF on keep-alive responses.
-    let mut body_bytes = Vec::new();
-    if let Some(content_length) = parse_content_length(&headers) {
-        let limit = content_length.min(MAX_HEALTH_BODY_BYTES) as u64;
-        let _ = reader.take(limit).read_to_end(&mut body_bytes);
-    } else {
-        let mut buf = [0_u8; MAX_HEALTH_BODY_BYTES];
-        if let Ok(bytes_read) = reader.read(&mut buf) {
-            body_bytes.extend_from_slice(&buf[..bytes_read]);
+        // Read body with a bounded length. Prefer `Content-Length` so we do not
+        // wait for EOF on keep-alive responses.
+        let mut body_bytes = Vec::new();
+        if let Some(content_length) = parse_content_length(&headers) {
+            let limit = content_length.min(MAX_HEALTH_BODY_BYTES) as u64;
+            let _ = reader.take(limit).read_to_end(&mut body_bytes);
+        } else {
+            let mut buf = [0_u8; MAX_HEALTH_BODY_BYTES];
+            if let Ok(bytes_read) = reader.read(&mut buf) {
+                body_bytes.extend_from_slice(&buf[..bytes_read]);
+            }
         }
-    }
-    let body = String::from_utf8_lossy(&body_bytes).to_string();
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
 
-    // Check for Agent Mail signatures in headers or body.
-    // Currently the server does NOT set a Server HTTP header, so detection
-    // relies on the JSON body from /health returning {"status":"ready"}.
-    let combined = format!("{headers}{body}").to_lowercase();
+        // Check for an explicit Agent Mail signature in headers or body. Do not
+        // trust generic {"status":"ready"} / {"ok":true} health payloads here;
+        // many unrelated services expose those exact shapes.
+        let combined = format!("{headers}{body}").to_lowercase();
+        has_agent_mail_signature(&headers)
+            || combined.contains("mcp-agent-mail")
+            || combined.contains("mcp_agent_mail")
+    })();
 
-    // Primary: body contains {"status":"ready"} (or legacy "healthy") / {"ok":true}.
-    // Defensive: headers/body contain "mcp-agent-mail" (would match if a Server
-    // header is added in the future).
-    combined.contains("mcp-agent-mail")
-        || combined.contains("mcp_agent_mail")
-        || combined.contains("agent-mail")
-        || (combined.contains("\"status\"")
-            && (combined.contains("ready") || combined.contains("healthy")))
-        || combined.contains("\"ok\":true")
-        || combined.contains("\"ok\": true")
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    result
 }
 
 fn parse_content_length(headers: &str) -> Option<usize> {
@@ -241,6 +240,20 @@ fn parse_content_length(headers: &str) -> Option<usize> {
         } else {
             None
         }
+    })
+}
+
+fn has_agent_mail_signature(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        (name.eq_ignore_ascii_case(HEALTH_SIGNATURE_HEADER_NAME)
+            && value.eq_ignore_ascii_case(HEALTH_SIGNATURE_HEADER_VALUE))
+            || (name.eq_ignore_ascii_case("server")
+                && value.to_ascii_lowercase().contains("mcp-agent-mail"))
     })
 }
 
@@ -281,7 +294,20 @@ pub fn agent_mail_port_holder_pids_with_hint(host: &str, port: u16) -> Vec<u32> 
     if let Some(pid) = hinted_agent_mail_pid(host, port) {
         return vec![pid];
     }
-    agent_mail_port_holder_pids(port)
+    listener_port_holder_pids(host, port)
+        .into_iter()
+        .filter(|pid| pid_is_agent_mail(*pid))
+        .collect()
+}
+
+/// Return listener PIDs currently holding `host:port`, preferring a recorded
+/// hint before falling back to system-wide listener discovery.
+#[must_use]
+pub fn listener_port_holder_pids_with_hint(host: &str, port: u16) -> Vec<u32> {
+    if let Some(pid) = hinted_agent_mail_pid(host, port) {
+        return vec![pid];
+    }
+    listener_port_holder_pids(host, port)
 }
 
 #[cfg(target_os = "linux")]
@@ -322,43 +348,14 @@ fn read_listener_pid_hint(host: &str, port: u16) -> Option<u32> {
 #[cfg(target_os = "linux")]
 fn hinted_agent_mail_pid(host: &str, port: u16) -> Option<u32> {
     let pid = read_listener_pid_hint(host, port)?;
-    if pid_is_agent_mail(pid) && pid_listens_on_port(pid, port) {
-        Some(pid)
-    } else {
-        None
-    }
+    (pid_is_agent_mail(pid) && listener_port_holder_pids(host, port).contains(&pid)).then_some(pid)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn hinted_agent_mail_pid(host: &str, port: u16) -> Option<u32> {
-    let _ = (host, port);
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn pid_listens_on_port(pid: u32, port: u16) -> bool {
-    let inodes = listener_socket_inodes(port);
-    if inodes.is_empty() {
-        return false;
-    }
-
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let Ok(target) = std::fs::read_link(entry.path()) else {
-            continue;
-        };
-        let target = target.to_string_lossy();
-        if let Some(inode) = target
-            .strip_prefix("socket:[")
-            .and_then(|value| value.strip_suffix(']'))
-            && inodes.contains(inode)
-        {
-            return true;
-        }
-    }
-    false
+    let pid = read_listener_pid_hint(host, port)?;
+    let listeners = listener_port_holder_pids(host, port);
+    (pid_is_agent_mail(pid) && listeners.contains(&pid)).then_some(pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -378,40 +375,6 @@ fn parse_proc_stat_state(stat: &str) -> Option<char> {
     stat.get(close_paren + 2..)?.chars().next()
 }
 
-#[cfg(target_os = "linux")]
-fn listener_socket_inodes(port: u16) -> BTreeSet<String> {
-    let mut inodes = BTreeSet::new();
-    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        collect_listener_socket_inodes(path, port, &mut inodes);
-    }
-    inodes
-}
-
-#[cfg(target_os = "linux")]
-fn collect_listener_socket_inodes(path: &str, port: u16, inodes: &mut BTreeSet<String>) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    for line in content.lines().skip(1) {
-        if let Some(inode) = parse_proc_net_listener_inode(line, port) {
-            inodes.insert(inode);
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn parse_proc_net_listener_inode(line: &str, port: u16) -> Option<String> {
-    let columns: Vec<&str> = line.split_whitespace().collect();
-    if columns.len() <= 10 || columns[3] != "0A" {
-        return None;
-    }
-    let (_, raw_port) = columns[1].rsplit_once(':')?;
-    if u16::from_str_radix(raw_port, 16).ok()? != port {
-        return None;
-    }
-    Some(columns[9].to_string())
-}
-
 fn port_holder_pids(port: u16) -> Vec<u32> {
     #[cfg(target_os = "linux")]
     {
@@ -422,6 +385,18 @@ fn port_holder_pids(port: u16) -> Vec<u32> {
     }
 
     port_holder_pids_via_lsof(port)
+}
+
+fn listener_port_holder_pids(host: &str, port: u16) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let pids = port_holder_pids_via_ss_for_host(host, port);
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+
+    port_holder_pids_via_lsof_for_host(host, port)
 }
 
 #[cfg(target_os = "linux")]
@@ -439,6 +414,21 @@ fn port_holder_pids_via_ss(port: u16) -> Vec<u32> {
     parse_ss_port_holder_pids(String::from_utf8_lossy(&output.stdout).as_ref())
 }
 
+#[cfg(target_os = "linux")]
+fn port_holder_pids_via_ss_for_host(host: &str, port: u16) -> Vec<u32> {
+    let output = match std::process::Command::new("ss")
+        .args(["-H", "-ltnp", &format!("sport = :{port}")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    parse_ss_port_holder_pids_for_host(String::from_utf8_lossy(&output.stdout).as_ref(), host)
+}
+
 fn port_holder_pids_via_lsof(port: u16) -> Vec<u32> {
     let output = match std::process::Command::new("lsof")
         .args(["-ti", &format!("tcp:{port}")])
@@ -453,12 +443,49 @@ fn port_holder_pids_via_lsof(port: u16) -> Vec<u32> {
     parse_lsof_port_holder_pids(String::from_utf8_lossy(&output.stdout).as_ref())
 }
 
+fn port_holder_pids_via_lsof_for_host(host: &str, port: u16) -> Vec<u32> {
+    let output = match std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpn"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() || !output.stdout.is_empty() => output,
+        _ => return Vec::new(),
+    };
+
+    parse_lsof_port_holder_pids_for_host(String::from_utf8_lossy(&output.stdout).as_ref(), host)
+}
+
 fn parse_ss_port_holder_pids(output: &str) -> Vec<u32> {
     let mut pids = BTreeSet::new();
     for segment in output.split("pid=").skip(1) {
         let digits: String = segment.chars().take_while(char::is_ascii_digit).collect();
         if let Ok(pid) = digits.parse::<u32>() {
             pids.insert(pid);
+        }
+    }
+    pids.into_iter().collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_ss_port_holder_pids_for_host(output: &str, host: &str) -> Vec<u32> {
+    let mut pids = BTreeSet::new();
+    for line in output.lines() {
+        let Some(local_addr) = line.split_whitespace().nth(3) else {
+            continue;
+        };
+        let Some(listener_host) = extract_socket_host(local_addr) else {
+            continue;
+        };
+        if !listener_host_matches_request(listener_host, host) {
+            continue;
+        }
+        for segment in line.split("pid=").skip(1) {
+            let digits: String = segment.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(pid) = digits.parse::<u32>() {
+                pids.insert(pid);
+            }
         }
     }
     pids.into_iter().collect()
@@ -474,47 +501,175 @@ fn parse_lsof_port_holder_pids(output: &str) -> Vec<u32> {
     pids.into_iter().collect()
 }
 
-/// Check if a PID belongs to an Agent Mail process by inspecting its
-/// command line or executable path via /proc.
-fn pid_is_agent_mail(pid: u32) -> bool {
-    // Check /proc/{pid}/cmdline (null-separated argv)
-    if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-        let cmdline_str = String::from_utf8_lossy(&cmdline).to_lowercase();
-        // The binary is typically "am" or contains "mcp-agent-mail" / "mcp_agent_mail"
-        if cmdline_str.contains("mcp-agent-mail")
-            || cmdline_str.contains("mcp_agent_mail")
-            || cmdline_str.contains("agent-mail")
-        {
-            return true;
-        }
-        // Check if argv[0] is "am" (the binary name)
-        if let Some(argv0) = cmdline.split(|&b| b == 0).next() {
-            let argv0_str = String::from_utf8_lossy(argv0);
-            // Extract just the filename from the path
-            let basename = argv0_str.rsplit('/').next().unwrap_or(&argv0_str);
-            if basename == "am" {
-                return true;
+fn parse_lsof_port_holder_pids_for_host(output: &str, host: &str) -> Vec<u32> {
+    let mut pids = BTreeSet::new();
+    let mut current_pid = None;
+
+    for line in output.lines() {
+        let Some(prefix) = line.chars().next() else {
+            continue;
+        };
+        let value = &line[prefix.len_utf8()..];
+        match prefix {
+            'p' => {
+                current_pid = value.trim().parse::<u32>().ok();
             }
+            'n' => {
+                let Some(pid) = current_pid else {
+                    continue;
+                };
+                let endpoint = value
+                    .trim()
+                    .strip_prefix("TCP ")
+                    .unwrap_or_else(|| value.trim())
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default();
+                let Some(listener_host) = extract_socket_host(endpoint) else {
+                    continue;
+                };
+                if listener_host_matches_request(listener_host, host) {
+                    pids.insert(pid);
+                }
+            }
+            _ => {}
         }
     }
 
-    // Fallback: check /proc/{pid}/exe symlink target
-    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
-        let exe_str = exe.to_string_lossy().to_lowercase();
-        if exe_str.contains("mcp-agent-mail")
-            || exe_str.contains("mcp_agent_mail")
-            || exe_str.contains("agent-mail")
-        {
-            return true;
-        }
-        if let Some(basename) = exe.file_name()
-            && basename == "am"
-        {
-            return true;
-        }
-    }
+    pids.into_iter().collect()
+}
 
-    false
+fn extract_socket_host(endpoint: &str) -> Option<&str> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (host, _) = rest.split_once("]:")?;
+        return Some(host);
+    }
+    let (host, _) = trimmed.rsplit_once(':')?;
+    Some(host)
+}
+
+fn listener_host_matches_request(listener_host: &str, requested_host: &str) -> bool {
+    let listener_host = normalize_socket_host(listener_host);
+    let requested_host = normalize_socket_host(requested_host);
+
+    if is_wildcard_host(&requested_host) || is_wildcard_host(&listener_host) {
+        return true;
+    }
+    if requested_host.eq_ignore_ascii_case("localhost") {
+        return is_loopback_host(&listener_host);
+    }
+    if listener_host.eq_ignore_ascii_case("localhost") {
+        return is_loopback_host(&requested_host);
+    }
+    match (
+        parse_canonical_ip(&listener_host),
+        parse_canonical_ip(&requested_host),
+    ) {
+        (Some(listener_ip), Some(requested_ip)) => listener_ip == requested_ip,
+        _ => listener_host.eq_ignore_ascii_case(&requested_host),
+    }
+}
+
+fn normalize_socket_host(host: &str) -> String {
+    host.trim().trim_matches(['[', ']']).to_string()
+}
+
+fn parse_canonical_ip(host: &str) -> Option<IpAddr> {
+    let ip = host.parse::<IpAddr>().ok()?;
+    Some(canonicalize_ip(ip))
+}
+
+fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+    }
+}
+
+fn is_wildcard_host(host: &str) -> bool {
+    host == "*"
+        || matches!(parse_canonical_ip(host), Some(IpAddr::V4(v4)) if v4.is_unspecified())
+        || matches!(parse_canonical_ip(host), Some(IpAddr::V6(v6)) if v6.is_unspecified())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    parse_canonical_ip(host).is_some_and(|ip| ip.is_loopback())
+}
+
+/// Check if a PID belongs to an Agent Mail process by inspecting its
+/// command line or executable path. This intentionally requires an explicit
+/// Agent Mail binary signature; ambiguous names like `am` are not sufficient.
+fn pid_is_agent_mail(pid: u32) -> bool {
+    pid_command_line(pid).is_some_and(|command| command_line_has_agent_mail_signature(&command))
+        || pid_executable_basename(pid)
+            .is_some_and(|basename| executable_name_has_agent_mail_signature(&basename))
+}
+
+fn command_line_has_agent_mail_signature(command: &str) -> bool {
+    let Some(argv0) = command.split_whitespace().next() else {
+        return false;
+    };
+    let basename = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+    executable_name_has_agent_mail_signature(basename)
+}
+
+fn executable_name_has_agent_mail_signature(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "mcp-agent-mail" | "mcp_agent_mail" | "mcp-agent-mail.exe" | "mcp_agent_mail.exe"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn pid_command_line(pid: u32) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let segments: Vec<String> = cmdline
+        .split(|&b| b == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).into_owned())
+        .collect();
+    (!segments.is_empty()).then(|| segments.join(" "))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_command_line(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
+}
+
+#[cfg(target_os = "linux")]
+fn pid_executable_basename(pid: u32) -> Option<String> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    exe.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_executable_basename(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1090,15 +1245,7 @@ fn probe_fd_limit(_config: &Config) -> ProbeResult {
                 recommended = MIN_RECOMMENDED_NOFILE,
                 "file descriptor limit (ulimit -n) is low; may cause failures under burst load"
             );
-            return ProbeResult::Fail(ProbeFailure {
-                name: "fd_limit",
-                problem: format!(
-                    "File descriptor limit (ulimit -n) is {soft_limit}, below recommended minimum of {MIN_RECOMMENDED_NOFILE}"
-                ),
-                fix: format!(
-                    "Increase the limit: `ulimit -n {MIN_RECOMMENDED_NOFILE}` or set in /etc/security/limits.conf"
-                ),
-            });
+            return ProbeResult::Ok { name: "fd_limit" };
         }
         tracing::debug!(soft_limit, "file descriptor limit check passed");
     }
@@ -1487,6 +1634,78 @@ mod tests {
     }
 
     #[test]
+    fn agent_mail_health_signature_header_is_detected() {
+        let headers = "Content-Type: application/json\r\nX-Agent-Mail-Health: 1\r\n";
+        assert!(has_agent_mail_signature(headers));
+    }
+
+    #[test]
+    fn generic_ready_json_without_signature_is_not_agent_mail() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).expect("read request line");
+                if bytes == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+
+            let body = r#"{"status":"ready"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write health response");
+            stream.flush().expect("flush health response");
+        });
+
+        let status = check_port_status("127.0.0.1", port);
+        assert!(
+            matches!(status, PortStatus::OtherProcess { .. }),
+            "expected OtherProcess for unsigned generic ready payload, got {status:?}"
+        );
+
+        server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn command_line_signature_rejects_generic_am_binary() {
+        assert!(!command_line_has_agent_mail_signature(
+            "/usr/local/bin/am serve"
+        ));
+        assert!(!executable_name_has_agent_mail_signature("am"));
+        assert!(!command_line_has_agent_mail_signature(
+            "/usr/bin/python worker.py --label=mcp-agent-mail"
+        ));
+    }
+
+    #[test]
+    fn command_line_signature_accepts_agent_mail_binary_names() {
+        assert!(command_line_has_agent_mail_signature(
+            "/usr/local/bin/mcp-agent-mail serve"
+        ));
+        assert!(command_line_has_agent_mail_signature(
+            "/opt/tools/mcp_agent_mail daemon"
+        ));
+        assert!(executable_name_has_agent_mail_signature("mcp-agent-mail"));
+        assert!(executable_name_has_agent_mail_signature(
+            "mcp_agent_mail.exe"
+        ));
+    }
+
+    #[test]
     fn parse_ss_port_holder_pids_extracts_unique_pids() {
         let output = r#"LISTEN 0 4096 127.0.0.1:8765 0.0.0.0:* users:(("am",pid=1234,fd=7),("helper",pid=5678,fd=8),("am",pid=1234,fd=9))"#;
         assert_eq!(parse_ss_port_holder_pids(output), vec![1234, 5678]);
@@ -1500,13 +1719,20 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn parse_proc_net_listener_inode_extracts_listening_inode() {
-        let line = "0: 3500007F:223D 00000000:0000 0A 00000000:00000000 00:00000000 00000000 990 0 74834 1 0000000000000000 100 0 0 10 5";
-        assert_eq!(
-            parse_proc_net_listener_inode(line, 8765),
-            Some("74834".to_string())
+    fn parse_ss_port_holder_pids_for_host_filters_non_matching_hosts() {
+        let output = concat!(
+            "LISTEN 0 4096 127.0.0.1:8765 0.0.0.0:* users:((\"am\",pid=1234,fd=7))\n",
+            "LISTEN 0 4096 127.0.0.2:8765 0.0.0.0:* users:((\"am\",pid=5678,fd=8))\n",
+            "LISTEN 0 4096 *:8765 0.0.0.0:* users:((\"am\",pid=9999,fd=9))\n"
         );
-        assert_eq!(parse_proc_net_listener_inode(line, 9000), None);
+        assert_eq!(
+            parse_ss_port_holder_pids_for_host(output, "127.0.0.1"),
+            vec![1234, 9999]
+        );
+        assert_eq!(
+            parse_ss_port_holder_pids_for_host(output, "127.0.0.2"),
+            vec![5678, 9999]
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1524,6 +1750,39 @@ mod tests {
         let path = listener_pid_hint_path("::1", 8765);
         let file_name = path.file_name().expect("file name");
         assert_eq!(file_name.to_string_lossy(), "__1-8765.pid");
+    }
+
+    #[test]
+    fn parse_lsof_port_holder_pids_for_host_filters_non_matching_hosts() {
+        let output = concat!(
+            "p1234\n",
+            "nTCP 127.0.0.1:8765 (LISTEN)\n",
+            "p5678\n",
+            "nTCP 127.0.0.2:8765 (LISTEN)\n",
+            "p9999\n",
+            "nTCP *:8765 (LISTEN)\n"
+        );
+        assert_eq!(
+            parse_lsof_port_holder_pids_for_host(output, "127.0.0.1"),
+            vec![1234, 9999]
+        );
+        assert_eq!(
+            parse_lsof_port_holder_pids_for_host(output, "127.0.0.2"),
+            vec![5678, 9999]
+        );
+    }
+
+    #[test]
+    fn listener_host_matches_request_handles_loopback_wildcard_and_ipv4_mapped_ipv6() {
+        assert!(listener_host_matches_request("*", "127.0.0.1"));
+        assert!(listener_host_matches_request("0.0.0.0", "127.0.0.1"));
+        assert!(listener_host_matches_request("::", "127.0.0.1"));
+        assert!(listener_host_matches_request(
+            "::ffff:127.0.0.1",
+            "127.0.0.1"
+        ));
+        assert!(listener_host_matches_request("127.0.0.1", "localhost"));
+        assert!(!listener_host_matches_request("127.0.0.2", "127.0.0.1"));
     }
 
     #[test]

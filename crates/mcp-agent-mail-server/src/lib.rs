@@ -4625,7 +4625,11 @@ impl HttpState {
                 if !matches!(req.method, Http1Method::Get) {
                     return Some(self.error_response(req, 405, "Method Not Allowed"));
                 }
-                return Some(self.json_response(req, 200, &serde_json::json!({"status":"alive"})));
+                return Some(self.health_json_response(
+                    req,
+                    200,
+                    &serde_json::json!({"status":"alive"}),
+                ));
             }
             "/health" | "/health/readiness" => {
                 if !matches!(req.method, Http1Method::Get) {
@@ -4635,7 +4639,7 @@ impl HttpState {
                 // before binding. During the first startup second, avoid rebuilding
                 // a fresh one-connection readiness pool on every probe.
                 if startup_readiness_fast_path_active() {
-                    return Some(self.json_response(
+                    return Some(self.health_json_response(
                         req,
                         200,
                         &serde_json::json!({"status":"ready"}),
@@ -4644,7 +4648,11 @@ impl HttpState {
                 if let Err(err) = readiness_check_quick(&self.config) {
                     return Some(self.error_response(req, 503, &err));
                 }
-                return Some(self.json_response(req, 200, &serde_json::json!({"status":"ready"})));
+                return Some(self.health_json_response(
+                    req,
+                    200,
+                    &serde_json::json!({"status":"ready"}),
+                ));
             }
             "/.well-known/oauth-authorization-server"
             | "/.well-known/oauth-authorization-server/mcp" => {
@@ -5710,6 +5718,20 @@ to skip auth for local requests.</p>
             &self.config.http_cors_allow_methods,
             &self.config.http_cors_allow_headers,
         );
+        resp
+    }
+
+    fn health_json_response(
+        &self,
+        req: &Http1Request,
+        status: u16,
+        value: &serde_json::Value,
+    ) -> Http1Response {
+        let mut resp = self.json_response(req, status, value);
+        resp.headers.push((
+            startup_checks::HEALTH_SIGNATURE_HEADER_NAME.to_string(),
+            startup_checks::HEALTH_SIGNATURE_HEADER_VALUE.to_string(),
+        ));
         resp
     }
 
@@ -13578,6 +13600,18 @@ mod tests {
     }
 
     #[test]
+    fn health_liveness_emits_agent_mail_signature_header() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/health/liveness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            response_header(&resp, startup_checks::HEALTH_SIGNATURE_HEADER_NAME),
+            Some(startup_checks::HEALTH_SIGNATURE_HEADER_VALUE)
+        );
+    }
+
+    #[test]
     fn health_liveness_rejects_post_with_405() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
@@ -13648,6 +13682,18 @@ mod tests {
         assert_eq!(
             response_header(&resp, "content-type"),
             Some("application/json")
+        );
+    }
+
+    #[test]
+    fn health_readiness_emits_agent_mail_signature_header() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            response_header(&resp, startup_checks::HEALTH_SIGNATURE_HEADER_NAME),
+            Some(startup_checks::HEALTH_SIGNATURE_HEADER_VALUE)
         );
     }
 

@@ -314,6 +314,17 @@ mod utility_tests {
         assert!(!result.is_empty());
     }
 
+    #[test]
+    fn matches_importance_filter_requires_exact_importance() {
+        assert!(matches_importance_filter("high", Some("high")));
+        assert!(matches_importance_filter("HIGH", Some("high")));
+        assert!(matches_importance_filter("urgent", Some("urgent")));
+        assert!(matches_importance_filter("low", None));
+        assert!(!matches_importance_filter("urgent", Some("high")));
+        assert!(!matches_importance_filter("high", Some("urgent")));
+        assert!(!matches_importance_filter("normal", Some("low")));
+    }
+
     // --- archive time-travel validation ---
 
     #[test]
@@ -872,6 +883,10 @@ fn render_unified_inbox(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Option<String>, (u16, String)> {
+    let normalized_filter = filter_importance
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
     let projects_rows = block_on_outcome(cx, queries::list_projects(cx, pool))?;
 
     let mut projects = Vec::new();
@@ -910,15 +925,15 @@ fn render_unified_inbox(
         let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
         for agent in &agents_rows {
             let aid = agent.id.unwrap_or(0);
-            let urgent_only = filter_importance.is_some_and(|f| {
-                f.eq_ignore_ascii_case("urgent") || f.eq_ignore_ascii_case("high")
-            });
             let inbox = block_on_outcome(
                 cx,
-                queries::fetch_inbox(cx, pool, pid, aid, urgent_only, None, limit),
+                queries::fetch_inbox(cx, pool, pid, aid, false, None, limit),
             )?;
             for row in inbox {
                 let m = &row.message;
+                if !matches_importance_filter(&m.importance, normalized_filter.as_deref()) {
+                    continue;
+                }
                 messages.push(UnifiedMessage {
                     id: m.id.unwrap_or(0),
                     subject: m.subject.clone(),
@@ -948,9 +963,13 @@ fn render_unified_inbox(
             messages,
             total_agents,
             total_messages,
-            filter_importance: filter_importance.unwrap_or("").to_string(),
+            filter_importance: normalized_filter.unwrap_or_default(),
         },
     )
+}
+
+fn matches_importance_filter(message_importance: &str, filter_importance: Option<&str>) -> bool {
+    filter_importance.is_none_or(|filter| message_importance.eq_ignore_ascii_case(filter))
 }
 
 // ---------------------------------------------------------------------------
@@ -2511,22 +2530,10 @@ fn handle_mark_all_read(
     let pid = p.id.unwrap_or(0);
     let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
     let aid = a.id.unwrap_or(0);
-
-    // Fetch all inbox messages and mark each as read.
-    // `mark_message_read` is idempotent — it uses COALESCE(read_ts, now) so
-    // already-read messages are harmlessly skipped.
-    let inbox = block_on_outcome(
+    let marked_count = block_on_outcome(
         cx,
-        queries::fetch_inbox(cx, pool, pid, aid, false, None, 10_000),
+        queries::mark_all_messages_read_in_project(cx, pool, pid, aid),
     )?;
-
-    let mut marked_count = 0i64;
-    for row in &inbox {
-        let mid = row.message.id.unwrap_or(0);
-        if block_on_outcome(cx, queries::mark_message_read(cx, pool, aid, mid)).is_ok() {
-            marked_count += 1;
-        }
-    }
 
     json_ok(&serde_json::json!({
         "success": true,
@@ -2568,10 +2575,17 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
+                .filter_map(|v| v.as_str().map(str::trim))
+                .filter(|value| !value.is_empty())
+                .map(String::from)
                 .collect()
         })
         .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let recipients: Vec<String> = recipients
+        .into_iter()
+        .filter(|recipient| seen.insert(recipient.to_ascii_lowercase()))
+        .collect();
     let subject = payload
         .get("subject")
         .and_then(|v| v.as_str())
@@ -2587,6 +2601,8 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
     let thread_id = payload
         .get("thread_id")
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(String::from);
 
     // Validation (Python parity).
@@ -2615,13 +2631,6 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
     if body_md.len() > 50_000 {
         return Err(err("Message body too long (maximum 50,000 characters)"));
     }
-
-    // Deduplicate recipients while preserving order.
-    let mut seen = std::collections::HashSet::new();
-    let recipients: Vec<String> = recipients
-        .into_iter()
-        .filter(|r| seen.insert(r.clone()))
-        .collect();
 
     Ok(OverseerPayload {
         recipients,
@@ -2785,9 +2794,9 @@ mod overseer_form_validation_tests {
     }
 
     #[test]
-    fn parse_overseer_body_success_and_deduplicates_recipients() {
+    fn parse_overseer_body_normalizes_and_deduplicates_recipients() {
         let body = json!({
-            "recipients": ["BlueLake", "GreenField", "BlueLake"],
+            "recipients": [" BlueLake ", "GreenField", "bluelake", "  "],
             "subject": "  Operator notice  ",
             "body_md": "  Please prioritize this task.  ",
             "thread_id": "br-123",
@@ -2910,6 +2919,22 @@ mod overseer_form_validation_tests {
         .to_string();
         let parsed = parse_overseer_body(&body).expect("valid payload");
         assert_eq!(parsed.thread_id, None);
+    }
+
+    #[test]
+    fn parse_overseer_body_trims_thread_id_and_deduplicates_before_limit() {
+        let recipients: Vec<String> = (0..101).map(|_| "BlueLake".to_string()).collect();
+        let body = json!({
+            "recipients": recipients,
+            "subject": "hello",
+            "body_md": "body",
+            "thread_id": "  br-123  ",
+        })
+        .to_string();
+
+        let parsed = parse_overseer_body(&body).expect("duplicates should collapse before limit");
+        assert_eq!(parsed.recipients, vec!["BlueLake"]);
+        assert_eq!(parsed.thread_id.as_deref(), Some("br-123"));
     }
 
     #[test]

@@ -51,6 +51,20 @@ fn full_check_interval(config: &Config) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
+fn full_check_due(
+    config: &Config,
+    interval: Option<Duration>,
+    last_full_attempt: Option<Instant>,
+) -> bool {
+    let Some(interval) = interval else {
+        return false;
+    };
+    if let Some(last_full_attempt) = last_full_attempt {
+        return last_full_attempt.elapsed() >= interval;
+    }
+    mcp_agent_mail_db::is_full_check_due(config.integrity_check_interval_hours)
+}
+
 /// Tell the guard that startup already ran an integrity probe.
 ///
 /// Used by HTTP/TUI startup to avoid immediately repeating the same quick-check
@@ -157,7 +171,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
         "integrity guard worker started"
     );
 
-    let mut last_full_check = Instant::now();
+    let mut last_full_attempt: Option<Instant> = None;
     let mut last_recovery_attempt: Option<Instant> = None;
     let mut skip_first_quick_cycle = SKIP_NEXT_QUICK_CYCLE.swap(false, Ordering::AcqRel);
 
@@ -181,16 +195,15 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             );
         }
 
-        if let Some(interval) = full_every
-            && last_full_check.elapsed() >= interval
-        {
-            run_full_cycle(
+        if full_check_due(config, full_every, last_full_attempt)
+            && run_full_cycle(
                 &pool,
                 sqlite_path,
                 &storage_root,
                 &mut last_recovery_attempt,
-            );
-            last_full_check = Instant::now();
+            )
+        {
+            last_full_attempt = Some(Instant::now());
         }
 
         // Sleep in short increments so shutdown reacts quickly.
@@ -241,18 +254,22 @@ fn run_full_cycle(
     sqlite_path: &Path,
     storage_root: &Path,
     last_recovery_attempt: &mut Option<Instant>,
-) {
+) -> bool {
     match pool.run_full_integrity_check() {
         Ok(_) => {
             tracing::info!("integrity guard: periodic full integrity check passed");
+            true
         }
-        Err(err) => handle_integrity_error(
-            "integrity_check",
-            &err.to_string(),
-            sqlite_path,
-            storage_root,
-            last_recovery_attempt,
-        ),
+        Err(err) => {
+            handle_integrity_error(
+                "integrity_check",
+                &err.to_string(),
+                sqlite_path,
+                storage_root,
+                last_recovery_attempt,
+            );
+            false
+        }
     }
 }
 
@@ -370,6 +387,14 @@ mod tests {
     #[test]
     fn quick_check_interval_is_5_minutes() {
         assert_eq!(quick_check_interval().as_secs(), 300);
+    }
+
+    #[test]
+    fn full_check_due_respects_attempt_throttle() {
+        let mut config = Config::from_env();
+        config.integrity_check_interval_hours = 1;
+        let interval = full_check_interval(&config);
+        assert!(!full_check_due(&config, interval, Some(Instant::now())));
     }
 
     #[test]
