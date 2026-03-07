@@ -177,7 +177,7 @@ pub fn build_materialized_views(
         .map_err(sql_err)?;
 
     let thread_expr = if has_thread_id {
-        "m.thread_id"
+        "NULLIF(TRIM(m.thread_id), '')"
     } else {
         "printf('msg:%d', m.id)"
     };
@@ -187,13 +187,13 @@ pub fn build_materialized_views(
         "'' AS sender_name"
     };
     let recipients_expr = "COALESCE( \
-             (SELECT ag.name FROM agents ag \
-               WHERE ag.id = ( \
-                 SELECT mr.agent_id FROM message_recipients mr \
+             (SELECT GROUP_CONCAT(name, ', ') FROM ( \
+                 SELECT COALESCE(ag.name, '') AS name \
+                 FROM message_recipients mr \
+                 LEFT JOIN agents ag ON ag.id = mr.agent_id \
                  WHERE mr.message_id = m.id \
-                 LIMIT 1 \
-               ) \
-               LIMIT 1), \
+                 ORDER BY ag.name \
+             )), \
              '' \
          ) AS recipients";
 
@@ -231,7 +231,11 @@ pub fn build_materialized_views(
     conn.execute_raw("DROP TABLE IF EXISTS attachments_by_message_mv")
         .map_err(sql_err)?;
 
-    let attach_thread_expr = if has_thread_id { "m.thread_id" } else { "NULL" };
+    let attach_thread_expr = if has_thread_id {
+        "NULLIF(TRIM(m.thread_id), '')"
+    } else {
+        "NULL"
+    };
     let attach_sql = format!(
         "CREATE TABLE attachments_by_message_mv AS \
          SELECT \
@@ -681,6 +685,33 @@ mod tests {
             .unwrap();
         let count: i64 = rows[0].get_named("cnt").unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn materialized_views_aggregate_all_recipients_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (2, 1, 'BetaAgent', 'codex-cli', 'gpt-5', 'testing', \
+             '2025-01-01T00:00:00Z', '2025-01-01T12:00:00Z', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (1, 2, 'cc', NULL, NULL)")
+            .unwrap();
+        drop(conn);
+
+        build_materialized_views(&db, false).unwrap();
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT recipients FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let recipients: String = rows[0].get_named("recipients").unwrap();
+        assert_eq!(recipients, "AlphaAgent, BetaAgent");
     }
 
     #[test]
@@ -1163,6 +1194,48 @@ mod tests {
             .unwrap();
         let name: String = rows[0].get_named("sender_name").unwrap();
         assert_eq!(name, "", "should have empty sender_name without sender_id");
+    }
+
+    #[test]
+    fn materialized_views_normalize_blank_thread_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("UPDATE messages SET thread_id = '   ' WHERE id = 2")
+            .unwrap();
+        drop(conn);
+
+        let views = build_materialized_views(&db, false).unwrap();
+        assert!(views.contains(&"message_overview_mv".to_string()));
+        assert!(views.contains(&"attachments_by_message_mv".to_string()));
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let overview_rows = conn
+            .query_sync(
+                "SELECT thread_id FROM message_overview_mv WHERE id = 2",
+                &[],
+            )
+            .unwrap();
+        let attach_rows = conn
+            .query_sync(
+                "SELECT thread_id FROM attachments_by_message_mv WHERE message_id = 2",
+                &[],
+            )
+            .unwrap();
+
+        assert!(
+            overview_rows[0]
+                .get_named::<Option<String>>("thread_id")
+                .is_ok_and(|tid| tid.is_none()),
+            "blank thread IDs should normalize to NULL in message_overview_mv"
+        );
+        assert!(
+            attach_rows[0]
+                .get_named::<Option<String>>("thread_id")
+                .is_ok_and(|tid| tid.is_none()),
+            "blank thread IDs should normalize to NULL in attachments_by_message_mv"
+        );
     }
 
     #[test]

@@ -263,68 +263,52 @@ fn probe_get_inner(
     let mut redirects = 0u32;
 
     loop {
-        let result = probe_single_get(&parsed, config, capture_body);
-        match result {
-            Ok(resp) => {
-                // Check for redirect
-                if is_redirect(resp.status) && redirects < config.max_redirects {
-                    if let Some(location) = resp.header("location") {
-                        let next_url = resolve_redirect(&parsed, location);
-                        parsed = ParsedUrl::parse(&next_url)?;
-                        redirects += 1;
-                        continue;
-                    }
-                } else if is_redirect(resp.status) {
-                    return Err(ProbeError::TooManyRedirects {
-                        count: redirects + 1,
-                        max: config.max_redirects,
-                    });
-                }
+        let resp = send_with_retries(&parsed, config, capture_body)?;
 
-                return Ok(ProbeResponse {
-                    final_url: parsed.to_url(),
-                    status: resp.status,
-                    headers: resp.headers,
-                    body: resp.body,
-                    redirects,
-                    elapsed: start.elapsed(),
-                });
+        // Check for redirect
+        if is_redirect(resp.status) && redirects < config.max_redirects {
+            if let Some(location) = resp.header("location") {
+                let next_url = resolve_redirect(&parsed, location);
+                parsed = ParsedUrl::parse(&next_url)?;
+                redirects += 1;
+                continue;
             }
-            Err(e) if is_retryable(&e) => {
-                // Retry handled below
-                return retry_probe(&parsed, config, start, redirects, capture_body);
-            }
-            Err(e) => return Err(e),
+        } else if is_redirect(resp.status) {
+            return Err(ProbeError::TooManyRedirects {
+                count: redirects + 1,
+                max: config.max_redirects,
+            });
         }
+
+        return Ok(ProbeResponse {
+            final_url: parsed.to_url(),
+            status: resp.status,
+            headers: resp.headers,
+            body: resp.body,
+            redirects,
+            elapsed: start.elapsed(),
+        });
     }
 }
 
-/// Retry a failed probe up to `config.retries` times.
-fn retry_probe(
+/// Execute a single probe attempt plus any configured retries.
+///
+/// Retries apply uniformly to retryable transport failures and HTTP 5xx
+/// responses so redirect and non-redirect paths share the same semantics.
+fn send_with_retries(
     parsed: &ParsedUrl,
     config: &ProbeConfig,
-    start: Instant,
-    redirects: u32,
     capture_body: bool,
-) -> Result<ProbeResponse, ProbeError> {
+) -> Result<RawResponse, ProbeError> {
     let mut last_err = None;
 
-    for attempt in 0..config.retries {
+    for attempt in 0..=config.retries {
         if attempt > 0 {
             std::thread::sleep(config.retry_delay);
         }
 
         match probe_single_get(parsed, config, capture_body) {
-            Ok(resp) if !is_server_error(resp.status) => {
-                return Ok(ProbeResponse {
-                    final_url: parsed.to_url(),
-                    status: resp.status,
-                    headers: resp.headers,
-                    body: resp.body,
-                    redirects,
-                    elapsed: start.elapsed(),
-                });
-            }
+            Ok(resp) if !is_server_error(resp.status) => return Ok(resp),
             Ok(resp) => {
                 // 5xx — retryable
                 last_err = Some(ProbeError::ProtocolError {
@@ -722,18 +706,25 @@ fn resolve_redirect(base: &ParsedUrl, location: &str) -> String {
         format!("{}://{}{}", scheme, base.authority(), location)
     } else {
         // Relative path
-        let base_path = base.path.rsplit_once('/').map_or("/", |(p, _)| p);
+        let base_dir = base
+            .path
+            .rsplit_once('/')
+            .map_or("", |(p, _)| p.trim_start_matches('/'));
         let scheme = match base.scheme {
             Scheme::Http => "http",
             Scheme::Https => "https",
         };
-        format!(
-            "{}://{}{}/{}",
-            scheme,
-            base.authority(),
-            base_path,
-            location
-        )
+        if base_dir.is_empty() {
+            format!("{}://{}/{}", scheme, base.authority(), location)
+        } else {
+            format!(
+                "{}://{}/{}/{}",
+                scheme,
+                base.authority(),
+                base_dir,
+                location
+            )
+        }
     }
 }
 
@@ -886,6 +877,26 @@ pub fn run_probe_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn spawn_http_sequence_server(responses: Vec<String>) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                stream.flush().expect("flush response");
+            }
+        });
+        (port, handle)
+    }
 
     // ── URL parsing ─────────────────────────────────────────────────
 
@@ -1007,6 +1018,13 @@ mod tests {
     }
 
     #[test]
+    fn redirect_relative_path_from_root_does_not_introduce_double_slash() {
+        let base = ParsedUrl::parse("https://a.com/").unwrap();
+        let resolved = resolve_redirect(&base, "new");
+        assert_eq!(resolved, "https://a.com/new");
+    }
+
+    #[test]
     fn parse_curl_http_response_preserves_binary_body_bytes() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n\xff\x00\x80";
         let response = parse_curl_http_response(raw, true).expect("parse curl response");
@@ -1102,6 +1120,32 @@ mod tests {
         assert_eq!(cfg.retries, 2);
         assert_eq!(cfg.retry_delay, Duration::from_secs(1));
         assert_eq!(cfg.max_redirects, 5);
+    }
+
+    #[test]
+    fn probe_get_retries_server_error_and_follows_redirect() {
+        let responses = vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone"
+                .to_string(),
+        ];
+        let (port, handle) = spawn_http_sequence_server(responses);
+        let config = ProbeConfig {
+            retries: 1,
+            retry_delay: Duration::from_millis(1),
+            ..ProbeConfig::default()
+        };
+
+        let resp = probe_get(&format!("http://127.0.0.1:{port}/start"), &config).unwrap();
+        handle.join().expect("join server");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.final_url, format!("http://127.0.0.1:{port}/final"));
+        assert_eq!(resp.redirects, 1);
+        assert_eq!(resp.body_text(), "done");
     }
 
     // ── ProbeResponse helpers ───────────────────────────────────────

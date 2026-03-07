@@ -177,7 +177,12 @@ fn apply_body_redaction(
             format!("message {msg_id}: body was redacted by scrub pass"),
             Some(msg_id),
         );
-        return (BODY_REDACTED_PLACEHOLDER.to_string(), true);
+        let placeholder = if policy.redact_bodies {
+            policy.body_placeholder.clone()
+        } else {
+            BODY_REDACTED_PLACEHOLDER.to_string()
+        };
+        return (placeholder, true);
     }
 
     // If the policy says to redact all bodies (strict mode), replace it.
@@ -352,7 +357,7 @@ pub fn render_static_site(
     std::fs::create_dir_all(&msg_pages_dir)?;
 
     for msg in &messages {
-        let body_was_redacted = is_redacted_body(&msg.body_md);
+        let body_was_redacted = config.redaction.redact_bodies || is_redacted_body(&msg.body_md);
         let msg_html = render_message_page(msg, body_was_redacted, config);
         let filename = format!("{}.html", msg.id);
         write_page(&msg_pages_dir, &filename, &msg_html)?;
@@ -495,11 +500,11 @@ fn discover_messages(
     let rows = conn
         .query_sync(
             "SELECT m.id, m.subject, m.body_md, m.importance, m.created_ts, \
-             m.thread_id, \
+             NULLIF(TRIM(m.thread_id), '') AS thread_id, \
              COALESCE(a.name, 'unknown') AS sender_name, \
              p.slug AS project_slug \
              FROM messages m \
-             JOIN agents a ON a.id = m.sender_id \
+             LEFT JOIN agents a ON a.id = m.sender_id \
              JOIN projects p ON p.id = m.project_id \
              ORDER BY m.created_ts ASC, m.id ASC",
             &[],
@@ -566,17 +571,24 @@ fn build_thread_index(messages: &[MessageInfo]) -> BTreeMap<String, ThreadInfo> 
     let mut threads: BTreeMap<String, ThreadInfo> = BTreeMap::new();
 
     for msg in messages {
-        let Some(tid) = &msg.thread_id else {
+        let Some(tid) = msg
+            .thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|tid| !tid.is_empty())
+        else {
             continue;
         };
-        let entry = threads.entry(tid.clone()).or_insert_with(|| ThreadInfo {
-            thread_id: tid.clone(),
-            project_slug: msg.project_slug.clone(),
-            subject: msg.subject.clone(),
-            message_count: 0,
-            participants: BTreeSet::new(),
-            latest_ts: String::new(),
-        });
+        let entry = threads
+            .entry(tid.to_string())
+            .or_insert_with(|| ThreadInfo {
+                thread_id: tid.to_string(),
+                project_slug: msg.project_slug.clone(),
+                subject: msg.subject.clone(),
+                message_count: 0,
+                participants: BTreeSet::new(),
+                latest_ts: String::new(),
+            });
         entry.message_count += 1;
         entry.participants.insert(msg.sender_name.clone());
         for r in &msg.recipients {
@@ -850,6 +862,8 @@ fn render_message_page(
     let thread_link = msg
         .thread_id
         .as_ref()
+        .map(|tid| tid.trim())
+        .filter(|tid| !tid.is_empty())
         .map(|tid| {
             let safe_id = sanitize_filename(tid);
             format!(
@@ -942,7 +956,7 @@ fn render_thread_page(
                 // Apply redaction to body snippets in thread view
                 let body_snippet = if config.redaction.redact_bodies || is_redacted_body(&m.body_md)
                 {
-                    format!("<em>{}</em>", html_escape(BODY_REDACTED_PLACEHOLDER))
+                    format!("<em>{}</em>", html_escape(&m.body_md))
                 } else {
                     let truncated = truncate_str(&m.body_md, 500);
                     let (sanitized, _) = defense_scan(&truncated, &config.redaction);
@@ -1249,6 +1263,37 @@ mod tests {
         assert_eq!(t1.latest_ts, "2024-01-01T01:00:00Z");
     }
 
+    #[test]
+    fn build_thread_index_skips_empty_thread_ids() {
+        let messages = vec![
+            MessageInfo {
+                id: 1,
+                subject: "Blank".to_string(),
+                body_md: "body".to_string(),
+                importance: "normal".to_string(),
+                created_ts: "2024-01-01T00:00:00Z".to_string(),
+                sender_name: "Alice".to_string(),
+                project_slug: "proj".to_string(),
+                thread_id: Some(String::new()),
+                recipients: vec!["Bob".to_string()],
+            },
+            MessageInfo {
+                id: 2,
+                subject: "Whitespace".to_string(),
+                body_md: "body".to_string(),
+                importance: "normal".to_string(),
+                created_ts: "2024-01-01T01:00:00Z".to_string(),
+                sender_name: "Alice".to_string(),
+                project_slug: "proj".to_string(),
+                thread_id: Some("   ".to_string()),
+                recipients: vec!["Bob".to_string()],
+            },
+        ];
+
+        let threads = build_thread_index(&messages);
+        assert!(threads.is_empty());
+    }
+
     // ── SearchIndexEntry serialization ──────────────────────────────
 
     #[test]
@@ -1476,6 +1521,120 @@ mod tests {
         assert!(msg_html.contains("Hello World"));
         assert!(msg_html.contains("RedFox"));
         assert!(msg_html.contains("test-project"));
+    }
+
+    #[test]
+    fn render_with_missing_sender_agent_preserves_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing-sender.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'test-project', '/tmp/test')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 999, 'Orphan sender', 'Body still matters', 'normal', '2024-01-01T00:00:00Z', NULL)",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("output");
+        let result = render_static_site(&db_path, &output, &StaticRenderConfig::default()).unwrap();
+
+        assert_eq!(result.messages_count, 1);
+        let msg_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/1.html")).unwrap();
+        assert!(msg_html.contains("Orphan sender"));
+        assert!(msg_html.contains("unknown"));
+    }
+
+    #[test]
+    fn render_ignores_blank_thread_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("blank-thread.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Alice')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 1, 'Blank thread', 'Body', 'normal', '2024-01-01T00:00:00Z', '   ')",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("output");
+        let result = render_static_site(&db_path, &output, &StaticRenderConfig::default()).unwrap();
+
+        assert_eq!(result.threads_count, 0);
+
+        let msg_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/1.html")).unwrap();
+        assert!(
+            !msg_html.contains("../threads/.html"),
+            "blank thread IDs must not produce empty thread links"
+        );
+
+        let nav_json = std::fs::read_to_string(output.join("viewer/data/navigation.json")).unwrap();
+        let nav: serde_json::Value = serde_json::from_str(&nav_json).unwrap();
+        assert_eq!(nav["threads"].as_array().unwrap().len(), 0);
     }
 
     // ── Threat-model negative fixture tests ──────────────────────────
@@ -1742,6 +1901,47 @@ mod tests {
         );
 
         // Audit log should reflect redaction counts
+        assert!(result.redaction_audit.bodies_redacted > 0);
+        assert!(result.redaction_audit.snippets_filtered > 0);
+    }
+
+    #[test]
+    fn negative_strict_custom_placeholder_still_marks_body_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("strict-custom-output");
+
+        let mut redaction = ExportRedactionPolicy::from_preset(crate::ScrubPreset::Strict);
+        redaction.body_placeholder = "<<hidden body>>".to_string();
+        redaction.snippet_placeholder = "<<hidden snippet>>".to_string();
+        let config = StaticRenderConfig {
+            redaction,
+            ..StaticRenderConfig::default()
+        };
+
+        let result = render_static_site(&db_path, &output, &config).unwrap();
+
+        let msg1_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/1.html")).unwrap();
+        assert!(msg1_html.contains("&lt;&lt;hidden body&gt;&gt;"));
+        assert!(msg1_html.contains("data-redaction-reason=\"body_redacted\""));
+
+        let msg4_html =
+            std::fs::read_to_string(output.join("viewer/pages/messages/4.html")).unwrap();
+        assert!(msg4_html.contains("&lt;&lt;hidden body&gt;&gt;"));
+
+        let thread_html =
+            std::fs::read_to_string(output.join("viewer/pages/threads/setup-thread.html")).unwrap();
+        assert!(thread_html.contains("&lt;&lt;hidden body&gt;&gt;"));
+
+        let search_json =
+            std::fs::read_to_string(output.join("viewer/data/search_index.json")).unwrap();
+        let entries: Vec<SearchIndexEntry> = serde_json::from_str(&search_json).unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.snippet == "<<hidden snippet>>")
+        );
         assert!(result.redaction_audit.bodies_redacted > 0);
         assert!(result.redaction_audit.snippets_filtered > 0);
     }
