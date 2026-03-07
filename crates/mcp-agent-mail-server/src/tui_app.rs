@@ -57,13 +57,15 @@ use crate::tui_widgets::{
     determine_ambient_health_state,
 };
 
-/// How often the TUI ticks (100 ms ≈ 10 fps).
+/// Fast transient tick cadence used while animations or deferred ingress work
+/// are active.
+const FAST_TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// Idle tick cadence used when the TUI is quiescent.
 ///
-/// 10 fps is more than adequate for a data-dashboard TUI.  Input latency
-/// stays imperceptible (< 120 ms round-trip including terminal I/O).
-/// Previous 33 ms (30 fps) caused excessive terminal writes and visible
-/// flashing, especially with ambient effects enabled.
-const TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// The ftui runtime redraws the full frame on every tick, so keeping the
+/// steady state at 10 Hz causes visible terminal churn even when the content
+/// is effectively static.
+const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const PALETTE_MAX_VISIBLE: usize = 12;
 const PALETTE_DYNAMIC_AGENT_CAP: usize = 50;
 const PALETTE_DYNAMIC_THREAD_CAP: usize = 50;
@@ -1157,6 +1159,7 @@ pub struct MailAppModel {
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
+    scheduled_tick_interval: Duration,
     /// Global cursor for per-tick shared event ingestion batch.
     tick_event_batch_last_seq: u64,
     /// Last terminal dimensions dispatched to screens. Duplicate resize events
@@ -1304,6 +1307,7 @@ impl MailAppModel {
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq: 0,
             tick_count: 0,
+            scheduled_tick_interval: IDLE_TICK_INTERVAL,
             tick_event_batch_last_seq: 0,
             last_dispatched_resize: None,
             pending_resize: None,
@@ -2547,8 +2551,8 @@ impl MailAppModel {
         let duration = Duration::from_secs(self.toast_dismiss_secs(icon));
         let toast = toast
             .duration(duration)
-            .entrance_duration(TICK_INTERVAL.saturating_mul(u32::from(TOAST_ENTRANCE_TICKS)))
-            .exit_duration(TICK_INTERVAL.saturating_mul(u32::from(TOAST_EXIT_TICKS)));
+            .entrance_duration(FAST_TICK_INTERVAL.saturating_mul(u32::from(TOAST_ENTRANCE_TICKS)))
+            .exit_duration(FAST_TICK_INTERVAL.saturating_mul(u32::from(TOAST_EXIT_TICKS)));
         if toast_reduced_motion_enabled(&self.accessibility) {
             toast.no_animation()
         } else {
@@ -2568,6 +2572,42 @@ impl MailAppModel {
         }
         self.toast_age_ticks
             .retain(|id, _| visible_ids.contains(id));
+    }
+
+    fn has_animating_toasts(&self) -> bool {
+        self.notifications
+            .visible()
+            .iter()
+            .any(|toast| toast.is_animating())
+    }
+
+    fn active_screen_prefers_fast_tick(&self) -> bool {
+        self.screen_manager
+            .active_screen_ref()
+            .is_some_and(|screen| screen.prefers_fast_tick(&self.state))
+    }
+
+    fn desired_tick_interval(&self) -> Duration {
+        if self.screen_transition.is_some()
+            || self.notifications.pending_count() > 0
+            || self.has_animating_toasts()
+            || self.macro_engine.recorder_state().is_recording()
+            || self.state.remote_terminal_queue_len() > 0
+            || self.active_screen_prefers_fast_tick()
+        {
+            FAST_TICK_INTERVAL
+        } else {
+            IDLE_TICK_INTERVAL
+        }
+    }
+
+    fn update_tick_schedule(&mut self) -> Cmd<MailMsg> {
+        let desired = self.desired_tick_interval();
+        if desired == self.scheduled_tick_interval {
+            return Cmd::none();
+        }
+        self.scheduled_tick_interval = desired;
+        Cmd::tick(desired)
     }
 
     fn record_palette_action_usage(&mut self, action_id: &str) {
@@ -3643,7 +3683,11 @@ impl Model for MailAppModel {
     type Message = MailMsg;
 
     fn init(&mut self) -> Cmd<Self::Message> {
-        Cmd::batch(vec![Cmd::tick(TICK_INTERVAL), Cmd::set_mouse_capture(true)])
+        self.scheduled_tick_interval = self.desired_tick_interval();
+        Cmd::batch(vec![
+            Cmd::tick(self.scheduled_tick_interval),
+            Cmd::set_mouse_capture(true),
+        ])
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3659,6 +3703,7 @@ impl Model for MailAppModel {
         match msg {
             // ── Tick ────────────────────────────────────────────────
             MailMsg::Terminal(Event::Tick) => {
+                let elapsed_tick = self.scheduled_tick_interval;
                 let pre_tick_resize_cmd = self.flush_pending_resize_event();
                 self.tick_count = self.tick_count.wrapping_add(1);
                 let tick_count = self.tick_count;
@@ -3678,15 +3723,17 @@ impl Model for MailAppModel {
                         self.tick_screen_with_panic_guard(id, tick_count);
                     }
                 }
-                let housekeeping_cmd = self.run_housekeeping_tick(TICK_INTERVAL);
+                let housekeeping_cmd = self.run_housekeeping_tick(elapsed_tick);
                 let post_tick_resize_cmd = self.flush_pending_resize_event();
+                let tick_schedule_cmd = self.update_tick_schedule();
                 Cmd::batch(vec![
                     pre_tick_resize_cmd,
                     housekeeping_cmd,
                     post_tick_resize_cmd,
+                    tick_schedule_cmd,
                 ])
             }
-            MailMsg::HousekeepingTick => self.run_housekeeping_tick(TICK_INTERVAL),
+            MailMsg::HousekeepingTick => self.run_housekeeping_tick(self.scheduled_tick_interval),
 
             // ── Terminal events (key, mouse, resize, etc.) ─────────
             MailMsg::Terminal(ref event) => {
@@ -6102,7 +6149,7 @@ fn render_animated_toast_stack(
 }
 
 fn remaining_ticks_from_duration(remaining: Duration) -> u8 {
-    let tick_ms = TICK_INTERVAL.as_millis().max(1);
+    let tick_ms = FAST_TICK_INTERVAL.as_millis().max(1);
     let rem_ms = remaining.as_millis();
     let ticks = rem_ms.div_ceil(tick_ms);
     let capped = ticks.min(u128::from(u8::MAX));
@@ -7653,6 +7700,30 @@ mod tests {
         assert!(!matches!(cmd, Cmd::Quit));
         assert_eq!(state.remote_terminal_queue_len(), 0);
         assert_eq!(model.active_screen(), MailScreenId::Messages);
+    }
+
+    #[test]
+    fn init_uses_idle_tick_interval_when_quiescent() {
+        let mut model = test_model();
+        let cmd = model.init();
+
+        assert_eq!(model.scheduled_tick_interval, IDLE_TICK_INTERVAL);
+        match cmd {
+            Cmd::Batch(cmds) => {
+                assert!(cmds.iter().any(
+                    |cmd| matches!(cmd, Cmd::Tick(duration) if *duration == IDLE_TICK_INTERVAL)
+                ));
+            }
+            other => panic!("expected batch init command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn desired_tick_interval_uses_fast_cadence_for_pending_toasts() {
+        let mut model = test_model();
+        model.notifications.notify(Toast::new("toast"));
+
+        assert_eq!(model.desired_tick_interval(), FAST_TICK_INTERVAL);
     }
 
     #[test]
@@ -10417,7 +10488,7 @@ mod tests {
 
     #[test]
     fn toast_remaining_ticks_rounds_up() {
-        // TICK_INTERVAL=100ms, formula: ceil(ms / 100)
+        // FAST_TICK_INTERVAL=100ms, formula: ceil(ms / 100)
         assert_eq!(remaining_ticks_from_duration(Duration::from_millis(1)), 1);
         assert_eq!(remaining_ticks_from_duration(Duration::from_millis(99)), 1); // ceil(99/100)
         assert_eq!(remaining_ticks_from_duration(Duration::from_millis(100)), 1); // ceil(100/100)
@@ -10432,7 +10503,7 @@ mod tests {
         let mut queue =
             NotificationQueue::new(QueueConfig::default().position(ToastPosition::TopLeft));
         queue.notify(Toast::new("slide test").duration(Duration::from_secs(10)));
-        queue.tick(TICK_INTERVAL);
+        queue.tick(FAST_TICK_INTERVAL);
 
         let id = queue.visible()[0].id;
         let mut age = HashMap::new();

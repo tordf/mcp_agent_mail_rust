@@ -198,7 +198,7 @@ fn register_agent_under_sqlite_lock_maps_to_resource_busy() {
         lock_conn.execute_raw("ROLLBACK").expect("release lock");
 
         let p = error_payload(&err);
-        assert_eq!(p["type"], "RESOURCE_BUSY");
+        assert_eq!(p["type"], "RESOURCE_BUSY", "unexpected payload: {p:?}");
         assert_eq!(
             p["message"],
             "Resource is temporarily busy. Wait a moment and try again."

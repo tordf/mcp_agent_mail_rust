@@ -2314,7 +2314,7 @@ fn run_tui_main_thread(
         .with_mouse()
         .with_diff_config(stable_tui_diff_config())
         .with_budget(ftui_render::budget::FrameBudgetConfig {
-            total: Duration::from_millis(100), // Match TICK_INTERVAL
+            total: Duration::from_millis(100), // Match FAST_TICK_INTERVAL
             allow_frame_skip: false,           // Never blank frames
             degradation_cooldown: 5,           // 500ms between level changes
             upgrade_threshold: 0.5,

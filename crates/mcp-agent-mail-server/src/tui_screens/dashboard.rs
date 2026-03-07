@@ -1398,6 +1398,12 @@ impl MailScreen for DashboardScreen {
         self.last_data_gen = current_gen;
     }
 
+    fn prefers_fast_tick(&self, _state: &TuiSharedState) -> bool {
+        self.chart_animations_enabled
+            && !self.reduced_motion
+            && self.animated_throughput_history != self.throughput_history
+    }
+
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         let tc = TerminalClass::from_rect(area);
@@ -5954,6 +5960,8 @@ fn activity_indicator(now_us: i64, last_active_us: i64) -> (char, PackedRgba) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui_bridge::TuiSharedState;
+    use mcp_agent_mail_core::Config;
 
     fn rects_overlap(left: Rect, right: Rect) -> bool {
         let left_right = left.x.saturating_add(left.width);
@@ -6138,6 +6146,21 @@ mod tests {
             shimmer_progress_for_timestamp(now, now - (SHIMMER_WINDOW_MICROS / 2)),
             Some(0.5)
         );
+    }
+
+    #[test]
+    fn dashboard_prefers_fast_tick_while_chart_animation_is_in_progress() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut screen = DashboardScreen::new();
+        screen.chart_animations_enabled = true;
+        screen.reduced_motion = false;
+        screen.throughput_history = vec![1.0, 3.0, 5.0];
+        screen.animated_throughput_history = vec![1.0, 2.0, 4.0];
+
+        assert!(screen.prefers_fast_tick(&state));
+
+        screen.animated_throughput_history = screen.throughput_history.clone();
+        assert!(!screen.prefers_fast_tick(&state));
     }
 
     #[test]

@@ -99,6 +99,10 @@ pub mod tool_util {
         )
     }
 
+    fn is_retryable_post_commit_visibility_probe(message: &str) -> bool {
+        message.contains("row not visible after commit")
+    }
+
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
@@ -199,6 +203,14 @@ pub mod tool_util {
                 legacy_tool_error(
                     "TYPE_ERROR",
                     format!("Argument type mismatch: {message}.{hint}"),
+                    true,
+                    json!({ "error_detail": message }),
+                )
+            }
+            DbError::Internal(message) if is_retryable_post_commit_visibility_probe(&message) => {
+                legacy_tool_error(
+                    "RESOURCE_BUSY",
+                    "Resource is temporarily busy. Wait a moment and try again.",
                     true,
                     json!({ "error_detail": message }),
                 )
@@ -917,6 +929,16 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "UNHANDLED_EXCEPTION");
             assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_post_commit_visibility_probe_as_resource_busy() {
+            let err = db_error_to_mcp_error(DbError::Internal(
+                "agent row not visible after commit for 1:BlueLake".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(data["error"]["recoverable"], true);
         }
 
         // -------------------------------------------------------------------

@@ -332,8 +332,14 @@ pub trait MailScreen {
     /// Render the screen into the given area.
     fn view(&self, frame: &mut ftui::Frame<'_>, area: Rect, state: &TuiSharedState);
 
-    /// Called on each tick (~100ms) with the global tick count.
+    /// Called on each periodic tick with the global tick count.
     fn tick(&mut self, _tick_count: u64, _state: &TuiSharedState) {}
+
+    /// Return `true` when this screen has active transient state that benefits
+    /// from the fast tick cadence.
+    fn prefers_fast_tick(&self, _state: &TuiSharedState) -> bool {
+        false
+    }
 
     /// Return screen-specific keybindings for the help overlay.
     fn keybindings(&self) -> Vec<HelpEntry> {
