@@ -11278,7 +11278,7 @@ fn fix_mcp_config_entry(config_path: &Path, rust_binary: &Path) -> Result<String
     ))
 }
 
-fn handle_doctor_fix(dry_run: bool, _yes: bool, json: bool) -> CliResult<()> {
+fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let storage_root = &config.storage_root;
@@ -11293,6 +11293,15 @@ fn handle_doctor_fix(dry_run: bool, _yes: bool, json: bool) -> CliResult<()> {
     let mut skipped_count = 0u32;
 
     let mode_label = if dry_run { "would fix" } else { "fixing" };
+
+    if !confirm_mutating_doctor_action(
+        "Proceed with doctor fix? This can edit shell rc files, MCP configs, git hook state, and database settings.",
+        dry_run,
+        yes,
+    )? {
+        ftui_runtime::ftui_println!("Doctor fix cancelled.");
+        return Ok(());
+    }
 
     // Fix 1: Legacy Python aliases in shell rc files.
     {
@@ -12639,6 +12648,9 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     "project key must be an absolute path (e.g. /data/projects/backend)".into(),
                 ));
             }
+            if !reserve_paths.is_empty() {
+                validate_reservation_ttl_seconds(reserve_ttl)?;
+            }
 
             // 1. Ensure project
             let proj = resolve_project_async(&cx, &ctx.pool, &human_key).await?;
@@ -12884,11 +12896,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let is_exclusive = context::resolve_bool(exclusive, no_exclusive, true);
 
-            if ttl < 60 {
-                return Err(CliError::InvalidArgument(
-                    "ttl must be at least 60 seconds".into(),
-                ));
-            }
+            validate_reservation_ttl_seconds(ttl)?;
 
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
@@ -13005,9 +13013,9 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             };
 
             // Resolve or register target agent
-            let to_agent = match resolve_agent_async(&cx, &ctx.pool, target_pid, &to).await {
-                Ok(a) => a,
-                Err(_) if register_missing => {
+            let to_agent = match find_agent_async(&cx, &ctx.pool, target_pid, &to).await? {
+                Some(agent) => agent,
+                None if register_missing => {
                     let program = reg_program.unwrap_or_else(|| "unknown".to_string());
                     let model = reg_model.unwrap_or_else(|| "unknown".to_string());
                     outcome_to_result(
@@ -13024,7 +13032,9 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                         .await,
                     )?
                 }
-                Err(e) => return Err(e),
+                None => {
+                    return Err(CliError::InvalidArgument(format!("agent not found: {to}")));
+                }
             };
 
             let ttl_clamped = if ttl < 60 { 60 } else { ttl };
@@ -13121,6 +13131,23 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
     }
 }
 
+async fn find_agent_async(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    agent_name: &str,
+) -> CliResult<Option<mcp_agent_mail_db::AgentRow>> {
+    match mcp_agent_mail_db::queries::get_agent(cx, pool, project_id, agent_name).await {
+        asupersync::Outcome::Ok(row) => Ok(Some(row)),
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => Ok(None),
+        asupersync::Outcome::Err(e) => Err(CliError::Other(format!("database error: {e}"))),
+        asupersync::Outcome::Cancelled(_) => Err(CliError::Other("request cancelled".into())),
+        asupersync::Outcome::Panicked(p) => {
+            Err(CliError::Other(format!("internal panic: {}", p.message())))
+        }
+    }
+}
+
 /// Resolve an agent by name within a project via the async DB layer.
 async fn resolve_agent_async(
     cx: &asupersync::Cx,
@@ -13128,8 +13155,19 @@ async fn resolve_agent_async(
     project_id: i64,
     agent_name: &str,
 ) -> CliResult<mcp_agent_mail_db::AgentRow> {
-    outcome_to_result(mcp_agent_mail_db::queries::get_agent(cx, pool, project_id, agent_name).await)
-        .map_err(|_| CliError::InvalidArgument(format!("agent not found: {agent_name}")))
+    find_agent_async(cx, pool, project_id, agent_name)
+        .await?
+        .ok_or_else(|| CliError::InvalidArgument(format!("agent not found: {agent_name}")))
+}
+
+fn validate_reservation_ttl_seconds(ttl: i64) -> CliResult<()> {
+    if ttl < 60 {
+        Err(CliError::InvalidArgument(
+            "ttl must be at least 60 seconds".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Convert an asupersync `Outcome` to a `CliResult`.
@@ -18714,6 +18752,7 @@ mod tests {
             Some(Path::new("/tmp/nonexistent.db")),
             Some(Path::new("/nonexistent/storage/root")),
             false,
+            true,
             false,
         );
         assert!(result.is_err());
@@ -18732,7 +18771,8 @@ mod tests {
         std::fs::create_dir_all(&projects_dir).unwrap();
         let db_path = tmp.path().join("test.db");
 
-        let result = handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, true);
+        let result =
+            handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, false, true);
         assert!(result.is_ok());
     }
 
@@ -18761,9 +18801,56 @@ mod tests {
 
         let db_path = tmp.path().join("reconstructed.db");
 
-        let result = handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true);
+        let result =
+            handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true, true);
         assert!(result.is_ok(), "reconstruct failed: {result:?}");
         assert!(db_path.exists(), "reconstructed DB file should exist");
+    }
+
+    #[test]
+    fn doctor_repair_rejects_unimplemented_project_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("repair_scope.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let result = handle_doctor_repair_with(
+            &db_url,
+            &tmp.path().join("backups"),
+            Some("demo-project".to_string()),
+            true,
+            false,
+        );
+        assert!(result.is_err());
+        let err = result.expect_err("project-scoped repair should fail fast");
+        assert!(
+            err.to_string()
+                .contains("scoped doctor repair is not implemented")
+        );
+    }
+
+    #[test]
+    fn mutating_doctor_action_mode_requires_yes_on_noninteractive_stdin() {
+        let result = mutating_doctor_action_mode(false, false, false);
+        assert!(result.is_err());
+        let err = result.expect_err("non-interactive mutation without --yes should fail");
+        assert!(err.to_string().contains("pass --yes to apply"));
+    }
+
+    #[test]
+    fn mutating_doctor_action_mode_bypasses_prompt_for_safe_cases() {
+        assert_eq!(
+            mutating_doctor_action_mode(true, false, false).expect("dry run"),
+            MutatingDoctorActionMode::Proceed
+        );
+        assert_eq!(
+            mutating_doctor_action_mode(false, true, false).expect("--yes"),
+            MutatingDoctorActionMode::Proceed
+        );
+        assert_eq!(
+            mutating_doctor_action_mode(false, false, true).expect("interactive"),
+            MutatingDoctorActionMode::Prompt
+        );
     }
 
     #[test]
@@ -23827,6 +23914,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_agent_async_returns_invalid_argument_for_missing_agent() {
+        let (pool, _dir) = make_test_pool();
+
+        block_on_async(|cx| async move {
+            let project =
+                mcp_agent_mail_db::queries::ensure_project(&cx, &pool, "/tmp/agents-test")
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+
+            let err = resolve_agent_async(&cx, &pool, project.id.unwrap_or(0), "MissingAgent")
+                .await
+                .expect_err("missing agent should error");
+            assert!(
+                matches!(err, CliError::InvalidArgument(message) if message.contains("agent not found: MissingAgent")),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_agent_async_surfaces_db_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("broken-agent.db");
+        std::fs::write(&db_path, b"this is not a valid sqlite database")
+            .expect("write junk DB file");
+
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..mcp_agent_mail_db::DbPoolConfig::default()
+        };
+
+        match mcp_agent_mail_db::create_pool(&cfg) {
+            Ok(pool) => {
+                let result = block_on_async(|cx| async move {
+                    resolve_agent_async(&cx, &pool, 1, "anything").await
+                });
+                let err = result.expect_err("corrupt DB should surface");
+                let err_msg = err.to_string();
+                assert!(
+                    err_msg.contains("database error")
+                        || err_msg.contains("not a database")
+                        || err_msg.contains("corrupt")
+                        || err_msg.contains("malformed"),
+                    "expected DB error to surface, got: {err_msg}"
+                );
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("database")
+                        || err_msg.contains("sqlite")
+                        || err_msg.contains("not a database"),
+                    "pool creation error should mention database, got: {err_msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_reservation_ttl_seconds_rejects_short_values() {
+        let err = validate_reservation_ttl_seconds(59).expect_err("short ttl should fail");
+        assert!(
+            matches!(err, CliError::InvalidArgument(message) if message.contains("ttl must be at least 60 seconds")),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── Doctor check probe tests (br-3h13.16.3) ────────────────────────────
 
     /// Run doctor check and capture JSON output, retrying once if capture is empty.
@@ -24731,7 +24891,7 @@ mod tests {
 
         // Run doctor repair (not dry_run)
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_repair_with(&db_url, &backup_dir, None, false, false);
+        let result = handle_doctor_repair_with(&db_url, &backup_dir, None, false, true);
         assert!(result.is_ok(), "repair failed: {result:?}");
 
         // Verify .bak sibling exists
@@ -24799,7 +24959,7 @@ mod tests {
         drop(conn);
 
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_repair_with(&db_url, &backup_dir, None, false, false).expect("repair");
+        handle_doctor_repair_with(&db_url, &backup_dir, None, false, true).expect("repair");
 
         // Verify the .bak is a valid DB that passes quick_check
         let bak_path = format!("{}.bak", db_path.display());
@@ -24841,7 +25001,7 @@ mod tests {
         std::fs::create_dir_all(&bak_path).expect("create .bak as directory");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_repair_with(&db_url, &backup_dir, None, false, false);
+        let result = handle_doctor_repair_with(&db_url, &backup_dir, None, false, true);
         let output = capture.drain_to_string();
 
         // Repair should still complete (non-fatal .bak failure)
@@ -24913,7 +25073,7 @@ mod tests {
         drop(conn);
 
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_repair_with(&db_url, &backup_dir, None, false, false).expect("repair");
+        handle_doctor_repair_with(&db_url, &backup_dir, None, false, true).expect("repair");
 
         let timestamped_backup =
             find_backup_entry(&backup_dir, "pre_repair_").expect("backup path");
@@ -26717,6 +26877,35 @@ fn confirm(prompt: &str, default: bool) -> CliResult<bool> {
     Ok(default)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutatingDoctorActionMode {
+    Proceed,
+    Prompt,
+}
+
+fn mutating_doctor_action_mode(
+    dry_run: bool,
+    yes: bool,
+    stdin_is_tty: bool,
+) -> CliResult<MutatingDoctorActionMode> {
+    if dry_run || yes {
+        return Ok(MutatingDoctorActionMode::Proceed);
+    }
+    if !stdin_is_tty {
+        return Err(CliError::Other(
+            "refusing to prompt on non-interactive stdin; pass --yes to apply".to_string(),
+        ));
+    }
+    Ok(MutatingDoctorActionMode::Prompt)
+}
+
+fn confirm_mutating_doctor_action(prompt: &str, dry_run: bool, yes: bool) -> CliResult<bool> {
+    match mutating_doctor_action_mode(dry_run, yes, output::is_stdin_tty())? {
+        MutatingDoctorActionMode::Proceed => Ok(true),
+        MutatingDoctorActionMode::Prompt => confirm(prompt, false),
+    }
+}
+
 #[allow(dead_code)]
 fn archive_save_state(
     source_db: &Path,
@@ -27395,11 +27584,29 @@ fn handle_doctor_repair_with(
     backup_dir: &Path,
     project: Option<String>,
     dry_run: bool,
-    _yes: bool,
+    yes: bool,
 ) -> CliResult<()> {
+    if let Some(project) = project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Err(CliError::InvalidArgument(format!(
+            "scoped doctor repair is not implemented; rerun without a project selector (received {project:?})"
+        )));
+    }
+
     let conn = open_db_sync_with_database_url(database_url)?;
 
     ftui_runtime::ftui_println!("Running database repair...");
+    if !confirm_mutating_doctor_action(
+        "Proceed with database repair? This can create backups, rebuild FTS tables, VACUUM/ANALYZE, and delete orphaned rows.",
+        dry_run,
+        yes,
+    )? {
+        ftui_runtime::ftui_println!("Repair cancelled.");
+        return Ok(());
+    }
 
     // 1. Integrity check
     let integrity = conn
@@ -27632,8 +27839,8 @@ fn handle_doctor_restore_to(
     Ok(())
 }
 
-fn handle_doctor_reconstruct(dry_run: bool, _yes: bool, json: bool) -> CliResult<()> {
-    handle_doctor_reconstruct_with(None, None, dry_run, json)
+fn handle_doctor_reconstruct(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
+    handle_doctor_reconstruct_with(None, None, dry_run, yes, json)
 }
 
 #[derive(Debug)]
@@ -27692,6 +27899,7 @@ fn handle_doctor_reconstruct_with(
     db_path_override: Option<&Path>,
     storage_root_override: Option<&Path>,
     dry_run: bool,
+    yes: bool,
     json: bool,
 ) -> CliResult<()> {
     let config = Config::from_env();
@@ -27761,6 +27969,15 @@ fn handle_doctor_reconstruct_with(
             ftui_runtime::ftui_println!("  Database path: {}", db_path.display());
             ftui_runtime::ftui_println!("No changes made.");
         }
+        return Ok(());
+    }
+
+    if !confirm_mutating_doctor_action(
+        "Proceed with database reconstruction? This can move the current database aside and rebuild it from the Git archive.",
+        dry_run,
+        yes,
+    )? {
+        ftui_runtime::ftui_println!("Reconstruction cancelled.");
         return Ok(());
     }
 

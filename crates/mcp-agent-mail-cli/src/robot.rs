@@ -1783,34 +1783,24 @@ fn build_thread(
     }
 
     let where_clause = conditions.join(" AND ");
-    let reverse_to_chronological = if let Some(limit_val) = limit {
-        params.push(Value::BigInt(limit_val.try_into().unwrap_or(i64::MAX)));
-        true
-    } else {
-        params.push(Value::BigInt(200));
-        false
-    };
-    let order_clause = if reverse_to_chronological {
-        "ORDER BY m.created_ts DESC, m.id DESC"
-    } else {
-        "ORDER BY m.created_ts ASC, m.id ASC"
-    };
+    let effective_limit = limit.unwrap_or(200);
+    params.push(Value::BigInt(
+        effective_limit.try_into().unwrap_or(i64::MAX),
+    ));
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
                 m.sender_id, a_sender.name AS sender_name
          FROM messages m
          JOIN agents a_sender ON a_sender.id = m.sender_id
          WHERE {where_clause}
-         {order_clause}
+         ORDER BY m.created_ts DESC, m.id DESC
          LIMIT ?"
     );
 
     let mut rows = conn
         .query_sync(&sql, &params)
         .map_err(|e| CliError::Other(format!("thread query failed: {e}")))?;
-    if reverse_to_chronological {
-        rows.reverse();
-    }
+    rows.reverse();
 
     let mut messages = Vec::new();
     let mut last_ts: i64 = 0;
@@ -7512,6 +7502,53 @@ mod tests {
         let err = build_thread(&conn, 1, "missing-thread", Some(10), None, false)
             .expect_err("unknown thread should error");
         assert!(err.to_string().contains("thread not found: missing-thread"));
+    }
+
+    #[test]
+    fn test_build_thread_default_window_prefers_latest_messages() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+
+        for id in 10_000..10_205 {
+            let seq = id - 9_999;
+            conn.query_sync(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+                 VALUES (?, 1, 1, 'LONG-THREAD', ?, '', 'normal', 0, ?, '[]')",
+                &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(format!("Message {seq:03}")),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1_000_000 + seq),
+                ],
+            )
+            .expect("insert long-thread message");
+            conn.query_sync(
+                "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (?, ?, 2, 'to', NULL, NULL)",
+                &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                ],
+            )
+            .expect("insert long-thread recipient");
+        }
+
+        let latest_window =
+            build_thread(&conn, 1, "LONG-THREAD", None, None, false).expect("build thread");
+        assert_eq!(latest_window.message_count, 200);
+        assert_eq!(
+            latest_window
+                .messages
+                .first()
+                .map(|msg| msg.subject.as_str()),
+            Some("Message 006")
+        );
+        assert_eq!(
+            latest_window
+                .messages
+                .last()
+                .map(|msg| msg.subject.as_str()),
+            Some("Message 205")
+        );
     }
 
     #[test]

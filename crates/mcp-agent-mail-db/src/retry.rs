@@ -149,7 +149,7 @@ impl CircuitBreaker {
             half_open_successes: AtomicU32::new(0),
             open_until_us: AtomicU64::new(0),
             last_probe_us: AtomicU64::new(0),
-            threshold,
+            threshold: threshold.max(1),
             reset_duration,
             epoch: Instant::now(),
             subsystem,
@@ -230,25 +230,51 @@ impl CircuitBreaker {
             CircuitState::HalfOpen => {
                 // Rate-limit probes: only allow one per HALF_OPEN_PROBE_INTERVAL.
                 let now_us = self.now_us();
-                let last = self.last_probe_us.load(Ordering::Acquire);
                 let interval_us = micros_from_duration(HALF_OPEN_PROBE_INTERVAL);
-                if last > 0 && now_us.saturating_sub(last) < interval_us {
-                    #[allow(clippy::cast_precision_loss)]
-                    let remaining =
-                        (interval_us - now_us.saturating_sub(last)) as f64 / 1_000_000.0;
-                    return Err(DbError::CircuitBreakerOpen {
-                        message: format!(
-                            "[{subsystem}] Circuit breaker half-open, probe rate-limited. \
-                             Next probe in {remaining:.1}s.",
-                            subsystem = self.subsystem,
-                        ),
-                        failures: self.failures.load(Ordering::Acquire),
-                        reset_after_secs: 0.0,
-                    });
+                loop {
+                    let last = self.last_probe_us.load(Ordering::Acquire);
+                    let elapsed = now_us.saturating_sub(last);
+                    if last > 0 && elapsed < interval_us {
+                        #[allow(clippy::cast_precision_loss)]
+                        let remaining = (interval_us - elapsed) as f64 / 1_000_000.0;
+                        return Err(DbError::CircuitBreakerOpen {
+                            message: format!(
+                                "[{subsystem}] Circuit breaker half-open, probe rate-limited. \
+                                 Next probe in {remaining:.1}s.",
+                                subsystem = self.subsystem,
+                            ),
+                            failures: self.failures.load(Ordering::Acquire),
+                            reset_after_secs: remaining,
+                        });
+                    }
+
+                    // Reserve the half-open probe atomically so concurrent callers
+                    // cannot all pass through on the same interval boundary.
+                    match self.last_probe_us.compare_exchange(
+                        last,
+                        now_us,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(observed) => {
+                            let elapsed = now_us.saturating_sub(observed);
+                            if observed > 0 && elapsed < interval_us {
+                                #[allow(clippy::cast_precision_loss)]
+                                let remaining = (interval_us - elapsed) as f64 / 1_000_000.0;
+                                return Err(DbError::CircuitBreakerOpen {
+                                    message: format!(
+                                        "[{subsystem}] Circuit breaker half-open, probe rate-limited. \
+                                         Next probe in {remaining:.1}s.",
+                                        subsystem = self.subsystem,
+                                    ),
+                                    failures: self.failures.load(Ordering::Acquire),
+                                    reset_after_secs: remaining,
+                                });
+                            }
+                        }
+                    }
                 }
-                // Allow probe and record the time.
-                self.last_probe_us.store(now_us, Ordering::Release);
-                Ok(())
             }
             CircuitState::Open => Err(DbError::CircuitBreakerOpen {
                 message: format!(
@@ -566,9 +592,12 @@ where
 
     for attempt in 0..=config.max_retries {
         // Check circuit breaker before each attempt.
-        if let Some(cb) = cb {
+        let attempt_state = if let Some(cb) = cb {
             cb.check()?;
-        }
+            Some(cb.state())
+        } else {
+            None
+        };
 
         match op() {
             Ok(val) => {
@@ -581,18 +610,27 @@ where
                 return Ok(val);
             }
             Err(e) => {
-                if !e.is_retryable() || attempt == config.max_retries {
-                    if let Some(cb) = cb
-                        && e.is_retryable()
-                    {
-                        cb.record_failure();
-                    }
+                let retryable = e.is_retryable();
+                if let Some(cb) = cb
+                    && retryable
+                    && attempt_state == Some(CircuitState::HalfOpen)
+                {
+                    // A failed half-open probe means the subsystem is still
+                    // unhealthy. Re-open immediately instead of consuming the
+                    // entire local retry budget inside the probe window.
+                    cb.record_failure();
                     return Err(e);
                 }
 
-                // Record failure for circuit breaker.
-                if let Some(cb) = cb {
-                    cb.record_failure();
+                if !retryable || attempt == config.max_retries {
+                    if let Some(cb) = cb
+                        && retryable
+                    {
+                        // Count one logical operation failure after retries are
+                        // exhausted instead of charging every internal attempt.
+                        cb.record_failure();
+                    }
+                    return Err(e);
                 }
 
                 last_err = Some(e);
@@ -724,6 +762,16 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(cb.failure_count(), 0);
         assert!(cb.check().is_ok());
+    }
+
+    #[test]
+    fn circuit_breaker_clamps_zero_threshold_to_one() {
+        let cb = CircuitBreaker::with_params(0, Duration::from_secs(30));
+        assert_eq!(cb.threshold(), 1);
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
     }
 
     #[test]
@@ -944,10 +992,19 @@ mod tests {
         // Immediate second probe: rate-limited (within 5s interval).
         let err = cb.check().unwrap_err();
         assert!(matches!(err, DbError::CircuitBreakerOpen { .. }));
-        if let DbError::CircuitBreakerOpen { message, .. } = err {
+        if let DbError::CircuitBreakerOpen {
+            message,
+            reset_after_secs,
+            ..
+        } = err
+        {
             assert!(
                 message.contains("rate-limited"),
                 "should mention rate limit: {message}"
+            );
+            assert!(
+                reset_after_secs > 0.0,
+                "half-open rate limit should report wait time, got {reset_after_secs}"
             );
         }
     }
@@ -1602,12 +1659,9 @@ mod tests {
             Err(DbError::Sqlite("database is locked".to_string()))
         });
 
-        // Should have recorded failures (3 attempts = 3 failures recorded).
-        assert!(
-            CIRCUIT_DB.failure_count() >= 3,
-            "expected at least 3 failures recorded, got {}",
-            CIRCUIT_DB.failure_count()
-        );
+        // Exhausting one logical operation should count as one breaker failure,
+        // not one failure per internal retry attempt.
+        assert_eq!(CIRCUIT_DB.failure_count(), 1);
 
         CIRCUIT_DB.reset();
     }

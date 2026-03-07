@@ -1004,7 +1004,7 @@ impl Config {
         }
         config.http_port = env_u16("HTTP_PORT", config.http_port);
         if let Some(v) = env_value("HTTP_PATH") {
-            config.http_path = v;
+            config.http_path = normalize_http_path(&v);
         }
         config.http_bearer_token = full_env_value("HTTP_BEARER_TOKEN").filter(|s| !s.is_empty());
         config.http_allow_localhost_unauthenticated = env_bool(
@@ -1943,6 +1943,32 @@ pub fn env_value(key: &str) -> Option<String> {
         return Some(v);
     }
     env::var(key).ok().or_else(|| dotenv_value(key))
+}
+
+fn normalize_http_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "mcp" | "/mcp" | "/mcp/" => return "/mcp/".to_string(),
+        "api" | "/api" | "/api/" => return "/api/".to_string(),
+        _ => {}
+    }
+
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+
+    let mut with_leading = trimmed.to_string();
+    if !with_leading.starts_with('/') {
+        with_leading.insert(0, '/');
+    }
+
+    let without_trailing = with_leading.trim_end_matches('/');
+    if without_trailing.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{without_trailing}/")
+    }
 }
 
 /// Read from the real environment only (no working-directory `.env` fallback).
@@ -3093,6 +3119,13 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("HTTP_BEARER_TOKEN", "")]);
         let config = Config::from_env();
         assert!(config.http_bearer_token.is_none());
+    }
+
+    #[test]
+    fn http_path_env_is_normalized() {
+        let _env = TestEnvOverrideGuard::set(&[("HTTP_PATH", "api")]);
+        let config = Config::from_env();
+        assert_eq!(config.http_path, "/api/");
     }
 
     // -----------------------------------------------------------------------

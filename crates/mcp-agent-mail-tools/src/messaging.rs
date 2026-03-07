@@ -660,6 +660,7 @@ fn python_value_repr(value: &Value) -> String {
     }
 }
 
+#[cfg(test)]
 fn send_message_has_explicit_to_recipients(value: Option<&Value>) -> bool {
     match value {
         Some(Value::Array(items)) => items
@@ -756,7 +757,7 @@ fn normalize_send_message_cc_bcc_argument(
 /// Normalize raw `send_message` arguments for parity with the Python reference:
 /// - accepts single-string forms for to/cc/bcc (converts to one-element arrays)
 /// - validates recipient container/item types with parity messages
-/// - enforces broadcast+explicit-to mutual exclusivity message parity
+/// - rejects `broadcast=true` because broadcast messaging is intentionally disabled
 pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> {
     let Some(args) = arguments.as_object_mut() else {
         return Err(legacy_tool_error(
@@ -771,11 +772,10 @@ pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> 
         .get("broadcast")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && send_message_has_explicit_to_recipients(args.get("to"))
     {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
-            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
+            "broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.",
             true,
             json!({ "argument": "broadcast" }),
         ));
@@ -3305,7 +3305,7 @@ mod tests {
         assert_eq!(err.code, McpErrorCode::ToolExecutionError);
         assert_eq!(
             err.message,
-            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast."
+            "broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag."
         );
         let data = err.data.expect("error payload");
         assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");

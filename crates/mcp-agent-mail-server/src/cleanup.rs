@@ -508,6 +508,63 @@ fn path_has_recent_activity_cached(
         .is_some_and(|commit_us| now_us.saturating_sub(commit_us) <= grace_us)
 }
 
+const ACTIVITY_PROBE_PATH_LIMIT: usize = 5_000;
+
+fn path_modified_within_grace(path: &Path, now_us: i64, grace_us: i64) -> bool {
+    path.metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|modified| {
+            let mtime_us = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
+            now_us.saturating_sub(mtime_us) <= grace_us
+        })
+        .unwrap_or(false)
+}
+
+fn check_git_listed_activity(
+    workspace: &Path,
+    pathspec: &str,
+    now_us: i64,
+    grace_us: i64,
+) -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &workspace.to_string_lossy(),
+            "ls-files",
+            "-c",
+            "-o",
+            "--exclude-standard",
+            "--",
+            pathspec,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().take(ACTIVITY_PROBE_PATH_LIMIT) {
+        if path_modified_within_grace(&workspace.join(line), now_us, grace_us) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn check_directory_activity_fallback(dir: &Path, now_us: i64, grace_us: i64) -> bool {
+    walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .take(ACTIVITY_PROBE_PATH_LIMIT)
+        .any(|entry| path_modified_within_grace(entry.path(), now_us, grace_us))
+}
+
 /// Check if any matched files have recent filesystem activity.
 fn check_filesystem_activity(
     workspace: &Path,
@@ -531,40 +588,10 @@ fn check_filesystem_activity(
 
     if has_glob {
         let pathspec = format!(":(glob){pattern}");
-        // Fast path: use `git ls-files -c -o --exclude-standard -- pattern` to get matching files.
-        // This leverages git's index and ignores `.gitignore`d folders like `target/` which would
-        // otherwise cause insane CPU usage during synchronous directory traversal.
-        let git_ls = std::process::Command::new("git")
-            .args([
-                "-C",
-                &workspace.to_string_lossy(),
-                "ls-files",
-                "-c",
-                "-o",
-                "--exclude-standard",
-                "--",
-                &pathspec,
-            ])
-            .output();
-
-        if let Ok(output) = git_ls
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines().take(5000) {
-                let file_path = workspace.join(line);
-                if let Ok(metadata) = file_path.metadata()
-                    && let Ok(modified) = metadata.modified()
-                {
-                    let mtime_us = modified
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-                    if now_us.saturating_sub(mtime_us) <= grace_us {
-                        return true;
-                    }
-                }
-            }
-            return false;
+        // Fast path: let git enumerate matching files so ignored trees such as
+        // `target/` do not explode synchronous traversal cost.
+        if let Some(recent) = check_git_listed_activity(workspace, &pathspec, now_us, grace_us) {
+            return recent;
         }
 
         // Fallback: unbounded glob (slow, but works outside git repos)
@@ -580,31 +607,22 @@ fn check_filesystem_activity(
 
         if let Ok(paths) = glob::glob(&full_pattern) {
             // Cap the fallback traversal so it doesn't freeze the server completely.
-            for entry in paths.flatten().take(5000) {
-                if let Ok(metadata) = entry.metadata()
-                    && let Ok(modified) = metadata.modified()
-                {
-                    let mtime_us = modified
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-                    if now_us.saturating_sub(mtime_us) <= grace_us {
-                        return true;
-                    }
+            for entry in paths.flatten().take(ACTIVITY_PROBE_PATH_LIMIT) {
+                if path_modified_within_grace(&entry, now_us, grace_us) {
+                    return true;
                 }
             }
         }
     } else {
         let candidate = workspace.join(&pattern);
-        if candidate.exists()
-            && let Ok(metadata) = candidate.metadata()
-            && let Ok(modified) = metadata.modified()
-        {
-            let mtime_us = modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
-            if now_us.saturating_sub(mtime_us) <= grace_us {
-                return true;
+        if candidate.is_dir() {
+            if let Some(recent) = check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
+                return recent;
             }
+            return check_directory_activity_fallback(&candidate, now_us, grace_us);
+        }
+        if candidate.exists() && path_modified_within_grace(&candidate, now_us, grace_us) {
+            return true;
         }
     }
 
@@ -1121,6 +1139,25 @@ mod tests {
         assert!(!check_filesystem_activity(
             workspace,
             "active.rs",
+            now + 10_000_000,
+            1_000_000
+        ));
+    }
+
+    #[test]
+    fn check_filesystem_activity_detects_recent_nested_file_for_literal_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let nested_dir = workspace.join("src");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("lib.rs");
+        std::fs::write(&nested_file, "pub fn nested() {}\n").unwrap();
+
+        let now = now_micros();
+        assert!(check_filesystem_activity(workspace, "src", now, 1_000_000));
+        assert!(!check_filesystem_activity(
+            workspace,
+            "src",
             now + 10_000_000,
             1_000_000
         ));

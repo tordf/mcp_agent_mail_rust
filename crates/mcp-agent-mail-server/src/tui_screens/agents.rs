@@ -237,6 +237,8 @@ pub struct AgentsScreen {
     last_selection: Option<usize>,
     /// Generation counter for agent list changes (gates focused-event sync).
     agents_list_gen: u64,
+    /// Last agent-list generation observed by the focused-event sync gate.
+    last_agents_list_gen: u64,
 }
 
 impl AgentsScreen {
@@ -275,6 +277,7 @@ impl AgentsScreen {
             sparkline_dirty: true,
             last_selection: None,
             agents_list_gen: 0,
+            last_agents_list_gen: 0,
         }
     }
 
@@ -298,6 +301,10 @@ impl AgentsScreen {
         let db = state.db_stats_snapshot().unwrap_or_default();
         let total_rows = db.agents;
         let raw_count = u64::try_from(db.agents_list.len()).unwrap_or(u64::MAX);
+        let previous_selection = self.table_state.selected;
+        let previous_selected_name = previous_selection
+            .and_then(|index| self.agents.get(index))
+            .map(|agent| agent.name.clone());
         let mut rows: Vec<AgentRow> = db
             .agents_list
             .iter()
@@ -391,14 +398,16 @@ impl AgentsScreen {
         self.cached_total_msgs = self.msg_counts.values().sum();
         self.sparkline_dirty = true;
 
-        // Clamp selection
-        if let Some(sel) = self.table_state.selected
-            && sel >= self.agents.len()
+        self.table_state.selected = previous_selected_name
+            .and_then(|name| self.agents.iter().position(|agent| agent.name == name));
+
+        if self.table_state.selected.is_none()
+            && let Some(sel) = previous_selection
         {
             self.table_state.selected = if self.agents.is_empty() {
                 None
             } else {
-                Some(self.agents.len() - 1)
+                Some(sel.min(self.agents.len() - 1))
             };
         }
     }
@@ -442,7 +451,11 @@ impl AgentsScreen {
             return;
         }
         let len = self.agents.len();
-        let current = self.table_state.selected.unwrap_or(0);
+        let current = match self.table_state.selected {
+            Some(selected) => selected,
+            None if delta > 0 => 0,
+            None => len - 1,
+        };
         let next = if delta > 0 {
             current.saturating_add(delta.unsigned_abs()).min(len - 1)
         } else {
@@ -715,9 +728,11 @@ impl MailScreen for AgentsScreen {
 
         // Only recompute focused_synthetic when selection or agent list changed.
         let current_sel = self.table_state.selected;
-        if current_sel != self.last_selection || (dirty.db_stats && self.last_selection.is_some()) {
+        let list_changed = self.agents_list_gen != self.last_agents_list_gen;
+        if current_sel != self.last_selection || list_changed {
             self.sync_focused_event();
             self.last_selection = current_sel;
+            self.last_agents_list_gen = self.agents_list_gen;
         }
 
         // Lazily refresh sparkline cache before next render.
@@ -1423,6 +1438,31 @@ mod tests {
         });
         let handled = screen.receive_deep_link(&DeepLinkTarget::AgentByName("RedFox".into()));
         assert!(handled);
+        assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    #[test]
+    fn down_key_selects_first_agent_when_nothing_is_selected() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+        screen.agents.push(AgentRow {
+            name: "RedFox".to_string(),
+            program: "claude-code".to_string(),
+            model: "opus-4.6".to_string(),
+            last_active_ts: 100,
+            message_count: 5,
+        });
+        screen.agents.push(AgentRow {
+            name: "BlueLake".to_string(),
+            program: "codex-cli".to_string(),
+            model: "gpt-5".to_string(),
+            last_active_ts: 200,
+            message_count: 7,
+        });
+
+        let down = Event::Key(ftui::KeyEvent::new(KeyCode::Down));
+        screen.update(&down, &state);
+
         assert_eq!(screen.table_state.selected, Some(0));
     }
 
@@ -2140,6 +2180,40 @@ mod tests {
     }
 
     #[test]
+    fn sync_focused_event_refreshes_when_agent_list_changes() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+        screen.agents.push(AgentRow {
+            name: "RedFox".to_string(),
+            program: "claude-code".to_string(),
+            model: "opus-4.6".to_string(),
+            last_active_ts: 100,
+            message_count: 0,
+        });
+        screen.table_state.selected = Some(0);
+        screen.sync_focused_event();
+        assert!(matches!(
+            screen.focused_event(),
+            Some(crate::tui_events::MailEvent::AgentRegistered { model_name, .. })
+                if model_name == "opus-4.6"
+        ));
+
+        screen.last_selection = Some(0);
+        screen.last_agents_list_gen = screen.agents_list_gen;
+        screen.agents[0].model = "gpt-5".to_string();
+        screen.agents_list_gen = screen.agents_list_gen.wrapping_add(1);
+
+        screen.tick(1, &state);
+
+        assert!(matches!(
+            screen.focused_event(),
+            Some(crate::tui_events::MailEvent::AgentRegistered { model_name, .. })
+                if model_name == "gpt-5"
+        ));
+        assert_eq!(screen.last_agents_list_gen, screen.agents_list_gen);
+    }
+
+    #[test]
     fn format_relative_time_with_uses_provided_now() {
         let now = 1_000_000_000_000i64; // 1e12 micros
         let ts = now - 120_000_000; // 120s ago
@@ -2166,5 +2240,51 @@ mod tests {
         assert_eq!(screen.agents_list_gen, gen_before + 1);
         screen.rebuild_from_state(&state);
         assert_eq!(screen.agents_list_gen, gen_before + 2);
+    }
+
+    #[test]
+    fn rebuild_from_state_keeps_selection_on_same_agent_after_reorder() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+        screen.agents = vec![
+            AgentRow {
+                name: "AliceRiver".to_string(),
+                program: "codex-cli".to_string(),
+                model: "gpt-5".to_string(),
+                last_active_ts: 100,
+                message_count: 1,
+            },
+            AgentRow {
+                name: "BobStone".to_string(),
+                program: "claude-code".to_string(),
+                model: "opus-4.6".to_string(),
+                last_active_ts: 90,
+                message_count: 2,
+            },
+        ];
+        screen.table_state.selected = Some(1);
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 2,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    name: "AliceRiver".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 100,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "BobStone".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 200,
+                },
+            ],
+            ..Default::default()
+        });
+
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.table_state.selected, Some(0));
+        assert_eq!(screen.agents[0].name, "BobStone");
     }
 }

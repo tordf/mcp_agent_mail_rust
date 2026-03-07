@@ -1256,6 +1256,7 @@ impl MailAppModel {
     #[must_use]
     pub fn new(state: Arc<TuiSharedState>) -> Self {
         let screen_manager = ScreenManager::new(&state);
+        let last_toast_seq = state.event_ring_stats().next_seq.saturating_sub(1);
 
         let static_actions = build_palette_actions_static();
         let mut command_palette = CommandPalette::new()
@@ -1305,7 +1306,7 @@ impl MailAppModel {
             palette_usage_stats: HashMap::new(),
             palette_usage_dirty: false,
             notifications: NotificationQueue::new(QueueConfig::default()),
-            last_toast_seq: 0,
+            last_toast_seq,
             tick_count: 0,
             scheduled_tick_interval: IDLE_TICK_INTERVAL,
             tick_event_batch_last_seq: 0,
@@ -2564,7 +2565,6 @@ impl MailAppModel {
         let mut visible_ids = HashSet::new();
         for toast in self.notifications.visible_mut() {
             visible_ids.insert(toast.id);
-            let _ = toast.tick_animation();
             self.toast_age_ticks
                 .entry(toast.id)
                 .and_modify(|age| *age = age.saturating_add(1))
@@ -2589,7 +2589,6 @@ impl MailAppModel {
 
     fn desired_tick_interval(&self) -> Duration {
         if self.screen_transition.is_some()
-            || self.notifications.pending_count() > 0
             || self.has_animating_toasts()
             || self.macro_engine.recorder_state().is_recording()
             || self.state.remote_terminal_queue_len() > 0
@@ -3655,7 +3654,7 @@ impl MailAppModel {
             }
         }
 
-        // Advance notification timers and toast animation.
+        // Advance notification timers and refresh per-toast age metadata.
         self.notifications.tick(elapsed_tick);
         self.tick_toast_animation_state();
 
@@ -7719,11 +7718,47 @@ mod tests {
     }
 
     #[test]
-    fn desired_tick_interval_uses_fast_cadence_for_pending_toasts() {
+    fn desired_tick_interval_keeps_idle_cadence_for_queued_toasts_without_visible_animation() {
         let mut model = test_model();
         model.notifications.notify(Toast::new("toast"));
 
+        assert_eq!(model.desired_tick_interval(), IDLE_TICK_INTERVAL);
+    }
+
+    #[test]
+    fn desired_tick_interval_uses_fast_cadence_for_animating_visible_toasts() {
+        let mut model = test_model();
+        model.notifications.notify(Toast::new("toast"));
+        let _ = model.notifications.tick(Duration::from_millis(16));
+
+        assert!(model.has_animating_toasts());
         assert_eq!(model.desired_tick_interval(), FAST_TICK_INTERVAL);
+    }
+
+    #[test]
+    fn init_skips_historical_event_toast_backlog() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(state.push_event(MailEvent::message_received(
+            1,
+            "BlueLake",
+            vec!["RedFox".to_string()],
+            "Historical toast",
+            "thread-1",
+            "proj",
+            "",
+        )));
+        let historical_tail = state.event_ring_stats().next_seq.saturating_sub(1);
+
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        assert_eq!(model.last_toast_seq, historical_tail);
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+        assert_eq!(model.last_toast_seq, historical_tail);
+        assert_eq!(model.notifications.pending_count(), 0);
+        assert_eq!(model.notifications.visible_count(), 0);
+        assert_eq!(model.desired_tick_interval(), IDLE_TICK_INTERVAL);
     }
 
     #[test]
