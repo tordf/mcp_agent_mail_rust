@@ -24,7 +24,7 @@ use crate::reservation_index::{ReservationIndex, ReservationRef};
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
 };
-use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
+use mcp_agent_mail_core::pattern_overlap::{CompiledPattern, has_glob_meta};
 
 /// Granted reservation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +124,16 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
         ));
     }
 
+    None
+}
+
+fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
+    let compiled = CompiledPattern::new(pattern);
+    if has_glob_meta(compiled.normalized()) && !compiled.is_matchable() {
+        return Some(format!(
+            "Pattern '{pattern}' is not a valid glob pattern. Check bracket/brace syntax or use a literal project-relative path."
+        ));
+    }
     None
 }
 
@@ -341,6 +351,14 @@ pub async fn file_reservation_paths(
                     return Err(legacy_tool_error(
                         "INVALID_PATH",
                         "Cannot reserve the project root directory itself. Please use more specific patterns.",
+                        true,
+                        json!({ "path": p }),
+                    ));
+                }
+                if let Some(message) = invalid_file_reservation_pattern(&rel) {
+                    return Err(legacy_tool_error(
+                        "INVALID_PATH",
+                        message,
                         true,
                         json!({ "path": p }),
                     ));
@@ -1892,5 +1910,21 @@ mod tests {
                 "unexpected warning for normal pattern: {pat}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_glob_pattern_detected() {
+        let warning = invalid_file_reservation_pattern("src/[abc");
+        assert!(warning.is_some(), "expected invalid glob to be rejected");
+        assert!(
+            warning.unwrap().contains("not a valid glob pattern"),
+            "error message should explain invalid glob syntax"
+        );
+    }
+
+    #[test]
+    fn valid_glob_pattern_not_rejected() {
+        let warning = invalid_file_reservation_pattern("src/**/*.{rs,toml}");
+        assert!(warning.is_none(), "valid glob syntax should remain allowed");
     }
 }

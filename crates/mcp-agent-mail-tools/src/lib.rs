@@ -160,6 +160,19 @@ pub mod tool_util {
                     json!({ "error_detail": message }),
                 )
             }
+            DbError::Sqlite(ref message)
+            | DbError::Schema(ref message)
+            | DbError::Pool(ref message)
+                if mcp_agent_mail_db::is_lock_error(message) =>
+            {
+                let message = message.clone();
+                legacy_tool_error(
+                    "RESOURCE_BUSY",
+                    "Resource is temporarily busy. Wait a moment and try again.",
+                    true,
+                    json!({ "error_detail": message }),
+                )
+            }
             DbError::Pool(message) => legacy_tool_error(
                 "DATABASE_POOL_EXHAUSTED",
                 "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
@@ -772,6 +785,14 @@ pub mod tool_util {
             let err = db_error_to_mcp_error(DbError::Sqlite("constraint violation".into()));
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+            assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_sqlite_lock_as_resource_busy() {
+            let err = db_error_to_mcp_error(DbError::Sqlite("database is locked".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
             assert_eq!(data["error"]["recoverable"], true);
         }
 

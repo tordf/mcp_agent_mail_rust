@@ -618,3 +618,45 @@ fn test_empty_paths_validation_message() {
         );
     });
 }
+
+#[test]
+fn test_invalid_reservation_glob_validation_message() {
+    run_serial_async(|cx| async move {
+        let project_key = format!("/tmp/invalid_res_glob-{}", unique_suffix());
+        eprintln!("Testing validation: input=invalid reservation glob...");
+
+        let ctx = McpContext::new(cx.clone(), 1);
+        setup_project_and_agent(&ctx, &project_key, "BlueLake").await;
+
+        let err = file_reservation_paths(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            vec!["src/[abc".to_string()],
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("invalid glob pattern should fail");
+
+        let payload = error_object(&err);
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("INVALID_PATH"),
+        );
+
+        let msg = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("message");
+        assert!(
+            msg.contains("not a valid glob pattern"),
+            "message should explain invalid glob syntax: {msg}"
+        );
+        assert!(
+            msg.contains("src/[abc"),
+            "message should identify the invalid pattern: {msg}"
+        );
+    });
+}

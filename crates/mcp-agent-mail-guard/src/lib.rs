@@ -10,6 +10,8 @@ pub enum GuardError {
     NotImplemented,
     #[error("invalid repository path: {path}")]
     InvalidRepo { path: String },
+    #[error("invalid reservation pattern '{pattern}': {error}")]
+    InvalidReservationPattern { pattern: String, error: String },
     #[error("missing AGENT_NAME env var")]
     MissingAgentName,
     #[error("git error: {0}")]
@@ -883,7 +885,7 @@ pub fn guard_check_full(
     // Read reservations from the archive
     let reservations = read_active_reservations_from_archive(archive_root)?;
 
-    let conflicts = check_path_conflicts(paths, &reservations, &agent_name, ignorecase);
+    let conflicts = check_path_conflicts(paths, &reservations, &agent_name, ignorecase)?;
 
     Ok(GuardCheckResult {
         conflicts,
@@ -913,12 +915,7 @@ pub fn guard_check(
     // Read reservations from archive JSON files
     let reservations = read_active_reservations_from_archive(archive_root)?;
 
-    Ok(check_path_conflicts(
-        paths,
-        &reservations,
-        &agent_name,
-        ignorecase,
-    ))
+    check_path_conflicts(paths, &reservations, &agent_name, ignorecase)
 }
 
 /// Core conflict detection: check paths against reservations using globset.
@@ -929,7 +926,7 @@ fn check_path_conflicts(
     reservations: &[FileReservationRecord],
     self_agent: &str,
     ignorecase: bool,
-) -> Vec<GuardConflict> {
+) -> GuardResult<Vec<GuardConflict>> {
     // 1. Build a GlobSet for all relevant reservations (other agents, exclusive).
     // Map glob index back to reservation record for conflict reporting.
     let mut builder = GlobSetBuilder::new();
@@ -945,20 +942,30 @@ fn check_path_conflicts(
             if pat_str.is_empty() {
                 continue;
             }
-            let glob = globset::GlobBuilder::new(&pat_str)
+            match globset::GlobBuilder::new(&pat_str)
                 .literal_separator(true)
-                .build();
-            if let Ok(g) = glob {
-                builder.add(g);
-                active_indices.push(res);
+                .build()
+            {
+                Ok(glob) => {
+                    builder.add(glob);
+                    active_indices.push(res);
+                }
+                Err(err) => {
+                    return Err(GuardError::InvalidReservationPattern {
+                        pattern: res.path_pattern.clone(),
+                        error: err.to_string(),
+                    });
+                }
             }
         }
     }
 
-    let glob_set = match builder.build() {
-        Ok(gs) => gs,
-        Err(_) => return Vec::new(), // Should not happen with valid globs
-    };
+    let glob_set = builder
+        .build()
+        .map_err(|err| GuardError::InvalidReservationPattern {
+            pattern: "<globset>".to_string(),
+            error: err.to_string(),
+        })?;
 
     let mut conflicts = Vec::new();
 
@@ -1035,7 +1042,7 @@ fn check_path_conflicts(
         }
     }
 
-    conflicts
+    Ok(conflicts)
 }
 
 /// Normalize a path for matching: forward slashes, strip leading `./` and `/`,
@@ -1827,7 +1834,8 @@ mod tests {
         let reservations = read_active_reservations_from_archive(&archive).expect("read");
         let paths = vec!["app/api/users.py".to_string()];
 
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].holder, "OtherAgent");
         assert_eq!(conflicts[0].pattern, "app/api/*.py");
@@ -1843,7 +1851,8 @@ mod tests {
         let paths = vec!["my/stuff/file.txt".to_string()];
 
         // "MyAgent" should not conflict with its own reservation
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert!(conflicts.is_empty(), "own reservations should be skipped");
     }
 
@@ -1852,7 +1861,8 @@ mod tests {
         let paths = vec!["src/main.rs".to_string()];
         let reservations = vec![reservation("src/main.rs", "BlueLake", true)];
 
-        let conflicts = check_path_conflicts(&paths, &reservations, "bluelake", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "bluelake", false).expect("conflicts");
         assert!(
             conflicts.is_empty(),
             "own reservations should be skipped regardless of agent-name casing"
@@ -1868,7 +1878,8 @@ mod tests {
         let paths = vec!["shared/README.md".to_string()];
 
         // SharedAgent's non-exclusive reservation should not block
-        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false);
+        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
+            .expect("conflicts");
         assert!(
             conflicts.is_empty(),
             "non-exclusive reservations should not conflict"
@@ -1883,7 +1894,8 @@ mod tests {
         let reservations = read_active_reservations_from_archive(&archive).expect("read");
         let paths = vec!["unrelated/file.txt".to_string()];
 
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert!(conflicts.is_empty());
     }
 
@@ -1899,7 +1911,8 @@ mod tests {
             "unrelated.txt".to_string(),
         ];
 
-        let conflicts = check_path_conflicts(&paths, &reservations, "SomeAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "SomeAgent", false).expect("conflicts");
         assert_eq!(conflicts.len(), 2, "two paths should conflict");
         assert!(conflicts.iter().all(|c| c.holder == "OtherAgent"));
     }
@@ -1911,7 +1924,7 @@ mod tests {
             "bin/tool.exe".to_string(),
             "modules/submod".to_string(),
         ];
-        let conflicts = check_path_conflicts(&paths, &[], "AnyAgent", false);
+        let conflicts = check_path_conflicts(&paths, &[], "AnyAgent", false).expect("conflicts");
         assert!(
             conflicts.is_empty(),
             "empty reservation set should never block"
@@ -1922,7 +1935,8 @@ mod tests {
     fn check_path_conflicts_submodule_pointer_path_matches_recursive_pattern() {
         let paths = vec!["modules/submod".to_string()];
         let reservations = vec![reservation("modules/submod/**", "OtherAgent", true)];
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].holder, "OtherAgent");
     }
@@ -1932,7 +1946,8 @@ mod tests {
         let paths = vec!["src/utils/file.rs".to_string()];
         // Reservation is a literal directory without glob metacharacters
         let reservations = vec![reservation("src/utils", "OtherAgent", true)];
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].holder, "OtherAgent");
     }
@@ -1941,7 +1956,8 @@ mod tests {
     fn check_path_conflicts_binary_file_matches_glob() {
         let paths = vec!["bin/tool.exe".to_string()];
         let reservations = vec![reservation("bin/*.exe", "Locker", true)];
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].path, "bin/tool.exe");
     }
@@ -1953,7 +1969,8 @@ mod tests {
             reservation("app/api/*.py", "SharedAgent", false),
             reservation("app/**", "ExclusiveAgent", true),
         ];
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].holder, "ExclusiveAgent");
         assert_eq!(conflicts[0].pattern, "app/**");
@@ -1967,7 +1984,8 @@ mod tests {
             reservation("src/new.rs", "NewOwner", true),
         ];
 
-        let conflicts = check_path_conflicts(&renamed_paths, &reservations, "MyAgent", false);
+        let conflicts = check_path_conflicts(&renamed_paths, &reservations, "MyAgent", false)
+            .expect("conflicts");
         assert_eq!(conflicts.len(), 2);
         assert!(
             conflicts
@@ -1994,9 +2012,20 @@ mod tests {
         reservations.push(reservation("src/target.rs", "TargetOwner", true));
 
         let paths = vec!["src/target.rs".to_string()];
-        let conflicts = check_path_conflicts(&paths, &reservations, "MyAgent", false);
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].holder, "TargetOwner");
+    }
+
+    #[test]
+    fn check_path_conflicts_rejects_invalid_reservation_pattern() {
+        let paths = vec!["src/main.rs".to_string()];
+        let reservations = vec![reservation("src/[abc", "OtherAgent", true)];
+
+        let err = check_path_conflicts(&paths, &reservations, "MyAgent", false)
+            .expect_err("invalid reservation pattern should fail closed");
+        assert!(matches!(err, GuardError::InvalidReservationPattern { .. }));
     }
 
     // -----------------------------------------------------------------------
