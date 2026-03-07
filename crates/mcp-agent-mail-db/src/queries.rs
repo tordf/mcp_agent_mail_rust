@@ -305,7 +305,12 @@ pub fn generate_slug(human_key: &str) -> String {
 }
 
 fn map_sql_error(e: &SqlError) -> DbError {
-    DbError::Sqlite(e.to_string())
+    let message = e.to_string();
+    if crate::error::is_lock_error(&message) {
+        DbError::ResourceBusy(message)
+    } else {
+        DbError::Sqlite(message)
+    }
 }
 
 fn map_sql_outcome<T>(out: Outcome<T, SqlError>) -> Outcome<T, DbError> {
@@ -6555,6 +6560,28 @@ mod tests {
     fn begin_concurrent_fallback_rejects_non_recovery_errors() {
         assert!(!should_fallback_begin_concurrent("database is locked"));
         assert!(!should_fallback_begin_concurrent("no such table: agents"));
+    }
+
+    #[test]
+    fn map_sql_error_classifies_lock_errors_as_resource_busy() {
+        let err = map_sql_error(&SqlError::Custom("database is locked".to_string()));
+        match err {
+            DbError::ResourceBusy(message) => {
+                assert!(message.contains("database is locked"));
+            }
+            other => panic!("expected ResourceBusy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_sql_error_keeps_non_lock_errors_as_sqlite() {
+        let err = map_sql_error(&SqlError::Custom("constraint failed".to_string()));
+        match err {
+            DbError::Sqlite(message) => {
+                assert!(message.contains("constraint failed"));
+            }
+            other => panic!("expected Sqlite, got {other:?}"),
+        }
     }
 
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {

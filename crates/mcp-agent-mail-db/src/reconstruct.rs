@@ -432,10 +432,12 @@ fn parse_and_insert_message(
         .map_err(|e| DbError::Sqlite(format!("bad JSON in {}: {e}", file_path.display())))?;
 
     // Extract fields
-    let sender_name = json_str(&msg, "from")
-        .or_else(|| json_str(&msg, "sender"))
-        .or_else(|| json_str(&msg, "from_agent"))
-        .unwrap_or("unknown");
+    let sender_name = normalized_archive_agent_name(
+        json_str(&msg, "from")
+            .or_else(|| json_str(&msg, "sender"))
+            .or_else(|| json_str(&msg, "from_agent")),
+    )
+    .unwrap_or_else(|| "unknown".to_string());
 
     let subject = json_str(&msg, "subject").unwrap_or("");
     let body_md = extract_body_after_frontmatter(&content).unwrap_or("");
@@ -453,7 +455,7 @@ fn parse_and_insert_message(
         .map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
 
     // Ensure sender agent exists
-    let sender_id = ensure_agent_exists(conn, project_id, sender_name, agent_ids)?;
+    let sender_id = ensure_agent_exists(conn, project_id, &sender_name, agent_ids)?;
 
     // Build recipient lists
     let to_names = json_str_array(&msg, "to");
@@ -785,19 +787,23 @@ fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(serde_json::Value::as_str)
 }
 
+fn normalized_archive_agent_name(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 fn json_str_array(value: &serde_json::Value, key: &str) -> Vec<String> {
     match value.get(key) {
         Some(serde_json::Value::Array(arr)) => arr
             .iter()
             .filter_map(serde_json::Value::as_str)
-            .map(String::from)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
             .collect(),
         Some(serde_json::Value::String(s)) => {
-            if s.is_empty() {
-                Vec::new()
-            } else {
-                vec![s.clone()]
-            }
+            normalized_archive_agent_name(Some(s)).into_iter().collect()
         }
         _ => Vec::new(),
     }
@@ -985,14 +991,24 @@ mod tests {
     #[test]
     fn json_str_array_variants() {
         let v: serde_json::Value = serde_json::json!({
-            "to": ["Alice", "Bob"],
-            "cc": "Charlie",
+            "to": ["Alice", " Bob ", "   "],
+            "cc": " Charlie ",
             "bcc": [],
         });
         assert_eq!(json_str_array(&v, "to"), vec!["Alice", "Bob"]);
         assert_eq!(json_str_array(&v, "cc"), vec!["Charlie"]);
         assert!(json_str_array(&v, "bcc").is_empty());
         assert!(json_str_array(&v, "missing").is_empty());
+    }
+
+    #[test]
+    fn normalized_archive_agent_name_rejects_blank_values() {
+        assert_eq!(
+            normalized_archive_agent_name(Some(" Alice ")),
+            Some("Alice".to_string())
+        );
+        assert_eq!(normalized_archive_agent_name(Some("   ")), None);
+        assert_eq!(normalized_archive_agent_name(None), None);
     }
 
     #[test]
@@ -1464,6 +1480,67 @@ thread body
         assert_eq!(
             rows[0].get_named::<String>("thread_id").expect("thread_id"),
             "br123"
+        );
+    }
+
+    #[test]
+    fn reconstruct_trims_sender_and_recipient_names() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("trim-project");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"trim-project","human_key":"/trim-project","created_at":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__trim__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "   ",
+  "to": [" Bob ", "   "],
+  "cc": " Carol ",
+  "subject": "Trim names",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z"
+}
+---
+
+body
+"#,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.recipients, 2);
+
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let agent_rows = conn
+            .query_sync("SELECT name FROM agents ORDER BY name", &[])
+            .unwrap();
+        let names: Vec<String> = agent_rows
+            .iter()
+            .map(|row| row.get_named::<String>("name").expect("name"))
+            .collect();
+        assert_eq!(names, vec!["Bob", "Carol", "unknown"]);
+
+        let sender_rows = conn
+            .query_sync(
+                "SELECT a.name AS name \
+                 FROM messages m JOIN agents a ON a.id = m.sender_id \
+                 WHERE m.id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            sender_rows[0].get_named::<String>("name").expect("sender"),
+            "unknown"
         );
     }
 }
