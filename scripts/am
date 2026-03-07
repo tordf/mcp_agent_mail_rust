@@ -78,6 +78,18 @@ sync_toml_mcp_url() {
     return 0
   fi
 
+  # If the section already has a `command = ...` entry (stdio transport),
+  # injecting `url = ...` would corrupt a working config. Skip entirely.
+  if awk '
+    BEGIN { in_section = 0 }
+    /^\[mcp_servers\.mcp_agent_mail\]/ || /^\[mcp_servers\."mcp-agent-mail"\]/ { in_section = 1; next }
+    /^\[/ { in_section = 0 }
+    in_section && /^[[:space:]]*command[[:space:]]*=/ { exit 0 }
+    END { exit 1 }
+  ' "$config_file" 2>/dev/null; then
+    return 0
+  fi
+
   awk -v desired_url="$desired_url" -v create_if_missing="$create_if_missing" '
     BEGIN {
       in_section = 0

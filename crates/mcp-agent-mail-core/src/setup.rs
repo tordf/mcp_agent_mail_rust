@@ -167,6 +167,11 @@ pub enum ConfigContent {
         project_slug: String,
         agent_name: String,
     },
+    /// Append a TOML `[section]` with key-value pairs if not already present.
+    TomlSection {
+        section_header: String,
+        key_values: Vec<(String, String)>,
+    },
 }
 
 /// Parameters driving the setup.
@@ -610,6 +615,48 @@ pub fn ensure_gitignore_entries(
 }
 
 // ---------------------------------------------------------------------------
+// TOML section merge
+// ---------------------------------------------------------------------------
+
+/// Append a TOML section if it doesn't already exist in the file.
+/// If the section header (e.g. `[mcp_servers.mcp_agent_mail]`) is already
+/// present, returns the existing content unchanged.
+fn merge_toml_section(
+    existing: Option<&str>,
+    section_header: &str,
+    key_values: &[(String, String)],
+) -> Result<String, SetupError> {
+    // Build the section text
+    let mut section = String::new();
+    section.push_str(section_header);
+    section.push('\n');
+    for (k, v) in key_values {
+        section.push_str(&format!("{k} = \"{v}\"\n"));
+    }
+
+    match existing {
+        Some(text) if !text.trim().is_empty() => {
+            // Already has the section? Return unchanged.
+            if text.contains(section_header) {
+                return Ok(text.to_string());
+            }
+            // Append with a blank separator line.
+            let mut out = text.to_string();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            out.push_str(&section);
+            Ok(out)
+        }
+        _ => {
+            // No existing file — create fresh.
+            Ok(section)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-agent config generation
 // ---------------------------------------------------------------------------
 
@@ -622,6 +669,14 @@ fn standard_http_server_value(url: &str, token: &str) -> Value {
             "Authorization": format!("Bearer {token}")
         }
     })
+}
+
+/// Resolve the mcp-agent-mail binary path for stdio configs.
+fn which_mcp_binary() -> String {
+    // Allow override via env var; otherwise use the bare command name
+    // (Codex resolves it from PATH at runtime).
+    std::env::var("MCP_AGENT_MAIL_BIN")
+        .unwrap_or_else(|_| "mcp-agent-mail".to_string())
 }
 
 /// Helper: create a simple project-local JSON merge action.
@@ -676,14 +731,20 @@ impl AgentPlatform {
                 standard_http_server_value(&url, token),
                 "Windsurf project-local MCP config",
             )],
-            Self::Codex => vec![project_local_action(
-                self,
-                pdir,
-                "codex.mcp.json",
-                "mcpServers",
-                standard_http_server_value(&url, token),
-                "Codex CLI project-local MCP config",
-            )],
+            Self::Codex => {
+                let binary = which_mcp_binary();
+                vec![ConfigAction {
+                    platform: self,
+                    file_path: home.join(".codex").join("config.toml"),
+                    description: "Codex CLI TOML config (~/.codex/config.toml)".into(),
+                    content: ConfigContent::TomlSection {
+                        section_header: "[mcp_servers.mcp_agent_mail]".into(),
+                        key_values: vec![("command".into(), binary)],
+                    },
+                    permissions: 0o600,
+                    backup: true,
+                }]
+            }
             Self::Gemini => self.gemini_actions(params, &url, token, pdir, &home),
             Self::OpenCode => vec![project_local_action(
                 self,
@@ -900,6 +961,10 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
             project_slug,
             agent_name,
         } => merge_claude_hooks(existing.as_deref(), project_slug, agent_name)?,
+        ConfigContent::TomlSection {
+            section_header,
+            key_values,
+        } => merge_toml_section(existing.as_deref(), section_header, key_values)?,
     };
 
     // Check if unchanged
@@ -1076,6 +1141,15 @@ fn check_config_file(path: &Path, expected_url: &str) -> (bool, bool) {
     let Ok(content) = std::fs::read_to_string(path) else {
         return (false, false);
     };
+
+    // TOML files: check for section header presence
+    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        let has_section = content.contains("[mcp_servers.mcp_agent_mail]")
+            || content.contains("[mcp_servers.\"mcp-agent-mail\"]");
+        // For stdio TOML configs there is no URL to match; report true if present.
+        return (has_section, has_section);
+    }
+
     let Ok(doc) = serde_json::from_str::<Value>(&content) else {
         return (false, false);
     };

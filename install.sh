@@ -1484,6 +1484,53 @@ generate_bearer_token() {
   fi
 }
 
+# Insert or create an mcp-agent-mail entry in a TOML config file.
+# Handles Codex CLI's ~/.codex/config.toml with [mcp_servers.mcp_agent_mail].
+# Returns: 0=configured, 1=already present, 2=error.
+setup_single_toml_config() {
+  local tool="$1"
+  local config_path="$2"
+  local binary_path="$3"
+
+  local section_header='[mcp_servers.mcp_agent_mail]'
+
+  if [ ! -f "$config_path" ]; then
+    # File doesn't exist — create it with just the MCP section
+    local parent_dir
+    parent_dir=$(dirname "$config_path")
+    mkdir -p "$parent_dir" 2>/dev/null || true
+
+    cat > "$config_path" <<TOMLEOF
+${section_header}
+command = "${binary_path}"
+TOMLEOF
+    verbose "setup_toml_config:created tool=${tool} path=${config_path}"
+    return 0
+  fi
+
+  # File exists — check if section already present
+  if grep -q '^\[mcp_servers[.]mcp_agent_mail\]' "$config_path" 2>/dev/null || \
+     grep -q '^\[mcp_servers[.]["]mcp-agent-mail["]\]' "$config_path" 2>/dev/null; then
+    verbose "setup_toml_config:skip_existing tool=${tool} path=${config_path}"
+    return 1
+  fi
+
+  # Section not present — append it
+  # Ensure a trailing newline before appending
+  if [ -s "$config_path" ] && [ "$(tail -c 1 "$config_path" | wc -l)" -eq 0 ]; then
+    printf '\n' >> "$config_path"
+  fi
+
+  cat >> "$config_path" <<TOMLEOF
+
+${section_header}
+command = "${binary_path}"
+TOMLEOF
+
+  verbose "setup_toml_config:appended tool=${tool} path=${config_path}"
+  return 0
+}
+
 # Insert or create an mcp-agent-mail entry in a JSON config file.
 # Uses python3/jq for JSON manipulation if available, otherwise sed-based.
 setup_single_mcp_config() {
@@ -1495,11 +1542,11 @@ setup_single_mcp_config() {
 
   verbose "setup_mcp_config:start tool=${tool} path=${config_path}"
 
-  # Skip TOML configs — they need different handling and are secondary to JSON
+  # TOML configs (e.g. Codex ~/.codex/config.toml) — handle separately
   case "$config_path" in
     *.toml)
-      verbose "setup_mcp_config:skip_toml tool=${tool} path=${config_path}"
-      return 2
+      setup_single_toml_config "$tool" "$config_path" "$binary_path"
+      return $?
       ;;
   esac
 

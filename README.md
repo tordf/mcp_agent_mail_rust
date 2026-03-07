@@ -403,17 +403,11 @@ Or for HTTP transport (when the server is already running):
 
 ### Codex CLI
 
-Add to `.codex/config.json`:
+Add to `~/.codex/config.toml`:
 
-```json
-{
-  "mcpServers": {
-    "agent-mail": {
-      "command": "mcp-agent-mail",
-      "args": []
-    }
-  }
-}
+```toml
+[mcp_servers.mcp_agent_mail]
+command = "mcp-agent-mail"
 ```
 
 ### Gemini CLI
