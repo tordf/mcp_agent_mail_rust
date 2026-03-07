@@ -8919,7 +8919,10 @@ mod tests {
             *guard = PaletteDbCache::default();
         }
 
-        let config = Config::default();
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Config::default()
+        };
         let state = TuiSharedState::new(&config);
         let bridge_state = palette_cache_bridge_state(&state);
         let db_url = state.config_snapshot().raw_database_url;
@@ -8971,7 +8974,10 @@ mod tests {
             *guard = PaletteDbCache::default();
         }
 
-        let config = Config::default();
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Config::default()
+        };
         let state = TuiSharedState::new(&config);
         let bridge_state = palette_cache_bridge_state(&state);
         let db_url = state.config_snapshot().raw_database_url;
