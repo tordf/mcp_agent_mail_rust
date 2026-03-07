@@ -331,8 +331,13 @@ impl FileReservationRow {
     }
 
     #[must_use]
+    pub fn is_logically_unreleased(&self) -> bool {
+        self.released_ts.is_none_or(|ts| ts <= 0)
+    }
+
+    #[must_use]
     pub fn is_active(&self) -> bool {
-        self.released_ts.is_none() && self.expires_ts > now_micros()
+        self.is_logically_unreleased() && self.expires_ts > now_micros()
     }
 }
 
@@ -624,6 +629,15 @@ mod tests {
         let mut resv = FileReservationRow::default();
         resv.expires_ts = now_micros() - 1_000_000;
         assert!(!resv.is_active());
+    }
+
+    #[test]
+    fn file_reservation_zero_release_sentinel_stays_active_until_expiry() {
+        let mut resv = FileReservationRow::default();
+        resv.expires_ts = now_micros() + 60_000_000;
+        resv.released_ts = Some(0);
+        assert!(resv.is_logically_unreleased());
+        assert!(resv.is_active());
     }
 
     // ── AgentLinkRow ────────────────────────────────────────────────

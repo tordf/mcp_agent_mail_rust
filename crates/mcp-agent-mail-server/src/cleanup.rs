@@ -22,7 +22,7 @@ use mcp_agent_mail_db::{
     },
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
@@ -234,13 +234,44 @@ fn run_cleanup_cycle_with_cache(
         let expired_ids =
             match block_on(async { release_expired_reservations(&cx, pool, *pid).await }) {
                 Outcome::Ok(ids) => ids,
-                _ => Vec::new(), // Suppress per-project errors (legacy: contextlib.suppress).
+                Outcome::Err(err) => {
+                    warn!(
+                        project_id = *pid,
+                        error = %err,
+                        "cleanup: failed to release expired reservations for project"
+                    );
+                    Vec::new()
+                }
+                Outcome::Cancelled(_) => {
+                    warn!(
+                        project_id = *pid,
+                        "cleanup: expired reservation release was cancelled for project"
+                    );
+                    Vec::new()
+                }
+                Outcome::Panicked(panic) => {
+                    warn!(
+                        project_id = *pid,
+                        panic = %panic.message(),
+                        "cleanup: expired reservation release panicked for project"
+                    );
+                    Vec::new()
+                }
             };
         total_released += expired_ids.len();
 
         // Phase 2: detect and release stale.
-        let stale_ids =
-            detect_and_release_stale(config, pool, &cx, *pid, probe_cache).unwrap_or_default();
+        let stale_ids = match detect_and_release_stale(config, pool, &cx, *pid, probe_cache) {
+            Ok(ids) => ids,
+            Err(err) => {
+                warn!(
+                    project_id = *pid,
+                    error = %err,
+                    "cleanup: failed to detect and release stale reservations for project"
+                );
+                Vec::new()
+            }
+        };
         total_released += stale_ids.len();
 
         // Write archive artifacts for released reservations.
@@ -295,28 +326,14 @@ fn detect_and_release_stale(
         .saturating_mul(1_000_000);
     let now = now_micros();
 
-    // Get all unreleased reservations for this project.
-    let reservations =
-        match block_on(async { list_unreleased_file_reservations(cx, pool, project_id).await }) {
-            Outcome::Ok(rows) => rows,
-            other => return Err(format!("failed to list reservations: {other:?}")),
-        };
-
-    // Filter to only non-expired ones (expired were handled in phase 1).
-    let active: Vec<&FileReservationRow> =
-        reservations.iter().filter(|r| r.expires_ts > now).collect();
-
+    let active = active_reservations_for_stale_cleanup(cx, pool, project_id, now)?;
     if active.is_empty() {
         return Ok(Vec::new());
     }
 
     // Project workspace is identical for every reservation in this cycle.
-    let workspace = match block_on(async { queries::get_project_by_id(cx, pool, project_id).await })
-    {
-        Outcome::Ok(project) => Some(std::path::PathBuf::from(project.human_key)),
-        _ => None,
-    };
-    let git_head_oid = workspace.as_deref().and_then(git_head_oid_for_workspace);
+    let workspace = stale_cleanup_workspace(cx, pool, project_id)?;
+    let git_head_oid = git_head_oid_for_workspace(&workspace);
 
     // Many reservations share the same agent and/or path pattern. Cache activity
     // checks within a cycle to avoid repeated DB + git process work.
@@ -363,14 +380,6 @@ fn detect_and_release_stale(
             continue; // Recent mail activity, not stale.
         }
 
-        let Some(workspace) = workspace.as_deref() else {
-            // Can't determine filesystem activity; treat as stale based on agent+mail.
-            if let Some(id) = res.id {
-                stale_ids.push(id);
-            }
-            continue;
-        };
-
         // Check filesystem/git activity, cached by path pattern.
         let normalized_pattern = normalize_path_pattern_key(&res.path_pattern);
         let has_recent_path_activity = recent_path_activity_cache
@@ -379,7 +388,7 @@ fn detect_and_release_stale(
             .unwrap_or_else(|| {
                 let computed = path_has_recent_activity_cached(
                     probe_cache,
-                    workspace,
+                    &workspace,
                     project_id,
                     &normalized_pattern,
                     git_head_oid.as_deref(),
@@ -407,6 +416,51 @@ fn detect_and_release_stale(
     match block_on(async { release_reservations_by_ids(cx, pool, &stale_ids).await }) {
         Outcome::Ok(_) => Ok(stale_ids),
         other => Err(format!("failed to release stale reservations: {other:?}")),
+    }
+}
+
+fn active_reservations_for_stale_cleanup(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    now: i64,
+) -> Result<Vec<FileReservationRow>, String> {
+    match block_on(async { list_unreleased_file_reservations(cx, pool, project_id).await }) {
+        Outcome::Ok(rows) => Ok(rows
+            .into_iter()
+            .filter(|row| row.expires_ts > now)
+            .collect()),
+        other => Err(format!("failed to list reservations: {other:?}")),
+    }
+}
+
+fn stale_cleanup_workspace(cx: &Cx, pool: &DbPool, project_id: i64) -> Result<PathBuf, String> {
+    match block_on(async { queries::get_project_by_id(cx, pool, project_id).await }) {
+        Outcome::Ok(project) => {
+            let workspace = PathBuf::from(project.human_key);
+            if workspace.as_os_str().is_empty() {
+                return Err(format!(
+                    "project {project_id} has no workspace path; refusing stale cleanup without filesystem evidence"
+                ));
+            }
+            if !workspace.exists() {
+                return Err(format!(
+                    "project {project_id} workspace does not exist: {}",
+                    workspace.display()
+                ));
+            }
+            Ok(workspace)
+        }
+        Outcome::Err(err) => Err(format!(
+            "project lookup failed for stale cleanup on project {project_id}: {err}"
+        )),
+        Outcome::Cancelled(reason) => Err(format!(
+            "project lookup cancelled for stale cleanup on project {project_id}: {reason:?}"
+        )),
+        Outcome::Panicked(panic) => Err(format!(
+            "project lookup panicked for stale cleanup on project {project_id}: {}",
+            panic.message()
+        )),
     }
 }
 
@@ -476,6 +530,7 @@ fn check_filesystem_activity(
         || pattern.contains('{');
 
     if has_glob {
+        let pathspec = format!(":(glob){pattern}");
         // Fast path: use `git ls-files -c -o --exclude-standard -- pattern` to get matching files.
         // This leverages git's index and ignores `.gitignore`d folders like `target/` which would
         // otherwise cause insane CPU usage during synchronous directory traversal.
@@ -488,7 +543,7 @@ fn check_filesystem_activity(
                 "-o",
                 "--exclude-standard",
                 "--",
-                &pattern,
+                &pathspec,
             ])
             .output();
 
@@ -588,7 +643,16 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
         return None;
     }
 
-    // Use git log with the path pattern directly (git handles pathspecs including globs).
+    let has_glob = pattern.contains('*')
+        || pattern.contains('?')
+        || pattern.contains('[')
+        || pattern.contains('{');
+    let pathspec = if has_glob {
+        format!(":(glob){pattern}")
+    } else {
+        pattern
+    };
+
     let output = std::process::Command::new("git")
         .args([
             "-C",
@@ -597,7 +661,7 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
             "-1",
             "--format=%ct",
             "--",
-            &pattern,
+            &pathspec,
         ])
         .output()
         .ok()?;
@@ -677,8 +741,26 @@ fn write_cleanup_artifacts(
             let agent_name =
                 match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {
                     Outcome::Ok(agent) => agent.name,
-                    _ => format!("agent_{}", row.agent_id),
+                    Outcome::Err(error) => {
+                        return Err(format!(
+                            "cleanup artifact agent lookup failed for reservation {id}: {error}"
+                        ));
+                    }
+                    Outcome::Cancelled(_) => {
+                        return Err(format!(
+                            "cleanup artifact agent lookup cancelled for reservation {id}"
+                        ));
+                    }
+                    Outcome::Panicked(panic) => {
+                        return Err(format!(
+                            "cleanup artifact agent lookup panicked for reservation {id}: {}",
+                            panic.message()
+                        ));
+                    }
                 };
+            let released_ts = row.released_ts.ok_or_else(|| {
+                format!("cleanup artifact generation requires released_ts for reservation {id}")
+            })?;
 
             res_jsons.push(serde_json::json!({
                 "id": id,
@@ -688,7 +770,7 @@ fn write_cleanup_artifacts(
                 "reason": row.reason,
                 "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
                 "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
-                "released_ts": mcp_agent_mail_db::micros_to_iso(row.released_ts.unwrap_or_else(mcp_agent_mail_db::now_micros)),
+                "released_ts": mcp_agent_mail_db::micros_to_iso(released_ts),
             }));
         }
     }
@@ -1112,6 +1194,56 @@ mod tests {
     }
 
     #[test]
+    fn check_git_activity_glob_respects_directory_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::create_dir_all(repo.join("src/nested")).unwrap();
+        std::fs::write(repo.join("src/nested/lib.rs"), "fn nested() {}\n").unwrap();
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["init", "-b", "main"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.email", "cleanup-test@example.com"])
+            .status()
+            .expect("git config user.email should run");
+        assert!(status.success(), "git config user.email should succeed");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "user.name", "Cleanup Test"])
+            .status()
+            .expect("git config user.name should run");
+        assert!(status.success(), "git config user.name should succeed");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "."])
+            .status()
+            .expect("git add should run");
+        assert!(status.success(), "git add should succeed");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["commit", "-m", "nested"])
+            .status()
+            .expect("git commit should run");
+        assert!(status.success(), "git commit should succeed");
+
+        let now = now_micros();
+        assert!(
+            !check_git_activity(repo, "src/*.rs", now, 120_000_000),
+            "nested file should not match shallow glob"
+        );
+    }
+
+    #[test]
     fn path_probe_cache_normalizes_leading_slash_patterns() {
         let tmp = tempfile::tempdir().unwrap();
         let now = now_micros();
@@ -1205,6 +1337,39 @@ mod tests {
     }
 
     #[test]
+    fn detect_and_release_stale_errors_when_workspace_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, _agent_id, reservation_id, human_key, _pattern) =
+            seed_active_reservation(&tmp);
+
+        std::fs::remove_dir_all(&human_key).expect("remove workspace");
+
+        let mut config = Config::from_env();
+        config.file_reservation_inactivity_seconds = 0;
+        config.file_reservation_activity_grace_seconds = 0;
+
+        let mut probe_cache = CleanupProbeCache::default();
+        let err = detect_and_release_stale(&config, &pool, &cx, project_id, &mut probe_cache)
+            .expect_err("missing workspace must not trigger stale release");
+        assert!(err.contains("workspace does not exist"));
+
+        let rows = match fastmcp_core::block_on(async {
+            queries::list_file_reservations(&cx, &pool, project_id, false).await
+        }) {
+            Outcome::Ok(r) => r,
+            other => panic!("list_file_reservations failed: {other:?}"),
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.id.is_some_and(|rid| rid == reservation_id))
+            .expect("reservation should exist");
+        assert!(
+            row.released_ts.is_none(),
+            "workspace lookup failure must not release reservations"
+        );
+    }
+
+    #[test]
     fn write_cleanup_artifacts_errors_when_archive_enqueue_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
@@ -1230,6 +1395,55 @@ mod tests {
         assert_eq!(
             result,
             Err("cleanup archive enqueue skipped due to critical disk pressure".into())
+        );
+    }
+
+    #[test]
+    fn write_cleanup_artifacts_errors_when_agent_lookup_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, agent_id, reservation_id, _human_key, _pattern) =
+            seed_active_reservation(&tmp);
+
+        match fastmcp_core::block_on(async {
+            queries::release_reservations_by_ids(&cx, &pool, &[reservation_id]).await
+        }) {
+            Outcome::Ok(1) => {}
+            other => panic!("release_reservations_by_ids failed: {other:?}"),
+        }
+
+        let conn = match fastmcp_core::block_on(async { pool.acquire(&cx).await }) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(err) => panic!("pool acquire failed: {err}"),
+            Outcome::Cancelled(_) => panic!("pool acquire cancelled"),
+            Outcome::Panicked(panic) => panic!("pool acquire panicked: {}", panic.message()),
+        };
+        conn.execute_sync(
+            "DELETE FROM agents WHERE id = ?",
+            &[mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id)],
+        )
+        .expect("delete agent");
+
+        let config = Config::from_env();
+        let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
+        assert!(
+            result
+                .expect_err("missing agent lookup should fail cleanup artifact generation")
+                .contains("agent lookup failed")
+        );
+    }
+
+    #[test]
+    fn write_cleanup_artifacts_errors_when_release_timestamp_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
+            seed_active_reservation(&tmp);
+
+        let config = Config::from_env();
+        let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
+        assert!(
+            result
+                .expect_err("active reservation should not fabricate a release timestamp")
+                .contains("requires released_ts")
         );
     }
 }

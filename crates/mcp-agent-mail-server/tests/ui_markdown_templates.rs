@@ -186,43 +186,119 @@ struct SearchCtx {
     project: ProjectView,
     q: String,
     results: Vec<SearchResult>,
+    static_export: bool,
+    static_search_index_path: String,
+    order: String,
+    scope: String,
+    boost: bool,
+    importance: Vec<String>,
+    agent: String,
+    thread: String,
+    ack: String,
+    direction: String,
+    from_date: String,
+    to_date: String,
+    next_cursor: String,
+    cursor: String,
+    result_count: usize,
+    agents: Vec<AgentView>,
+    recipes: Vec<SearchRecipe>,
+    deep_link: String,
 }
 
 #[derive(Serialize)]
 struct SearchResult {
     id: i64,
     subject: String,
-    body_snippet: String,
-    sender_name: String,
+    snippet: String,
+    #[serde(rename = "from")]
+    from_name: String,
     created: String,
+    created_relative: String,
     importance: String,
     thread_id: String,
+    ack_required: bool,
+    score: String,
 }
 
-#[test]
-fn templates_render_mail_search() {
-    let ctx = SearchCtx {
+#[derive(Serialize)]
+struct SearchRecipe {
+    id: i64,
+    name: String,
+    description: String,
+    route: String,
+    pinned: bool,
+    use_count: i64,
+}
+
+fn sample_search_ctx(q: &str, results: Vec<SearchResult>, static_export: bool) -> SearchCtx {
+    SearchCtx {
         project: ProjectView {
             id: 1,
             slug: "proj".to_string(),
             human_key: "/data/proj".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
         },
-        q: "auth".to_string(),
-        results: vec![SearchResult {
+        q: q.to_string(),
+        result_count: results.len(),
+        results,
+        static_export,
+        static_search_index_path: "../../../search-index.json".to_string(),
+        order: "relevance".to_string(),
+        scope: String::new(),
+        boost: false,
+        importance: Vec::new(),
+        agent: String::new(),
+        thread: String::new(),
+        ack: "any".to_string(),
+        direction: String::new(),
+        from_date: String::new(),
+        to_date: String::new(),
+        next_cursor: String::new(),
+        cursor: String::new(),
+        agents: Vec::new(),
+        recipes: Vec::new(),
+        deep_link: "/mail/proj/search".to_string(),
+    }
+}
+
+#[test]
+fn templates_render_mail_search() {
+    let ctx = sample_search_ctx(
+        "auth",
+        vec![SearchResult {
             id: 7,
             subject: "Auth module refactor".to_string(),
-            body_snippet: "Working on auth changes...".to_string(),
-            sender_name: "RedFox".to_string(),
+            snippet: "Working on auth changes...".to_string(),
+            from_name: "RedFox".to_string(),
             created: "2026-02-05T00:00:00Z".to_string(),
+            created_relative: "2d ago".to_string(),
             importance: "high".to_string(),
             thread_id: "br-456".to_string(),
+            ack_required: false,
+            score: "1.00".to_string(),
         }],
-    };
+        false,
+    );
     let out = templates::render_template("mail_search.html", ctx).expect("render mail_search.html");
     assert!(
         out.contains("auth") || out.contains("Auth"),
         "should contain search query"
+    );
+}
+
+#[test]
+fn templates_render_mail_search_static_export() {
+    let ctx = sample_search_ctx("auth", Vec::new(), true);
+    let out =
+        templates::render_template("mail_search.html", ctx).expect("render static mail search");
+    assert!(
+        out.contains("__static_export"),
+        "should preserve static export marker"
+    );
+    assert!(
+        out.contains("search-index.json"),
+        "should reference offline search index"
     );
 }
 
@@ -772,16 +848,7 @@ fn templates_render_thread_unicode_content() {
 
 #[test]
 fn templates_render_search_empty_results() {
-    let ctx = SearchCtx {
-        project: ProjectView {
-            id: 1,
-            slug: "proj".to_string(),
-            human_key: "/data/proj".to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        },
-        q: "nonexistent".to_string(),
-        results: vec![],
-    };
+    let ctx = sample_search_ctx("nonexistent", Vec::new(), false);
     let out = templates::render_template("mail_search.html", ctx).expect("render empty search");
     assert!(
         out.contains("nonexistent"),

@@ -372,6 +372,20 @@ pub const ACTIVE_RESERVATION_PREDICATE: &str = "(
     )
 )";
 
+/// Return [`ACTIVE_RESERVATION_PREDICATE`] adjusted for a table reference.
+///
+/// This exists for queries that alias `file_reservations` (for example `fr`,
+/// `fr1`, or `fr2`) but still need the canonical active-reservation semantics,
+/// including the sidecar release ledger exclusion.
+#[must_use]
+pub fn active_reservation_predicate_for(table_ref: &str) -> String {
+    let table_ref = table_ref.trim().trim_end_matches('.');
+    if table_ref.is_empty() || table_ref == "file_reservations" {
+        return ACTIVE_RESERVATION_PREDICATE.to_string();
+    }
+    ACTIVE_RESERVATION_PREDICATE.replace("file_reservations.", &format!("{table_ref}."))
+}
+
 /// Decode `ProductRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `product_uid`, `name`, `created_at`.
 fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, DbError> {
@@ -2071,6 +2085,13 @@ pub struct ThreadMessageRow {
     pub from: String,
 }
 
+/// Recipient details for a single message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRecipientDetailRow {
+    pub name: String,
+    pub kind: String,
+}
+
 /// Atomically check for conflicts and create reservations.
 ///
 /// Executes the read-check-write cycle within a `BEGIN IMMEDIATE` transaction
@@ -2709,8 +2730,11 @@ pub async fn list_thread_messages(
     let tracked = tracked(&*conn);
 
     let mut sql = String::from(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                m.importance, m.ack_required, m.created_ts, m.attachments, a.name as from_name \
+        "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
+                m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                m.importance AS importance, m.ack_required AS ack_required, \
+                m.created_ts AS created_ts, m.attachments AS attachments, \
+                a.name AS from_name \
          FROM messages m \
          JOIN agents a ON a.id = m.sender_id \
          WHERE m.project_id = ? AND ",
@@ -2734,12 +2758,12 @@ pub async fn list_thread_messages(
             return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
         };
         // Select newest N first to avoid loading entire long-running threads.
-        sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC");
+        sql.push_str(" ORDER BY created_ts DESC, id DESC");
         sql.push_str(" LIMIT ?");
         params.push(Value::BigInt(limit_i64));
         true
     } else {
-        sql.push_str(" ORDER BY m.created_ts ASC, m.id ASC");
+        sql.push_str(" ORDER BY created_ts ASC, id ASC");
         false
     };
 
@@ -2874,6 +2898,66 @@ pub async fn list_message_recipient_names_for_messages(
     out.sort();
     out.dedup();
     Outcome::Ok(out)
+}
+
+/// List recipients for a single message, preserving delivery kind ordering.
+pub async fn list_message_recipients_by_message(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    message_id: i64,
+) -> Outcome<Vec<MessageRecipientDetailRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    let sql = "SELECT a.name, r.kind \
+               FROM message_recipients r \
+               JOIN agents a ON a.id = r.agent_id \
+               JOIN messages m ON m.id = r.message_id \
+               WHERE m.project_id = ? AND r.message_id = ?";
+    let params = [Value::BigInt(project_id), Value::BigInt(message_id)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let name: String = match row.get_as(0) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let kind: String = match row.get_as(1) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                out.push(MessageRecipientDetailRow { name, kind });
+            }
+            out.sort_by(|left, right| {
+                let kind_rank = |kind: &str| match kind.to_ascii_lowercase().as_str() {
+                    "to" => 0,
+                    "cc" => 1,
+                    "bcc" => 2,
+                    _ => 3,
+                };
+                kind_rank(&left.kind)
+                    .cmp(&kind_rank(&right.kind))
+                    .then_with(|| {
+                        left.name
+                            .to_ascii_lowercase()
+                            .cmp(&right.name.to_ascii_lowercase())
+                    })
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// List recipient agent names keyed by message id for a set of messages.
@@ -3047,6 +3131,7 @@ pub async fn fetch_inbox(
         agent_id,
         urgent_only,
         false,
+        false,
         since_ts,
         limit,
     )
@@ -3069,8 +3154,22 @@ pub async fn fetch_inbox_unread(
         agent_id,
         urgent_only,
         true,
+        false,
         since_ts,
         limit,
+    )
+    .await
+}
+
+pub async fn fetch_inbox_ack_required(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    limit: usize,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx, pool, project_id, agent_id, false, false, true, None, limit,
     )
     .await
 }
@@ -3083,6 +3182,7 @@ async fn fetch_inbox_impl(
     agent_id: i64,
     urgent_only: bool,
     unread_only: bool,
+    ack_required_only: bool,
     since_ts: Option<i64>,
     limit: usize,
 ) -> Outcome<Vec<InboxRow>, DbError> {
@@ -3111,6 +3211,9 @@ async fn fetch_inbox_impl(
     }
     if unread_only {
         sql.push_str(" AND r.read_ts IS NULL");
+    }
+    if ack_required_only {
+        sql.push_str(" AND m.ack_required = 1 AND r.ack_ts IS NULL");
     }
     if let Some(ts) = since_ts {
         sql.push_str(" AND m.created_ts > ?");
@@ -7470,6 +7573,84 @@ mod tests {
         });
     }
 
+    #[test]
+    fn list_thread_messages_without_limit_orders_in_chronological_order() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("thread_no_limit_order.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-thread-no-limit-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let sender_id = sender.id.expect("sender id");
+            let recipient_id = recipient.id.expect("recipient id");
+            let recipients = [(recipient_id, "to")];
+
+            for idx in 1..=2 {
+                create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender_id,
+                    &format!("msg-{idx}"),
+                    "body",
+                    Some("THREAD-NO-LIMIT"),
+                    "normal",
+                    false,
+                    "[]",
+                    &recipients,
+                )
+                .await
+                .into_result()
+                .expect("create message");
+            }
+
+            let rows = list_thread_messages(&cx, &pool, project_id, "THREAD-NO-LIMIT", None)
+                .await
+                .into_result()
+                .expect("list thread messages");
+
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].subject, "msg-1");
+            assert_eq!(rows[1].subject, "msg-2");
+        });
+    }
+
     /// Requires trigger-body execution. Under `FrankenSQLite`, `CREATE TRIGGER`
     /// can succeed while the trigger body is never run, so this harness cannot
     /// reliably suppress committed recipient rows.
@@ -9626,6 +9807,14 @@ mod tests {
         assert!(select_sql.contains("expires_ts <= ?"));
         assert!(!select_sql.contains("expires_ts < ?"));
         assert!(select_sql.contains("NOT EXISTS"));
+    }
+
+    #[test]
+    fn active_reservation_predicate_for_alias_retargets_release_ledger_probe() {
+        let aliased = active_reservation_predicate_for("fr");
+        assert!(aliased.contains("reservation_id = fr.id"));
+        assert!(!aliased.contains("reservation_id = file_reservations.id"));
+        assert!(aliased.contains("released_ts IS NULL"));
     }
 
     // ─── Global query tests (br-2bbt.14.1) ───────────────────────────────────

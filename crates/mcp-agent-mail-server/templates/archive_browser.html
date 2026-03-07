@@ -101,55 +101,75 @@ function browserManager() {
     async selectEntry(entry) {
       this.selected = entry;
 
+      if (entry.type === 'dir') {
+        const projectQuery = encodeURIComponent(this.project);
+        window.location.href = `/mail/archive/browser?project=${projectQuery}&path=${encodeURIComponent(entry.path)}`;
+        return;
+      }
+
       if (entry.type === 'file') {
-        const projectSegment = encodeURIComponent(this.project);
-        const container = document.getElementById('file-content');
-        try {
-          const response = await fetch(`/mail/archive/browser/${projectSegment}/file?path=${encodeURIComponent(entry.path)}`);
-          if (!response.ok) {
-            const errorMessage = `${response.status} ${response.statusText || ''}`.trim();
-            container.innerHTML = `<div class="p-4 bg-danger-50 dark:bg-danger-900/20 text-danger-700 dark:text-danger-300 rounded-lg">
-              Failed to load file: ${this.escapeHtml(errorMessage)}
-            </div>`;
-            return;
-          }
+        await this.renderFile(entry);
+      }
+    },
 
-          const content = await response.text();
+    async fetchFileContent(entry) {
+      const projectSegment = encodeURIComponent(this.project);
+      const response = await fetch(`/mail/archive/browser/${projectSegment}/file?path=${encodeURIComponent(entry.path)}`);
+      if (!response.ok) {
+        const errorMessage = `${response.status} ${response.statusText || ''}`.trim();
+        throw new Error(errorMessage || 'Request failed');
+      }
 
-          const isMarkdown = entry.name.endsWith('.md');
-          const isJSON = entry.name.endsWith('.json');
+      const payload = await response.json();
+      return typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+    },
 
-          if (isMarkdown) {
-            try {
-              container.innerHTML = typeof marked !== 'undefined' ? marked.parse(content) : this.escapeHtml(content);
-            } catch (error) {
-              console.error('Markdown rendering failed:', error);
+    async renderFile(entry) {
+      const container = document.getElementById('file-content');
+      try {
+        const content = await this.fetchFileContent(entry);
+
+        const isMarkdown = entry.name.endsWith('.md');
+        const isJSON = entry.name.endsWith('.json');
+
+        if (isMarkdown) {
+          try {
+            if (typeof marked !== 'undefined') {
+              const rendered = marked.parse(content);
+              container.innerHTML = typeof DOMPurify !== 'undefined'
+                ? DOMPurify.sanitize(rendered)
+                : this.escapeHtml(content);
+            } else {
               container.innerHTML = `<pre class="whitespace-pre-wrap break-words text-sm font-mono">${this.escapeHtml(content)}</pre>`;
             }
-          } else if (isJSON) {
-            try {
-              const formatted = JSON.stringify(JSON.parse(content), null, 2);
-              if (typeof Prism !== 'undefined') {
-                container.innerHTML = `<pre class="language-json"><code>${Prism.highlight(formatted, Prism.languages.json, 'json')}</code></pre>`;
-              } else {
-                container.innerHTML = `<pre class="whitespace-pre-wrap break-words text-sm font-mono">${this.escapeHtml(formatted)}</pre>`;
-              }
-            } catch {
-              container.innerHTML = `<pre class="whitespace-pre-wrap break-words text-sm font-mono">${this.escapeHtml(content)}</pre>`;
-            }
-          } else {
+          } catch (error) {
+            console.error('Markdown rendering failed:', error);
             container.innerHTML = `<pre class="whitespace-pre-wrap break-words text-sm font-mono">${this.escapeHtml(content)}</pre>`;
           }
-
-          if (typeof lucide !== 'undefined') {
-            lucide.createIcons();
+        } else if (isJSON) {
+          try {
+            const formatted = JSON.stringify(JSON.parse(content), null, 2);
+            if (typeof Prism !== 'undefined') {
+              container.innerHTML = `<pre class="language-json"><code>${Prism.highlight(formatted, Prism.languages.json, 'json')}</code></pre>`;
+            } else {
+              container.innerHTML = `<pre class="whitespace-pre-wrap break-words text-sm font-mono">${this.escapeHtml(formatted)}</pre>`;
+            }
+          } catch {
+            container.innerHTML = `<pre class="whitespace-pre-wrap break-words text-sm font-mono">${this.escapeHtml(content)}</pre>`;
           }
-        } catch (error) {
-          console.error('Failed to load file contents:', error);
-          container.innerHTML = `<div class="p-4 bg-danger-50 dark:bg-danger-900/20 text-danger-700 dark:text-danger-300 rounded-lg">
-            Unable to load file contents. Please try again.
-          </div>`;
+        } else {
+          container.innerHTML = `<pre class="whitespace-pre-wrap break-words text-sm font-mono">${this.escapeHtml(content)}</pre>`;
         }
+
+        if (typeof lucide !== 'undefined') {
+          lucide.createIcons();
+        }
+      } catch (error) {
+        console.error('Failed to load file contents:', error);
+        const message = error instanceof Error ? error.message : 'Unable to load file contents.';
+        container.innerHTML = `<div class="p-4 bg-danger-50 dark:bg-danger-900/20 text-danger-700 dark:text-danger-300 rounded-lg">
+          Failed to load file: ${this.escapeHtml(message)}
+        </div>`;
       }
     },
 
@@ -159,10 +179,20 @@ function browserManager() {
       return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     },
 
-    downloadFile() {
+    async downloadFile() {
       if (this.selected && this.selected.type === 'file') {
-        const projectSegment = encodeURIComponent(this.project);
-        window.open(`/mail/archive/browser/${projectSegment}/download?path=${encodeURIComponent(this.selected.path)}`, '_blank');
+        try {
+          const content = await this.fetchFileContent(this.selected);
+          const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement('a');
+          anchor.href = url;
+          anchor.download = this.selected.name;
+          anchor.click();
+          URL.revokeObjectURL(url);
+        } catch (error) {
+          console.error('Download failed:', error);
+        }
       }
     }
   };

@@ -1529,22 +1529,22 @@ const TUI_ADVISORY_CONSISTENCY_IDLE_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Default)]
 struct TuiDeferredWorkerProgress {
-    non_db_started: AtomicBool,
-    db_started: AtomicBool,
-    advisory_started: AtomicBool,
+    non_db: AtomicBool,
+    db: AtomicBool,
+    advisory: AtomicBool,
 }
 
 impl TuiDeferredWorkerProgress {
     fn claim_non_db_start(&self) -> bool {
-        !self.non_db_started.swap(true, Ordering::AcqRel)
+        !self.non_db.swap(true, Ordering::AcqRel)
     }
 
     fn claim_db_start(&self) -> bool {
-        !self.db_started.swap(true, Ordering::AcqRel)
+        !self.db.swap(true, Ordering::AcqRel)
     }
 
     fn claim_advisory_start(&self) -> bool {
-        !self.advisory_started.swap(true, Ordering::AcqRel)
+        !self.advisory.swap(true, Ordering::AcqRel)
     }
 
     fn start_non_db_if_needed(&self, config: &mcp_agent_mail_core::Config) {
@@ -1672,18 +1672,17 @@ fn handle_tui_deferred_background_worker_spawn_failure(
         "failed to spawn deferred TUI worker starter; keeping background workers gated off"
     );
     tui_state.push_console_log(tui_deferred_worker_spawn_failure_message(error));
-    progress.non_db_started.store(false, Ordering::Release);
-    progress.db_started.store(false, Ordering::Release);
-    progress.advisory_started.store(false, Ordering::Release);
+    progress.non_db.store(false, Ordering::Release);
+    progress.db.store(false, Ordering::Release);
+    progress.advisory.store(false, Ordering::Release);
 }
 
 fn spawn_tui_deferred_background_workers(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
 ) -> TuiDeferredWorkerHandle {
-    let inline_config = config.clone();
+    let worker_config = config.clone();
     let inline_tui_state = Arc::clone(tui_state);
-    let worker_config = inline_config.clone();
     let worker_tui_state = Arc::clone(&inline_tui_state);
     let progress = Arc::new(TuiDeferredWorkerProgress::default());
     let worker_progress = Arc::clone(&progress);
@@ -1708,7 +1707,6 @@ fn spawn_tui_deferred_background_workers(
             progress,
         },
         Err(error) => {
-            let _ = inline_config;
             handle_tui_deferred_background_worker_spawn_failure(
                 &progress,
                 &inline_tui_state,
@@ -4344,7 +4342,10 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
         messages: dashboard_count(conn, "SELECT COUNT(*) AS c FROM messages"),
         file_reservations: dashboard_count(
             conn,
-            "SELECT COUNT(*) AS c FROM file_reservations WHERE released_ts IS NULL",
+            &format!(
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE ({})",
+                mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE
+            ),
         ),
         contact_links: dashboard_count(conn, "SELECT COUNT(*) AS c FROM agent_links"),
         ack_pending: dashboard_count(
@@ -7986,9 +7987,9 @@ mod tests {
             &std::io::Error::other("boom"),
         );
 
-        assert!(!progress.non_db_started.load(Ordering::Acquire));
-        assert!(!progress.db_started.load(Ordering::Acquire));
-        assert!(!progress.advisory_started.load(Ordering::Acquire));
+        assert!(!progress.non_db.load(Ordering::Acquire));
+        assert!(!progress.db.load(Ordering::Acquire));
+        assert!(!progress.advisory.load(Ordering::Acquire));
         let logs = state.console_log_since(0);
         assert_eq!(logs.len(), 1);
         assert!(logs[0].1.contains("background services remain gated off"));

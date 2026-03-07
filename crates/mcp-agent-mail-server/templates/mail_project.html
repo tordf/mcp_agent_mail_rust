@@ -15,6 +15,7 @@
 
 {% block header_actions %}
 <div class="flex items-center gap-3">
+  {% if not static_export %}
   <!-- Human Overseer - Primary Action -->
   <a href="/mail/{{ project.slug }}/overseer/compose"
      class="inline-flex items-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-700 text-white font-semibold rounded-lg shadow-sm hover:shadow-md transition-all duration-200"
@@ -25,6 +26,7 @@
 
   <!-- Divider -->
   <div class="w-px h-8 bg-slate-200 dark:bg-slate-700"></div>
+  {% endif %}
 
   <!-- Secondary Actions -->
   <div class="flex items-center gap-2">
@@ -115,7 +117,7 @@
       </p>
     </div>
 
-    <form method="get" action="/mail/{{ project.slug }}" class="space-y-6">
+    <form method="get" action="/mail/{{ project.slug }}/search" class="space-y-6">
       <!-- Search Input -->
       <div class="relative group">
         <div class="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">

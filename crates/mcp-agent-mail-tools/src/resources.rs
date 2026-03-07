@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
-    tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_project},
+    tool_util::{db_outcome_to_mcp_result, get_db_pool},
 };
 
 fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
@@ -62,6 +62,19 @@ fn parse_resource_limit(query: &HashMap<String, String>) -> usize {
                 usize::try_from(v).map_or(RESOURCE_LIMIT_MAX, |u| u.min(RESOURCE_LIMIT_MAX))
             }
         })
+}
+
+fn parse_resource_since_ts(query: &HashMap<String, String>) -> McpResult<Option<i64>> {
+    match query.get("since_ts") {
+        None => Ok(None),
+        Some(raw) if raw.trim().is_empty() => Ok(None),
+        Some(raw) => iso_to_micros(raw).map(Some).ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                format!("Invalid since_ts value: {raw}"),
+            )
+        }),
+    }
 }
 
 fn parse_attachment_metadata(input: &str) -> Vec<serde_json::Value> {
@@ -191,6 +204,27 @@ async fn resolve_resource_agent(
             p.message()
         ))),
     }
+}
+
+async fn resolve_existing_resource_project(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_key: &str,
+) -> McpResult<mcp_agent_mail_db::ProjectRow> {
+    let project_key = project_key.trim();
+    if project_key.is_empty() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "project query parameter is required",
+        ));
+    }
+
+    let projects =
+        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), pool).await)?;
+    projects
+        .into_iter()
+        .find(|project| project.slug == project_key || project.human_key == project_key)
+        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))
 }
 
 // Float -> int casts saturate, but we treat out-of-range values as invalid timestamps.
@@ -353,7 +387,7 @@ pub struct AgentsListResponse {
 pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<String> {
     let (project_key, _query) = split_param_and_query(&project_key);
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 
@@ -1910,7 +1944,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
     }
 
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     // Get message from DB
@@ -1971,13 +2005,15 @@ pub struct ThreadMessageEntry {
 pub struct ThreadDetails {
     pub thread_id: String,
     pub project: String,
+    pub limit: usize,
+    pub truncated: bool,
     pub messages: Vec<ThreadMessageEntry>,
 }
 
 /// Get thread messages.
 #[resource(
     uri = "resource://thread/{thread_id}",
-    description = "List messages for a thread within a project.\n\nWhen to use\n-----------\n- Present a conversation view for a given ticket/thread key.\n- Export a thread for summarization or reporting.\n\nParameters\n----------\nthread_id : str\n    Either a string thread key or a numeric message id to seed the thread.\nproject : str\n    Project slug or human key (required).\ninclude_bodies : bool\n    Include message bodies if true (default false).\n\nReturns\n-------\ndict\n    { project, thread_id, messages: [{...}] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/TKT-123?project=/abs/path/backend&include_bodies=true\"}}\n```\n\nNumeric seed example (message id as thread seed):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/1234?project=/abs/path/backend\"}}\n```"
+    description = "List messages for a thread within a project.\n\nWhen to use\n-----------\n- Present a conversation view for a given ticket/thread key.\n- Export a thread for summarization or reporting.\n\nParameters\n----------\nthread_id : str\n    Either a string thread key or a numeric message id to seed the thread.\nproject : str\n    Project slug or human key (required).\ninclude_bodies : bool\n    Include message bodies if true (default false).\nlimit : int\n    Max number of messages to return (default 10,000).\n\nReturns\n-------\ndict\n    { project, thread_id, limit, truncated, messages: [{...}] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/TKT-123?project=/abs/path/backend&include_bodies=true\"}}\n```\n\nNumeric seed example (message id as thread seed):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/1234?project=/abs/path/backend\"}}\n```"
 )]
 pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<String> {
     let (thread_id_str, query) = split_param_and_query(&thread_id);
@@ -1986,6 +2022,16 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     let include_bodies = query
         .get("include_bodies")
         .is_some_and(|v| parse_bool_param(v));
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .map_or(RESOURCE_LIMIT_MAX, |value| {
+            if value <= 0 {
+                RESOURCE_LIMIT_MAX
+            } else {
+                usize::try_from(value).map_or(RESOURCE_LIMIT_MAX, |u| u.min(RESOURCE_LIMIT_MAX))
+            }
+        });
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2008,16 +2054,20 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     let project_id = project.id.unwrap_or(0);
 
     // Get thread messages
-    let rows = db_outcome_to_mcp_result(
+    let mut rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_thread_messages(
             ctx.cx(),
             &pool,
             project_id,
             &thread_id_str,
-            Some(100), // limit
+            Some(limit.saturating_add(1)),
         )
         .await,
     )?;
+    let truncated = rows.len() > limit;
+    if truncated {
+        rows.truncate(limit);
+    }
 
     // Sender names are already materialized by `list_thread_messages`.
     let mut messages: Vec<ThreadMessageEntry> = Vec::with_capacity(rows.len());
@@ -2044,6 +2094,8 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     let thread = ThreadDetails {
         thread_id: thread_id_str.clone(),
         project: project.human_key,
+        limit,
+        truncated,
         messages,
     };
 
@@ -2115,7 +2167,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let urgent_only = query
         .get("urgent_only")
         .is_some_and(|v| parse_bool_param(v));
-    let since_ts: Option<i64> = query.get("since_ts").and_then(|v| iso_to_micros(v));
+    let since_ts = parse_resource_since_ts(&query)?;
     let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {
@@ -2127,21 +2179,13 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 
     let pool = get_db_pool()?;
 
-    // Find project by slug or human_key
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 
-    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
-        .await?
-        .id
-        .unwrap_or(0);
+    let agent = resolve_resource_agent(ctx, &pool, project_id, &agent_name).await?;
+    let agent_id = agent.id.unwrap_or(0);
+    let agent_name = agent.name;
 
     // Fetch inbox messages
     let inbox_rows = db_outcome_to_mcp_result(
@@ -2161,26 +2205,12 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         .into_iter()
         .map(|row| {
             let msg = &row.message;
-            // Generate placeholder commit metadata matching Python output format
-            let commit_summary = format!(
-                "mail: {} -> {} | {}",
-                row.sender_name, agent_name, msg.subject
+            let commit_summary = unavailable_commit_summary(
+                "received",
+                &row.sender_name,
+                Some(&agent_name),
+                &msg.subject,
             );
-            let created_ts_str = micros_to_iso(msg.created_ts);
-            let excerpt = vec![
-                "+---json".to_string(),
-                "+{".to_string(),
-                format!("+  \"ack_required\": {},", msg.ack_required != 0),
-                "+  \"attachments\": [],".to_string(),
-                "+  \"bcc\": [],".to_string(),
-                "+  \"cc\": [],".to_string(),
-                format!("+  \"created\": \"{created_ts_str}\","),
-                format!("+  \"from\": \"{}\",", row.sender_name),
-                format!("+  \"id\": {},", msg.id.unwrap_or(0)),
-                format!("+  \"importance\": \"{}\",", msg.importance),
-                format!("+  \"project\": \"{}\",", project.human_key),
-                format!("+  \"project_slug\": \"{}\",", project.slug),
-            ];
 
             InboxResourceMessage {
                 id: msg.id.unwrap_or(0),
@@ -2199,14 +2229,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 } else {
                     None
                 },
-                commit: CommitMetadata {
-                    authored_ts: None,
-                    deletions: 0,
-                    diff_summary: DiffSummary { excerpt, hunks: 1 },
-                    hexsha: None,
-                    insertions: 21 + i64::from(msg.thread_id.is_some()),
-                    summary: commit_summary,
-                },
+                commit: unavailable_inbox_commit_metadata(commit_summary),
             }
         })
         .collect();
@@ -2307,16 +2330,85 @@ pub struct MailboxResponseFull {
     pub messages: Vec<MailboxMessageEntryFull>,
 }
 
-/// Get combined inbox/outbox for an agent.
-#[resource(
-    uri = "resource://mailbox/{agent}",
-    description = "List recent messages in an agent's mailbox with lightweight Git commit context.\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [{ id, subject, from, created_ts, importance, ack_required, kind, commit: {hexsha, summary} | null }] }"
-)]
-pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
-    let (agent_name, query) = split_param_and_query(&agent);
-    let project_key = query.get("project").cloned().unwrap_or_default();
-    let limit = parse_resource_limit(&query);
+struct MailboxResourceRequest {
+    agent_name: String,
+    project_key: String,
+    limit: usize,
+}
 
+struct ResolvedMailboxResourceRequest {
+    project: mcp_agent_mail_db::ProjectRow,
+    project_id: i64,
+    agent_id: i64,
+    agent_name: String,
+    limit: usize,
+}
+
+struct OutboxLoadOptions<'a> {
+    project_id: i64,
+    agent_id: i64,
+    agent_name: &'a str,
+    limit: usize,
+    include_bodies: bool,
+    since_ts: Option<i64>,
+}
+
+fn unavailable_commit_summary(
+    direction: &str,
+    from: &str,
+    counterpart: Option<&str>,
+    subject: &str,
+) -> String {
+    counterpart
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || format!("Commit metadata unavailable for {direction} message: {from} | {subject}"),
+            |counterpart| {
+            format!(
+                "Commit metadata unavailable for {direction} message: {from} -> {counterpart} | {subject}"
+            )
+            },
+        )
+}
+
+const fn unavailable_inbox_commit_metadata(summary: String) -> CommitMetadata {
+    CommitMetadata {
+        authored_ts: None,
+        deletions: 0,
+        diff_summary: DiffSummary {
+            excerpt: Vec::new(),
+            hunks: 0,
+        },
+        hexsha: None,
+        insertions: 0,
+        summary,
+    }
+}
+
+const fn unavailable_simple_commit_metadata(summary: String) -> MailboxCommitMetaSimple {
+    MailboxCommitMetaSimple {
+        hexsha: None,
+        summary,
+    }
+}
+
+const fn unavailable_full_commit_metadata(summary: String) -> MailboxCommitMetaFull {
+    MailboxCommitMetaFull {
+        authored_ts: None,
+        deletions: 0,
+        diff_summary: MailboxDiffSummary {
+            excerpt: None,
+            hunks: 0,
+        },
+        hexsha: None,
+        insertions: 0,
+        summary,
+    }
+}
+
+fn parse_mailbox_resource_request(agent: &str) -> McpResult<MailboxResourceRequest> {
+    let (agent_name, query) = split_param_and_query(agent);
+    let project_key = query.get("project").cloned().unwrap_or_default();
     if project_key.is_empty() {
         return Err(McpError::new(
             McpErrorCode::InvalidParams,
@@ -2324,66 +2416,373 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         ));
     }
 
-    let pool = get_db_pool()?;
+    Ok(MailboxResourceRequest {
+        agent_name,
+        project_key,
+        limit: parse_resource_limit(&query),
+    })
+}
 
-    // Find project
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
-
+async fn resolve_mailbox_resource_request(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    agent: &str,
+) -> McpResult<ResolvedMailboxResourceRequest> {
+    let request = parse_mailbox_resource_request(agent)?;
+    let project = resolve_existing_resource_project(ctx, pool, &request.project_key).await?;
     let project_id = project.id.unwrap_or(0);
+    let agent = resolve_resource_agent(ctx, pool, project_id, &request.agent_name).await?;
 
-    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
-        .await?
-        .id
-        .unwrap_or(0);
+    Ok(ResolvedMailboxResourceRequest {
+        project,
+        project_id,
+        agent_id: agent.id.unwrap_or(0),
+        agent_name: agent.name,
+        limit: request.limit,
+    })
+}
 
-    // Fetch inbox messages
+fn outbox_query(
+    options: &OutboxLoadOptions<'_>,
+    limit_i64: i64,
+) -> (String, Vec<mcp_agent_mail_db::sqlmodel::Value>) {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    options.since_ts.map_or_else(
+        || {
+            (
+                "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
+                 importance, ack_required, created_ts, attachments \
+                 FROM messages \
+                 WHERE project_id = ? AND sender_id = ? \
+                 ORDER BY created_ts + 0 DESC LIMIT ?"
+                    .to_string(),
+                vec![
+                    Value::BigInt(options.project_id),
+                    Value::BigInt(options.agent_id),
+                    Value::BigInt(limit_i64),
+                ],
+            )
+        },
+        |ts| {
+            (
+                "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
+                 importance, ack_required, created_ts, attachments \
+                 FROM messages \
+                 WHERE project_id = ? AND sender_id = ? AND created_ts > ? \
+                 ORDER BY created_ts + 0 DESC LIMIT ?"
+                    .to_string(),
+                vec![
+                    Value::BigInt(options.project_id),
+                    Value::BigInt(options.agent_id),
+                    Value::BigInt(ts),
+                    Value::BigInt(limit_i64),
+                ],
+            )
+        },
+    )
+}
+
+fn split_outbox_recipient_lists(
+    recip_rows: Vec<mcp_agent_mail_db::sqlmodel::Row>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut to_list: Vec<String> = Vec::with_capacity(4);
+    let mut cc_list: Vec<String> = Vec::with_capacity(2);
+    let mut bcc_list: Vec<String> = Vec::with_capacity(2);
+    for rr in recip_rows {
+        let name: String = rr.get_named("name").unwrap_or_default();
+        let kind: String = rr.get_named("kind").unwrap_or_default();
+        match kind.as_str() {
+            "cc" => cc_list.push(name),
+            "bcc" => bcc_list.push(name),
+            _ => to_list.push(name),
+        }
+    }
+    (to_list, cc_list, bcc_list)
+}
+
+fn outbox_message_from_row(
+    options: &OutboxLoadOptions<'_>,
+    row: &mcp_agent_mail_db::sqlmodel::Row,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+) -> OutboxMessageEntry {
+    let id: i64 = row.get_as(0).unwrap_or(0);
+    let subject: String = row.get_as(4).unwrap_or_default();
+    let summary = unavailable_commit_summary(
+        "sent",
+        options.agent_name,
+        to.first().map(String::as_str),
+        &subject,
+    );
+
+    OutboxMessageEntry {
+        id,
+        project_id: row.get_as(1).unwrap_or(0),
+        sender_id: row.get_as(2).unwrap_or(0),
+        thread_id: row.get_as(3).ok(),
+        subject,
+        importance: row.get_as(6).unwrap_or_default(),
+        ack_required: row.get_as::<i64>(7).unwrap_or(0) != 0,
+        created_ts: Some(micros_to_iso(row.get_as(8).unwrap_or(0))),
+        attachments: parse_attachment_metadata(&row.get_as::<String>(9).unwrap_or_default()),
+        from: options.agent_name.to_string(),
+        body_md: if options.include_bodies {
+            row.get_as(5).unwrap_or_default()
+        } else {
+            String::new()
+        },
+        to,
+        cc,
+        bcc,
+        commit: unavailable_full_commit_metadata(summary),
+    }
+}
+
+async fn load_outbox_messages(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    options: OutboxLoadOptions<'_>,
+) -> McpResult<Vec<OutboxMessageEntry>> {
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    let conn = match pool.acquire(ctx.cx()).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Err(McpError::internal_error(e.to_string())),
+        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+        Outcome::Panicked(p) => {
+            return Err(McpError::internal_error(format!(
+                "Internal panic: {}",
+                p.message()
+            )));
+        }
+    };
+
+    let limit_i64 = i64::try_from(options.limit).unwrap_or(20);
+    let (sql, params): (String, Vec<Value>) = outbox_query(&options, limit_i64);
+
+    let start = mcp_agent_mail_db::query_timer();
+    let rows = conn.query_sync(&sql, &params);
+    mcp_agent_mail_db::record_query(&sql, mcp_agent_mail_db::elapsed_us(start));
+    let rows = rows.map_err(|e| McpError::internal_error(e.to_string()))?;
+
+    let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.get_as(0).unwrap_or(0);
+        let recip_sql = "SELECT a.name, r.kind FROM message_recipients r \
+                        JOIN agents a ON a.id = r.agent_id \
+                        WHERE r.message_id = ?";
+        let recip_params = [Value::BigInt(id)];
+        let recip_start = mcp_agent_mail_db::query_timer();
+        let recip_rows = conn.query_sync(recip_sql, &recip_params);
+        mcp_agent_mail_db::record_query(recip_sql, mcp_agent_mail_db::elapsed_us(recip_start));
+        let recip_rows = recip_rows.map_err(|e| McpError::internal_error(e.to_string()))?;
+        let (to_list, cc_list, bcc_list) = split_outbox_recipient_lists(recip_rows);
+        messages.push(outbox_message_from_row(
+            &options, &row, to_list, cc_list, bcc_list,
+        ));
+    }
+
+    Ok(messages)
+}
+
+async fn load_mailbox_messages(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    request: &ResolvedMailboxResourceRequest,
+) -> McpResult<(
+    Vec<mcp_agent_mail_db::queries::InboxRow>,
+    Vec<OutboxMessageEntry>,
+)> {
     let inbox_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::fetch_inbox(
             ctx.cx(),
-            &pool,
-            project_id,
-            agent_id,
+            pool,
+            request.project_id,
+            request.agent_id,
             false,
             None,
-            limit,
+            request.limit,
         )
         .await,
     )?;
 
-    // Simple mailbox format: just hexsha and summary (file_reservation style)
-    let messages: Vec<MailboxMessageEntrySimple> = inbox_rows
+    let outbox_messages = load_outbox_messages(
+        ctx,
+        pool,
+        OutboxLoadOptions {
+            project_id: request.project_id,
+            agent_id: request.agent_id,
+            agent_name: &request.agent_name,
+            limit: request.limit,
+            include_bodies: false,
+            since_ts: None,
+        },
+    )
+    .await?;
+
+    Ok((inbox_rows, outbox_messages))
+}
+
+fn mailbox_created_ts(created_ts: Option<&str>) -> i64 {
+    created_ts.and_then(iso_to_micros).unwrap_or(0)
+}
+
+fn sort_mailbox_messages<T>(mut messages: Vec<(i64, i64, T)>, limit: usize) -> Vec<T> {
+    messages.sort_by(|(left_ts, left_id, _), (right_ts, right_id, _)| {
+        right_ts.cmp(left_ts).then_with(|| right_id.cmp(left_id))
+    });
+    messages
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, message)| message)
+        .collect()
+}
+
+fn mailbox_simple_messages(
+    inbox_rows: Vec<mcp_agent_mail_db::queries::InboxRow>,
+    outbox_messages: Vec<OutboxMessageEntry>,
+    agent_name: &str,
+    limit: usize,
+) -> Vec<MailboxMessageEntrySimple> {
+    let mut messages: Vec<(i64, i64, MailboxMessageEntrySimple)> = inbox_rows
         .into_iter()
         .map(|row| {
-            let msg = &row.message;
-            MailboxMessageEntrySimple {
-                id: msg.id.unwrap_or(0),
-                project_id: msg.project_id,
-                sender_id: msg.sender_id,
-                thread_id: msg.thread_id.clone(),
-                subject: msg.subject.clone(),
-                importance: msg.importance.clone(),
-                ack_required: msg.ack_required != 0,
-                created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: parse_attachment_metadata(&msg.attachments),
-                from: row.sender_name.clone(),
-                kind: row.kind.clone(),
-                commit: MailboxCommitMetaSimple {
-                    hexsha: None,
-                    summary: format!("file_reservation: {} src/**", row.sender_name),
+            let msg = row.message;
+            let message_id = msg.id.unwrap_or(0);
+            let summary = unavailable_commit_summary(
+                "received",
+                &row.sender_name,
+                Some(agent_name),
+                &msg.subject,
+            );
+            (
+                msg.created_ts,
+                message_id,
+                MailboxMessageEntrySimple {
+                    id: message_id,
+                    project_id: msg.project_id,
+                    sender_id: msg.sender_id,
+                    thread_id: msg.thread_id,
+                    subject: msg.subject,
+                    importance: msg.importance,
+                    ack_required: msg.ack_required != 0,
+                    created_ts: Some(micros_to_iso(msg.created_ts)),
+                    attachments: parse_attachment_metadata(&msg.attachments),
+                    from: row.sender_name,
+                    kind: row.kind,
+                    commit: unavailable_simple_commit_metadata(summary),
                 },
-            }
+            )
         })
         .collect();
 
+    messages.extend(outbox_messages.into_iter().map(|row| {
+        (
+            mailbox_created_ts(row.created_ts.as_deref()),
+            row.id,
+            MailboxMessageEntrySimple {
+                id: row.id,
+                project_id: row.project_id,
+                sender_id: row.sender_id,
+                thread_id: row.thread_id,
+                subject: row.subject,
+                importance: row.importance,
+                ack_required: row.ack_required,
+                created_ts: row.created_ts,
+                attachments: row.attachments,
+                from: row.from,
+                kind: "outbox".to_string(),
+                commit: unavailable_simple_commit_metadata(row.commit.summary),
+            },
+        )
+    }));
+
+    sort_mailbox_messages(messages, limit)
+}
+
+fn mailbox_full_messages(
+    inbox_rows: Vec<mcp_agent_mail_db::queries::InboxRow>,
+    outbox_messages: Vec<OutboxMessageEntry>,
+    agent_name: &str,
+    limit: usize,
+) -> Vec<MailboxMessageEntryFull> {
+    let mut messages: Vec<(i64, i64, MailboxMessageEntryFull)> = inbox_rows
+        .into_iter()
+        .map(|row| {
+            let msg = row.message;
+            let message_id = msg.id.unwrap_or(0);
+            let summary = unavailable_commit_summary(
+                "received",
+                &row.sender_name,
+                Some(agent_name),
+                &msg.subject,
+            );
+            (
+                msg.created_ts,
+                message_id,
+                MailboxMessageEntryFull {
+                    id: message_id,
+                    project_id: msg.project_id,
+                    sender_id: msg.sender_id,
+                    thread_id: msg.thread_id,
+                    subject: msg.subject,
+                    importance: msg.importance,
+                    ack_required: msg.ack_required != 0,
+                    created_ts: Some(micros_to_iso(msg.created_ts)),
+                    attachments: parse_attachment_metadata(&msg.attachments),
+                    from: row.sender_name,
+                    kind: row.kind,
+                    commit: unavailable_full_commit_metadata(summary),
+                },
+            )
+        })
+        .collect();
+
+    messages.extend(outbox_messages.into_iter().map(|row| {
+        (
+            mailbox_created_ts(row.created_ts.as_deref()),
+            row.id,
+            MailboxMessageEntryFull {
+                id: row.id,
+                project_id: row.project_id,
+                sender_id: row.sender_id,
+                thread_id: row.thread_id,
+                subject: row.subject,
+                importance: row.importance,
+                ack_required: row.ack_required,
+                created_ts: row.created_ts,
+                attachments: row.attachments,
+                from: row.from,
+                kind: "outbox".to_string(),
+                commit: unavailable_full_commit_metadata(row.commit.summary),
+            },
+        )
+    }));
+
+    sort_mailbox_messages(messages, limit)
+}
+
+/// Get combined inbox/outbox for an agent.
+#[resource(
+    uri = "resource://mailbox/{agent}",
+    description = "List recent messages in an agent's mailbox with commit metadata fields. When archive commit data is unavailable, the `commit.summary` explicitly says so.\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [{ id, subject, from, created_ts, importance, ack_required, kind, commit: {hexsha, summary} | null }] }"
+)]
+pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let request = resolve_mailbox_resource_request(ctx, &pool, &agent).await?;
+    let (inbox_rows, outbox_messages) = load_mailbox_messages(ctx, &pool, &request).await?;
+    let messages = mailbox_simple_messages(
+        inbox_rows,
+        outbox_messages,
+        &request.agent_name,
+        request.limit,
+    );
     let count = messages.len();
     let response = MailboxResponseSimple {
-        project: project.human_key,
-        agent: agent_name,
+        project: request.project.human_key,
+        agent: request.agent_name,
         count,
         messages,
     };
@@ -2395,91 +2794,22 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 /// Get mailbox with recent commits for an agent.
 #[resource(
     uri = "resource://mailbox-with-commits/{agent}",
-    description = "List recent messages in an agent's mailbox with commit metadata including diff summaries."
+    description = "List recent messages in an agent's mailbox with commit metadata fields, including explicit unavailable markers when no archive commit data is resolved."
 )]
 pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<String> {
-    let (agent_name, query) = split_param_and_query(&agent);
-    let project_key = query.get("project").cloned().unwrap_or_default();
-    let limit = parse_resource_limit(&query);
-
-    if project_key.is_empty() {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "project query parameter is required",
-        ));
-    }
-
     let pool = get_db_pool()?;
-
-    // Find project
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
-
-    let project_id = project.id.unwrap_or(0);
-
-    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
-        .await?
-        .id
-        .unwrap_or(0);
-
-    // Fetch inbox messages
-    let inbox_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_inbox(
-            ctx.cx(),
-            &pool,
-            project_id,
-            agent_id,
-            false,
-            None,
-            limit,
-        )
-        .await,
-    )?;
-
-    // Full commit metadata format
-    let messages: Vec<MailboxMessageEntryFull> = inbox_rows
-        .into_iter()
-        .map(|row| {
-            let msg = &row.message;
-            let summary = format!(
-                "mail: {} -> {} | {}",
-                row.sender_name, agent_name, msg.subject
-            );
-            MailboxMessageEntryFull {
-                id: msg.id.unwrap_or(0),
-                project_id: msg.project_id,
-                sender_id: msg.sender_id,
-                thread_id: msg.thread_id.clone(),
-                subject: msg.subject.clone(),
-                importance: msg.importance.clone(),
-                ack_required: msg.ack_required != 0,
-                created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: parse_attachment_metadata(&msg.attachments),
-                from: row.sender_name.clone(),
-                kind: row.kind.clone(),
-                commit: MailboxCommitMetaFull {
-                    authored_ts: None,
-                    deletions: 0,
-                    diff_summary: MailboxDiffSummary {
-                        excerpt: None,
-                        hunks: 1,
-                    },
-                    hexsha: None,
-                    insertions: 21 + i64::from(msg.thread_id.is_some()),
-                    summary,
-                },
-            }
-        })
-        .collect();
-
+    let request = resolve_mailbox_resource_request(ctx, &pool, &agent).await?;
+    let (inbox_rows, outbox_messages) = load_mailbox_messages(ctx, &pool, &request).await?;
+    let messages = mailbox_full_messages(
+        inbox_rows,
+        outbox_messages,
+        &request.agent_name,
+        request.limit,
+    );
     let count = messages.len();
     let response = MailboxResponseFull {
-        project: project.human_key,
-        agent: agent_name,
+        project: request.project.human_key,
+        agent: request.agent_name,
         count,
         messages,
     };
@@ -2520,19 +2850,16 @@ pub struct OutboxResponse {
 /// Get outbox for an agent.
 #[resource(
     uri = "resource://outbox/{agent}",
-    description = "List messages sent by the agent, enriched with commit metadata for canonical files."
+    description = "List messages sent by the agent with commit metadata fields. When archive commit data is unavailable, the response marks that explicitly instead of fabricating values."
 )]
-#[allow(clippy::too_many_lines)]
 pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
-    use mcp_agent_mail_db::sqlmodel::Value;
-
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
     let limit = parse_resource_limit(&query);
     let include_bodies = query
         .get("include_bodies")
         .is_some_and(|v| parse_bool_param(v));
-    let since_ts: Option<i64> = query.get("since_ts").and_then(|v| iso_to_micros(v));
+    let since_ts = parse_resource_since_ts(&query)?;
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2543,146 +2870,27 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
 
     let pool = get_db_pool()?;
 
-    // Find project
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 
-    let agent_id = resolve_resource_agent(ctx, &pool, project_id, &agent_name)
-        .await?
-        .id
-        .unwrap_or(0);
+    let agent = resolve_resource_agent(ctx, &pool, project_id, &agent_name).await?;
+    let agent_id = agent.id.unwrap_or(0);
+    let agent_name = agent.name;
 
-    // Query sent messages (where sender_id = agent_id)
-    let conn = match pool.acquire(ctx.cx()).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Err(McpError::internal_error(e.to_string())),
-        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-        Outcome::Panicked(p) => {
-            return Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                p.message()
-            )));
-        }
-    };
-
-    let limit_i64 = i64::try_from(limit).unwrap_or(20);
-    #[allow(clippy::option_if_let_else)]
-    let (sql, params): (String, Vec<Value>) = if let Some(ts) = since_ts {
-        (
-            "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
-             importance, ack_required, created_ts, attachments \
-             FROM messages \
-             WHERE project_id = ? AND sender_id = ? AND created_ts > ? \
-             ORDER BY created_ts + 0 DESC LIMIT ?"
-                .to_string(),
-            vec![
-                Value::BigInt(project_id),
-                Value::BigInt(agent_id),
-                Value::BigInt(ts),
-                Value::BigInt(limit_i64),
-            ],
-        )
-    } else {
-        (
-            "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
-             importance, ack_required, created_ts, attachments \
-             FROM messages \
-             WHERE project_id = ? AND sender_id = ? \
-             ORDER BY created_ts + 0 DESC LIMIT ?"
-                .to_string(),
-            vec![
-                Value::BigInt(project_id),
-                Value::BigInt(agent_id),
-                Value::BigInt(limit_i64),
-            ],
-        )
-    };
-
-    let start = mcp_agent_mail_db::query_timer();
-    let rows = conn.query_sync(&sql, &params);
-    mcp_agent_mail_db::record_query(&sql, mcp_agent_mail_db::elapsed_us(start));
-    let rows = rows.map_err(|e| McpError::internal_error(e.to_string()))?;
-
-    let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: i64 = row.get_as(0).unwrap_or(0);
-        let msg_project_id: i64 = row.get_as(1).unwrap_or(0);
-        let sender_id: i64 = row.get_as(2).unwrap_or(0);
-        let thread_id: Option<String> = row.get_as(3).ok();
-        let subject: String = row.get_as(4).unwrap_or_default();
-        let body_md: String = if include_bodies {
-            row.get_as(5).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let importance: String = row.get_as(6).unwrap_or_default();
-        let ack_required: i64 = row.get_as(7).unwrap_or(0);
-        let created_ts: i64 = row.get_as(8).unwrap_or(0);
-        let attachments_json: String = row.get_as(9).unwrap_or_default();
-
-        // Get recipients for this message
-        let recip_sql = "SELECT a.name, r.kind FROM message_recipients r \
-                        JOIN agents a ON a.id = r.agent_id \
-                        WHERE r.message_id = ?";
-        let recip_params = [Value::BigInt(id)];
-        let recip_start = mcp_agent_mail_db::query_timer();
-        let recip_rows = conn.query_sync(recip_sql, &recip_params);
-        mcp_agent_mail_db::record_query(recip_sql, mcp_agent_mail_db::elapsed_us(recip_start));
-        let recip_rows = recip_rows.map_err(|e| McpError::internal_error(e.to_string()))?;
-
-        let mut to_list: Vec<String> = Vec::with_capacity(4);
-        let mut cc_list: Vec<String> = Vec::with_capacity(2);
-        let mut bcc_list: Vec<String> = Vec::with_capacity(2);
-        for rr in recip_rows {
-            let name: String = rr.get_named("name").unwrap_or_default();
-            let kind: String = rr.get_named("kind").unwrap_or_default();
-            match kind.as_str() {
-                "cc" => cc_list.push(name),
-                "bcc" => bcc_list.push(name),
-                // "to" or any other kind defaults to to_list
-                _ => to_list.push(name),
-            }
-        }
-
-        // Build summary - find first "to" recipient
-        let first_to = to_list.first().cloned().unwrap_or_default();
-        let summary = format!("mail: {agent_name} -> {first_to} | {subject}");
-        let has_thread_id = thread_id.is_some();
-
-        messages.push(OutboxMessageEntry {
-            id,
-            project_id: msg_project_id,
-            sender_id,
-            thread_id,
-            subject,
-            importance,
-            ack_required: ack_required != 0,
-            created_ts: Some(micros_to_iso(created_ts)),
-            attachments: parse_attachment_metadata(&attachments_json),
-            from: agent_name.clone(),
-            body_md,
-            to: to_list,
-            cc: cc_list,
-            bcc: bcc_list,
-            commit: MailboxCommitMetaFull {
-                authored_ts: None,
-                deletions: 0,
-                diff_summary: MailboxDiffSummary {
-                    excerpt: None,
-                    hunks: 1,
-                },
-                hexsha: None,
-                insertions: 21 + i64::from(has_thread_id),
-                summary,
-            },
-        });
-    }
+    let messages = load_outbox_messages(
+        ctx,
+        &pool,
+        OutboxLoadOptions {
+            project_id,
+            agent_id,
+            agent_name: &agent_name,
+            limit,
+            include_bodies,
+            since_ts,
+        },
+    )
+    .await?;
 
     let count = messages.len();
     let response = OutboxResponse {
@@ -2843,25 +3051,19 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
         .id
         .unwrap_or(0);
 
-    // Fetch full inbox (no pre-limit) so post-filter for ack_required gets enough rows
     let inbox_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_inbox(
+        mcp_agent_mail_db::queries::fetch_inbox_ack_required(
             ctx.cx(),
             &pool,
             project_id,
             agent_id,
-            false,
-            None,
-            500, // fetch generously; limit applied after filter
+            limit,
         )
         .await,
     )?;
 
-    // Filter for ack_required messages that haven't been acknowledged yet, then apply limit
     let messages: Vec<ViewMessageEntry> = inbox_rows
         .into_iter()
-        .filter(|row| row.message.ack_required != 0 && row.ack_ts.is_none())
-        .take(limit)
         .map(|row| {
             let msg = &row.message;
             ViewMessageEntry {
@@ -3122,10 +3324,10 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
 // ============================================================================
 
 #[derive(Debug, Clone, Default)]
-struct ReservationPatternActivity {
-    matches: bool,
-    fs_activity_micros: Option<i64>,
-    git_activity_micros: Option<i64>,
+pub(crate) struct ReservationPatternActivity {
+    pub(crate) matches: bool,
+    pub(crate) fs_activity_micros: Option<i64>,
+    pub(crate) git_activity_micros: Option<i64>,
 }
 
 const RESERVATION_GLOB_MARKERS: &[char] = &['*', '?', '[', '{'];
@@ -3144,7 +3346,7 @@ fn reservation_normalize_pattern(pattern: &str) -> String {
     s.trim_start_matches('/').trim().to_string()
 }
 
-fn reservation_project_workspace_path(project_human_key: &str) -> Option<PathBuf> {
+pub(crate) fn reservation_project_workspace_path(project_human_key: &str) -> Option<PathBuf> {
     let candidate = PathBuf::from(project_human_key);
     if candidate.exists() {
         Some(candidate)
@@ -3153,7 +3355,7 @@ fn reservation_project_workspace_path(project_human_key: &str) -> Option<PathBuf
     }
 }
 
-fn reservation_open_repo_root(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn reservation_open_repo_root(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
     let repo = git2::Repository::discover(workspace).ok()?;
     let root = repo.workdir()?.to_path_buf();
     let root_canon = root.canonicalize().unwrap_or(root);
@@ -3225,7 +3427,74 @@ fn reservation_git_latest_activity_micros(repo_root: &Path, pathspecs: &[String]
     best
 }
 
-fn reservation_compute_pattern_activity(
+fn reservation_glob_matcher(normalized_pattern: &str) -> Option<globset::GlobMatcher> {
+    globset::GlobBuilder::new(normalized_pattern)
+        .literal_separator(true)
+        .build()
+        .ok()
+        .map(|glob| glob.compile_matcher())
+}
+
+fn reservation_glob_walk_latest_micros(
+    workspace: &Path,
+    matcher: &globset::GlobMatcher,
+) -> (bool, Option<i64>) {
+    let mut stack = vec![workspace.to_path_buf()];
+    let mut matched_any = false;
+    let mut fs_latest: Option<i64> = None;
+    let mut visited_entries = 0usize;
+
+    while let Some(dir) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in read_dir.flatten() {
+            if visited_entries >= 20_000 {
+                return (matched_any, fs_latest);
+            }
+            visited_entries += 1;
+
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Ok(rel) = path.strip_prefix(workspace) else {
+                continue;
+            };
+            let rel = reservation_path_to_slash_string(rel);
+            if !matcher.is_match(&rel) {
+                continue;
+            }
+
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            matched_any = true;
+            if let Ok(modified) = meta.modified()
+                && let Some(micros) = reservation_system_time_to_micros(modified)
+            {
+                fs_latest = Some(fs_latest.map_or(micros, |prev| prev.max(micros)));
+            }
+        }
+    }
+
+    (matched_any, fs_latest)
+}
+
+pub(crate) fn reservation_compute_pattern_activity(
     workspace: Option<&Path>,
     repo_root: Option<&Path>,
     workspace_rel: Option<&Path>,
@@ -3243,46 +3512,57 @@ fn reservation_compute_pattern_activity(
     let want_git = repo_root.is_some() && workspace_rel.is_some();
 
     let has_glob = reservation_contains_glob(&normalized);
-    let mut matches = false;
+    let mut matched_paths = false;
     let mut fs_latest: Option<i64> = None;
 
     if has_glob {
-        // IMPORTANT: Do not expand globs by walking the filesystem. Broad patterns like `src/**`
-        // can explode to thousands of matches and stall the MCP server.
-        //
-        // Instead, treat "matched" as "base directory exists" and ask git for the latest commit
-        // affecting the pathspec via `:(glob)` magic (cheap and bounded).
-        let base_dir = {
-            let first_glob = normalized
-                .char_indices()
-                .find_map(|(idx, ch)| RESERVATION_GLOB_MARKERS.contains(&ch).then_some(idx))
-                .unwrap_or(0);
-            let prefix = &normalized[..first_glob];
-            if prefix.ends_with('/') {
-                prefix.trim_end_matches('/')
-            } else {
-                prefix
-                    .rsplit_once('/')
-                    .map_or("", |(dir, _)| dir.trim_end_matches('/'))
-            }
-        };
+        let spec = reservation_git_pathspec(
+            workspace_rel.unwrap_or_else(|| std::path::Path::new("")),
+            &normalized,
+        );
+        let git_glob = format!(":(glob){spec}");
 
-        let base_path = if base_dir.is_empty() {
-            workspace.to_path_buf()
-        } else {
-            workspace.join(base_dir)
-        };
-
-        if let Ok(meta) = std::fs::metadata(&base_path) {
-            matches = true;
-            if let Ok(modified) = meta.modified() {
-                fs_latest = reservation_system_time_to_micros(modified);
+        if let Some(repo_root) = repo_root
+            && let Ok(out) = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .args([
+                    "ls-files",
+                    "-c",
+                    "-o",
+                    "--exclude-standard",
+                    "--",
+                    &git_glob,
+                ])
+                .output()
+            && out.status.success()
+        {
+            for rel in String::from_utf8_lossy(&out.stdout).lines().take(5000) {
+                let candidate = repo_root.join(rel);
+                let Ok(meta) = std::fs::metadata(&candidate) else {
+                    continue;
+                };
+                matched_paths = true;
+                if let Ok(modified) = meta.modified()
+                    && let Some(micros) = reservation_system_time_to_micros(modified)
+                {
+                    fs_latest = Some(fs_latest.map_or(micros, |prev| prev.max(micros)));
+                }
             }
+        }
+
+        if !matched_paths && let Some(matcher) = reservation_glob_matcher(&normalized) {
+            let (fallback_matches, fallback_latest) =
+                reservation_glob_walk_latest_micros(workspace, &matcher);
+            matched_paths = fallback_matches;
+            fs_latest = fallback_latest;
+        } else if !matched_paths {
+            return ReservationPatternActivity::default();
         }
     } else {
         let candidate = workspace.join(&normalized);
         if candidate.exists() {
-            matches = true;
+            matched_paths = true;
 
             if let Ok(meta) = std::fs::metadata(&candidate)
                 && let Ok(modified) = meta.modified()
@@ -3292,7 +3572,7 @@ fn reservation_compute_pattern_activity(
         }
     }
 
-    let git_activity = if matches && want_git {
+    let git_activity = if matched_paths && want_git {
         let spec = reservation_git_pathspec(
             workspace_rel.unwrap_or_else(|| std::path::Path::new("")),
             &normalized,
@@ -3311,7 +3591,7 @@ fn reservation_compute_pattern_activity(
     };
 
     ReservationPatternActivity {
-        matches,
+        matches: matched_paths,
         fs_activity_micros: fs_latest,
         git_activity_micros: git_activity,
     }
@@ -3369,6 +3649,44 @@ mod reservation_activity_tests {
         assert!(!unmatched.matches);
         assert!(unmatched.git_activity_micros.is_none());
     }
+
+    #[test]
+    fn reservation_compute_pattern_activity_glob_tracks_matched_file_mtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("src")).expect("create src dir");
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").expect("write file");
+
+        run_git(root, &["init", "-b", "main"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test User"]);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "init"]);
+
+        let (repo_root, workspace_rel) =
+            reservation_open_repo_root(root).expect("repo root discoverable");
+        let before = reservation_compute_pattern_activity(
+            Some(root),
+            Some(repo_root.as_path()),
+            Some(workspace_rel.as_path()),
+            "src/*.rs",
+        );
+        assert!(before.matches);
+        let before_fs = before.fs_activity_micros.expect("initial fs activity");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("src/lib.rs"), "fn updated() {}\n").expect("rewrite file");
+
+        let after = reservation_compute_pattern_activity(
+            Some(root),
+            Some(repo_root.as_path()),
+            Some(workspace_rel.as_path()),
+            "src/*.rs",
+        );
+        let after_fs = after.fs_activity_micros.expect("updated fs activity");
+        assert!(after_fs >= before_fs);
+    }
 }
 
 /// File reservation entry (matches Python output format)
@@ -3394,7 +3712,18 @@ fn retain_active_file_reservations(
     rows: &mut Vec<mcp_agent_mail_db::FileReservationRow>,
     now_micros: i64,
 ) {
-    rows.retain(|row| row.released_ts.is_none() && row.expires_ts > now_micros);
+    rows.retain(|row| reservation_row_is_active_at(row, now_micros));
+}
+
+fn reservation_row_is_logically_unreleased(row: &mcp_agent_mail_db::FileReservationRow) -> bool {
+    row.released_ts.is_none_or(|ts| ts <= 0)
+}
+
+fn reservation_row_is_active_at(
+    row: &mcp_agent_mail_db::FileReservationRow,
+    now_micros: i64,
+) -> bool {
+    reservation_row_is_logically_unreleased(row) && row.expires_ts > now_micros
 }
 
 /// Get file reservations for a project.
@@ -3409,28 +3738,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     let pool = get_db_pool()?;
 
-    // Resolve project by slug or human key.
-    let is_absolute = std::path::Path::new(&slug_str).is_absolute();
-    let project = if is_absolute {
-        resolve_project(ctx, &pool, &slug_str).await?
-    } else {
-        match mcp_agent_mail_db::queries::get_project_by_slug(ctx.cx(), &pool, &slug_str).await {
-            asupersync::Outcome::Ok(row) => row,
-            asupersync::Outcome::Err(_) => {
-                return Err(McpError::new(
-                    McpErrorCode::InvalidParams,
-                    "Project not found",
-                ));
-            }
-            asupersync::Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-            asupersync::Outcome::Panicked(p) => {
-                return Err(McpError::internal_error(format!(
-                    "Internal panic: {}",
-                    p.message()
-                )));
-            }
-        }
-    };
+    let project = resolve_existing_resource_project(ctx, &pool, &slug_str).await?;
 
     let project_id = project.id.unwrap_or(0);
 
@@ -3448,6 +3756,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     let repo_info = workspace.as_deref().and_then(reservation_open_repo_root);
     let repo_root = repo_info.as_ref().map(|(root, _)| root.as_path());
     let workspace_rel = repo_info.as_ref().map(|(_, rel)| rel.as_path());
+    let workspace_available = workspace.is_some();
 
     // Cleanup: release any expired (TTL) reservations and any stale reservations.
     //
@@ -3476,10 +3785,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     )?;
 
     // Expire TTL-elapsed reservations (released_ts=NULL AND expires_ts <= now).
-    for row in all_rows
-        .iter()
-        .filter(|r| r.released_ts.is_none() && r.expires_ts <= now_micros)
-    {
+    for row in all_rows.iter().filter(|r| r.expires_ts <= now_micros) {
         let Some(id) = row.id else { continue };
         let updated = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::force_release_reservation(ctx.cx(), &pool, id).await,
@@ -3505,10 +3811,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     }
 
     // Release stale reservations (unreleased + agent inactive + no recent mail/fs/git).
-    for row in all_rows
-        .iter()
-        .filter(|r| r.released_ts.is_none() && r.expires_ts > now_micros)
-    {
+    for row in all_rows.iter().filter(|r| r.expires_ts > now_micros) {
         let Some(id) = row.id else { continue };
         let Some(agent) = agent_by_id.get(&row.agent_id) else {
             continue;
@@ -3533,6 +3836,10 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         };
         let recent_mail =
             mail_activity.is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+
+        if !workspace_available {
+            continue;
+        }
 
         let pat_activity = pattern_activity_cache
             .entry(row.path_pattern.clone())
@@ -3667,7 +3974,8 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             .git_activity_micros
             .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
 
-        let stale = row.released_ts.is_none()
+        let stale = reservation_row_is_logically_unreleased(&row)
+            && workspace_available
             && agent_inactive
             && !(recent_mail || recent_fs || recent_git);
 
@@ -3682,7 +3990,9 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         } else {
             stale_reasons.push(format!("no_recent_mail_activity>{grace_seconds}s"));
         }
-        if pat_activity.matches {
+        if !workspace_available {
+            stale_reasons.push("workspace_unavailable".to_string());
+        } else if pat_activity.matches {
             if recent_fs {
                 stale_reasons.push("filesystem_activity_recent".to_string());
             } else {
@@ -3755,7 +4065,23 @@ mod resource_shape_tests {
         let _lock = RESOURCE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f()
+        let temp = tempfile::tempdir().expect("resource test tempdir");
+        let storage_root = temp.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("resource test storage root");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("resource test storage root utf-8")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            f,
+        )
     }
 
     fn run_async<F, Fut, T>(f: F) -> T
@@ -3867,6 +4193,200 @@ mod resource_shape_tests {
 
     fn parse_json(payload: &str) -> Value {
         serde_json::from_str(payload).expect("valid JSON")
+    }
+
+    struct PopulatedMailboxFixture {
+        ctx: McpContext,
+        project_ref: String,
+        sender_name: String,
+        recipient_name: String,
+        thread_id: String,
+        message_id: i64,
+    }
+
+    async fn setup_populated_mailbox_fixture(cx: &Cx) -> PopulatedMailboxFixture {
+        let pool = get_db_pool().expect("db pool");
+        let project_key = format!("/tmp/resources-populated-{}", unique_suffix());
+        let project = ensure_project(cx, &pool, &project_key).await;
+        let project_id = project.id.unwrap_or(0);
+        let sender = register_agent(cx, &pool, project_id, "SilverFox").await;
+        let recipient = register_agent(cx, &pool, project_id, "GoldenLynx").await;
+        let thread_id = format!("thread-{}", unique_suffix());
+        let message = create_message(
+            cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            recipient.id.unwrap_or(0),
+            "Integration Subject",
+            "Hello from integration test.",
+            &thread_id,
+            true,
+        )
+        .await;
+
+        PopulatedMailboxFixture {
+            ctx: McpContext::new(cx.clone(), 1),
+            project_ref: project.human_key,
+            sender_name: sender.name,
+            recipient_name: recipient.name,
+            thread_id,
+            message_id: message.id.unwrap_or(0),
+        }
+    }
+
+    async fn assert_recipient_mailbox_views(fixture: &PopulatedMailboxFixture) {
+        let inbox_payload = inbox(
+            &fixture.ctx,
+            format!(
+                "{}?project={}&include_bodies=true",
+                fixture.recipient_name, fixture.project_ref
+            ),
+        )
+        .await
+        .expect("inbox");
+        let inbox_value = parse_json(&inbox_payload);
+        assert_eq!(inbox_value["count"], 1);
+        assert_eq!(inbox_value["messages"][0]["subject"], "Integration Subject");
+        assert_eq!(
+            inbox_value["messages"][0]["body_md"],
+            "Hello from integration test."
+        );
+
+        let mailbox_payload = mailbox(
+            &fixture.ctx,
+            format!("{}?project={}", fixture.recipient_name, fixture.project_ref),
+        )
+        .await
+        .expect("mailbox");
+        let mailbox_value = parse_json(&mailbox_payload);
+        assert_eq!(mailbox_value["count"], 1);
+        assert!(
+            mailbox_value["messages"][0]["commit"]["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Commit metadata unavailable")
+        );
+
+        let ack_required_payload = views_ack_required(
+            &fixture.ctx,
+            format!("{}?project={}", fixture.recipient_name, fixture.project_ref),
+        )
+        .await
+        .expect("ack-required view");
+        let ack_required_value = parse_json(&ack_required_payload);
+        assert_eq!(ack_required_value["count"], 1);
+    }
+
+    async fn assert_sender_mailbox_views(fixture: &PopulatedMailboxFixture) {
+        let sender_mailbox_payload = mailbox(
+            &fixture.ctx,
+            format!("{}?project={}", fixture.sender_name, fixture.project_ref),
+        )
+        .await
+        .expect("sender mailbox");
+        let sender_mailbox_value = parse_json(&sender_mailbox_payload);
+        assert_eq!(sender_mailbox_value["count"], 1);
+        assert_eq!(sender_mailbox_value["messages"][0]["kind"], "outbox");
+
+        let sender_mailbox_commits_payload = mailbox_with_commits(
+            &fixture.ctx,
+            format!("{}?project={}", fixture.sender_name, fixture.project_ref),
+        )
+        .await
+        .expect("sender mailbox with commits");
+        let sender_mailbox_commits_value = parse_json(&sender_mailbox_commits_payload);
+        assert_eq!(sender_mailbox_commits_value["count"], 1);
+
+        let outbox_payload = outbox(
+            &fixture.ctx,
+            format!("{}?project={}", fixture.sender_name, fixture.project_ref),
+        )
+        .await
+        .expect("outbox");
+        let outbox_value = parse_json(&outbox_payload);
+        assert_eq!(outbox_value["count"], 1);
+        assert_eq!(
+            outbox_value["messages"][0]["subject"],
+            "Integration Subject"
+        );
+        assert!(
+            outbox_value["messages"][0]["commit"]["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Commit metadata unavailable")
+        );
+    }
+
+    async fn assert_message_and_thread_views(fixture: &PopulatedMailboxFixture) {
+        let message_details_payload = message_details(
+            &fixture.ctx,
+            format!("{}?project={}", fixture.message_id, fixture.project_ref),
+        )
+        .await
+        .expect("message details");
+        let message_details_value = parse_json(&message_details_payload);
+        assert_eq!(message_details_value["subject"], "Integration Subject");
+        assert_eq!(message_details_value["from"], fixture.sender_name);
+
+        let thread_payload = thread_details(
+            &fixture.ctx,
+            format!(
+                "{}?project={}&include_bodies=true",
+                fixture.thread_id, fixture.project_ref
+            ),
+        )
+        .await
+        .expect("thread details");
+        let thread_value = parse_json(&thread_payload);
+        assert_eq!(thread_value["messages"].as_array().map_or(0, Vec::len), 1);
+        assert_eq!(
+            thread_value["messages"][0]["body_md"],
+            "Hello from integration test."
+        );
+    }
+
+    async fn assert_mailbox_uses_canonical_agent_names(cx: &Cx) {
+        let fixture = setup_populated_mailbox_fixture(cx).await;
+
+        let inbox_payload = inbox(
+            &fixture.ctx,
+            format!(
+                "{}?project={}",
+                fixture.recipient_name.to_ascii_lowercase(),
+                fixture.project_ref
+            ),
+        )
+        .await
+        .expect("inbox");
+        let inbox_value = parse_json(&inbox_payload);
+        assert_eq!(inbox_value["agent"], fixture.recipient_name);
+
+        let mailbox_payload = mailbox(
+            &fixture.ctx,
+            format!(
+                "{}?project={}",
+                fixture.sender_name.to_ascii_lowercase(),
+                fixture.project_ref
+            ),
+        )
+        .await
+        .expect("mailbox");
+        let mailbox_value = parse_json(&mailbox_payload);
+        assert_eq!(mailbox_value["agent"], fixture.sender_name);
+
+        let outbox_payload = outbox(
+            &fixture.ctx,
+            format!(
+                "{}?project={}",
+                fixture.sender_name.to_ascii_lowercase(),
+                fixture.project_ref
+            ),
+        )
+        .await
+        .expect("outbox");
+        let outbox_value = parse_json(&outbox_payload);
+        assert_eq!(outbox_value["agent"], fixture.sender_name);
     }
 
     #[test]
@@ -4061,93 +4581,81 @@ mod resource_shape_tests {
     fn populated_dataset_message_mailbox_and_views_are_non_empty() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
+                let fixture = setup_populated_mailbox_fixture(&cx).await;
+                assert_recipient_mailbox_views(&fixture).await;
+                assert_sender_mailbox_views(&fixture).await;
+                assert_message_and_thread_views(&fixture).await;
+            });
+        });
+    }
+
+    #[test]
+    fn mailbox_and_outbox_responses_use_canonical_agent_names() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                assert_mailbox_uses_canonical_agent_names(&cx).await;
+            });
+        });
+    }
+
+    #[test]
+    fn resource_reads_do_not_create_projects_for_missing_absolute_paths() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
                 let pool = get_db_pool().expect("db pool");
-                let project_key = format!("/tmp/resources-populated-{}", unique_suffix());
+                let before = db_outcome_to_mcp_result(queries::list_projects(&cx, &pool).await)
+                    .expect("projects before")
+                    .len();
+                let missing_project =
+                    format!("/tmp/resources-missing-readonly-{}", unique_suffix());
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                let err = agents_list(&ctx, missing_project.clone())
+                    .await
+                    .expect_err("missing project should not be auto-created");
+                assert_eq!(err.code, McpErrorCode::InvalidParams);
+
+                let after = db_outcome_to_mcp_result(queries::list_projects(&cx, &pool).await)
+                    .expect("projects after")
+                    .len();
+                assert_eq!(after, before, "read-only resource created a project");
+            });
+        });
+    }
+
+    #[test]
+    fn inbox_and_outbox_reject_invalid_since_ts() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-invalid-since-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let sender = register_agent(&cx, &pool, project_id, "SilverFox").await;
-                let recipient = register_agent(&cx, &pool, project_id, "GoldenLynx").await;
-                let thread_id = format!("thread-{}", unique_suffix());
-                let message = create_message(
-                    &cx,
-                    &pool,
-                    project_id,
-                    sender.id.unwrap_or(0),
-                    recipient.id.unwrap_or(0),
-                    "Integration Subject",
-                    "Hello from integration test.",
-                    &thread_id,
-                    true,
-                )
-                .await;
-
+                let agent = register_agent(&cx, &pool, project_id, "QuartzSeal").await;
                 let ctx = McpContext::new(cx.clone(), 1);
                 let project_ref = project.human_key.clone();
 
-                let inbox_payload = inbox(
+                let inbox_err = inbox(
                     &ctx,
                     format!(
-                        "{}?project={}&include_bodies=true",
-                        recipient.name, project_ref
+                        "{}?project={project_ref}&since_ts=not-a-timestamp",
+                        agent.name
                     ),
                 )
                 .await
-                .expect("inbox");
-                let inbox_value = parse_json(&inbox_payload);
-                assert_eq!(inbox_value["count"], 1);
-                assert_eq!(inbox_value["messages"][0]["subject"], "Integration Subject");
-                assert_eq!(
-                    inbox_value["messages"][0]["body_md"],
-                    "Hello from integration test."
-                );
+                .expect_err("invalid inbox since_ts should fail");
+                assert_eq!(inbox_err.code, McpErrorCode::InvalidParams);
 
-                let mailbox_payload =
-                    mailbox(&ctx, format!("{}?project={}", recipient.name, project_ref))
-                        .await
-                        .expect("mailbox");
-                let mailbox_value = parse_json(&mailbox_payload);
-                assert_eq!(mailbox_value["count"], 1);
-
-                let outbox_payload =
-                    outbox(&ctx, format!("{}?project={}", sender.name, project_ref))
-                        .await
-                        .expect("outbox");
-                let outbox_value = parse_json(&outbox_payload);
-
-                assert_eq!(outbox_value["count"], 1);
-                assert_eq!(
-                    outbox_value["messages"][0]["subject"],
-                    "Integration Subject"
-                );
-
-                let ack_required_payload =
-                    views_ack_required(&ctx, format!("{}?project={}", recipient.name, project_ref))
-                        .await
-                        .expect("ack-required view");
-                let ack_required_value = parse_json(&ack_required_payload);
-                assert_eq!(ack_required_value["count"], 1);
-
-                let msg_id = message.id.unwrap_or(0);
-                let message_details_payload =
-                    message_details(&ctx, format!("{msg_id}?project={project_ref}"))
-                        .await
-                        .expect("message details");
-                let message_details_value = parse_json(&message_details_payload);
-                assert_eq!(message_details_value["subject"], "Integration Subject");
-                assert_eq!(message_details_value["from"], sender.name);
-
-                let thread_payload = thread_details(
+                let outbox_err = outbox(
                     &ctx,
-                    format!("{thread_id}?project={project_ref}&include_bodies=true"),
+                    format!(
+                        "{}?project={project_ref}&since_ts=still-not-a-timestamp",
+                        agent.name
+                    ),
                 )
                 .await
-                .expect("thread details");
-                let thread_value = parse_json(&thread_payload);
-                assert_eq!(thread_value["messages"].as_array().map_or(0, Vec::len), 1);
-                assert_eq!(
-                    thread_value["messages"][0]["body_md"],
-                    "Hello from integration test."
-                );
+                .expect_err("invalid outbox since_ts should fail");
+                assert_eq!(outbox_err.code, McpErrorCode::InvalidParams);
             });
         });
     }
@@ -4932,6 +5440,82 @@ mod resource_shape_tests {
                 assert!(
                     all_paths.iter().any(|path| path == "docs/**"),
                     "released reservation should be present when active_only=false"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn file_reservations_missing_workspace_does_not_release_stale_rows() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-missing-workspace-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let agent_id = agent.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/**"],
+                    3600,
+                    true,
+                    "workspace-missing test",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                conn.execute_sync(
+                    "UPDATE agents SET last_active_ts = 0 WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id)],
+                )
+                .expect("backdate agent activity");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = file_reservations(&ctx, project.slug.clone())
+                    .await
+                    .expect("file reservations");
+                let reservations = parse_json(&payload);
+                let entries = reservations.as_array().expect("reservations array");
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0]["id"].as_i64(), Some(reservation_id));
+                assert_eq!(entries[0]["stale"], false);
+                assert!(
+                    entries[0]["stale_reasons"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_str())
+                        .any(|reason| reason == "workspace_unavailable"),
+                    "stale reasons should explain why stale cleanup was skipped"
+                );
+
+                let rows =
+                    match queries::list_file_reservations(&cx, &pool, project_id, false).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("list reservations failed: {other:?}"),
+                    };
+                let row = rows
+                    .iter()
+                    .find(|row| row.id == Some(reservation_id))
+                    .expect("reservation row");
+                assert!(
+                    row.released_ts.is_none(),
+                    "missing workspace must not auto-release reservations"
                 );
             });
         });

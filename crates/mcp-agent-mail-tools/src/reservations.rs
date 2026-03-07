@@ -21,6 +21,10 @@ use std::path::PathBuf;
 
 use crate::messaging::{enqueue_message_semantic_index, try_write_message_archive};
 use crate::reservation_index::{ReservationIndex, ReservationRef};
+use crate::resources::{
+    reservation_compute_pattern_activity, reservation_open_repo_root,
+    reservation_project_workspace_path,
+};
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
 };
@@ -230,6 +234,22 @@ fn expand_tilde(input: &str) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     PathBuf::from(input)
+}
+
+fn reservation_pattern_activity_for_project(
+    project_human_key: &str,
+    path_pattern: &str,
+) -> crate::resources::ReservationPatternActivity {
+    let workspace = reservation_project_workspace_path(project_human_key);
+    let repo_info = workspace.as_deref().and_then(reservation_open_repo_root);
+    let repo_root = repo_info.as_ref().map(|(root, _)| root.as_path());
+    let workspace_rel = repo_info.as_ref().map(|(_, rel)| rel.as_path());
+    reservation_compute_pattern_activity(
+        workspace.as_deref(),
+        repo_root,
+        workspace_rel,
+        path_pattern,
+    )
 }
 
 fn released_ts_json_value(released_ts: Option<i64>) -> serde_json::Value {
@@ -960,21 +980,35 @@ pub async fn force_release_file_reservation(
         stale_reasons.push("mail_activity_recent".to_string());
     }
 
-    // Signal 3: Git activity (via archive commits)
-    let config = &Config::get();
-    let git_activity = get_git_activity_for_agent(config, &project.slug, &holder_agent.name);
-    let git_stale = git_activity.is_none_or(|ts| now_micros.saturating_sub(ts) > grace_micros);
-    if git_stale {
-        stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
+    let pattern_activity =
+        reservation_pattern_activity_for_project(&project.human_key, &reservation.path_pattern);
+    let recent_fs = pattern_activity
+        .fs_activity_micros
+        .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+    let recent_git = pattern_activity
+        .git_activity_micros
+        .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+
+    if pattern_activity.matches {
+        if recent_fs {
+            stale_reasons.push("filesystem_activity_recent".to_string());
+        } else {
+            stale_reasons.push(format!("no_recent_filesystem_activity>{grace_seconds}s"));
+        }
+        if recent_git {
+            stale_reasons.push("git_activity_recent".to_string());
+        } else {
+            stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
+        }
     } else {
-        stale_reasons.push("git_activity_recent".to_string());
+        stale_reasons.push("path_pattern_unmatched".to_string());
     }
 
     // Check if reservation has expired
     let is_expired = reservation.expires_ts <= now_micros;
 
     // Must be inactive (agent + all signals stale) OR expired to force-release
-    let all_signals_stale = agent_inactive && mail_stale && git_stale;
+    let all_signals_stale = agent_inactive && mail_stale && !recent_fs && !recent_git;
     if !all_signals_stale && !is_expired {
         return Err(legacy_tool_error(
             "RESERVATION_ACTIVE",
@@ -1047,7 +1081,14 @@ pub async fn force_release_file_reservation(
                 now_micros.saturating_sub(ts) / 1_000_000
             );
         }
-        if let Some(ts) = git_activity {
+        if let Some(ts) = pattern_activity.fs_activity_micros {
+            let _ = writeln!(
+                details,
+                "- last filesystem activity ≈ {}s ago",
+                now_micros.saturating_sub(ts) / 1_000_000
+            );
+        }
+        if let Some(ts) = pattern_activity.git_activity_micros {
             let _ = writeln!(
                 details,
                 "- last git commit \u{2248} {}s ago",
@@ -1156,8 +1197,8 @@ pub async fn force_release_file_reservation(
             "stale_reasons": stale_reasons,
             "last_agent_activity_ts": micros_to_iso(holder_agent.last_active_ts),
             "last_mail_activity_ts": mail_activity.map(micros_to_iso),
-            "last_filesystem_activity_ts": serde_json::Value::Null,
-            "last_git_activity_ts": git_activity.map(micros_to_iso),
+            "last_filesystem_activity_ts": pattern_activity.fs_activity_micros.map(micros_to_iso),
+            "last_git_activity_ts": pattern_activity.git_activity_micros.map(micros_to_iso),
             "notified": notified,
         },
     });
@@ -1173,27 +1214,6 @@ pub async fn force_release_file_reservation(
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
-}
-
-/// Get the most recent git activity timestamp for an agent (from archive commits).
-fn get_git_activity_for_agent(
-    config: &Config,
-    project_slug: &str,
-    agent_name: &str,
-) -> Option<i64> {
-    let archive = mcp_agent_mail_storage::ensure_archive(config, project_slug).ok()?;
-    let commits = mcp_agent_mail_storage::get_commits_by_author(&archive, agent_name, 1).ok()?;
-    commits.first().and_then(|c| {
-        // Parse ISO-8601 date string to micros
-        chrono::DateTime::parse_from_rfc3339(&c.date)
-            .ok()
-            .map(|dt| dt.timestamp_micros())
-            .or_else(|| {
-                chrono::NaiveDateTime::parse_from_str(&c.date, "%Y-%m-%dT%H:%M:%S%.f")
-                    .ok()
-                    .map(|dt| dt.and_utc().timestamp_micros())
-            })
-    })
 }
 
 /// Install pre-commit guard for file reservation enforcement.

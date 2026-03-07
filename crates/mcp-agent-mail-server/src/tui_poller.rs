@@ -387,6 +387,7 @@ impl DbPoller {
     }
 
     /// Main polling loop.
+    #[allow(clippy::too_many_lines)]
     fn run(self) {
         let mut prev = DbStatSnapshot::default();
         let now = Instant::now();
@@ -1186,11 +1187,12 @@ const RESERVATION_LEGACY_SCAN_SQL: &str = "SELECT \
 
 static RESERVATION_ACTIVE_FAST_SQL: OnceLock<String> = OnceLock::new();
 static RESERVATION_ACTIVE_FAST_COUNTS_SQL: OnceLock<String> = OnceLock::new();
-const RESERVATION_ACTIVE_FAST_PREDICATE: &str = "released_ts IS NULL OR released_ts <= 0";
 
 fn reservation_active_fast_snapshots_sql() -> &'static str {
     RESERVATION_ACTIVE_FAST_SQL
         .get_or_init(|| {
+            let active_reservation_predicate =
+                mcp_agent_mail_db::queries::active_reservation_predicate_for("fr");
             format!(
                 "SELECT \
                    fr.id, \
@@ -1205,7 +1207,7 @@ fn reservation_active_fast_snapshots_sql() -> &'static str {
                  FROM file_reservations fr \
                  LEFT JOIN projects p ON p.id = fr.project_id \
                  LEFT JOIN agents a ON a.id = fr.agent_id \
-                 WHERE ({RESERVATION_ACTIVE_FAST_PREDICATE}) AND expires_ts > ? \
+                 WHERE ({active_reservation_predicate}) AND expires_ts > ? \
                  ORDER BY fr.expires_ts ASC, fr.id ASC \
                  LIMIT {MAX_RESERVATIONS}"
             )
@@ -1216,12 +1218,14 @@ fn reservation_active_fast_snapshots_sql() -> &'static str {
 fn reservation_active_fast_counts_sql() -> &'static str {
     RESERVATION_ACTIVE_FAST_COUNTS_SQL
         .get_or_init(|| {
+            let active_reservation_predicate =
+                mcp_agent_mail_db::queries::active_reservation_predicate_for("fr");
             format!(
                 "SELECT \
                    fr.project_id AS raw_project_id, \
                    COUNT(*) AS active_count \
                  FROM file_reservations fr \
-                 WHERE ({RESERVATION_ACTIVE_FAST_PREDICATE}) AND expires_ts > ? \
+                 WHERE ({active_reservation_predicate}) AND expires_ts > ? \
                  GROUP BY fr.project_id"
             )
         })

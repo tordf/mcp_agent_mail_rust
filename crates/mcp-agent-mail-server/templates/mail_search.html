@@ -102,6 +102,9 @@
         />
         <input type="hidden" name="scope" x-model="scope" />
         <input type="hidden" name="order" x-model="order" />
+        {% if static_export %}
+        <input type="hidden" name="__static_export" value="1" />
+        {% endif %}
       </div>
 
       <!-- Quick Controls Row -->
@@ -265,7 +268,43 @@
     <!-- Main Results Column -->
     <div class="flex-1 min-w-0">
       <!-- Search Results -->
-      {% if results %}
+      {% if static_export %}
+        <div class="bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800 rounded-xl p-4 mb-6">
+          <div class="flex items-start gap-3">
+            <i data-lucide="search" class="w-5 h-5 text-primary-600 dark:text-primary-400 mt-0.5"></i>
+            <div>
+              <p class="text-sm font-medium text-primary-900 dark:text-primary-100">Static search is running from the exported search index.</p>
+              <p id="static-search-note" class="text-sm text-primary-700 dark:text-primary-200 mt-1">Direction and ack filters are unavailable in static export mode.</p>
+            </div>
+          </div>
+        </div>
+        <div id="static-search-results-panel" class="hidden bg-white dark:bg-slate-800 rounded-xl shadow-soft border border-slate-200 dark:border-slate-700 overflow-hidden">
+          <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <i data-lucide="list" class="w-5 h-5 text-primary-600 dark:text-primary-400"></i>
+                <h3 class="text-lg font-semibold text-slate-900 dark:text-white">Results</h3>
+                <span id="static-search-count" class="px-2 py-1 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-medium rounded-full">0 found</span>
+              </div>
+            </div>
+          </div>
+          <div id="static-search-results-list" class="divide-y divide-slate-200 dark:divide-slate-700"></div>
+        </div>
+        <div id="static-search-empty" class="hidden bg-white dark:bg-slate-800 rounded-xl p-16 shadow-soft border border-slate-200 dark:border-slate-700 text-center">
+          <div class="w-24 h-24 bg-slate-100 dark:bg-slate-700 rounded-full flex items-center justify-center mx-auto mb-6">
+            <i data-lucide="search-x" class="w-12 h-12 text-slate-400 dark:text-slate-500"></i>
+          </div>
+          <h3 class="text-2xl font-semibold text-slate-900 dark:text-white mb-3">No results found</h3>
+          <p class="text-slate-600 dark:text-slate-400 mb-6 max-w-md mx-auto">
+            No messages in the exported search index match your current query.
+          </p>
+          <button type="button" id="static-search-clear"
+             class="inline-flex px-6 py-3 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg shadow-medium hover:shadow-large transition-all duration-300 items-center gap-2 btn-ripple">
+            <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+            Clear Search
+          </button>
+        </div>
+      {% elif results %}
         <div class="bg-white dark:bg-slate-800 rounded-xl shadow-soft border border-slate-200 dark:border-slate-700 overflow-hidden">
           <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900">
             <div class="flex items-center justify-between">
@@ -409,22 +448,322 @@
   document.addEventListener('DOMContentLoaded', () => {
     const form = document.getElementById('searchForm');
     const input = document.getElementById('q');
+    const staticExport = {{ static_export|tojson }};
     let timeout;
 
-    // Debounced search on text input
+    if (!staticExport) {
+      input?.addEventListener('input', () => {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => {
+          if (input.value.length >= 2 || input.value.length === 0) {
+            form.submit();
+          }
+        }, 600);
+      });
+
+      document.querySelectorAll('select[name="agent"], input[name="direction"], input[name="ack"]').forEach(el => {
+        el.addEventListener('change', () => form.submit());
+      });
+      return;
+    }
+
+    const projectSlug = {{ project.slug|tojson }};
+    const searchIndexPath = {{ static_search_index_path|tojson }};
+    const resultsPanel = document.getElementById('static-search-results-panel');
+    const resultsList = document.getElementById('static-search-results-list');
+    const resultsCount = document.getElementById('static-search-count');
+    const emptyState = document.getElementById('static-search-empty');
+    const clearButton = document.getElementById('static-search-clear');
+    const note = document.getElementById('static-search-note');
+    const cssEscape = window.CSS && typeof window.CSS.escape === 'function'
+      ? window.CSS.escape.bind(window.CSS)
+      : value => `${value}`.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+    let searchIndexPromise;
+
+    function escapeHtml(value) {
+      const div = document.createElement('div');
+      div.textContent = value ?? '';
+      return div.innerHTML;
+    }
+
+    function parseTerms(query) {
+      return (query || '')
+        .split(/\s+/)
+        .map(term => term.trim().replace(/^([^:]+:)/, '').replace(/^"+|"+$/g, ''))
+        .filter(term => term.length >= 2);
+    }
+
+    function countOccurrences(haystack, needle) {
+      if (!needle) return 0;
+      const source = (haystack || '').toLowerCase();
+      const pattern = needle.toLowerCase();
+      let count = 0;
+      let index = 0;
+      while ((index = source.indexOf(pattern, index)) !== -1) {
+        count += 1;
+        index += pattern.length;
+      }
+      return count;
+    }
+
+    function formatRelativeTime(isoString) {
+      const ts = Date.parse(isoString || '');
+      if (!Number.isFinite(ts)) return '';
+      const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (seconds < 60) return `${seconds}s ago`;
+      if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+      if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+      return `${Math.floor(seconds / 86400)}d ago`;
+    }
+
+    function dispatchReactiveUpdate(field) {
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+      field.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function syncReactiveStateFromDom() {
+      form.querySelectorAll('input[type="hidden"][name="scope"], input[type="hidden"][name="order"]').forEach(field => {
+        dispatchReactiveUpdate(field);
+      });
+    }
+
+    function hydrateFormFromLocation() {
+      form.reset();
+      const params = new URLSearchParams(window.location.search);
+      for (const [name, value] of params.entries()) {
+        const fields = form.querySelectorAll(`[name="${cssEscape(name)}"]`);
+        fields.forEach(field => {
+          if (field.type === 'checkbox' || field.type === 'radio') {
+            if (field.value === value) {
+              field.checked = true;
+            }
+          } else {
+            field.value = value;
+            if (name === 'scope' || name === 'order') {
+              dispatchReactiveUpdate(field);
+            }
+          }
+        });
+      }
+      syncReactiveStateFromDom();
+    }
+
+    async function loadSearchIndex() {
+      if (!searchIndexPromise) {
+        searchIndexPromise = fetch(searchIndexPath)
+          .then(response => {
+            if (!response.ok) {
+              throw new Error(`Failed to load search index (${response.status})`);
+            }
+            return response.json();
+          });
+      }
+      return searchIndexPromise;
+    }
+
+    function buildSearchParams() {
+      const params = new URLSearchParams();
+      const formData = new FormData(form);
+      for (const [name, rawValue] of formData.entries()) {
+        const value = `${rawValue}`.trim();
+        if (!value || name === '__static_export') {
+          continue;
+        }
+        params.append(name, value);
+      }
+      return params;
+    }
+
+    function filterResults(entries, params) {
+      const unsupported = [];
+      if ((params.get('ack') || 'any') !== 'any') {
+        unsupported.push('ack');
+      }
+      if (params.get('direction')) {
+        unsupported.push('direction');
+      }
+
+      const terms = parseTerms(params.get('q') || '');
+      const scope = params.get('scope') || '';
+      const importance = new Set(params.getAll('imp'));
+      const agent = (params.get('agent') || '').trim();
+      const thread = (params.get('thread') || '').trim();
+      const fromDate = params.get('from_date');
+      const toDate = params.get('to_date');
+      const boost = params.get('boost') === '1';
+      const order = params.get('order') || 'relevance';
+
+      const filtered = entries
+        .filter(entry => entry.project === projectSlug)
+        .map(entry => {
+          const createdMs = Date.parse(entry.created_ts || '');
+          if (agent && entry.from_agent !== agent) {
+            return null;
+          }
+          if (thread && entry.thread_id !== thread) {
+            return null;
+          }
+          if (importance.size && !importance.has(entry.importance || '')) {
+            return null;
+          }
+          if (fromDate && Number.isFinite(createdMs) && createdMs < Date.parse(fromDate)) {
+            return null;
+          }
+          if (toDate && Number.isFinite(createdMs) && createdMs > Date.parse(`${toDate}T23:59:59Z`)) {
+            return null;
+          }
+
+          const subject = entry.subject || '';
+          const body = entry.body_text || entry.body_excerpt || '';
+          const haystack = scope === 'subject'
+            ? subject
+            : scope === 'body'
+              ? body
+              : `${subject}\n${body}\n${entry.from_agent || ''}\n${entry.thread_id || ''}`;
+
+          let score = 0;
+          if (terms.length > 0) {
+            const matched = terms.every(term => {
+              const subjectHits = countOccurrences(subject, term);
+              const bodyHits = countOccurrences(body, term);
+              const totalHits = countOccurrences(haystack, term);
+              score += (boost ? subjectHits * 6 : subjectHits * 3) + bodyHits + totalHits;
+              return totalHits > 0;
+            });
+            if (!matched) {
+              return null;
+            }
+          }
+
+          return {
+            ...entry,
+            _createdMs: Number.isFinite(createdMs) ? createdMs : 0,
+            _score: score,
+          };
+        })
+        .filter(Boolean);
+
+      filtered.sort((left, right) => {
+        if (order === 'time') {
+          return right._createdMs - left._createdMs || right.id - left.id;
+        }
+        return right._score - left._score || right._createdMs - left._createdMs || right.id - left.id;
+      });
+
+      return {
+        results: filtered.slice(0, 50),
+        unsupported,
+      };
+    }
+
+    function renderResult(entry) {
+      const importanceBadge = entry.importance === 'urgent'
+        ? '<span class="px-1.5 py-0.5 bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 text-xs font-medium rounded">Urgent</span>'
+        : entry.importance === 'high'
+          ? '<span class="px-1.5 py-0.5 bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300 text-xs font-medium rounded">High</span>'
+          : '';
+      const threadLink = entry.thread_id
+        ? `<a href="/mail/${projectSlug}/thread/${encodeURIComponent(entry.thread_id)}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors" onclick="event.stopPropagation()"><i data-lucide="message-circle" class="w-3.5 h-3.5"></i><span class="font-mono text-xs">${escapeHtml(entry.thread_id)}</span></a>`
+        : '';
+      const snippet = entry.body_excerpt
+        ? `<div class="text-sm text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/50 rounded-lg p-3 line-clamp-3">${escapeHtml(entry.body_excerpt)}</div>`
+        : '';
+      return `
+        <a href="/mail/${projectSlug}/message/${entry.id}"
+           class="block p-6 hover:bg-slate-50 dark:hover:bg-slate-900 transition-all duration-200 group">
+          <div class="flex items-start justify-between mb-2">
+            <h4 class="text-base font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors flex-1 mr-3">${escapeHtml(entry.subject || '(no subject)')}</h4>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              ${importanceBadge}
+            </div>
+          </div>
+          <div class="flex items-center gap-4 text-sm text-slate-600 dark:text-slate-400 mb-2">
+            <div class="flex items-center gap-1.5">
+              <i data-lucide="user" class="w-3.5 h-3.5"></i>
+              <span>${escapeHtml(entry.from_agent || '')}</span>
+            </div>
+            <div class="flex items-center gap-1.5" title="${escapeHtml(entry.created_ts || '')}">
+              <i data-lucide="calendar" class="w-3.5 h-3.5"></i>
+              <span>${escapeHtml(formatRelativeTime(entry.created_ts))}</span>
+            </div>
+            ${threadLink}
+          </div>
+          ${snippet}
+          <div class="flex items-center gap-2 mt-2 text-primary-600 dark:text-primary-400 opacity-0 group-hover:opacity-100 transition-opacity">
+            <span class="text-sm font-medium">View message</span>
+            <i data-lucide="arrow-right" class="w-4 h-4 group-hover:translate-x-1 transition-transform"></i>
+          </div>
+        </a>`;
+    }
+
+    function renderResults(results, params, unsupported) {
+      const activeFilters = Array.from(params.keys()).length > 0;
+      if (unsupported.length > 0) {
+        note.textContent = `Static search is running from the exported search index. ${unsupported.join(' and ')} filters are unavailable in static export mode.`;
+      } else {
+        note.textContent = 'Static search is running from the exported search index.';
+      }
+
+      if (!activeFilters) {
+        resultsPanel.classList.add('hidden');
+        emptyState.classList.add('hidden');
+        resultsList.innerHTML = '';
+        resultsCount.textContent = '0 found';
+        return;
+      }
+
+      resultsCount.textContent = `${results.length} found`;
+      if (results.length === 0) {
+        resultsPanel.classList.add('hidden');
+        emptyState.classList.remove('hidden');
+        resultsList.innerHTML = '';
+      } else {
+        emptyState.classList.add('hidden');
+        resultsPanel.classList.remove('hidden');
+        resultsList.innerHTML = results.map(renderResult).join('');
+      }
+
+      if (typeof lucide !== 'undefined') {
+        lucide.createIcons();
+      }
+    }
+
+    async function runStaticSearch() {
+      const params = buildSearchParams();
+      const index = await loadSearchIndex();
+      const queryString = params.toString();
+      window.history.replaceState(null, '', queryString ? `${window.location.pathname}?${queryString}` : window.location.pathname);
+      const { results, unsupported } = filterResults(index, params);
+      renderResults(results, params, unsupported);
+    }
+
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      void runStaticSearch();
+    });
+
     input?.addEventListener('input', () => {
       clearTimeout(timeout);
       timeout = setTimeout(() => {
-        if (input.value.length >= 2 || input.value.length === 0) {
-          form.submit();
-        }
-      }, 600);
+        void runStaticSearch();
+      }, 300);
     });
 
-    // Auto-submit on filter changes
-    document.querySelectorAll('select[name="agent"], input[name="direction"], input[name="ack"]').forEach(el => {
-      el.addEventListener('change', () => form.submit());
+    document.querySelectorAll('select[name="agent"], input[name="direction"], input[name="ack"], input[name="imp"], input[name="boost"], input[name="from_date"], input[name="to_date"], input[name="thread"]').forEach(el => {
+      el.addEventListener('change', () => {
+        void runStaticSearch();
+      });
     });
+
+    clearButton?.addEventListener('click', () => {
+      form.reset();
+      syncReactiveStateFromDom();
+      window.history.replaceState(null, '', window.location.pathname);
+      void runStaticSearch();
+    });
+
+    hydrateFormFromLocation();
+    void runStaticSearch();
   });
 </script>
 {% endblock %}

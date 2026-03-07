@@ -275,12 +275,36 @@ impl ArchiveBrowserScreen {
         }
     }
 
+    fn clear_preview(&mut self) {
+        self.preview_content = None;
+        self.preview_path.clear();
+        self.preview_scroll = 0;
+        self.preview_type = ContentType::PlainText;
+    }
+
+    fn expanded_paths(&self) -> HashSet<PathBuf> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.is_dir && entry.expanded)
+            .map(|entry| entry.rel_path.clone())
+            .collect()
+    }
+
+    fn selected_rel_path(&self) -> Option<PathBuf> {
+        self.tree_state
+            .selected
+            .and_then(|sel| self.entries.get(sel))
+            .map(|entry| entry.rel_path.clone())
+    }
+
     /// Rebuild the entry list from the archive on disk.
     fn refresh_entries(&mut self, state: &TuiSharedState) {
         let config = state.config_snapshot();
-        let storage_root = &config.storage_root;
-        if storage_root.is_empty() {
+        if config.storage_root.is_empty() {
+            self.archive_root = None;
             self.entries.clear();
+            self.tree_state.selected = None;
+            self.clear_preview();
             return;
         }
 
@@ -292,124 +316,65 @@ impl ArchiveBrowserScreen {
             .or_else(|| db.projects_list.first().map(|p| p.slug.clone()));
 
         let Some(slug) = project_slug else {
+            self.archive_root = None;
             self.entries.clear();
+            self.tree_state.selected = None;
+            self.clear_preview();
             return;
         };
         self.selected_project = Some(slug.clone());
 
-        let archive_path = PathBuf::from(storage_root).join(&slug).join(".archive");
-        if archive_path.is_dir() {
-            self.archive_root = Some(archive_path);
-        } else {
-            // Try without .archive suffix (some layouts use project root directly)
-            let alt_path = PathBuf::from(storage_root).join(&slug);
-            if alt_path.is_dir() {
-                self.archive_root = Some(alt_path);
-            } else {
-                self.archive_root = None;
-                self.entries.clear();
-                return;
-            }
+        let expanded_paths = self.expanded_paths();
+        let selected_rel_path = self.selected_rel_path();
+        let had_preview = self.preview_content.is_some() || !self.preview_path.is_empty();
+
+        let archive_path = PathBuf::from(&config.storage_root)
+            .join("projects")
+            .join(&slug);
+        if !archive_path.is_dir() {
+            self.archive_root = None;
+            self.entries.clear();
+            self.tree_state.selected = None;
+            self.clear_preview();
+            return;
         }
+        self.archive_root = Some(archive_path.clone());
 
         // Build flattened visible tree
-        let Some(root) = self.archive_root.as_ref() else {
-            self.entries.clear();
-            return;
-        };
         let mut entries = Vec::new();
-        Self::scan_directory(root, root, 0, &self.filter, &mut entries);
+        Self::scan_directory_with_state(
+            &archive_path,
+            &archive_path,
+            0,
+            &self.filter,
+            &expanded_paths,
+            &mut entries,
+        );
         self.entries = entries;
 
-        // Clamp selection
-        if let Some(sel) = self.tree_state.selected
+        if let Some(path) = selected_rel_path {
+            self.tree_state.selected = self.entries.iter().position(|entry| entry.rel_path == path);
+        } else if let Some(sel) = self.tree_state.selected
             && sel >= self.entries.len()
         {
-            self.tree_state.selected = if self.entries.is_empty() {
-                None
-            } else {
-                Some(self.entries.len() - 1)
-            };
-        }
-    }
-
-    /// Recursively scan a directory and add entries to the flat list.
-    fn scan_directory(
-        root: &Path,
-        dir: &Path,
-        depth: usize,
-        filter: &str,
-        entries: &mut Vec<ArchiveEntry>,
-    ) {
-        let Ok(read_dir) = std::fs::read_dir(dir) else {
-            return;
-        };
-
-        let filter_lc = filter.to_lowercase();
-        let mut items: Vec<(bool, String, PathBuf, u64)> = Vec::new();
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            // Skip hidden files/dirs (like .git)
-            if name.starts_with('.') {
-                continue;
-            }
-
-            let is_dir = path.is_dir();
-            let size = if is_dir {
-                0
-            } else {
-                entry.metadata().map_or(0, |metadata| metadata.len())
-            };
-
-            // Apply filter (only to files; always show dirs that might contain matches)
-            if !filter_lc.is_empty() && !is_dir && !name.to_lowercase().contains(&filter_lc) {
-                continue;
-            }
-
-            items.push((is_dir, name, path, size));
+            self.tree_state.selected = None;
         }
 
-        // Sort: directories first, then alphabetically
-        items.sort_by(|a, b| match (a.0, b.0) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => super::cmp_ci(&a.1, &b.1),
-        });
-
-        for (is_dir, name, path, size) in items {
-            let rel_path = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-            let child_count = if is_dir {
-                std::fs::read_dir(&path).map_or(0, std::iter::Iterator::count)
-            } else {
-                0
-            };
-
-            // Fresh scan — nothing is expanded (state restore uses
-            // scan_directory_with_state instead).
-            let expanded = false;
-
-            entries.push(ArchiveEntry {
-                name,
-                rel_path,
-                is_dir,
-                size,
-                depth,
-                expanded,
-                child_count,
-            });
+        if self.entries.is_empty() {
+            self.clear_preview();
+        } else if had_preview || self.tree_state.selected.is_some() {
+            self.load_preview();
         }
     }
 
     /// Load file content for preview.
     fn load_preview(&mut self) {
         let Some(sel) = self.tree_state.selected else {
-            self.preview_content = None;
+            self.clear_preview();
             return;
         };
         let Some(entry) = self.entries.get(sel) else {
-            self.preview_content = None;
+            self.clear_preview();
             return;
         };
 
@@ -417,15 +382,34 @@ impl ArchiveBrowserScreen {
             self.preview_content = None;
             self.preview_path = entry.rel_path.display().to_string();
             self.preview_type = ContentType::PlainText;
+            self.preview_scroll = 0;
             return;
         }
 
         let Some(root) = &self.archive_root else {
-            self.preview_content = None;
+            self.clear_preview();
             return;
         };
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
 
-        let full_path = root.join(&entry.rel_path);
+        let rel_path = entry.rel_path.display().to_string();
+        let full_path = match root.join(&entry.rel_path).canonicalize() {
+            Ok(path) if path.starts_with(&canonical_root) => path,
+            Ok(_) => {
+                self.preview_path = rel_path;
+                self.preview_type = ContentType::PlainText;
+                self.preview_scroll = 0;
+                self.preview_content = Some("[Invalid archive path: outside archive root]".into());
+                return;
+            }
+            Err(err) => {
+                self.preview_path = rel_path;
+                self.preview_type = ContentType::PlainText;
+                self.preview_scroll = 0;
+                self.preview_content = Some(format!("[Error resolving file path: {err}]"));
+                return;
+            }
+        };
         self.preview_path = entry.rel_path.display().to_string();
         self.preview_type = ContentType::from_path(&full_path);
         self.preview_scroll = 0;
@@ -442,19 +426,21 @@ impl ArchiveBrowserScreen {
         // Read file content with size limit (max 512 KB)
         if entry.size > MAX_PREVIEW_BYTES {
             use std::io::Read;
-            self.preview_content = Some(format!(
+            let header = format!(
                 "[File too large for preview: {} — {}]\n\nShowing first {} of content...",
                 entry.name,
                 format_file_size(entry.size),
                 format_file_size(MAX_PREVIEW_BYTES)
-            ));
+            );
+            self.preview_content = Some(header.clone());
             // Read partial
             if let Ok(mut file) = std::fs::File::open(&full_path) {
                 let max_bytes = usize::try_from(MAX_PREVIEW_BYTES).unwrap_or(512 * 1024);
                 let mut buf = vec![0; max_bytes];
                 if let Ok(n) = file.read(&mut buf) {
                     buf.truncate(n);
-                    self.preview_content = Some(String::from_utf8_lossy(&buf).into_owned());
+                    self.preview_content =
+                        Some(format!("{header}\n\n{}", String::from_utf8_lossy(&buf)));
                 }
             }
             return;
@@ -545,12 +531,15 @@ impl ArchiveBrowserScreen {
         for entry in read_dir.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
 
-            if name.starts_with('.') {
+            if name.starts_with('.') || file_type.is_symlink() {
                 continue;
             }
 
-            let is_dir = path.is_dir();
+            let is_dir = file_type.is_dir();
             let size = if is_dir {
                 0
             } else {
@@ -1051,25 +1040,7 @@ impl MailScreen for ArchiveBrowserScreen {
         if is_first || is_periodic {
             self.last_refresh_tick = tick_count;
             self.pending_periodic_refresh = false;
-            // Preserve expansion state across refreshes
-            let expanded_state: Vec<(PathBuf, bool)> = self
-                .entries
-                .iter()
-                .filter(|e| e.is_dir)
-                .map(|e| (e.rel_path.clone(), e.expanded))
-                .collect();
-
             self.refresh_entries(state);
-
-            // Restore expansion state
-            for entry in &mut self.entries {
-                if entry.is_dir
-                    && let Some((_, exp)) =
-                        expanded_state.iter().find(|(p, _)| *p == entry.rel_path)
-                {
-                    entry.expanded = *exp;
-                }
-            }
 
             let raw_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
             let rendered_count = raw_count; // All entries are rendered (filter applied during scan)
@@ -1322,6 +1293,153 @@ mod tests {
     }
 
     #[test]
+    fn refresh_entries_preserves_expanded_tree_and_preview_selection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let archive_root = tmp.path().join("projects").join("demo");
+        std::fs::create_dir_all(archive_root.join("agents/RedFox")).expect("create archive tree");
+        std::fs::write(
+            archive_root.join("agents/RedFox/profile.json"),
+            "{\"name\":\"RedFox\"}",
+        )
+        .expect("write profile");
+
+        let config = mcp_agent_mail_core::Config {
+            storage_root: tmp.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            projects_list: vec![crate::tui_events::ProjectSummary {
+                id: 1,
+                slug: "demo".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ArchiveBrowserScreen::new();
+        screen.entries = vec![
+            ArchiveEntry {
+                name: "agents".into(),
+                rel_path: "agents".into(),
+                is_dir: true,
+                size: 0,
+                depth: 0,
+                expanded: true,
+                child_count: 1,
+            },
+            ArchiveEntry {
+                name: "RedFox".into(),
+                rel_path: "agents/RedFox".into(),
+                is_dir: true,
+                size: 0,
+                depth: 1,
+                expanded: true,
+                child_count: 1,
+            },
+            ArchiveEntry {
+                name: "profile.json".into(),
+                rel_path: "agents/RedFox/profile.json".into(),
+                is_dir: false,
+                size: 17,
+                depth: 2,
+                expanded: false,
+                child_count: 0,
+            },
+        ];
+        screen.tree_state.selected = Some(2);
+        screen.preview_content = Some("stale".into());
+        screen.preview_path = "agents/RedFox/profile.json".into();
+
+        screen.refresh_entries(&state);
+
+        assert!(
+            screen
+                .entries
+                .iter()
+                .any(|entry| entry.rel_path == std::path::Path::new("agents/RedFox/profile.json"))
+        );
+        let selected_path = screen
+            .tree_state
+            .selected
+            .and_then(|idx| screen.entries.get(idx))
+            .map(|entry| entry.rel_path.clone());
+        assert_eq!(
+            selected_path,
+            Some(PathBuf::from("agents/RedFox/profile.json"))
+        );
+        assert!(
+            screen
+                .preview_content
+                .as_deref()
+                .is_some_and(|content| content.contains("RedFox"))
+        );
+    }
+
+    #[test]
+    fn load_preview_large_file_keeps_warning_banner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp.path().join("large.txt");
+        let oversized_len =
+            usize::try_from(MAX_PREVIEW_BYTES).expect("preview bytes should fit usize") + 32;
+        std::fs::write(&file_path, "x".repeat(oversized_len)).expect("write large file");
+
+        let mut screen = ArchiveBrowserScreen::new();
+        screen.archive_root = Some(tmp.path().to_path_buf());
+        screen.entries = vec![ArchiveEntry {
+            name: "large.txt".into(),
+            rel_path: "large.txt".into(),
+            is_dir: false,
+            size: MAX_PREVIEW_BYTES + 32,
+            depth: 0,
+            expanded: false,
+            child_count: 0,
+        }];
+        screen.tree_state.selected = Some(0);
+
+        screen.load_preview();
+
+        let preview = screen.preview_content.expect("preview content");
+        assert!(preview.contains("File too large for preview"));
+        assert!(preview.contains("Showing first"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_preview_accepts_symlinked_archive_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_root = tmp.path().join("real");
+        std::fs::create_dir_all(&real_root).expect("create real root");
+        std::fs::write(real_root.join("note.txt"), "hello from symlinked archive")
+            .expect("write note");
+
+        let symlink_root = tmp.path().join("archive-link");
+        std::os::unix::fs::symlink(&real_root, &symlink_root).expect("create symlink");
+
+        let mut screen = ArchiveBrowserScreen::new();
+        screen.archive_root = Some(symlink_root);
+        screen.entries = vec![ArchiveEntry {
+            name: "note.txt".into(),
+            rel_path: "note.txt".into(),
+            is_dir: false,
+            size: 26,
+            depth: 0,
+            expanded: false,
+            child_count: 0,
+        }];
+        screen.tree_state.selected = Some(0);
+
+        screen.load_preview();
+
+        assert_eq!(screen.preview_type, ContentType::PlainText);
+        assert_eq!(
+            screen.preview_content.as_deref(),
+            Some("hello from symlinked archive")
+        );
+    }
+
+    #[test]
     fn test_move_selection_empty() {
         let mut screen = ArchiveBrowserScreen::new();
         screen.move_selection(1);
@@ -1399,7 +1517,8 @@ mod tests {
         .unwrap();
 
         let mut entries = Vec::new();
-        ArchiveBrowserScreen::scan_directory(&tmp, &tmp, 0, "", &mut entries);
+        let expanded = std::collections::HashSet::new();
+        ArchiveBrowserScreen::scan_directory_with_state(&tmp, &tmp, 0, "", &expanded, &mut entries);
 
         // Should have agents/ and messages/ at depth 0
         assert!(entries.len() >= 2);
@@ -1487,7 +1606,15 @@ mod tests {
         std::fs::write(tmp.join("notes.txt"), "notes").unwrap();
 
         let mut entries = Vec::new();
-        ArchiveBrowserScreen::scan_directory(&tmp, &tmp, 0, "json", &mut entries);
+        let expanded = std::collections::HashSet::new();
+        ArchiveBrowserScreen::scan_directory_with_state(
+            &tmp,
+            &tmp,
+            0,
+            "json",
+            &expanded,
+            &mut entries,
+        );
 
         // Only json file should match
         assert_eq!(entries.len(), 1);

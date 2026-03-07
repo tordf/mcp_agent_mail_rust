@@ -787,17 +787,20 @@ impl MailExplorerScreen {
         conn: &DbConn,
         now: i64,
     ) -> Result<Vec<ReservationPressureCard>, String> {
-        let sql = "SELECT fr.path_pattern, fr.\"exclusive\", fr.expires_ts, \
-                   a.name AS agent_name, p.slug AS project_slug \
-                   FROM file_reservations fr \
-                   JOIN agents a ON a.id = fr.agent_id \
-                   JOIN projects p ON p.id = fr.project_id \
-                   WHERE fr.released_ts IS NULL AND fr.expires_ts > ?1 \
-                   ORDER BY fr.expires_ts ASC \
-                   LIMIT 50";
+        let sql = format!(
+            "SELECT fr.path_pattern, fr.\"exclusive\", fr.expires_ts, \
+               a.name AS agent_name, p.slug AS project_slug \
+               FROM file_reservations fr \
+               JOIN agents a ON a.id = fr.agent_id \
+               JOIN projects p ON p.id = fr.project_id \
+               WHERE ({}) AND fr.expires_ts > ?1 \
+               ORDER BY fr.expires_ts ASC \
+               LIMIT 50",
+            mcp_agent_mail_db::queries::active_reservation_predicate_for("fr")
+        );
 
         let params = vec![Value::BigInt(now)];
-        conn.query_sync(sql, &params)
+        conn.query_sync(&sql, &params)
             .map_err(|e| format!("Reservation pressure query: {e}"))
             .map(|rows| {
                 rows.into_iter()

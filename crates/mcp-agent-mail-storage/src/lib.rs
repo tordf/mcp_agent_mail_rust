@@ -3483,6 +3483,41 @@ pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
     Ok((root, fresh))
 }
 
+/// Open an existing per-project archive directory without creating it.
+pub fn open_archive(config: &Config, slug: &str) -> Result<Option<ProjectArchive>> {
+    if slug.contains('/') || slug.contains('\\') || slug.contains("..") || slug.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "invalid project slug: must not contain path separators or '..' components".to_string(),
+        ));
+    }
+
+    let repo_root = config.storage_root.clone();
+    if !repo_root.is_dir() {
+        return Ok(None);
+    }
+
+    let project_root = repo_root.join("projects").join(slug);
+    if !project_root.is_dir() {
+        return Ok(None);
+    }
+
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.clone());
+    let canonical_repo_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.clone());
+
+    Ok(Some(ProjectArchive {
+        slug: slug.to_string(),
+        root: project_root.clone(),
+        repo_root,
+        lock_path: project_root.join(".archive.lock"),
+        canonical_root,
+        canonical_repo_root,
+    }))
+}
+
 /// Ensure a per-project archive directory exists under the archive root.
 pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
     // Reject slugs with path separators or traversal components.
@@ -3710,12 +3745,9 @@ pub fn write_file_reservation_records(
         return Ok(());
     }
 
-    let reservation_dir = archive.root.join("file_reservations");
-    ensure_dir(&reservation_dir)?;
-
     let mut rel_paths = Vec::new();
     let mut entries = Vec::new();
-
+    let mut normalized_reservations = Vec::with_capacity(reservations.len());
     for res in reservations {
         let path_pattern = res
             .get("path_pattern")
@@ -3741,6 +3773,18 @@ pub fn write_file_reservation_records(
             obj.remove("path");
         }
 
+        let agent_name = normalized
+            .get("agent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        normalized_reservations.push((normalized, path_pattern, agent_name));
+    }
+
+    let reservation_dir = archive.root.join("file_reservations");
+    ensure_dir(&reservation_dir)?;
+
+    for (normalized, path_pattern, agent_name) in normalized_reservations {
         // Legacy path: sha1(path_pattern).json
         let digest = {
             let mut hasher = sha1::Sha1::new();
@@ -3758,11 +3802,6 @@ pub fn write_file_reservation_records(
             rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
         }
 
-        let agent_name = normalized
-            .get("agent")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
         entries.push((agent_name, path_pattern));
     }
 
@@ -7336,6 +7375,43 @@ mod tests {
             };
             assert_eq!(active.len(), expected_reservation_count);
         });
+    }
+
+    #[test]
+    fn write_file_reservation_records_validates_the_full_batch_before_writing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let reservations = vec![
+            serde_json::json!({
+                "id": 1,
+                "agent": "GreenCastle",
+                "path_pattern": "src/**",
+                "exclusive": true,
+            }),
+            serde_json::json!({
+                "id": 2,
+                "agent": "GreenCastle",
+                "exclusive": true,
+            }),
+        ];
+
+        let err = write_file_reservation_records(&archive, &config, &reservations)
+            .expect_err("invalid batch should fail");
+        assert!(err.to_string().contains("path_pattern"));
+
+        let reservation_dir = archive.root.join("file_reservations");
+        if reservation_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&reservation_dir)
+                .unwrap()
+                .flatten()
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "failed reservation batches must not leave partial archive artifacts"
+            );
+        }
     }
 
     #[test]

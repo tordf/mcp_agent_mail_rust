@@ -3,15 +3,20 @@
 //! Ported from legacy Python:
 //! - Only meaningful when `WORKTREES_ENABLED=1`
 //! - Stores per-slot leases as JSON files under the per-project archive root:
-//!   `{storage_root}/projects/{project_slug}/build_slots/{slot}/{agent__branch}.json`
+//!   `{storage_root}/projects/{project_slug}/build_slots/{slot}/{agent_hash}.json`
 //! - Conflicts are detected by scanning active (non-expired) leases.
 
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::tool_util::{get_db_pool, legacy_tool_error, resolve_project};
+
+static LEASE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSlotLease {
@@ -64,6 +69,82 @@ fn slot_dir(project_root: &Path, slot: &str) -> PathBuf {
     project_root.join("build_slots").join(safe_component(slot))
 }
 
+fn holder_identity(agent_name: &str, _branch: Option<&str>) -> String {
+    agent_name.to_string()
+}
+
+fn lease_path_for_holder(slot_path: &Path, agent_name: &str, branch: Option<&str>) -> PathBuf {
+    let identity = holder_identity(agent_name, branch);
+    let digest = Sha256::digest(identity.as_bytes());
+    let short_hash = &hex::encode(digest)[..16];
+    let holder_id = format!("{}--{short_hash}", safe_component(agent_name));
+    slot_path.join(format!("{holder_id}.json"))
+}
+
+fn lease_matches_holder(lease: &BuildSlotLease, agent_name: &str, _branch: Option<&str>) -> bool {
+    lease.agent == agent_name
+}
+
+fn legacy_lease_path_for_holder(
+    slot_path: &Path,
+    agent_name: &str,
+    branch: Option<&str>,
+) -> PathBuf {
+    let holder_id = safe_component(&holder_identity(agent_name, branch));
+    slot_path.join(format!("{holder_id}.json"))
+}
+
+fn existing_agent_lease_path(
+    slot_path: &Path,
+    agent_name: &str,
+    branch: Option<&str>,
+) -> Option<PathBuf> {
+    let mut same_agent_paths = Vec::new();
+    let entries = std::fs::read_dir(slot_path).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(lease) = serde_json::from_str::<BuildSlotLease>(&text) else {
+            continue;
+        };
+        if lease.agent != agent_name {
+            continue;
+        }
+        if lease.branch.as_deref() == branch {
+            return Some(path);
+        }
+        same_agent_paths.push(path);
+    }
+    if same_agent_paths.len() == 1 {
+        same_agent_paths.pop()
+    } else {
+        None
+    }
+}
+
+fn resolve_holder_lease_path(slot_path: &Path, agent_name: &str, branch: Option<&str>) -> PathBuf {
+    let preferred = lease_path_for_holder(slot_path, agent_name, branch);
+    if preferred.exists() {
+        return preferred;
+    }
+
+    let legacy = legacy_lease_path_for_holder(slot_path, agent_name, branch);
+    if legacy.exists() {
+        return legacy;
+    }
+
+    if let Some(existing) = existing_agent_lease_path(slot_path, agent_name, branch) {
+        return existing;
+    }
+
+    preferred
+}
+
 fn compute_branch(repo_path: &str) -> Option<String> {
     let repo = git2::Repository::discover(repo_path).ok()?;
     let head = repo.head().ok()?;
@@ -81,9 +162,11 @@ fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> V
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
+            tracing::warn!(path = %path.display(), "ignoring unreadable build slot lease file");
             continue;
         };
         let Ok(lease) = serde_json::from_str::<BuildSlotLease>(&text) else {
+            tracing::warn!(path = %path.display(), "ignoring malformed build slot lease file");
             continue;
         };
         let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts) else {
@@ -103,6 +186,18 @@ fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> V
     results
 }
 
+fn unique_tmp_lease_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let pid = std::process::id();
+    let seq = LEASE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    parent.join(format!(".{file_name}.{pid}.{nanos}.{seq}.tmp"))
+}
+
 fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -111,18 +206,37 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
         serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Write atomically to prevent race conditions during read_active_leases
-    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let pid = std::process::id();
-    let tmp_path = parent.join(format!(".{file_name}.{pid}.tmp"));
+    let tmp_path = unique_tmp_lease_path(path);
     std::fs::write(&tmp_path, text)?;
     std::fs::rename(&tmp_path, path)
+}
+
+fn compute_renewed_expiry(
+    now: chrono::DateTime<chrono::Utc>,
+    current_expires_ts: &str,
+    extend_seconds: i64,
+) -> String {
+    let current_expiry = chrono::DateTime::parse_from_rfc3339(current_expires_ts)
+        .map_or(now, |value| value.with_timezone(&chrono::Utc));
+    (std::cmp::max(now, current_expiry) + chrono::Duration::seconds(extend_seconds)).to_rfc3339()
+}
+
+async fn resolve_canonical_agent_name(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::pool::DbPool,
+    project_id: i64,
+    agent_name: &str,
+) -> String {
+    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await {
+        asupersync::Outcome::Ok(agent) => agent.name,
+        _ => agent_name.to_string(),
+    }
 }
 
 fn collect_slot_conflicts(
     active: Vec<BuildSlotLease>,
     agent_name: &str,
-    branch: Option<&str>,
+    _branch: Option<&str>,
     request_exclusive: bool,
 ) -> Vec<BuildSlotLease> {
     let mut conflicts = Vec::new();
@@ -131,7 +245,7 @@ fn collect_slot_conflicts(
             continue;
         }
         // Renewing/reacquiring your own lease should not self-conflict.
-        if entry.agent == agent_name && entry.branch.as_deref() == branch {
+        if entry.agent == agent_name {
             continue;
         }
         // Exclusive request conflicts with any active holder.
@@ -176,6 +290,8 @@ pub async fn acquire_build_slot(
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent_name = resolve_canonical_agent_name(ctx, &pool, project_id, &agent_name).await;
 
     let now = chrono::Utc::now();
     let ttl = ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000)); // 1 hour default
@@ -191,15 +307,11 @@ pub async fn acquire_build_slot(
     let active = read_active_leases(&slot_path, now);
     let conflicts = collect_slot_conflicts(active, &agent_name, branch.as_deref(), is_exclusive);
 
-    let holder_id = safe_component(&format!(
-        "{agent_name}__{}",
-        branch.clone().unwrap_or_else(|| "unknown".to_string())
-    ));
-    let lease_path = slot_path.join(format!("{holder_id}.json"));
+    let lease_path = resolve_holder_lease_path(&slot_path, &agent_name, branch.as_deref());
 
     let granted = BuildSlotLease {
         slot: slot.clone(),
-        agent: agent_name.clone(),
+        agent: agent_name,
         branch,
         exclusive: is_exclusive,
         acquired_ts: now.to_rfc3339(),
@@ -207,8 +319,9 @@ pub async fn acquire_build_slot(
         released_ts: None,
     };
 
-    // Best-effort write, matching legacy behavior.
-    let _ = write_lease_json(&lease_path, &granted);
+    write_lease_json(&lease_path, &granted).map_err(|e| {
+        McpError::internal_error(format!("failed to persist build slot lease: {e}"))
+    })?;
 
     let response = AcquireBuildSlotResponse { granted, conflicts };
     serde_json::to_string(&response)
@@ -231,47 +344,39 @@ pub async fn renew_build_slot(
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent_name = resolve_canonical_agent_name(ctx, &pool, project_id, &agent_name).await;
 
     let now = chrono::Utc::now();
     let extend = extend_seconds.map_or(1800, |t| t.clamp(60, 31_536_000)); // 30 minutes default
-    let new_exp = (now + chrono::Duration::seconds(extend)).to_rfc3339();
+    let branch = compute_branch(&project.human_key);
 
     let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
 
-    let mut renewed = false;
     let active = read_active_leases(&slot_path, now);
 
     for mut current in active {
-        if current.agent == agent_name && current.released_ts.is_none() {
-            let holder_id = safe_component(&format!(
-                "{}__{}",
-                current.agent,
-                current
-                    .branch
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string())
-            ));
-            let lease_path = slot_path.join(format!("{holder_id}.json"));
-
+        if lease_matches_holder(&current, &agent_name, branch.as_deref())
+            && current.released_ts.is_none()
+        {
+            let lease_path =
+                resolve_holder_lease_path(&slot_path, &current.agent, current.branch.as_deref());
+            let new_exp = compute_renewed_expiry(now, &current.expires_ts, extend);
             current.expires_ts.clone_from(&new_exp);
-            let _ = write_lease_json(&lease_path, &current);
-            renewed = true;
+            write_lease_json(&lease_path, &current).map_err(|e| {
+                McpError::internal_error(format!("failed to persist renewed build slot lease: {e}"))
+            })?;
+            return serde_json::to_string(&RenewBuildSlotResponse {
+                renewed: true,
+                expires_ts: new_exp,
+            })
+            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
         }
     }
-
-    if !renewed {
-        let response = RenewBuildSlotResponse {
-            renewed: false,
-            expires_ts: String::new(),
-        };
-        return serde_json::to_string(&response)
-            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
-    }
-
     let response = RenewBuildSlotResponse {
-        renewed: true,
-        expires_ts: new_exp,
+        renewed: false,
+        expires_ts: String::new(),
     };
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
@@ -294,65 +399,45 @@ pub async fn release_build_slot(
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent_name = resolve_canonical_agent_name(ctx, &pool, project_id, &agent_name).await;
 
     let now = chrono::Utc::now();
     let now_iso = now.to_rfc3339();
+    let branch = compute_branch(&project.human_key);
 
     let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
 
     let mut released = false;
+    let mut released_at = String::new();
     let active = read_active_leases(&slot_path, now);
 
     for mut lease in active {
-        if lease.agent == agent_name {
-            if lease.released_ts.is_some() {
+        if lease_matches_holder(&lease, &agent_name, branch.as_deref()) {
+            if let Some(existing_release) = lease.released_ts.clone() {
                 released = true;
-                continue;
+                released_at = existing_release;
+                break;
             }
-            let holder_id = safe_component(&format!(
-                "{}__{}",
-                lease.agent,
-                lease
-                    .branch
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string())
-            ));
-            let lease_path = slot_path.join(format!("{holder_id}.json"));
+            let lease_path =
+                resolve_holder_lease_path(&slot_path, &lease.agent, lease.branch.as_deref());
 
-            lease.released_ts = Some(now_iso.clone());
-            if write_lease_json(&lease_path, &lease).is_ok() {
-                released = true;
-            }
-        }
-    }
-
-    if !released {
-        let branch = compute_branch(&project.human_key);
-        let holder_id = safe_component(&format!(
-            "{agent_name}__{}",
-            branch.clone().unwrap_or_else(|| "unknown".to_string())
-        ));
-        let lease_path = slot_path.join(format!("{holder_id}.json"));
-
-        let data = BuildSlotLease {
-            slot: slot.clone(),
-            agent: agent_name.clone(),
-            branch,
-            exclusive: true,
-            acquired_ts: now_iso.clone(),
-            expires_ts: now_iso.clone(),
-            released_ts: Some(now_iso.clone()),
-        };
-
-        if write_lease_json(&lease_path, &data).is_ok() {
+            released_at.clone_from(&now_iso);
+            lease.released_ts = Some(now_iso);
+            write_lease_json(&lease_path, &lease).map_err(|e| {
+                McpError::internal_error(format!(
+                    "failed to persist released build slot lease: {e}"
+                ))
+            })?;
             released = true;
+            break;
         }
     }
 
     let response = ReleaseBuildSlotResponse {
         released,
-        released_at: now_iso,
+        released_at,
     };
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
@@ -466,6 +551,70 @@ mod tests {
         assert_eq!(
             dir,
             PathBuf::from("/archive/my-project/build_slots/my_slot_name")
+        );
+    }
+
+    #[test]
+    fn lease_path_for_holder_is_stable_for_the_same_agent() {
+        let slot_path = PathBuf::from("/archive/my-project/build_slots/default");
+        let slash_branch = lease_path_for_holder(&slot_path, "BlueLake", Some("feature/x"));
+        let underscore_branch = lease_path_for_holder(&slot_path, "BlueLake", Some("feature_x"));
+        assert_eq!(
+            slash_branch, underscore_branch,
+            "the same agent should reuse a single lease file across branch changes"
+        );
+        let file_name = slash_branch
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap();
+        assert!(file_name.starts_with("BlueLake--"));
+        assert!(
+            Path::new(file_name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        );
+    }
+
+    #[test]
+    fn resolve_holder_lease_path_prefers_existing_legacy_file() {
+        let slot_dir = tempfile::tempdir().unwrap();
+        let legacy_path =
+            legacy_lease_path_for_holder(slot_dir.path(), "BlueLake", Some("feature/x"));
+        std::fs::write(&legacy_path, "{}").unwrap();
+
+        let resolved = resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x"));
+        assert_eq!(resolved, legacy_path);
+    }
+
+    #[test]
+    fn resolve_holder_lease_path_reuses_existing_same_agent_file_after_branch_change() {
+        let slot_dir = tempfile::tempdir().unwrap();
+        let existing_path = slot_dir.path().join("BlueLake--current.json");
+        let lease = make_lease("BlueLake", Some("main"), true);
+        std::fs::write(&existing_path, serde_json::to_string(&lease).unwrap()).unwrap();
+
+        let resolved = resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x"));
+        assert_eq!(resolved, existing_path);
+    }
+
+    #[test]
+    fn lease_matches_holder_ignores_branch_changes_for_same_agent() {
+        let lease = make_lease("BlueLake", Some("main"), true);
+        assert!(lease_matches_holder(&lease, "BlueLake", Some("main")));
+        assert!(lease_matches_holder(&lease, "BlueLake", Some("feature")));
+    }
+
+    #[test]
+    fn compute_renewed_expiry_extends_from_existing_future_expiry() {
+        let now = chrono::Utc::now();
+        let existing_expiry = (now + chrono::Duration::minutes(30)).to_rfc3339();
+        let renewed = compute_renewed_expiry(now, &existing_expiry, 600);
+        let renewed_ts = chrono::DateTime::parse_from_rfc3339(&renewed)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(
+            renewed_ts >= now + chrono::Duration::minutes(40),
+            "renewing an active lease must not shorten it"
         );
     }
 
@@ -762,6 +911,17 @@ mod tests {
         assert!(
             conflicts.is_empty(),
             "agent reacquiring the same branch lease should not self-conflict"
+        );
+    }
+
+    #[test]
+    fn collect_slot_conflicts_same_agent_different_branch_is_not_a_conflict() {
+        let active = vec![make_lease("BlueLake", Some("main"), true)];
+        let branch = Some("feature".to_string());
+        let conflicts = collect_slot_conflicts(active, "BlueLake", branch.as_deref(), true);
+        assert!(
+            conflicts.is_empty(),
+            "the same agent should not self-conflict after a branch change"
         );
     }
 }

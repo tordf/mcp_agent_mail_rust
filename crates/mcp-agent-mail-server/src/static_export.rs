@@ -26,6 +26,8 @@ use mcp_agent_mail_share::scan_for_secrets;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+const EXPORT_INBOX_SCAN_LIMIT: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -74,6 +76,8 @@ pub struct ExportManifest {
 ///
 /// Returns the export manifest on success.
 pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, String> {
+    ensure_export_features_supported(config)?;
+    ensure_output_dir_empty(&config.output_dir)?;
     fs::create_dir_all(&config.output_dir).map_err(|e| format!("create output dir: {e}"))?;
 
     let pool = get_pool()?;
@@ -82,28 +86,12 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
 
     // ── 1. Enumerate projects ───────────────────────────────────────
     let all_projects = bo(&cx, queries::list_projects(&cx, &pool))?;
-    let project_slugs: Vec<String> = if config.projects.is_empty() {
-        all_projects.iter().map(|p| p.slug.clone()).collect()
-    } else {
-        // Filter to requested slugs that actually exist.
-        let existing: Vec<String> = all_projects.iter().map(|p| p.slug.clone()).collect();
-        config
-            .projects
-            .iter()
-            .filter(|s| existing.contains(s))
-            .cloned()
-            .collect()
-    };
+    let existing_slugs: Vec<String> = all_projects.iter().map(|p| p.slug.clone()).collect();
+    let project_slugs = resolve_requested_project_slugs(&existing_slugs, &config.projects)?;
 
     // ── 2. Top-level routes ─────────────────────────────────────────
-    emit_route("/mail", "", "index.html", &config.output_dir, &mut files);
-    emit_route(
-        "/mail/projects",
-        "",
-        "projects.html",
-        &config.output_dir,
-        &mut files,
-    );
+    emit_html_route("/mail", "__static_export=1", &config.output_dir, &mut files)?;
+    emit_html_route("/mail/projects", "", &config.output_dir, &mut files)?;
 
     // ── 3. Per-project routes ───────────────────────────────────────
     for slug in &project_slugs {
@@ -112,7 +100,7 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
 
     // ── 4. Archive routes ───────────────────────────────────────────
     if config.include_archive {
-        emit_archive_routes(&config.output_dir, &mut files);
+        emit_archive_routes(&config.output_dir, &mut files)?;
     }
 
     // ── 5. Search index ─────────────────────────────────────────────
@@ -149,6 +137,87 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
     Ok(manifest)
 }
 
+fn ensure_export_features_supported(config: &ExportConfig) -> Result<(), String> {
+    if config.include_archive {
+        return Err(
+            "static export archive routes are not offline-safe yet; rerun without --include-archive"
+                .to_string(),
+        );
+    }
+    if !config.include_search_index {
+        return Err(
+            "static export requires the search index because offline /mail/{project}/search pages are backed by search-index.json"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_output_dir_empty(output_dir: &Path) -> Result<(), String> {
+    if !output_dir.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(output_dir)
+        .map_err(|e| format!("stat output dir {}: {e}", output_dir.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "static export output path is not a directory: {}",
+            output_dir.display()
+        ));
+    }
+
+    let mut entries = fs::read_dir(output_dir)
+        .map_err(|e| format!("read output dir {}: {e}", output_dir.display()))?;
+    if let Some(entry) = entries.next() {
+        let entry = entry.map_err(|e| format!("read output dir entry: {e}"))?;
+        let rel = entry.path().strip_prefix(output_dir).map_or_else(
+            |_| entry.path().display().to_string(),
+            |path| path.display().to_string(),
+        );
+        return Err(format!(
+            "static export output directory must be empty because the exporter does not prune stale files: {} contains {rel}",
+            output_dir.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn resolve_requested_project_slugs(
+    existing: &[String],
+    requested: &[String],
+) -> Result<Vec<String>, String> {
+    if requested.is_empty() {
+        return Ok(existing.to_vec());
+    }
+
+    let existing_set: std::collections::BTreeSet<&str> =
+        existing.iter().map(String::as_str).collect();
+    let mut missing = Vec::new();
+    let mut resolved = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for slug in requested {
+        if !existing_set.contains(slug.as_str()) {
+            missing.push(slug.clone());
+            continue;
+        }
+        if seen.insert(slug.clone()) {
+            resolved.push(slug.clone());
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(format!(
+            "unknown project slug(s) requested for static export: {}",
+            missing.join(", ")
+        ));
+    }
+
+    Ok(resolved)
+}
+
 // ---------------------------------------------------------------------------
 // DB helpers
 // ---------------------------------------------------------------------------
@@ -175,39 +244,110 @@ fn bo<T>(
 // Route emission
 // ---------------------------------------------------------------------------
 
+/// Convert a route like `/mail/demo/search` into a pretty static path.
+fn route_html_output_path(route: &str) -> String {
+    let trimmed = route.trim_matches('/');
+    if trimmed.is_empty() {
+        "index.html".to_string()
+    } else {
+        format!("{trimmed}/index.html")
+    }
+}
+
+fn export_thread_ref(message_id: i64, thread_id: Option<&str>) -> Option<String> {
+    match thread_id.map(str::trim).filter(|thread| !thread.is_empty()) {
+        Some(thread_id) => Some(thread_id.to_string()),
+        None if message_id > 0 => Some(message_id.to_string()),
+        None => None,
+    }
+}
+
+const fn export_inbox_scan_is_truncated(row_count: usize) -> bool {
+    row_count > EXPORT_INBOX_SCAN_LIMIT
+}
+
+fn fetch_export_inbox_rows(
+    slug: &str,
+    agent_name: &str,
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+) -> Result<Vec<queries::InboxRow>, String> {
+    let rows = bo(
+        cx,
+        queries::fetch_inbox(
+            cx,
+            pool,
+            project_id,
+            agent_id,
+            false,
+            None,
+            EXPORT_INBOX_SCAN_LIMIT.saturating_add(1),
+        ),
+    )?;
+
+    if export_inbox_scan_is_truncated(rows.len()) {
+        return Err(format!(
+            "static export aborted because project {slug} agent {agent_name} has at least {EXPORT_INBOX_SCAN_LIMIT} inbox rows and export would be truncated"
+        ));
+    }
+
+    Ok(rows)
+}
+
+/// Render a single HTML route via the web UI dispatcher and write to its
+/// static path mirror.
+fn emit_html_route(
+    path: &str,
+    query: &str,
+    output_dir: &Path,
+    files: &mut BTreeMap<String, ManifestEntry>,
+) -> Result<(), String> {
+    let file_path = route_html_output_path(path);
+    emit_route(path, query, &file_path, output_dir, files)
+}
+
 /// Render a single route via the web UI dispatcher and write to a file.
-///
-/// Non-fatal: logs warnings on errors instead of aborting the export.
 fn emit_route(
     path: &str,
     query: &str,
     file_path: &str,
     output_dir: &Path,
     files: &mut BTreeMap<String, ManifestEntry>,
-) {
+) -> Result<(), String> {
     match crate::mail_ui::dispatch(path, query, "GET", "") {
         Ok(Some(html)) => {
             let dest = output_dir.join(file_path);
-            if write_html(&dest, &html).is_ok() {
-                let sha = sha256_hex(html.as_bytes());
-                files.insert(
-                    file_path.to_string(),
-                    ManifestEntry {
-                        route: if query.is_empty() {
-                            path.to_string()
-                        } else {
-                            format!("{path}?{query}")
-                        },
-                        size: html.len() as u64,
-                        sha256: sha,
+            write_html(&dest, &html).map_err(|err| {
+                format!("failed to write exported route {path} -> {file_path}: {err}")
+            })?;
+            let sha = sha256_hex(html.as_bytes());
+            files.insert(
+                file_path.to_string(),
+                ManifestEntry {
+                    route: if query.is_empty() {
+                        path.to_string()
+                    } else {
+                        format!("{path}?{query}")
                     },
-                );
+                    size: html.len() as u64,
+                    sha256: sha,
+                },
+            );
+            Ok(())
+        }
+        Ok(None) => Err(format!(
+            "exported route was not handled by mail UI dispatcher: {path} -> {file_path}"
+        )),
+        Err((status, msg)) => Err(format!(
+            "route failed during static export: {path}{} (status {status}): {msg}",
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
             }
-        }
-        Ok(None) => {} // Route not matched, skip silently.
-        Err((_status, msg)) => {
-            tracing::warn!(path = %path, error = %msg, "route failed during static export");
-        }
+        )),
     }
 }
 
@@ -220,43 +360,28 @@ fn emit_project_routes(
     files: &mut BTreeMap<String, ManifestEntry>,
 ) -> Result<(), String> {
     let prefix = format!("/mail/{slug}");
-    let dir_prefix = format!("mail/{slug}");
 
     // Project overview
-    emit_route(
-        &prefix,
-        "",
-        &format!("{dir_prefix}/index.html"),
-        output_dir,
-        files,
-    );
+    emit_html_route(&prefix, "__static_export=1", output_dir, files)?;
 
     // Search (empty query → shows interface)
-    emit_route(
+    emit_html_route(
         &format!("{prefix}/search"),
-        "",
-        &format!("{dir_prefix}/search.html"),
+        "__static_export=1",
         output_dir,
         files,
-    );
+    )?;
 
     // File reservations
-    emit_route(
+    emit_html_route(
         &format!("{prefix}/file_reservations"),
         "",
-        &format!("{dir_prefix}/file_reservations.html"),
         output_dir,
         files,
-    );
+    )?;
 
     // Attachments
-    emit_route(
-        &format!("{prefix}/attachments"),
-        "",
-        &format!("{dir_prefix}/attachments.html"),
-        output_dir,
-        files,
-    );
+    emit_html_route(&format!("{prefix}/attachments"), "", output_dir, files)?;
 
     // Get project ID for agent/message queries.
     let project = bo(cx, queries::get_project_by_slug(cx, pool, slug))?;
@@ -266,13 +391,12 @@ fn emit_project_routes(
     let agents = bo(cx, queries::list_agents(cx, pool, pid))?;
     for agent in &agents {
         let name = &agent.name;
-        emit_route(
+        emit_html_route(
             &format!("{prefix}/inbox/{name}"),
-            "",
-            &format!("{dir_prefix}/inbox/{name}.html"),
+            "__static_export=1",
             output_dir,
             files,
-        );
+        )?;
     }
 
     // ── Threads and messages ────────────────────────────────────────
@@ -282,69 +406,49 @@ fn emit_project_routes(
 
     for agent in &agents {
         let aid = agent.id.unwrap_or(0);
-        let inbox = bo(
-            cx,
-            queries::fetch_inbox(cx, pool, pid, aid, false, None, 10_000),
-        )?;
+        let inbox = fetch_export_inbox_rows(slug, &agent.name, cx, pool, pid, aid)?;
         for row in &inbox {
             let msg = &row.message;
             let mid = msg.id.unwrap_or(0);
             if mid > 0 {
                 seen_messages.insert(mid);
             }
-            if let Some(ref tid) = msg.thread_id
-                && !tid.is_empty()
-            {
-                seen_threads.insert(tid.clone());
+            if let Some(thread_ref) = export_thread_ref(mid, msg.thread_id.as_deref()) {
+                seen_threads.insert(thread_ref);
             }
         }
     }
 
     // Render thread pages.
     for tid in &seen_threads {
-        let safe_name = sanitize_filename(tid);
-        emit_route(
-            &format!("{prefix}/thread/{tid}"),
-            "",
-            &format!("{dir_prefix}/thread/{safe_name}.html"),
-            output_dir,
-            files,
-        );
+        emit_html_route(&format!("{prefix}/thread/{tid}"), "", output_dir, files)?;
     }
 
     // Render message detail pages.
     for mid in &seen_messages {
-        emit_route(
-            &format!("{prefix}/message/{mid}"),
-            "",
-            &format!("{dir_prefix}/message/{mid}.html"),
-            output_dir,
-            files,
-        );
+        emit_html_route(&format!("{prefix}/message/{mid}"), "", output_dir, files)?;
     }
 
     Ok(())
 }
 
 /// Emit archive visualization routes.
-fn emit_archive_routes(output_dir: &Path, files: &mut BTreeMap<String, ManifestEntry>) {
+fn emit_archive_routes(
+    output_dir: &Path,
+    files: &mut BTreeMap<String, ManifestEntry>,
+) -> Result<(), String> {
     let routes = [
-        ("guide", "guide"),
-        ("timeline", "timeline"),
-        ("activity", "activity"),
-        ("browser", "browser"),
-        ("network", "network"),
-        ("time-travel", "time-travel"),
+        "guide",
+        "timeline",
+        "activity",
+        "browser",
+        "network",
+        "time-travel",
     ];
-    for (route, file) in &routes {
-        emit_route(
-            &format!("/mail/archive/{route}"),
-            "",
-            &format!("mail/archive/{file}.html"),
-            output_dir,
-            files,
-        );
+    for route in &routes {
+        emit_html_route(&format!("/mail/archive/{route}"), "", output_dir, files)?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +462,7 @@ struct SearchIndexEntry {
     project: String,
     subject: String,
     body_excerpt: String,
+    body_text: String,
     from_agent: String,
     thread_id: String,
     importance: String,
@@ -373,6 +478,7 @@ fn emit_search_index(
     files: &mut BTreeMap<String, ManifestEntry>,
 ) -> Result<(), String> {
     let mut entries: Vec<SearchIndexEntry> = Vec::new();
+    let mut seen_message_ids = std::collections::BTreeSet::new();
 
     for slug in project_slugs {
         let project = bo(cx, queries::get_project_by_slug(cx, pool, slug))?;
@@ -381,19 +487,17 @@ fn emit_search_index(
 
         for agent in &agents {
             let aid = agent.id.unwrap_or(0);
-            let inbox = bo(
-                cx,
-                queries::fetch_inbox(cx, pool, pid, aid, false, None, 10_000),
-            )?;
+            let inbox = fetch_export_inbox_rows(slug, &agent.name, cx, pool, pid, aid)?;
             for row in inbox {
                 let msg = row.message;
                 let mid = msg.id.unwrap_or(0);
                 // Deduplicate by message ID.
-                if entries.iter().any(|e| e.id == mid) {
+                if !seen_message_ids.insert(mid) {
                     continue;
                 }
-                // Defense-in-depth: scan subject and body excerpt for leaked secrets
+                // Defense-in-depth: scan subject and body text for leaked secrets
                 let (safe_subject, _) = scan_for_secrets(&msg.subject);
+                let (safe_body_text, _) = scan_for_secrets(&msg.body_md);
                 let excerpt = truncate(&msg.body_md, 300);
                 let (safe_excerpt, _) = scan_for_secrets(&excerpt);
                 entries.push(SearchIndexEntry {
@@ -401,8 +505,9 @@ fn emit_search_index(
                     project: slug.clone(),
                     subject: safe_subject,
                     body_excerpt: safe_excerpt,
+                    body_text: safe_body_text,
                     from_agent: row.sender_name.clone(),
-                    thread_id: msg.thread_id.clone().unwrap_or_default(),
+                    thread_id: export_thread_ref(mid, msg.thread_id.as_deref()).unwrap_or_default(),
                     importance: msg.importance.clone(),
                     created_ts: mcp_agent_mail_db::timestamps::micros_to_iso(msg.created_ts),
                 });
@@ -562,7 +667,7 @@ fn emit_hosting_files(
 </body>
 </html>
 "#;
-    write_and_record(output_dir, "redirect.html", redirect.as_bytes(), "/", files)?;
+    write_and_record(output_dir, "index.html", redirect.as_bytes(), "/", files)?;
 
     Ok(())
 }
@@ -647,6 +752,7 @@ fn compute_content_hash(files: &BTreeMap<String, ManifestEntry>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Sanitize a string for use as a filename (replace unsafe chars).
+#[cfg(test)]
 fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -736,13 +842,106 @@ mod tests {
     }
 
     #[test]
-    fn emit_route_handles_missing_dispatch() {
-        // dispatch() will fail without a real DB, but emit_route is non-fatal.
+    fn emit_route_reports_missing_dispatch() {
         let dir = PathBuf::from("/tmp/static_export_test_missing");
         let _ = fs::remove_dir_all(&dir);
         let mut files = BTreeMap::new();
-        emit_route("/nonexistent/route", "", "test.html", &dir, &mut files);
-        // Should not crash; file may or may not be recorded.
+        let err = emit_route("/nonexistent/route", "", "test.html", &dir, &mut files)
+            .expect_err("missing dispatch route should fail export");
+        assert!(err.contains("not handled by mail UI dispatcher"));
+        assert!(files.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_thread_ref_uses_explicit_thread_id_when_present() {
+        assert_eq!(
+            export_thread_ref(42, Some("thread-123")),
+            Some("thread-123".to_string())
+        );
+    }
+
+    #[test]
+    fn export_thread_ref_uses_message_id_for_root_messages() {
+        assert_eq!(export_thread_ref(42, None), Some("42".to_string()));
+        assert_eq!(export_thread_ref(42, Some("")), Some("42".to_string()));
+    }
+
+    #[test]
+    fn export_thread_ref_returns_none_for_invalid_zero_message_without_thread() {
+        assert_eq!(export_thread_ref(0, None), None);
+    }
+
+    #[test]
+    fn export_inbox_scan_is_truncated_only_above_limit() {
+        assert!(!export_inbox_scan_is_truncated(EXPORT_INBOX_SCAN_LIMIT - 1));
+        assert!(!export_inbox_scan_is_truncated(EXPORT_INBOX_SCAN_LIMIT));
+        assert!(export_inbox_scan_is_truncated(
+            EXPORT_INBOX_SCAN_LIMIT.saturating_add(1)
+        ));
+    }
+
+    #[test]
+    fn resolve_requested_project_slugs_rejects_unknown_slugs() {
+        let err = resolve_requested_project_slugs(
+            &["alpha".to_string(), "beta".to_string()],
+            &["beta".to_string(), "missing".to_string()],
+        )
+        .expect_err("unknown requested slug should fail");
+        assert!(err.contains("missing"));
+    }
+
+    #[test]
+    fn resolve_requested_project_slugs_preserves_requested_order_without_duplicates() {
+        let resolved = resolve_requested_project_slugs(
+            &["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+            &[
+                "gamma".to_string(),
+                "alpha".to_string(),
+                "gamma".to_string(),
+            ],
+        )
+        .expect("requested slugs should resolve");
+        assert_eq!(resolved, vec!["gamma".to_string(), "alpha".to_string()]);
+    }
+
+    #[test]
+    fn ensure_export_features_supported_rejects_archive_routes() {
+        let config = ExportConfig {
+            output_dir: PathBuf::from("/tmp/static-export-features"),
+            projects: Vec::new(),
+            include_archive: true,
+            include_search_index: true,
+        };
+        let err = ensure_export_features_supported(&config)
+            .expect_err("archive routes should not be exported yet");
+        assert!(err.contains("--include-archive"));
+    }
+
+    #[test]
+    fn ensure_export_features_supported_requires_search_index() {
+        let config = ExportConfig {
+            output_dir: PathBuf::from("/tmp/static-export-features"),
+            projects: Vec::new(),
+            include_archive: false,
+            include_search_index: false,
+        };
+        let err =
+            ensure_export_features_supported(&config).expect_err("search index should be required");
+        assert!(err.contains("search index"));
+    }
+
+    #[test]
+    fn ensure_output_dir_empty_rejects_non_empty_directory() {
+        let dir = PathBuf::from("/tmp/static_export_test_nonempty");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create test dir");
+        fs::write(dir.join("stale.txt"), "stale").expect("seed stale file");
+
+        let err = ensure_output_dir_empty(&dir).expect_err("non-empty dir should fail");
+        assert!(err.contains("must be empty"));
+        assert!(err.contains("stale.txt"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -940,6 +1139,16 @@ mod tests {
     }
 
     #[test]
+    fn route_html_output_path_mirrors_pretty_urls() {
+        assert_eq!(route_html_output_path("/"), "index.html");
+        assert_eq!(route_html_output_path("/mail"), "mail/index.html");
+        assert_eq!(
+            route_html_output_path("/mail/demo/search"),
+            "mail/demo/search/index.html"
+        );
+    }
+
+    #[test]
     fn hosting_files_are_emitted() {
         let dir = PathBuf::from("/tmp/static_export_test_hosting");
         let _ = fs::remove_dir_all(&dir);
@@ -948,7 +1157,7 @@ mod tests {
         emit_hosting_files(&dir, &mut files).unwrap();
         assert!(files.contains_key(".nojekyll"));
         assert!(files.contains_key("_headers"));
-        assert!(files.contains_key("redirect.html"));
+        assert!(files.contains_key("index.html"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

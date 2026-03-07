@@ -576,6 +576,17 @@ fn validate_message_size_limits(
     Ok(())
 }
 
+fn attachment_size_bytes(meta: &Value) -> Option<u64> {
+    meta.get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| meta.get("size").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            meta.get("size")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| raw.parse::<u64>().ok())
+        })
+}
+
 /// Validate body-only size limit for `reply_message` (no attachments, subject comes later).
 fn validate_reply_body_limit(config: &Config, body_md: &str) -> McpResult<()> {
     if config.max_message_body_bytes > 0 && body_md.len() > config.max_message_body_bytes {
@@ -1058,7 +1069,7 @@ fn process_message_attachments(
                 }
 
                 if (att_type == Some("file") || att_type == Some("inline"))
-                    && let Some(bytes) = meta.get("bytes").and_then(serde_json::Value::as_u64)
+                    && let Some(bytes) = attachment_size_bytes(meta)
                 {
                     if let Ok(bytes_usize) = usize::try_from(bytes) {
                         let effective_bytes = if att_type == Some("inline") {
@@ -3832,6 +3843,17 @@ mod tests {
             max_subject_bytes: subject,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn attachment_size_bytes_accepts_size_aliases() {
+        let numeric = serde_json::json!({"size": 128});
+        let stringly = serde_json::json!({"size": "256"});
+        let bytes = serde_json::json!({"bytes": 512});
+
+        assert_eq!(attachment_size_bytes(&numeric), Some(128));
+        assert_eq!(attachment_size_bytes(&stringly), Some(256));
+        assert_eq!(attachment_size_bytes(&bytes), Some(512));
     }
 
     #[test]

@@ -13,6 +13,204 @@ use sqlmodel_core::Value;
 
 use crate::CliError;
 
+fn legacy_active_reservation_predicate_sql(table_ref: &str) -> String {
+    let table_ref = table_ref.trim().trim_end_matches('.');
+    let predicate = mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE;
+    if table_ref.is_empty() || table_ref == "file_reservations" {
+        predicate.to_string()
+    } else {
+        predicate.replace("released_ts", &format!("{table_ref}.released_ts"))
+    }
+}
+
+fn has_file_reservation_release_ledger(conn: &DbConn) -> bool {
+    conn.query_sync(
+        "SELECT 1
+         FROM sqlite_master
+         WHERE type = 'table' AND name = 'file_reservation_releases'
+         LIMIT 1",
+        &[],
+    )
+    .ok()
+    .is_some_and(|rows| !rows.is_empty())
+}
+
+fn active_reservation_release_join_sql(
+    has_release_ledger: bool,
+    table_ref: &str,
+    release_alias: &str,
+) -> String {
+    if has_release_ledger {
+        format!(
+            " LEFT JOIN file_reservation_releases {release_alias} ON {release_alias}.reservation_id = {table_ref}.id"
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn active_reservation_filter_sql(
+    has_release_ledger: bool,
+    table_ref: &str,
+    release_alias: &str,
+) -> String {
+    let legacy = legacy_active_reservation_predicate_sql(table_ref);
+    if has_release_ledger {
+        format!("({legacy}) AND {release_alias}.reservation_id IS NULL")
+    } else {
+        legacy
+    }
+}
+
+fn reservation_released_ts_sql(
+    has_release_ledger: bool,
+    table_ref: &str,
+    release_alias: &str,
+) -> String {
+    let table_ref = table_ref.trim().trim_end_matches('.');
+    let release_expr = format!(
+        "CASE \
+             WHEN {table_ref}.released_ts IS NULL THEN NULL \
+             WHEN typeof({table_ref}.released_ts) = 'text' THEN CAST(strftime('%s', {table_ref}.released_ts) AS INTEGER) * 1000000 + \
+                 CASE WHEN instr({table_ref}.released_ts, '.') > 0 \
+                      THEN CAST(substr({table_ref}.released_ts || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
+                      ELSE 0 \
+                 END \
+             ELSE {table_ref}.released_ts \
+         END"
+    );
+    if has_release_ledger {
+        format!("COALESCE({release_alias}.released_ts, {release_expr})")
+    } else {
+        release_expr
+    }
+}
+
+fn reservation_is_released(released_ts: Option<i64>) -> bool {
+    released_ts.is_some_and(|ts| ts > 0)
+}
+
+fn canonical_thread_ref_for_row(message_id: i64, thread_id: Option<&str>) -> String {
+    canonical_thread_ref(message_id, thread_id.unwrap_or_default())
+}
+
+fn status_alert_hints(anomalies: &[AnomalyCard]) -> Vec<(String, String, Option<String>)> {
+    anomalies
+        .iter()
+        .filter(|anomaly| anomaly.severity == "warn")
+        .map(|anomaly| {
+            let action_hint = match anomaly.category.as_str() {
+                "ack_sla" => Some("am robot inbox --ack-overdue".to_string()),
+                "reservation_expiry" => Some("am robot reservations --expiring=5".to_string()),
+                _ => None,
+            };
+            (
+                anomaly.severity.clone(),
+                anomaly.headline.clone(),
+                action_hint,
+            )
+        })
+        .collect()
+}
+
+fn append_status_anomaly_alerts<T: Serialize>(
+    mut env: RobotEnvelope<T>,
+    anomalies: &[AnomalyCard],
+) -> RobotEnvelope<T> {
+    for (severity, headline, action) in status_alert_hints(anomalies) {
+        let already_present = env
+            ._alerts
+            .iter()
+            .any(|alert| alert.severity == severity && alert.summary == headline);
+        if !already_present {
+            env = env.with_alert(severity, headline, action);
+        }
+    }
+    env
+}
+
+#[derive(Debug, Clone)]
+struct ParsedAttachment {
+    name: String,
+    size_text: String,
+    size_bytes: usize,
+    mime_type: String,
+}
+
+fn parse_attachment_size_bytes(value: &serde_json::Value) -> Option<usize> {
+    value
+        .get("bytes")
+        .and_then(|v| v.as_u64())
+        .or_else(|| value.get("size").and_then(|v| v.as_u64()))
+        .or_else(|| {
+            value
+                .get("size")
+                .and_then(|v| v.as_str())
+                .and_then(|raw| raw.parse::<u64>().ok())
+        })
+        .and_then(|bytes| usize::try_from(bytes).ok())
+}
+
+fn parse_attachment_name(value: &serde_json::Value) -> String {
+    value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            value.get("path").and_then(|v| v.as_str()).and_then(|path| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+            })
+        })
+        .unwrap_or("attachment")
+        .to_string()
+}
+
+fn parse_attachment_mime_type(value: &serde_json::Value) -> String {
+    value
+        .get("media_type")
+        .or_else(|| value.get("content_type"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .filter(|kind| !matches!(*kind, "file" | "inline" | "auto"))
+        })
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+fn parse_attachments_json(attachments_json: &str) -> Vec<ParsedAttachment> {
+    serde_json::from_str::<serde_json::Value>(attachments_json)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .map(|items| {
+            items
+                .iter()
+                .map(|value| {
+                    let size_bytes = parse_attachment_size_bytes(value).unwrap_or(0);
+                    let size_text = parse_attachment_size_bytes(value)
+                        .map(|bytes| bytes.to_string())
+                        .or_else(|| {
+                            value
+                                .get("size")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    ParsedAttachment {
+                        name: parse_attachment_name(value),
+                        size_text,
+                        size_bytes,
+                        mime_type: parse_attachment_mime_type(value),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ── Output format ────────────────────────────────────────────────────────────
 
 /// Output format for robot commands.
@@ -651,7 +849,7 @@ pub enum RobotSubcommand {
         /// Filter by agent name.
         #[arg(long)]
         agent: Option<String>,
-        /// Show all reservations (including expired).
+        /// Show reservations for all agents, not just the selected agent.
         #[arg(long)]
         all: bool,
         /// Show only conflicting reservations.
@@ -965,6 +1163,11 @@ fn build_status(
 ) -> Result<(StatusData, Vec<String>), CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let _now_s = now_us / 1_000_000;
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate =
+        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
 
     // 1. Inbox counts (agent-specific, if resolved)
     let (unread, urgent, ack_required, ack_overdue) = if let Some((agent_id, _)) = &agent {
@@ -1011,8 +1214,9 @@ fn build_status(
             "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = ? AND last_active_ts > ?",
             &[Value::BigInt(project_id), Value::BigInt(active_threshold)],
         )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("cnt").ok()))
+        .map_err(|e| CliError::Other(format!("active agents query failed: {e}")))?
+        .first()
+        .and_then(|r| r.get_named::<i64>("cnt").ok())
         .unwrap_or(0) as usize;
 
     // 3. Recent messages (last hour)
@@ -1022,51 +1226,64 @@ fn build_status(
             "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ? AND created_ts > ?",
             &[Value::BigInt(project_id), Value::BigInt(hour_ago)],
         )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("cnt").ok()))
+        .map_err(|e| CliError::Other(format!("recent messages query failed: {e}")))?
+        .first()
+        .and_then(|r| r.get_named::<i64>("cnt").ok())
         .unwrap_or(0) as usize;
 
     // 4. File reservations (active = not released and not expired)
     let active_reservations = conn
         .query_sync(
-            "SELECT COUNT(*) AS cnt FROM file_reservations
-             WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ?",
+            &format!(
+                "SELECT COUNT(*) AS cnt
+                 FROM file_reservations fr{active_reservation_join}
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?"
+            ),
             &[Value::BigInt(project_id), Value::BigInt(now_us)],
         )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("cnt").ok()))
+        .map_err(|e| CliError::Other(format!("active reservations query failed: {e}")))?
+        .first()
+        .and_then(|r| r.get_named::<i64>("cnt").ok())
         .unwrap_or(0) as usize;
 
     // Reservations expiring soon (within 5 minutes)
     let expiring_threshold = now_us + 5 * 60 * 1_000_000;
     let reservations_expiring_soon = conn
         .query_sync(
-            "SELECT COUNT(*) AS cnt FROM file_reservations
-             WHERE project_id = ? AND released_ts IS NULL
-             AND expires_ts > ? AND expires_ts < ?",
+            &format!(
+                "SELECT COUNT(*) AS cnt
+                 FROM file_reservations fr{active_reservation_join}
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate})
+                 AND fr.expires_ts > ? AND fr.expires_ts < ?"
+            ),
             &[
                 Value::BigInt(project_id),
                 Value::BigInt(now_us),
                 Value::BigInt(expiring_threshold),
             ],
         )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|r| r.get_named::<i64>("cnt").ok()))
+        .map_err(|e| CliError::Other(format!("expiring reservations query failed: {e}")))?
+        .first()
+        .and_then(|r| r.get_named::<i64>("cnt").ok())
         .unwrap_or(0) as usize;
 
     // 5. My reservations (agent-specific)
     let my_reservations = if let Some((agent_id, _)) = &agent {
         conn.query_sync(
-            "SELECT path_pattern, \"exclusive\", expires_ts FROM file_reservations
-             WHERE project_id = ? AND agent_id = ? AND released_ts IS NULL AND expires_ts > ?
-             ORDER BY expires_ts ASC",
+            &format!(
+                "SELECT fr.path_pattern, fr.\"exclusive\", fr.expires_ts
+                 FROM file_reservations fr{active_reservation_join}
+                 WHERE fr.project_id = ? AND fr.agent_id = ? AND ({active_reservation_predicate})
+                   AND fr.expires_ts > ?
+                 ORDER BY fr.expires_ts ASC"
+            ),
             &[
                 Value::BigInt(project_id),
                 Value::BigInt(*agent_id),
                 Value::BigInt(now_us),
             ],
         )
-        .unwrap_or_default()
+        .map_err(|e| CliError::Other(format!("my reservations query failed: {e}")))?
         .iter()
         .map(|r| {
             let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
@@ -1087,46 +1304,43 @@ fn build_status(
     // 6. Top threads (3 most recently active)
     let top_threads_rows = conn
         .query_sync(
-            "SELECT thread_id,
+            "SELECT CASE
+                        WHEN m.thread_id IS NOT NULL AND m.thread_id <> '' THEN m.thread_id
+                        ELSE CAST(m.id AS TEXT)
+                    END AS thread_id,
                     COUNT(*) AS msg_count,
-                    MAX(created_ts) AS last_ts,
-                    MIN(subject) AS subject
-             FROM messages
-             WHERE project_id = ? AND thread_id IS NOT NULL
-             GROUP BY thread_id
+                    MAX(created_ts) AS last_ts
+             FROM messages m
+             WHERE project_id = ?
+             GROUP BY CASE
+                        WHEN m.thread_id IS NOT NULL AND m.thread_id <> '' THEN m.thread_id
+                        ELSE CAST(m.id AS TEXT)
+                      END
              ORDER BY last_ts DESC
              LIMIT 3",
             &[Value::BigInt(project_id)],
         )
-        .unwrap_or_default();
+        .map_err(|e| CliError::Other(format!("top threads query failed: {e}")))?;
 
     let top_threads: Vec<ThreadSummary> = top_threads_rows
         .iter()
-        .map(|r| {
+        .map(|r| -> Result<ThreadSummary, CliError> {
             let thread_id: String = r.get_named("thread_id").unwrap_or_default();
             let msg_count: i64 = r.get_named("msg_count").unwrap_or(0);
             let last_ts: i64 = r.get_named("last_ts").unwrap_or(0);
-            let subject: String = r.get_named("subject").unwrap_or_default();
-            // Count distinct participants for this thread
-            let participants = conn
-                .query_sync(
-                    "SELECT COUNT(DISTINCT sender_id) AS cnt FROM messages
-                     WHERE project_id = ? AND thread_id = ?",
-                    &[Value::BigInt(project_id), Value::Text(thread_id.clone())],
-                )
-                .ok()
-                .and_then(|rows| rows.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
-                .unwrap_or(1) as usize;
+            let subject = load_thread_subject(conn, project_id, &thread_id, true)?
+                .ok_or_else(|| CliError::Other(format!("top thread not found: {thread_id}")))?;
+            let participants = load_thread_participants(conn, project_id, &thread_id)?.len();
             let age_seconds = now_us.saturating_sub(last_ts) / 1_000_000;
-            ThreadSummary {
+            Ok(ThreadSummary {
                 id: thread_id,
                 subject,
                 participants,
                 messages: msg_count as usize,
                 last_activity: format_age(age_seconds),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     // 7. Build anomalies
     let mut anomalies = Vec::new();
@@ -1284,6 +1498,7 @@ fn build_inbox(
         let sender: String = row.get_named("sender_name").unwrap_or_default();
         let subject: String = row.get_named("subject").unwrap_or_default();
         let thread_id: String = row.get_named("thread_id").unwrap_or_default();
+        let thread_ref = canonical_thread_ref(id, &thread_id);
         let importance: String = row.get_named("importance").unwrap_or_default();
         let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
@@ -1329,7 +1544,7 @@ fn build_inbox(
             priority: priority_label.to_string(),
             from: sender,
             subject,
-            thread: thread_id,
+            thread: thread_ref,
             age: format_age(age_seconds),
             ack_status,
             importance,
@@ -1403,6 +1618,7 @@ fn build_outbox_entries(
         let id: i64 = row.get_named("id").unwrap_or(0);
         let subject: String = row.get_named("subject").unwrap_or_default();
         let thread_id: String = row.get_named("thread_id").unwrap_or_default();
+        let thread_ref = canonical_thread_ref(id, &thread_id);
         let importance: String = row.get_named("importance").unwrap_or_default();
         let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
@@ -1487,7 +1703,7 @@ fn build_outbox_entries(
             priority: "sent".to_string(),
             from: recipient_names,
             subject,
-            thread: thread_id,
+            thread: thread_ref,
             age: format_age(age_seconds),
             ack_status,
             importance,
@@ -1552,6 +1768,9 @@ fn build_thread(
     include_bodies: bool,
 ) -> Result<ThreadData, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
+    let thread_subject = load_thread_subject(conn, project_id, thread_id, false)?
+        .ok_or_else(|| CliError::InvalidArgument(format!("thread not found: {thread_id}")))?;
+    let participants = load_thread_participants(conn, project_id, thread_id)?;
 
     let mut conditions = vec!["m.project_id = ?".to_string()];
     let mut params: Vec<Value> = vec![Value::BigInt(project_id)];
@@ -1594,9 +1813,7 @@ fn build_thread(
     }
 
     let mut messages = Vec::new();
-    let mut participants = Vec::new();
     let mut last_ts: i64 = 0;
-    let mut thread_subject = String::new();
 
     for (idx, row) in rows.iter().enumerate() {
         let msg_id: i64 = row.get_named("id").unwrap_or(0);
@@ -1607,14 +1824,8 @@ fn build_thread(
         let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
         let sender: String = row.get_named("sender_name").unwrap_or_default();
 
-        if idx == 0 {
-            thread_subject.clone_from(&subject);
-        }
         if created_ts > last_ts {
             last_ts = created_ts;
-        }
-        if !participants.contains(&sender) {
-            participants.push(sender.clone());
         }
 
         // Get recipients for this message
@@ -1625,7 +1836,7 @@ fn build_thread(
                  WHERE mr.message_id = ?",
                 &[Value::BigInt(msg_id)],
             )
-            .unwrap_or_default();
+            .map_err(|e| CliError::Other(format!("thread recipients query failed: {e}")))?;
         let to_names: Vec<String> = recipients
             .iter()
             .filter_map(|r| r.get_named::<String>("name").ok())
@@ -1641,16 +1852,18 @@ fn build_thread(
                      WHERE message_id = ? AND ack_ts IS NOT NULL",
                     &[Value::BigInt(msg_id)],
                 )
-                .ok()
-                .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+                .map_err(|e| CliError::Other(format!("thread ack-count query failed: {e}")))?
+                .first()
+                .and_then(|r2| r2.get_named::<i64>("cnt").ok())
                 .unwrap_or(0);
             let total_recipients = conn
                 .query_sync(
                     "SELECT COUNT(*) AS cnt FROM message_recipients WHERE message_id = ?",
                     &[Value::BigInt(msg_id)],
                 )
-                .ok()
-                .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+                .map_err(|e| CliError::Other(format!("thread recipient-count query failed: {e}")))?
+                .first()
+                .and_then(|r2| r2.get_named::<i64>("cnt").ok())
                 .unwrap_or(0);
             if total_recipients > 0 && acked_count >= total_recipients {
                 "done".to_string()
@@ -1715,6 +1928,79 @@ fn thread_scope_params(alias: &str, project_id: i64, thread_ref: &str) -> (Strin
     let mut params = vec![Value::BigInt(project_id)];
     append_thread_membership_condition(alias, thread_ref, &mut conditions, &mut params);
     (conditions.join(" AND "), params)
+}
+
+fn load_thread_subject(
+    conn: &DbConn,
+    project_id: i64,
+    thread_ref: &str,
+    newest_first: bool,
+) -> Result<Option<String>, CliError> {
+    let (thread_where, thread_params) = thread_scope_params("m", project_id, thread_ref);
+    let order_clause = if newest_first {
+        "ORDER BY m.created_ts DESC, m.id DESC"
+    } else {
+        "ORDER BY m.created_ts ASC, m.id ASC"
+    };
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT m.subject
+                 FROM messages m
+                 WHERE {thread_where}
+                 {order_clause}
+                 LIMIT 1"
+            ),
+            &thread_params,
+        )
+        .map_err(|e| CliError::Other(format!("thread subject query failed: {e}")))?;
+    match rows.first() {
+        Some(row) => row
+            .get_named::<String>("subject")
+            .map(Some)
+            .map_err(|e| CliError::Other(format!("thread subject decode failed: {e}"))),
+        None => Ok(None),
+    }
+}
+
+fn load_thread_participants(
+    conn: &DbConn,
+    project_id: i64,
+    thread_ref: &str,
+) -> Result<Vec<String>, CliError> {
+    let (sender_where, mut sender_params) = thread_scope_params("m1", project_id, thread_ref);
+    let (recipient_where, mut recipient_params) = thread_scope_params("m2", project_id, thread_ref);
+    let sql = format!(
+        "SELECT name
+         FROM (
+             SELECT a_sender.name AS name, MIN(m1.created_ts) AS first_ts, MIN(m1.id) AS first_id
+             FROM messages m1
+             JOIN agents a_sender ON a_sender.id = m1.sender_id
+             WHERE {sender_where}
+             GROUP BY a_sender.name
+             UNION ALL
+             SELECT a_rec.name AS name, MIN(m2.created_ts) AS first_ts, MIN(m2.id) AS first_id
+             FROM message_recipients mr
+             JOIN messages m2 ON m2.id = mr.message_id
+             JOIN agents a_rec ON a_rec.id = mr.agent_id
+             WHERE {recipient_where}
+             GROUP BY a_rec.name
+         ) participants
+         GROUP BY name
+         ORDER BY MIN(first_ts) ASC, MIN(first_id) ASC, lower(name) ASC, name ASC"
+    );
+    let mut params = Vec::with_capacity(sender_params.len() + recipient_params.len());
+    params.append(&mut sender_params);
+    params.append(&mut recipient_params);
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|e| CliError::Other(format!("thread participants query failed: {e}")))?;
+    rows.iter()
+        .map(|row| {
+            row.get_named::<String>("name")
+                .map_err(|e| CliError::Other(format!("thread participant decode failed: {e}")))
+        })
+        .collect()
 }
 
 fn canonical_thread_ref(message_id: i64, thread_id: &str) -> String {
@@ -1786,7 +2072,7 @@ fn build_message(
              WHERE mr.message_id = ?",
             &[Value::BigInt(message_id)],
         )
-        .unwrap_or_default();
+        .map_err(|e| CliError::Other(format!("message recipients query failed: {e}")))?;
     let to: Vec<String> = recipient_rows
         .iter()
         .filter_map(|r| r.get_named::<String>("name").ok())
@@ -1802,16 +2088,18 @@ fn build_message(
                  WHERE message_id = ? AND ack_ts IS NOT NULL",
                 &[Value::BigInt(message_id)],
             )
-            .ok()
-            .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+            .map_err(|e| CliError::Other(format!("message ack-count query failed: {e}")))?
+            .first()
+            .and_then(|r2| r2.get_named::<i64>("cnt").ok())
             .unwrap_or(0);
         let total_recipients: i64 = conn
             .query_sync(
                 "SELECT COUNT(*) AS cnt FROM message_recipients WHERE message_id = ?",
                 &[Value::BigInt(message_id)],
             )
-            .ok()
-            .and_then(|r| r.first().and_then(|r2| r2.get_named::<i64>("cnt").ok()))
+            .map_err(|e| CliError::Other(format!("message recipient-count query failed: {e}")))?
+            .first()
+            .and_then(|r2| r2.get_named::<i64>("cnt").ok())
             .unwrap_or(0);
         if total_recipients > 0 && acked_count >= total_recipients {
             "done".to_string()
@@ -1857,48 +2145,14 @@ fn build_message(
     };
 
     // Parse attachments JSON
-    let attachments: Vec<AttachmentInfo> =
-        serde_json::from_str::<serde_json::Value>(&attachments_json)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .map(|arr| {
-                arr.iter()
-                    .map(|a| AttachmentInfo {
-                        name: a
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| {
-                                a.get("path").and_then(|v| v.as_str()).and_then(|path| {
-                                    std::path::Path::new(path)
-                                        .file_name()
-                                        .and_then(std::ffi::OsStr::to_str)
-                                })
-                            })
-                            .unwrap_or("attachment")
-                            .to_string(),
-                        size: a
-                            .get("bytes")
-                            .and_then(|v| v.as_u64())
-                            .or_else(|| a.get("size").and_then(|v| v.as_u64()))
-                            .map(|bytes| bytes.to_string())
-                            .or_else(|| a.get("size").and_then(|v| v.as_str()).map(str::to_string))
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        mime_type: a
-                            .get("media_type")
-                            .or_else(|| a.get("content_type"))
-                            .and_then(|s| s.as_str())
-                            .or_else(|| {
-                                a.get("type").and_then(|s| s.as_str()).filter(|kind| {
-                                    // Disposition values are not MIME types
-                                    !matches!(*kind, "file" | "inline" | "auto")
-                                })
-                            })
-                            .unwrap_or("application/octet-stream")
-                            .to_string(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    let attachments: Vec<AttachmentInfo> = parse_attachments_json(&attachments_json)
+        .into_iter()
+        .map(|attachment| AttachmentInfo {
+            name: attachment.name,
+            size: attachment.size_text,
+            mime_type: attachment.mime_type,
+        })
+        .collect();
 
     let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
     let created_iso = mcp_agent_mail_db::micros_to_iso(created_ts);
@@ -1979,14 +2233,9 @@ fn build_search(
     if let Some(imp) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
         let parsed = mcp_agent_mail_db::search_planner::Importance::parse(imp);
         let Some(parsed) = parsed else {
-            return Ok(SearchData {
-                query: query.to_string(),
-                total_results: 0,
-                results: vec![],
-                by_thread: vec![],
-                by_agent: vec![],
-                by_importance: vec![],
-            });
+            return Err(CliError::InvalidArgument(format!(
+                "invalid importance filter: {imp}"
+            )));
         };
         search_query.importance = vec![parsed];
     }
@@ -2013,7 +2262,7 @@ fn build_search(
 
     for row in search_rows {
         let subject = row.title;
-        let thread_id = row.thread_id.unwrap_or_default();
+        let thread_ref = canonical_thread_ref_for_row(row.id, row.thread_id.as_deref());
         let importance = row.importance.unwrap_or_else(|| "normal".to_string());
         let created_ts = row.created_ts.unwrap_or(0);
         let sender = row.from_agent.unwrap_or_default();
@@ -2024,8 +2273,8 @@ fn build_search(
         };
         let snippet = truncate_str(&snippet_source, 220);
 
-        if !thread_id.is_empty() {
-            *thread_counts.entry(thread_id.clone()).or_insert(0) += 1;
+        if !thread_ref.is_empty() {
+            *thread_counts.entry(thread_ref.clone()).or_insert(0) += 1;
         }
         *agent_counts.entry(sender.clone()).or_insert(0) += 1;
         *importance_counts.entry(importance.clone()).or_insert(0) += 1;
@@ -2041,7 +2290,7 @@ fn build_search(
             relevance: row.score.unwrap_or(0.0),
             from: sender,
             subject,
-            thread: thread_id,
+            thread: thread_ref,
             snippet,
             age: format_age(age_seconds),
         });
@@ -2303,16 +2552,23 @@ fn build_reservations(
 ) -> Result<(ReservationsData, Vec<String>), CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let expiring_threshold = now_us + i64::from(expiring_minutes.unwrap_or(10)) * 60 * 1_000_000;
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate =
+        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
 
     // Fetch all active reservations
     let all_rows = conn
         .query_sync(
-            "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.created_ts, fr.expires_ts,
-                    a.name AS agent_name, a.id AS agent_id
-             FROM file_reservations fr
-             JOIN agents a ON a.id = fr.agent_id
-             WHERE fr.project_id = ? AND fr.released_ts IS NULL AND fr.expires_ts > ?
-             ORDER BY fr.expires_ts ASC",
+            &format!(
+                "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.created_ts, fr.expires_ts,
+                        a.name AS agent_name, a.id AS agent_id
+                 FROM file_reservations fr{active_reservation_join}
+                 JOIN agents a ON a.id = fr.agent_id
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
+                 ORDER BY fr.expires_ts ASC"
+            ),
             &[Value::BigInt(project_id), Value::BigInt(now_us)],
         )
         .map_err(|e| CliError::Other(format!("reservations query failed: {e}")))?;
@@ -2386,7 +2642,7 @@ fn build_reservations(
         for entry in &expiring_soon {
             if entry.agent.as_deref() == Some(agent_name.as_str()) {
                 actions.push(format!(
-                    "am file_reservations renew {project_slug} {agent_name} --paths {} --extend 3600",
+                    "am file_reservations renew {project_slug} {agent_name} --paths {} --extend-seconds 3600",
                     entry.path
                 ));
             }
@@ -2439,9 +2695,9 @@ fn build_reservations(
     ))
 }
 
-/// Check whether `path` matches `pattern` with one-way glob semantics.
+/// Check whether two reservation path patterns can overlap.
 fn glob_matches(pattern: &str, path: &str) -> bool {
-    mcp_agent_mail_core::pattern_overlap::CompiledPattern::new(pattern).matches(path)
+    mcp_agent_mail_core::pattern_overlap::patterns_overlap(pattern, path)
 }
 
 // ── Timeline command implementation ─────────────────────────────────────────
@@ -2503,13 +2759,19 @@ fn build_timeline(
 
     // Reservation events
     if kind_filter.is_none() || kind_filter == Some("reservation") {
+        let has_release_ledger = has_file_reservation_release_ledger(conn);
+        let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+        let released_ts_sql = reservation_released_ts_sql(has_release_ledger, "fr", "rr");
         let res_rows = conn
             .query_sync(
-                "SELECT fr.id, fr.path_pattern, fr.created_ts, fr.released_ts, a.name AS agent
-                 FROM file_reservations fr
+                &format!(
+                    "SELECT fr.id, fr.path_pattern, fr.created_ts, {released_ts_sql} AS released_ts, a.name AS agent
+                 FROM file_reservations fr{release_join}
                  JOIN agents a ON a.id = fr.agent_id
-                 WHERE fr.project_id = ? AND (fr.created_ts > ? OR (fr.released_ts IS NOT NULL AND fr.released_ts > ?))
-                 ORDER BY fr.created_ts ASC",
+                 WHERE fr.project_id = ?
+                   AND (fr.created_ts > ? OR (({released_ts_sql}) IS NOT NULL AND ({released_ts_sql}) > ?))
+                 ORDER BY fr.created_ts ASC"
+                ),
                 &[
                     Value::BigInt(project_id),
                     Value::BigInt(since_us),
@@ -2601,6 +2863,11 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
     }
 
     let now_us = mcp_agent_mail_db::now_micros();
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate =
+        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
 
     let rows = conn
         .query_sync("SELECT id, slug FROM projects ORDER BY slug ASC", &[])
@@ -2666,8 +2933,11 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
         // Count active reservations
         let reservations: i64 = conn
             .query_sync(
-                "SELECT COUNT(*) AS cnt FROM file_reservations
-                 WHERE project_id = ? AND released_ts IS NULL AND expires_ts > ?",
+                &format!(
+                    "SELECT COUNT(*) AS cnt
+                     FROM file_reservations fr{active_reservation_join}
+                     WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?"
+                ),
                 &[Value::BigInt(pid), Value::BigInt(now_us)],
             )
             .map_err(|e| CliError::Other(format!("overview reservations query failed: {e}")))?
@@ -2697,6 +2967,7 @@ fn build_analytics(
 ) -> Result<Vec<AnomalyCard>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let mut anomalies = Vec::new();
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
 
     // Check for ack SLA violations (>1h old unacked)
     let ack_overdue: i64 = conn
@@ -2710,7 +2981,7 @@ fn build_analytics(
                 Value::BigInt(now_us - ACK_SLA_VIOLATION_THRESHOLD_US),
             ],
         )
-        .unwrap_or_default()
+        .map_err(|e| CliError::Other(format!("analytics ack-overdue query failed: {e}")))?
         .first()
         .and_then(|r| r.get_named("cnt").ok())
         .unwrap_or(0);
@@ -2727,26 +2998,36 @@ fn build_analytics(
     }
 
     // Check for reservation conflicts
+    let active_reservation_join_fr1 =
+        active_reservation_release_join_sql(has_release_ledger, "fr1", "rr1");
+    let active_reservation_join_fr2 =
+        active_reservation_release_join_sql(has_release_ledger, "fr2", "rr2");
+    let active_reservation_predicate_fr1 =
+        active_reservation_filter_sql(has_release_ledger, "fr1", "rr1");
+    let active_reservation_predicate_fr2 =
+        active_reservation_filter_sql(has_release_ledger, "fr2", "rr2");
     let conflict_rows = conn
         .query_sync(
-            "SELECT fr1.path_pattern AS p1, fr2.path_pattern AS p2,
-                    a1.name AS agent1, a2.name AS agent2
-             FROM file_reservations fr1
-             JOIN file_reservations fr2 ON fr1.id < fr2.id
-               AND fr1.project_id = fr2.project_id
-               AND fr1.agent_id != fr2.agent_id
-             JOIN agents a1 ON a1.id = fr1.agent_id
-             JOIN agents a2 ON a2.id = fr2.agent_id
-             WHERE fr1.project_id = ? AND fr1.\"exclusive\" = 1 AND fr2.\"exclusive\" = 1
-               AND fr1.released_ts IS NULL AND fr2.released_ts IS NULL
-               AND fr1.expires_ts > ? AND fr2.expires_ts > ?",
+            &format!(
+                "SELECT fr1.path_pattern AS p1, fr2.path_pattern AS p2,
+                        a1.name AS agent1, a2.name AS agent2
+                 FROM file_reservations fr1{active_reservation_join_fr1}
+                 JOIN file_reservations fr2{active_reservation_join_fr2} ON fr1.id < fr2.id
+                   AND fr1.project_id = fr2.project_id
+                   AND fr1.agent_id != fr2.agent_id
+                 JOIN agents a1 ON a1.id = fr1.agent_id
+                 JOIN agents a2 ON a2.id = fr2.agent_id
+                 WHERE fr1.project_id = ? AND fr1.\"exclusive\" = 1 AND fr2.\"exclusive\" = 1
+                   AND ({active_reservation_predicate_fr1}) AND ({active_reservation_predicate_fr2})
+                   AND fr1.expires_ts > ? AND fr2.expires_ts > ?"
+            ),
             &[
                 Value::BigInt(project_id),
                 Value::BigInt(now_us),
                 Value::BigInt(now_us),
             ],
         )
-        .unwrap_or_default();
+        .map_err(|e| CliError::Other(format!("analytics conflicts query failed: {e}")))?;
     let mut conflict_count = 0;
     for row in &conflict_rows {
         let p1: String = row.get_named("p1").unwrap_or_default();
@@ -2769,11 +3050,18 @@ fn build_analytics(
 
     // Check for expiring-soon reservations
     let expiring_threshold = now_us + 10 * 60 * 1_000_000;
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate =
+        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
     let expiring_count: i64 = if let Some((agent_id, _)) = &agent {
         conn.query_sync(
-            "SELECT COUNT(*) AS cnt FROM file_reservations
-             WHERE project_id = ? AND agent_id = ? AND released_ts IS NULL
-               AND expires_ts > ? AND expires_ts < ?",
+            &format!(
+                "SELECT COUNT(*) AS cnt
+                 FROM file_reservations fr{active_reservation_join}
+                 WHERE fr.project_id = ? AND fr.agent_id = ? AND ({active_reservation_predicate})
+                   AND fr.expires_ts > ? AND fr.expires_ts < ?"
+            ),
             &[
                 Value::BigInt(project_id),
                 Value::BigInt(*agent_id),
@@ -2783,9 +3071,12 @@ fn build_analytics(
         )
     } else {
         conn.query_sync(
-            "SELECT COUNT(*) AS cnt FROM file_reservations
-             WHERE project_id = ? AND released_ts IS NULL
-               AND expires_ts > ? AND expires_ts < ?",
+            &format!(
+                "SELECT COUNT(*) AS cnt
+                 FROM file_reservations fr{active_reservation_join}
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate})
+                   AND fr.expires_ts > ? AND fr.expires_ts < ?"
+            ),
             &[
                 Value::BigInt(project_id),
                 Value::BigInt(now_us),
@@ -2793,7 +3084,7 @@ fn build_analytics(
             ],
         )
     }
-    .unwrap_or_default()
+    .map_err(|e| CliError::Other(format!("analytics expiring reservations query failed: {e}")))?
     .first()
     .and_then(|r| r.get_named("cnt").ok())
     .unwrap_or(0);
@@ -2823,7 +3114,7 @@ fn build_analytics(
                 Value::BigInt(now_us - 24 * 3600 * 1_000_000),
             ],
         )
-        .unwrap_or_default();
+        .map_err(|e| CliError::Other(format!("analytics idle agents query failed: {e}")))?;
     if !idle_rows.is_empty() {
         let idle_names: Vec<String> = idle_rows
             .iter()
@@ -2871,6 +3162,11 @@ fn build_agents(
     active_only: bool,
     sort_field: Option<&str>,
 ) -> Result<Vec<AgentRow>, CliError> {
+    struct PendingAgentRow {
+        row: AgentRow,
+        last_active_ts: i64,
+    }
+
     let now_us = mcp_agent_mail_db::now_micros();
     let active_threshold = now_us - 15 * 60 * 1_000_000; // 15 min
     let idle_threshold = now_us - 4 * 3600 * 1_000_000; // 4 hours
@@ -2886,13 +3182,10 @@ fn build_agents(
         )
         .map_err(|e| CliError::Other(format!("agents query: {e}")))?;
 
-    let mut seen_names = std::collections::HashSet::new();
-    let mut agents: Vec<AgentRow> = Vec::new();
+    let mut agents_by_name: std::collections::HashMap<String, PendingAgentRow> =
+        std::collections::HashMap::new();
     for row in &rows {
         let name: String = row.get_named("name").unwrap_or_default();
-        if !seen_names.insert(name.to_lowercase()) {
-            continue;
-        }
         let program: String = row.get_named("program").unwrap_or_default();
         let model: String = row.get_named("model").unwrap_or_default();
         let last_active_ts: i64 = row.get_named("last_active_ts").unwrap_or(0);
@@ -2912,24 +3205,47 @@ fn build_agents(
 
         let age_seconds = now_us.saturating_sub(last_active_ts) / 1_000_000;
 
-        agents.push(AgentRow {
-            name,
-            program,
-            model,
-            last_active: format_age(age_seconds),
-            msg_count: msg_count as usize,
-            status: status.to_string(),
-        });
+        let logical_name = name.to_lowercase();
+        let candidate = PendingAgentRow {
+            row: AgentRow {
+                name,
+                program,
+                model,
+                last_active: format_age(age_seconds),
+                msg_count: msg_count as usize,
+                status: status.to_string(),
+            },
+            last_active_ts,
+        };
+        match agents_by_name.entry(logical_name) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if candidate.last_active_ts > slot.get().last_active_ts {
+                    slot.insert(candidate);
+                }
+            }
+        }
     }
+    let mut pending_agents: Vec<PendingAgentRow> = agents_by_name.into_values().collect();
 
     // Sort
     match sort_field {
-        Some("name") => agents.sort_by(|a, b| a.name.cmp(&b.name)),
-        Some("msg_count") => agents.sort_by_key(|x| std::cmp::Reverse(x.msg_count)),
-        _ => {} // Default: already sorted by last_active (DESC from SQL)
+        Some("name") => pending_agents.sort_by(|a, b| a.row.name.cmp(&b.row.name)),
+        Some("msg_count") => pending_agents.sort_by_key(|x| std::cmp::Reverse(x.row.msg_count)),
+        _ => pending_agents.sort_by_key(|x| {
+            (
+                std::cmp::Reverse(x.last_active_ts),
+                std::cmp::Reverse(x.row.msg_count),
+            )
+        }),
     }
 
-    Ok(agents)
+    Ok(pending_agents
+        .into_iter()
+        .map(|pending| pending.row)
+        .collect())
 }
 
 // ── Contacts command implementation ─────────────────────────────────────────
@@ -2979,16 +3295,23 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
 
 fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate =
+        active_reservation_filter_sql(has_release_ledger, "fr", "rr");
 
     let rows = conn
         .query_sync(
-            "SELECT p.id, p.slug, p.human_key, p.created_at,
-                    (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id) AS agent_count,
-                    (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id) AS msg_count,
-                    (SELECT COUNT(*) FROM file_reservations fr
-                     WHERE fr.project_id = p.id AND fr.released_ts IS NULL AND fr.expires_ts > ?) AS res_count
-             FROM projects p
-             ORDER BY p.slug ASC",
+            &format!(
+                "SELECT p.id, p.slug, p.human_key, p.created_at,
+                        (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id) AS agent_count,
+                        (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id) AS msg_count,
+                        (SELECT COUNT(*) FROM file_reservations fr{active_reservation_join}
+                         WHERE fr.project_id = p.id AND ({active_reservation_predicate}) AND fr.expires_ts > ?) AS res_count
+                 FROM projects p
+                 ORDER BY p.slug ASC"
+            ),
             &[Value::BigInt(now_us)],
         )
         .map_err(|e| CliError::Other(format!("projects query: {e}")))?;
@@ -3174,17 +3497,43 @@ fn build_navigate(
         ["file_reservations", project_key] => {
             let (resolved_project_id, resolved_project_slug) =
                 resolve_project_sync(conn, project_key)?;
+            let active_only = query
+                .get("active_only")
+                .is_none_or(|value| parse_resource_bool(Some(value)));
+            let now_us = mcp_agent_mail_db::now_micros();
+            let has_release_ledger = has_file_reservation_release_ledger(conn);
+            let active_reservation_join =
+                active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+            let active_reservation_predicate =
+                active_reservation_filter_sql(has_release_ledger, "fr", "rr");
+            let released_ts_sql = reservation_released_ts_sql(has_release_ledger, "fr", "rr");
 
-            let rows = conn
-                .query_sync(
-                    "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, fr.released_ts, fr.created_ts
-                     FROM file_reservations fr
+            let (sql, params) = if active_only {
+                (
+                    format!(
+                        "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, fr.released_ts, fr.created_ts
+                         FROM file_reservations fr{active_reservation_join}
+                         JOIN agents a ON a.id = fr.agent_id
+                         WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
+                         ORDER BY fr.created_ts DESC LIMIT 50"
+                    ),
+                    vec![Value::BigInt(resolved_project_id), Value::BigInt(now_us)],
+                )
+            } else {
+                (
+                    format!(
+                        "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
+                     FROM file_reservations fr{active_reservation_join}
                      JOIN agents a ON a.id = fr.agent_id
                      WHERE fr.project_id = ?
-                     ORDER BY fr.created_ts DESC LIMIT 50",
-                    &[Value::BigInt(resolved_project_id)],
+                     ORDER BY fr.created_ts DESC LIMIT 50"
+                    ),
+                    vec![Value::BigInt(resolved_project_id)],
                 )
-                .unwrap_or_default();
+            };
+            let rows = conn
+                .query_sync(&sql, &params)
+                .map_err(|e| CliError::Other(format!("navigate reservations query failed: {e}")))?;
 
             let reservations: Vec<serde_json::Value> = rows
                 .iter()
@@ -3194,7 +3543,7 @@ fn build_navigate(
                         "agent": r.get_named::<String>("name").unwrap_or_default(),
                         "exclusive": r.get_named::<i64>("exclusive").unwrap_or(0) == 1,
                         "expires_ts": r.get_named::<i64>("expires_ts").unwrap_or(0),
-                        "released": r.get_named::<i64>("released_ts").ok().is_some(),
+                        "released": reservation_is_released(r.get_named::<i64>("released_ts").ok()),
                     })
                 })
                 .collect();
@@ -3305,32 +3654,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             for a in actions {
                 env = env.with_action(&a);
             }
-            // Collect alert data before mutating env (avoids borrow conflict)
-            let pending_alerts: Vec<(String, String, Option<String>)> = env
-                .data
-                .anomalies
-                .iter()
-                .filter(|a| a.severity == "warn")
-                .map(|anomaly| {
-                    let action_hint = match anomaly.category.as_str() {
-                        "ack_sla" => Some("am robot inbox --ack-overdue".to_string()),
-                        "reservation_expiry" => {
-                            Some("am robot reservations --expiring=5".to_string())
-                        }
-                        _ => None,
-                    };
-                    (
-                        anomaly.severity.clone(),
-                        anomaly.headline.clone(),
-                        action_hint,
-                    )
-                })
-                .collect();
-            if env._alerts.is_empty() && !pending_alerts.is_empty() {
-                for (severity, headline, action) in pending_alerts {
-                    env = env.with_alert(severity, headline, action);
-                }
-            }
+            let anomalies = env.data.anomalies.clone();
+            env = append_status_anomaly_alerts(env, &anomalies);
             format_output(&env, format)?
         }
         RobotSubcommand::Inbox {
@@ -3600,14 +3925,17 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             // 2. Circuit breaker status
             let db_health = mcp_agent_mail_db::db_health_status();
-            let circuits_ok = db_health.circuit_state == "closed";
+            let open_circuits: Vec<String> = db_health
+                .circuits
+                .iter()
+                .filter(|c| c.state != "closed")
+                .map(|c| format!("{}={} ({} failures)", c.subsystem, c.state, c.failures))
+                .collect();
+            let circuits_ok = open_circuits.is_empty();
             let circuit_detail = if circuits_ok {
                 "All circuits closed".to_string()
             } else {
-                format!(
-                    "Circuit {} ({} failures)",
-                    db_health.circuit_state, db_health.circuit_failures
-                )
+                format!("Active circuit faults: {}", open_circuits.join(", "))
             };
             probes.push(HealthProbe {
                 name: "circuit_breakers".into(),
@@ -3631,6 +3959,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let (health_level, signals) =
                 mcp_agent_mail_core::backpressure::compute_health_level_with_signals();
             let health_str = format!("{health_level:?}").to_lowercase();
+            let backpressure_degraded = health_str != "green";
+            let backpressure_unhealthy = health_str == "red";
             probes.push(HealthProbe {
                 name: "backpressure".into(),
                 status: health_str.clone(),
@@ -3649,7 +3979,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // 5. Disk space probe
             let config = mcp_agent_mail_core::Config::from_env();
             let disk = mcp_agent_mail_core::disk::sample_disk(&config);
-            let disk_status = disk.pressure.label();
+            let disk_probe_failed = !disk.errors.is_empty();
+            let disk_status = if disk_probe_failed {
+                "degraded"
+            } else {
+                disk.pressure.label()
+            };
             let free_mb = disk
                 .effective_free_bytes
                 .map(|b| b / (1024 * 1024))
@@ -3658,14 +3993,20 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 name: "disk".into(),
                 status: disk_status.into(),
                 latency_ms: 0.0,
-                detail: format!("{free_mb} MB free"),
+                detail: if disk_probe_failed {
+                    disk.errors.join(" | ")
+                } else {
+                    format!("{free_mb} MB free")
+                },
             });
 
             // Overall health
-            let overall = if !db_ok {
+            let overall = if !db_ok || backpressure_unhealthy {
                 "unhealthy"
             } else if !integrity_ok
                 || !circuits_ok
+                || backpressure_degraded
+                || disk_probe_failed
                 || disk.pressure != mcp_agent_mail_core::disk::DiskPressure::Ok
             {
                 "degraded"
@@ -3894,24 +4235,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 let sender: String = row.get_named("sender_name").unwrap_or_default();
                 let att_json: String = row.get_named("attachments").unwrap_or_default();
 
-                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&att_json) {
-                    for att in arr {
-                        let atype = att
-                            .get("type")
-                            .or_else(|| att.get("content_type"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let size = att.get("size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        attachments.push(AttachmentRow {
-                            r#type: atype,
-                            size,
-                            sender: sender.clone(),
-                            subject: truncate_str(&subject, 60).to_string(),
-                            message_id: msg_id,
-                            project: project_slug.clone(),
-                        });
-                    }
+                for attachment in parse_attachments_json(&att_json) {
+                    attachments.push(AttachmentRow {
+                        r#type: attachment.mime_type,
+                        size: attachment.size_bytes,
+                        sender: sender.clone(),
+                        subject: truncate_str(&subject, 60).to_string(),
+                        message_id: msg_id,
+                        project: project_slug.clone(),
+                    });
                 }
             }
 
@@ -4756,6 +5088,8 @@ mod tests {
         assert!(!glob_matches("src/auth/*", "src/auth/sub/file.rs"));
         assert!(glob_matches("src/auth/jwt.rs", "src/auth/jwt.rs"));
         assert!(!glob_matches("src/auth/jwt.rs", "src/auth/other.rs"));
+        assert!(glob_matches("src/**/*.rs", "src/*/main.rs"));
+        assert!(!glob_matches("src/**/*.rs", "docs/**/*.md"));
     }
 
     #[test]
@@ -5227,6 +5561,198 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["health"], "degraded");
         assert_eq!(v["_alerts"][0]["severity"], "warn");
+    }
+
+    #[test]
+    fn build_status_uses_latest_thread_subject_and_all_participants() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_status.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                thread_id TEXT,
+                subject TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL DEFAULT 0,
+                importance TEXT NOT NULL DEFAULT 'normal'
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                exclusive INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create reservations");
+
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, last_active_ts) VALUES
+                (1, 1, 'Alpha', 1),
+                (2, 1, 'Beta', 1),
+                (3, 1, 'Gamma', 1)",
+            &empty,
+        )
+        .expect("seed agents");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance) VALUES
+                (1, 1, 1, 'thread-1', 'Alpha subject', 100, 0, 'normal'),
+                (2, 1, 1, 'thread-1', 'Latest subject', 200, 0, 'normal')",
+            &empty,
+        )
+        .expect("seed messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES
+                (1, 2, 'to', NULL, NULL),
+                (2, 2, 'to', NULL, NULL),
+                (2, 3, 'cc', NULL, NULL)",
+            &empty,
+        )
+        .expect("seed recipients");
+
+        let (status, _) = build_status(&conn, 1, "demo", None).expect("build status");
+        assert_eq!(status.top_threads.len(), 1);
+        assert_eq!(status.top_threads[0].subject, "Latest subject");
+        assert_eq!(status.top_threads[0].participants, 3);
+    }
+
+    #[test]
+    fn build_status_numeric_seed_threads_include_root_message_and_participants() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES
+                (210, 1, 1, 'Root subject', NULL, 'normal', 0, 10, 'root', '[]'),
+                (211, 1, 2, 'Latest subject', '210', 'normal', 0, 20, 'reply', '[]')",
+            &[],
+        )
+        .expect("insert thread messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (210, 210, 2, 'to', NULL, NULL),
+                (211, 211, 3, 'cc', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let (status, _) = build_status(&conn, 1, "demo", None).expect("build status");
+        assert_eq!(status.top_threads.len(), 1);
+        assert_eq!(status.top_threads[0].id, "210");
+        assert_eq!(status.top_threads[0].subject, "Latest subject");
+        assert_eq!(status.top_threads[0].messages, 2);
+        assert_eq!(status.top_threads[0].participants, 3);
+    }
+
+    #[test]
+    fn build_status_keeps_root_messages_as_distinct_threads() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES
+                (310, 1, 1, 'Root one', NULL, 'normal', 0, 10, 'root one', '[]'),
+                (320, 1, 2, 'Root two', NULL, 'normal', 0, 20, 'root two', '[]')",
+            &[],
+        )
+        .expect("insert root messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (310, 310, 2, 'to', NULL, NULL),
+                (320, 320, 1, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let (status, _) = build_status(&conn, 1, "demo", None).expect("build status");
+        let thread_ids: Vec<&str> = status
+            .top_threads
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect();
+        assert_eq!(thread_ids, vec!["320", "310"]);
+    }
+
+    #[test]
+    fn append_status_anomaly_alerts_keeps_existing_info_alerts() {
+        let anomalies = vec![AnomalyCard {
+            severity: "warn".into(),
+            confidence: 1.0,
+            category: "ack_sla".into(),
+            headline: "2 acks overdue".into(),
+            rationale: "Pending acknowledgements".into(),
+            remediation: "am robot inbox --ack-overdue".into(),
+        }];
+        let status = StatusData {
+            health: "ok".into(),
+            unread: 0,
+            urgent: 0,
+            ack_required: 0,
+            ack_overdue: 2,
+            active_reservations: 0,
+            reservations_expiring_soon: 0,
+            active_agents: 0,
+            recent_messages: 0,
+            my_reservations: vec![],
+            top_threads: vec![],
+            anomalies: anomalies.clone(),
+        };
+        let env = RobotEnvelope::new("robot status", OutputFormat::Json, status).with_alert(
+            "info",
+            "Agent not detected",
+            Some("am robot status --agent <NAME>".into()),
+        );
+
+        let env = append_status_anomaly_alerts(env, &anomalies);
+
+        assert_eq!(env._alerts.len(), 2);
+        assert_eq!(env._alerts[0].severity, "info");
+        assert_eq!(env._alerts[1].severity, "warn");
+        assert_eq!(env._alerts[1].summary, "2 acks overdue");
+        assert_eq!(
+            env._alerts[1].action.as_deref(),
+            Some("am robot inbox --ack-overdue")
+        );
     }
 
     #[test]
@@ -6095,6 +6621,170 @@ mod tests {
             other => panic!("unexpected reservations result: {other:?}"),
         }
         assert_eq!(reservations_scope.as_deref(), Some("proj"));
+
+        conn.query_sync(
+            "UPDATE file_reservations SET released_ts = 3000 WHERE id = 1",
+            &empty,
+        )
+        .expect("release reservation");
+
+        let (active_only_result, _) = build_navigate(
+            &conn,
+            &format!("resource://file_reservations/{encoded_project_key}"),
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate active-only reservations");
+        match active_only_result {
+            NavigateResult::Generic { data, .. } => {
+                assert_eq!(data["reservations"].as_array().map(Vec::len), Some(0));
+            }
+            other => panic!("unexpected active-only reservations result: {other:?}"),
+        }
+
+        let (all_result, _) = build_navigate(
+            &conn,
+            &format!("resource://file_reservations/{encoded_project_key}?active_only=false"),
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate all reservations");
+        match all_result {
+            NavigateResult::Generic { data, .. } => {
+                assert_eq!(data["reservations"].as_array().map(Vec::len), Some(1));
+                assert_eq!(data["reservations"][0]["released"], true);
+            }
+            other => panic!("unexpected all reservations result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_navigate_file_reservations_uses_release_ledger_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir
+            .path()
+            .join("robot_navigate_reservation_release_ledger.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                task_description TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                contact_policy TEXT,
+                attachments_policy TEXT,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                \"exclusive\" INTEGER NOT NULL,
+                reason TEXT,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create file reservations");
+        conn.query_sync(
+            "CREATE TABLE file_reservation_releases (
+                reservation_id INTEGER PRIMARY KEY,
+                released_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create file reservation releases");
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'proj', '/tmp/proj', 1000)",
+            &empty,
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (
+                id, project_id, name, program, model, task_description,
+                created_at, updated_at, contact_policy, attachments_policy, last_active_ts
+             ) VALUES (
+                1, 1, 'Sender', 'codex-cli', 'gpt-5', 'task',
+                1000, 1000, 'auto', 'inline', 1000
+             )",
+            &empty,
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO file_reservations (
+                id, project_id, agent_id, path_pattern, \"exclusive\",
+                reason, created_ts, expires_ts, released_ts
+             ) VALUES (
+                1, 1, 1, 'src/**', 1, 'test', 1000, 2000, NULL
+             )",
+            &empty,
+        )
+        .expect("insert reservation");
+        conn.query_sync(
+            "INSERT INTO file_reservation_releases (reservation_id, released_ts)
+             VALUES (1, 3000)",
+            &empty,
+        )
+        .expect("insert reservation release");
+
+        let (active_only_result, _) = build_navigate(
+            &conn,
+            "resource://file_reservations/%2Ftmp%2Fproj",
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate active-only reservations");
+        match active_only_result {
+            NavigateResult::Generic { data, .. } => {
+                assert_eq!(data["reservations"].as_array().map(Vec::len), Some(0));
+            }
+            other => panic!("unexpected active-only reservations result: {other:?}"),
+        }
+
+        let (all_result, _) = build_navigate(
+            &conn,
+            "resource://file_reservations/%2Ftmp%2Fproj?active_only=false",
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate all reservations");
+        match all_result {
+            NavigateResult::Generic { data, .. } => {
+                assert_eq!(data["reservations"].as_array().map(Vec::len), Some(1));
+                assert_eq!(data["reservations"][0]["released"], true);
+            }
+            other => panic!("unexpected all reservations result: {other:?}"),
+        }
     }
 
     #[test]
@@ -6364,6 +7054,21 @@ mod tests {
         )
         .expect("create recipients");
         conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                exclusive INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create reservations");
+        conn.query_sync(
             "INSERT INTO projects (id, slug, human_key) VALUES (1, 'proj', '/tmp/proj')",
             &empty,
         )
@@ -6416,6 +7121,112 @@ mod tests {
             .expect("build thread should succeed");
         assert_eq!(thread.message_count, 1);
         assert_eq!(thread.messages[0].ack, "partial (1/2)");
+    }
+
+    #[test]
+    fn test_build_thread_collects_sender_and_recipient_participants() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES
+                (110, 1, 1, 'First', 'PARTICIPANTS', 'normal', 0, ?, 'body', '[]'),
+                (111, 1, 2, 'Second', 'PARTICIPANTS', 'normal', 0, ?, 'body', '[]')",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts + 1),
+            ],
+        )
+        .expect("insert messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (10, 110, 2, 'to', NULL, NULL),
+                (11, 110, 3, 'cc', NULL, NULL),
+                (12, 111, 1, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let thread =
+            build_thread(&conn, 1, "PARTICIPANTS", Some(10), None, false).expect("build thread");
+        assert_eq!(
+            thread.participants,
+            vec!["Alice".to_string(), "Bob".to_string(), "Carol".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_thread_missing_thread_errors() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let err = build_thread(&conn, 1, "does-not-exist", Some(10), None, false)
+            .expect_err("missing thread should error");
+        assert!(matches!(err, CliError::InvalidArgument(msg) if msg.contains("does-not-exist")));
+    }
+
+    #[test]
+    fn test_build_inbox_root_message_uses_numeric_thread_ref() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (120, 1, 1, 'Root inbox message', NULL, 'normal', 0, 10, 'body', '[]')",
+            &[],
+        )
+        .expect("insert inbox message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (120, 120, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert inbox recipient");
+
+        let result = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("build inbox");
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].thread, "120");
+        assert_eq!(
+            result.actions.last().map(String::as_str),
+            Some("am robot thread 120")
+        );
+    }
+
+    #[test]
+    fn test_build_outbox_root_message_uses_numeric_thread_ref() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (121, 1, 1, 'Root outbox message', NULL, 'normal', 0, 10, 'body', '[]')",
+            &[],
+        )
+        .expect("insert outbox message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (121, 121, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert outbox recipient");
+
+        let entries = build_outbox_entries(&conn, 1, 1, 20, false).expect("build outbox");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].thread, "121");
+    }
+
+    #[test]
+    fn test_build_search_invalid_importance_errors() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let err = build_search(&conn, 1, "auth", None, Some("totally-invalid"), None, 20)
+            .expect_err("invalid importance should error");
+
+        assert!(
+            matches!(err, CliError::InvalidArgument(msg) if msg.contains("invalid importance filter"))
+        );
     }
 
     #[test]
@@ -6689,8 +7500,18 @@ mod tests {
         let latest_two =
             build_thread(&conn, 1, "200", Some(2), None, false).expect("build limited thread");
         assert_eq!(latest_two.message_count, 2);
+        assert_eq!(latest_two.subject, "Root");
+        assert_eq!(latest_two.participants, vec!["Alice", "Bob"]);
         assert_eq!(latest_two.messages[0].subject, "Reply one");
         assert_eq!(latest_two.messages[1].subject, "Reply two");
+    }
+
+    #[test]
+    fn test_build_thread_rejects_unknown_thread() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let err = build_thread(&conn, 1, "missing-thread", Some(10), None, false)
+            .expect_err("unknown thread should error");
+        assert!(err.to_string().contains("thread not found: missing-thread"));
     }
 
     #[test]

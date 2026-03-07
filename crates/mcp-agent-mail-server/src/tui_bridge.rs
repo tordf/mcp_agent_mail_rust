@@ -1099,7 +1099,7 @@ fn next_active_reservation_expiry_micros(snapshot: &DbStatSnapshot) -> i64 {
     snapshot
         .reservation_snapshots
         .iter()
-        .filter(|reservation| reservation.released_ts.is_none())
+        .filter(|reservation| reservation.released_ts.is_none_or(|ts| ts <= 0))
         .map(|reservation| reservation.expires_ts)
         .min()
         .unwrap_or(0)

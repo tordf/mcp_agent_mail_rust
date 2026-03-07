@@ -48,6 +48,42 @@ fn sanitize_diagnostic_value(value: &str) -> String {
 }
 const ATTACHMENTS_DETAIL_GAP_THRESHOLD: u16 = 24;
 
+fn attachment_media_type(att: &serde_json::Value) -> String {
+    att.get("media_type")
+        .or_else(|| att.get("content_type"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            att.get("type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| !matches!(*kind, "file" | "inline" | "auto"))
+        })
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+fn attachment_bytes(att: &serde_json::Value) -> u64 {
+    att.get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| att.get("size").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            att.get("size")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| raw.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn attachment_path(att: &serde_json::Value) -> Option<String> {
+    att.get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            att.get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // AttachmentEntry — parsed attachment with provenance
 // ──────────────────────────────────────────────────────────────────────
@@ -282,15 +318,8 @@ impl AttachmentExplorerScreen {
                         serde_json::from_str::<Vec<serde_json::Value>>(&attachments_json)
                     {
                         for att in &attachments {
-                            let media_type = att
-                                .get("media_type")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let bytes = att
-                                .get("bytes")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0);
+                            let media_type = attachment_media_type(att);
+                            let bytes = attachment_bytes(att);
                             let sha1 = att
                                 .get("sha1")
                                 .and_then(serde_json::Value::as_str)
@@ -311,10 +340,7 @@ impl AttachmentExplorerScreen {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("unknown")
                                 .to_string();
-                            let path = att
-                                .get("path")
-                                .and_then(serde_json::Value::as_str)
-                                .map(String::from);
+                            let path = attachment_path(att);
 
                             self.entries.push(AttachmentEntry {
                                 media_type,
@@ -1387,6 +1413,19 @@ mod tests {
         assert_eq!(MediaFilter::Images.label(), "Images");
         assert_eq!(MediaFilter::Documents.label(), "Docs");
         assert_eq!(MediaFilter::Other.label(), "Other");
+    }
+
+    #[test]
+    fn attachment_metadata_helpers_accept_content_type_size_and_name() {
+        let value = serde_json::json!({
+            "name": "artifact.txt",
+            "content_type": "text/plain",
+            "size": "128"
+        });
+
+        assert_eq!(attachment_media_type(&value), "text/plain");
+        assert_eq!(attachment_bytes(&value), 128);
+        assert_eq!(attachment_path(&value).as_deref(), Some("artifact.txt"));
     }
 
     #[test]

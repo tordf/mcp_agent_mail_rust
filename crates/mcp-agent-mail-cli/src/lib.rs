@@ -997,10 +997,10 @@ pub struct ShareStaticExportArgs {
     /// Project slugs to export (omit for all).
     #[arg(long = "project", short = 'p')]
     pub projects: Vec<String>,
-    /// Include archive visualization routes.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Include archive visualization routes. Disabled by default because archive pages are not yet self-contained offline.
+    #[arg(long, default_value_t = false)]
     pub include_archive: bool,
-    /// Generate client-side search index artifact.
+    /// Generate the client-side search index artifact required by offline search pages.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub include_search_index: bool,
 }
@@ -3989,7 +3989,11 @@ where
     let conn = match mcp_agent_mail_db::DbConn::open_file(&path_string) {
         Ok(conn) => conn,
         Err(e) => {
-            println!("DEBUG: open_file failed for {}: {}", path.display(), e);
+            eprintln!(
+                "DEBUG: sqlite health probe open_file failed for {}: {}",
+                path.display(),
+                e
+            );
             if is_sqlite_recovery_error_message(&e.to_string()) {
                 return Ok(false);
             }
@@ -4011,8 +4015,8 @@ where
         match compatibility_probe(path) {
             Ok(ok) => return Ok(ok),
             Err(e) => {
-                println!(
-                    "DEBUG: compatibility_probe failed for {}: {}",
+                eprintln!(
+                    "DEBUG: sqlite health probe compatibility check failed for {}: {}",
                     path.display(),
                     e
                 );
@@ -5652,6 +5656,10 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
     handle_file_reservations_with_conn(&conn, action)
 }
 
+fn active_reservation_predicate_sql(table_ref: &str) -> String {
+    mcp_agent_mail_db::queries::active_reservation_predicate_for(table_ref)
+}
+
 fn handle_file_reservations_with_conn(
     conn: &mcp_agent_mail_db::DbConn,
     action: FileReservationsCommand,
@@ -5664,14 +5672,18 @@ fn handle_file_reservations_with_conn(
             active_only,
             all,
         } => {
+            let active_reservation_predicate =
+                active_reservation_predicate_sql("file_reservations");
             let sql = if active_only {
-                "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                        fr.expires_ts, fr.released_ts, a.name AS agent_name \
-                 FROM file_reservations fr \
-                 JOIN agents a ON a.id = fr.agent_id \
-                 JOIN projects p ON p.id = fr.project_id \
-                 WHERE p.slug = ? AND fr.released_ts IS NULL AND fr.expires_ts > ? \
-                 ORDER BY fr.id"
+                &format!(
+                    "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.\"exclusive\", file_reservations.reason, \
+                            file_reservations.expires_ts, file_reservations.released_ts, a.name AS agent_name \
+                     FROM file_reservations \
+                     JOIN agents a ON a.id = file_reservations.agent_id \
+                     JOIN projects p ON p.id = file_reservations.project_id \
+                     WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
+                     ORDER BY file_reservations.id"
+                )
             } else if all {
                 "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                         fr.expires_ts, fr.released_ts, a.name AS agent_name \
@@ -5682,13 +5694,15 @@ fn handle_file_reservations_with_conn(
                  ORDER BY fr.id"
             } else {
                 // Default: active (not released, not expired)
-                "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                        fr.expires_ts, fr.released_ts, a.name AS agent_name \
-                 FROM file_reservations fr \
-                 JOIN agents a ON a.id = fr.agent_id \
-                 JOIN projects p ON p.id = fr.project_id \
-                 WHERE p.slug = ? AND fr.released_ts IS NULL AND fr.expires_ts > ? \
-                 ORDER BY fr.id"
+                &format!(
+                    "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.\"exclusive\", file_reservations.reason, \
+                            file_reservations.expires_ts, file_reservations.released_ts, a.name AS agent_name \
+                     FROM file_reservations \
+                     JOIN agents a ON a.id = file_reservations.agent_id \
+                     JOIN projects p ON p.id = file_reservations.project_id \
+                     WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
+                     ORDER BY file_reservations.id"
+                )
             };
             let params: Vec<sqlmodel_core::Value> = if active_only || (!all) {
                 vec![
@@ -5729,16 +5743,21 @@ fn handle_file_reservations_with_conn(
         }
         FileReservationsCommand::Active { project, limit } => {
             let limit = limit.unwrap_or(50);
+            let active_reservation_predicate =
+                active_reservation_predicate_sql("file_reservations");
+            let sql = format!(
+                "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.\"exclusive\", file_reservations.reason, \
+                        file_reservations.expires_ts, a.name AS agent_name \
+                 FROM file_reservations \
+                 JOIN agents a ON a.id = file_reservations.agent_id \
+                 JOIN projects p ON p.id = file_reservations.project_id \
+                 WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
+                 ORDER BY file_reservations.expires_ts ASC \
+                 LIMIT ?"
+            );
             let rows = conn
                 .query_sync(
-                    "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                            fr.expires_ts, a.name AS agent_name \
-                     FROM file_reservations fr \
-                     JOIN agents a ON a.id = fr.agent_id \
-                     JOIN projects p ON p.id = fr.project_id \
-                     WHERE p.slug = ? AND fr.released_ts IS NULL AND fr.expires_ts > ? \
-                     ORDER BY fr.expires_ts ASC \
-                     LIMIT ?",
+                    &sql,
                     &[
                         sqlmodel_core::Value::Text(project),
                         sqlmodel_core::Value::BigInt(now_us),
@@ -5763,15 +5782,20 @@ fn handle_file_reservations_with_conn(
         FileReservationsCommand::Soon { project, minutes } => {
             let minutes = minutes.unwrap_or(30);
             let threshold_us = now_us.saturating_add(minutes.saturating_mul(60_000_000));
+            let active_reservation_predicate =
+                active_reservation_predicate_sql("file_reservations");
+            let sql = format!(
+                "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.expires_ts, a.name AS agent_name \
+                 FROM file_reservations \
+                 JOIN agents a ON a.id = file_reservations.agent_id \
+                 JOIN projects p ON p.id = file_reservations.project_id \
+                 WHERE p.slug = ? AND ({active_reservation_predicate}) \
+                   AND file_reservations.expires_ts > ? AND file_reservations.expires_ts <= ? \
+                 ORDER BY file_reservations.expires_ts ASC"
+            );
             let rows = conn
                 .query_sync(
-                    "SELECT fr.id, fr.path_pattern, fr.expires_ts, a.name AS agent_name \
-                     FROM file_reservations fr \
-                     JOIN agents a ON a.id = fr.agent_id \
-                     JOIN projects p ON p.id = fr.project_id \
-                     WHERE p.slug = ? AND fr.released_ts IS NULL \
-                       AND fr.expires_ts > ? AND fr.expires_ts <= ? \
-                     ORDER BY fr.expires_ts ASC",
+                    &sql,
                     &[
                         sqlmodel_core::Value::Text(project),
                         sqlmodel_core::Value::BigInt(now_us),
@@ -5829,18 +5853,22 @@ fn handle_file_reservations_with_conn(
 
             // Check conflicts: find active exclusive reservations that overlap.
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
+            let active_reservation_predicate = active_reservation_predicate_sql("fr");
             for path in &paths {
+                let sql = format!(
+                    "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                            fr.expires_ts, a.name AS agent_name \
+                     FROM file_reservations fr \
+                     JOIN agents a ON a.id = fr.agent_id \
+                     WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
+                       AND fr.expires_ts > ? AND fr.agent_id != ? \
+                       AND (fr.\"exclusive\" = 1 OR ? = 1) \
+                       AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
+                            OR ? GLOB fr.path_pattern)"
+                );
                 let overlap_rows = conn
                     .query_sync(
-                        "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                                fr.expires_ts, a.name AS agent_name \
-                         FROM file_reservations fr \
-                         JOIN agents a ON a.id = fr.agent_id \
-                         WHERE fr.project_id = ? AND fr.released_ts IS NULL \
-                           AND fr.expires_ts > ? AND fr.agent_id != ? \
-                           AND (fr.\"exclusive\" = 1 OR ? = 1) \
-                           AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
-                                OR ? GLOB fr.path_pattern)",
+                        &sql,
                         &[
                             sqlmodel_core::Value::BigInt(project_id),
                             sqlmodel_core::Value::BigInt(now_us),
@@ -5947,8 +5975,11 @@ fn handle_file_reservations_with_conn(
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             // Build WHERE clause for renewal.
-            let base_where =
-                "project_id = ? AND agent_id = ? AND released_ts IS NULL AND expires_ts > ?";
+            let active_reservation_predicate =
+                active_reservation_predicate_sql("file_reservations");
+            let base_where = format!(
+                "project_id = ? AND agent_id = ? AND ({active_reservation_predicate}) AND expires_ts > ?"
+            );
             let (sql, params) = if !ids.is_empty() {
                 let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let sql = format!(
@@ -6044,7 +6075,10 @@ fn handle_file_reservations_with_conn(
 
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
-            let base_where = "project_id = ? AND agent_id = ? AND released_ts IS NULL";
+            let active_reservation_predicate =
+                active_reservation_predicate_sql("file_reservations");
+            let base_where =
+                format!("project_id = ? AND agent_id = ? AND ({active_reservation_predicate})");
             let (sql, params) = if !ids.is_empty() {
                 let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let sql = format!(
@@ -6118,17 +6152,21 @@ fn handle_file_reservations_with_conn(
                 })?;
 
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
+            let active_reservation_predicate = active_reservation_predicate_sql("fr");
             for path in &paths {
+                let sql = format!(
+                    "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                            fr.expires_ts, a.name AS agent_name \
+                     FROM file_reservations fr \
+                     JOIN agents a ON a.id = fr.agent_id \
+                     WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
+                       AND fr.expires_ts > ? AND fr.\"exclusive\" = 1 \
+                       AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
+                            OR ? LIKE fr.path_pattern)"
+                );
                 let overlap_rows = conn
                     .query_sync(
-                        "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                                fr.expires_ts, a.name AS agent_name \
-                         FROM file_reservations fr \
-                         JOIN agents a ON a.id = fr.agent_id \
-                         WHERE fr.project_id = ? AND fr.released_ts IS NULL \
-                           AND fr.expires_ts > ? AND fr.\"exclusive\" = 1 \
-                           AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
-                                OR ? LIKE fr.path_pattern)",
+                        &sql,
                         &[
                             sqlmodel_core::Value::BigInt(project_id),
                             sqlmodel_core::Value::BigInt(now_us),
@@ -7475,6 +7513,35 @@ fn sqlite_checkpoint_truncate(db_path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliResult<()> {
+    if !source_db.exists() {
+        return Err(CliError::Other(format!(
+            "database file does not exist: {}",
+            source_db.display()
+        )));
+    }
+
+    sqlite_checkpoint_truncate(source_db)?;
+
+    if let Some(parent) = backup_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CliError::Other(format!(
+                "cannot create backup directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    std::fs::copy(source_db, backup_path).map_err(|e| {
+        CliError::Other(format!(
+            "cannot create backup at {}: {e}",
+            backup_path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
 fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
     if db_path.exists() {
         let rollback_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
@@ -7530,15 +7597,6 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
 
 /// Create a timestamped backup of the database file.
 fn create_db_backup(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<PathBuf> {
-    if !db_path.exists() {
-        return Err(CliError::Other(format!(
-            "database file does not exist: {}",
-            db_path.display()
-        )));
-    }
-
-    sqlite_checkpoint_truncate(db_path)?;
-
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let backup_name = format!(
         "{}.bak.{timestamp}",
@@ -7548,21 +7606,8 @@ fn create_db_backup(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Path
     let backup_parent =
         backup_dir.unwrap_or_else(|| db_path.parent().unwrap_or_else(|| Path::new(".")));
 
-    std::fs::create_dir_all(backup_parent).map_err(|e| {
-        CliError::Other(format!(
-            "cannot create backup directory {}: {e}",
-            backup_parent.display()
-        ))
-    })?;
-
     let backup_path = backup_parent.join(&backup_name);
-    std::fs::copy(db_path, &backup_path).map_err(|e| {
-        CliError::Other(format!(
-            "cannot create backup at {}: {e}",
-            backup_path.display()
-        ))
-    })?;
-
+    copy_sqlite_backup_consistently(db_path, &backup_path)?;
     Ok(backup_path)
 }
 
@@ -7767,8 +7812,11 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
 }
 
 fn handle_self_update_check() -> CliResult<()> {
-    let result = check_for_update();
-    match &result {
+    handle_self_update_check_result(&check_for_update())
+}
+
+fn handle_self_update_check_result(result: &UpdateCheckResult) -> CliResult<()> {
+    match result {
         UpdateCheckResult::UpdateAvailable {
             current,
             latest,
@@ -7785,6 +7833,7 @@ fn handle_self_update_check() -> CliResult<()> {
         }
         UpdateCheckResult::CheckFailed { reason } => {
             ftui_runtime::ftui_eprintln!("Update check failed: {reason}");
+            return Err(CliError::Other(format!("update check failed: {reason}")));
         }
     }
     Ok(())
@@ -8172,13 +8221,9 @@ fn replace_binaries(release: &DownloadedRelease) -> Result<(), String> {
 
     // Replace mcp-agent-mail
     ftui_runtime::ftui_eprintln!("Replacing {server_name}...");
-    if let Err(e) = atomic_replace_binary(&release.server_binary, &server_target) {
-        // am was already replaced but server failed — report but don't rollback am
-        // (having a newer am with old server is better than a broken state)
-        ftui_runtime::ftui_eprintln!(
-            "Warning: {server_name} replacement failed ({e}), but {am_name} was updated"
-        );
-    }
+    atomic_replace_binary(&release.server_binary, &server_target).map_err(|e| {
+        format!("{server_name} replacement failed ({e}); {am_name} was already updated")
+    })?;
 
     Ok(())
 }
@@ -15125,6 +15170,165 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_slot_lease_path_is_stable_across_branch_changes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let main_path = lease_path(dir.path(), "BlueLake", "main");
+        let feature_path = lease_path(dir.path(), "BlueLake", "feature/x");
+
+        assert_eq!(
+            main_path, feature_path,
+            "the same agent should reuse one lease file across branch changes"
+        );
+        let file_name = main_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap();
+        assert!(file_name.starts_with("BlueLake--"));
+        assert!(file_name.ends_with(".json"));
+    }
+
+    #[test]
+    fn am_run_shared_request_blocks_on_existing_exclusive_holder() {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            worktrees_enabled: true,
+            storage_root: temp.path().join("storage_root"),
+            ..Config::default()
+        };
+
+        let identity = resolve_project_identity("/tmp/am-run-fixture");
+        let slot_dir = ensure_slot_dir(&config, &identity.slug, "frontend-build").unwrap();
+        let conflict_path = lease_path(&slot_dir, "OtherAgent", "main");
+        let now = Utc::now();
+        let lease = LeaseRecord {
+            slot: "frontend-build".to_string(),
+            agent: "OtherAgent".to_string(),
+            branch: "main".to_string(),
+            exclusive: true,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: (now + chrono::Duration::seconds(3600)).to_rfc3339(),
+            released_ts: None,
+        };
+        write_lease(&conflict_path, &lease).unwrap();
+
+        let args = AmRunArgs {
+            slot: "frontend-build".to_string(),
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo SHOULD_NOT_RUN".to_string(),
+            ],
+            path: PathBuf::from("/tmp/am-run-fixture"),
+            agent: Some("TestAgent".to_string()),
+            ttl_seconds: 60,
+            shared: true,
+            exclusive: false,
+            block_on_conflicts: true,
+            no_block_on_conflicts: false,
+        };
+
+        let capture = StdioCapture::install().unwrap();
+        let err = handle_am_run_with(&config, None, None, args).unwrap_err();
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        let output = String::from_utf8_lossy(&sink).to_string();
+        match err {
+            CliError::ExitCode(1) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            output.contains("--block-on-conflicts"),
+            "missing conflict abort message: {output}"
+        );
+        assert!(
+            !output.contains("$ sh -c"),
+            "did not expect command banner on abort: {output}"
+        );
+    }
+
+    #[test]
+    fn am_run_exclusive_request_blocks_on_existing_shared_holder() {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            worktrees_enabled: true,
+            storage_root: temp.path().join("storage_root"),
+            ..Config::default()
+        };
+
+        let identity = resolve_project_identity("/tmp/am-run-fixture");
+        let slot_dir = ensure_slot_dir(&config, &identity.slug, "frontend-build").unwrap();
+        let conflict_path = lease_path(&slot_dir, "OtherAgent", "main");
+        let now = Utc::now();
+        let lease = LeaseRecord {
+            slot: "frontend-build".to_string(),
+            agent: "OtherAgent".to_string(),
+            branch: "main".to_string(),
+            exclusive: false,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: (now + chrono::Duration::seconds(3600)).to_rfc3339(),
+            released_ts: None,
+        };
+        write_lease(&conflict_path, &lease).unwrap();
+
+        let args = AmRunArgs {
+            slot: "frontend-build".to_string(),
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo SHOULD_NOT_RUN".to_string(),
+            ],
+            path: PathBuf::from("/tmp/am-run-fixture"),
+            agent: Some("TestAgent".to_string()),
+            ttl_seconds: 60,
+            shared: false,
+            exclusive: false,
+            block_on_conflicts: true,
+            no_block_on_conflicts: false,
+        };
+
+        let capture = StdioCapture::install().unwrap();
+        let err = handle_am_run_with(&config, None, None, args).unwrap_err();
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        let output = String::from_utf8_lossy(&sink).to_string();
+        match err {
+            CliError::ExitCode(1) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            output.contains("--block-on-conflicts"),
+            "missing conflict abort message: {output}"
+        );
+        assert!(
+            !output.contains("$ sh -c"),
+            "did not expect command banner on abort: {output}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Share subcommand argument parsing tests
     // -----------------------------------------------------------------------
@@ -16515,6 +16719,34 @@ mod tests {
     }
 
     #[test]
+    fn doctor_restore_uses_sidecar_safe_restore_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("doctor.sqlite3");
+        let backup_path = dir.path().join("doctor.sqlite3.bak.20260102_000000");
+        let backup_source_path = dir.path().join("doctor-backup-source.sqlite3");
+
+        write_marker_db(&db_path, "live-db");
+        write_marker_db(&backup_source_path, "backup-db");
+        std::fs::copy(&backup_source_path, &backup_path).expect("seed backup db");
+
+        let db_wal = sqlite_sidecar_path(&db_path, "-wal");
+        let db_shm = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_wal, b"live-wal").expect("write live wal");
+        std::fs::write(&db_shm, b"live-shm").expect("write live shm");
+
+        handle_doctor_restore_to(&backup_path, &db_path, false, true).expect("doctor restore");
+        assert_eq!(read_marker_db(&db_path), "backup-db");
+        if db_wal.exists() {
+            let wal_bytes = std::fs::read(&db_wal).expect("read restored wal");
+            assert_ne!(wal_bytes, b"live-wal");
+        }
+        if db_shm.exists() {
+            let shm_bytes = std::fs::read(&db_shm).expect("read restored shm");
+            assert_ne!(shm_bytes, b"live-shm");
+        }
+    }
+
+    #[test]
     fn create_db_backup_omits_wal_and_shm_sidecar_artifacts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
@@ -17084,6 +17316,77 @@ mod tests {
             std::fs::read(restore_storage.join(".git/HEAD")).unwrap(),
             b"0123456789abcdef\n"
         );
+    }
+
+    #[test]
+    fn rollback_archive_restore_restores_backups_after_partial_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let storage_root = dir.path().join("storage_repo");
+        let db_backup = dir.path().join("mailbox.sqlite3.backup-test");
+        let storage_backup = dir.path().join("storage_repo.backup-test");
+
+        std::fs::write(&db_path, b"partial-db").unwrap();
+        std::fs::create_dir_all(&storage_root).unwrap();
+        std::fs::write(storage_root.join("partial.txt"), b"partial-storage").unwrap();
+
+        std::fs::write(&db_backup, b"old-db").unwrap();
+        std::fs::create_dir_all(&storage_backup).unwrap();
+        std::fs::write(storage_backup.join("old.txt"), b"old-storage").unwrap();
+
+        rollback_archive_restore(
+            &[
+                ArchiveRestoreBackupEntry {
+                    original: db_path.clone(),
+                    backup: db_backup.clone(),
+                },
+                ArchiveRestoreBackupEntry {
+                    original: storage_root.clone(),
+                    backup: storage_backup.clone(),
+                },
+            ],
+            &[],
+        )
+        .expect("rollback should succeed");
+
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"old-db");
+        assert_eq!(
+            std::fs::read(storage_root.join("old.txt")).unwrap(),
+            b"old-storage"
+        );
+        assert!(!db_backup.exists());
+        assert!(!storage_backup.exists());
+    }
+
+    #[test]
+    fn rollback_archive_restore_cleans_new_targets_without_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let storage_root = dir.path().join("storage_repo");
+
+        std::fs::write(&db_path, b"partial-db").unwrap();
+        std::fs::create_dir_all(&storage_root).unwrap();
+        std::fs::write(storage_root.join("partial.txt"), b"partial-storage").unwrap();
+
+        rollback_archive_restore(&[], &[db_path.clone(), storage_root.clone()])
+            .expect("cleanup-only rollback should succeed");
+
+        assert!(!db_path.exists());
+        assert!(!storage_root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_skips_symlink_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("nested")).unwrap();
+        std::fs::write(base.join("nested/file.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink(base.join("nested/file.txt"), base.join("linked.txt")).unwrap();
+
+        let mut files = Vec::new();
+        collect_files(base, base, &mut files).expect("collect files");
+        assert_eq!(files, vec![PathBuf::from("nested/file.txt")]);
     }
 
     // -----------------------------------------------------------------------
@@ -24572,6 +24875,72 @@ mod tests {
         let qc: String = rows.first().unwrap().get_named("quick_check").unwrap();
         assert_eq!(qc, "ok", "original DB should still be healthy");
     }
+
+    #[test]
+    fn doctor_repair_backup_includes_uncheckpointed_wal_changes() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal_backup_test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw("PRAGMA journal_mode=WAL")
+            .expect("enable wal");
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 0")
+            .expect("disable autocheckpoint");
+        conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT)")
+            .expect("create marker");
+        conn.execute_raw("DELETE FROM marker")
+            .expect("clear marker");
+        conn.execute_sync(
+            "INSERT INTO marker(value) VALUES (?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                "from-wal".to_string(),
+            )],
+        )
+        .expect("insert marker");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        assert!(
+            wal_path.exists(),
+            "expected WAL sidecar before repair backup"
+        );
+        drop(conn);
+
+        let _capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with(&db_url, &backup_dir, None, false, false).expect("repair");
+
+        let timestamped_backup =
+            find_backup_entry(&backup_dir, "pre_repair_").expect("backup path");
+        let backup_conn =
+            mcp_agent_mail_db::DbConn::open_file(timestamped_backup.display().to_string())
+                .expect("open timestamped backup");
+        let backup_rows = backup_conn
+            .query_sync("SELECT value FROM marker LIMIT 1", &[])
+            .expect("query timestamped backup");
+        let backup_marker: String = backup_rows
+            .first()
+            .and_then(|row| row.get_named("value").ok())
+            .expect("marker value in timestamped backup");
+        assert_eq!(backup_marker, "from-wal");
+
+        let sibling_bak = PathBuf::from(format!("{}.bak", db_path.display()));
+        let sibling_conn = mcp_agent_mail_db::DbConn::open_file(sibling_bak.display().to_string())
+            .expect("open sibling backup");
+        let sibling_rows = sibling_conn
+            .query_sync("SELECT value FROM marker LIMIT 1", &[])
+            .expect("query sibling backup");
+        let sibling_marker: String = sibling_rows
+            .first()
+            .and_then(|row| row.get_named("value").ok())
+            .expect("marker value in sibling backup");
+        assert_eq!(sibling_marker, "from-wal");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24740,7 +25109,7 @@ fn handle_am_run_with(
                         );
                     }
                 }
-                if !shared && block_on_conflicts {
+                if block_on_conflicts {
                     ftui_runtime::ftui_eprintln!(
                         "error: build slot conflicts detected and --block-on-conflicts set; aborting."
                     );
@@ -24758,7 +25127,7 @@ fn handle_am_run_with(
                 lease_path_opt = Some(path);
             }
 
-            let conflicts = read_active_leases(&slot_dir, &agent_name, &branch, shared);
+            let conflicts = read_active_leases(&slot_dir, &agent_name, shared);
             if !conflicts.is_empty() {
                 if guard_mode_warn() {
                     ftui_runtime::ftui_eprintln!(
@@ -24774,7 +25143,7 @@ fn handle_am_run_with(
                         );
                     }
                 }
-                if !shared && block_on_conflicts {
+                if block_on_conflicts {
                     ftui_runtime::ftui_eprintln!(
                         "error: build slot conflicts detected and --block-on-conflicts set; aborting."
                     );
@@ -25013,8 +25382,85 @@ fn ensure_slot_dir(config: &Config, slug: &str, slot: &str) -> CliResult<PathBuf
 }
 
 fn lease_path(slot_dir: &Path, agent: &str, branch: &str) -> PathBuf {
+    let preferred = preferred_lease_path(slot_dir, agent);
+    if preferred.exists() {
+        return preferred;
+    }
+
+    let legacy_agent = legacy_agent_lease_path(slot_dir, agent);
+    if legacy_agent.exists() {
+        return legacy_agent;
+    }
+
+    let legacy_branch = legacy_branch_lease_path(slot_dir, agent, branch);
+    if legacy_branch.exists() {
+        return legacy_branch;
+    }
+
+    if let Some(existing) = existing_agent_lease_path(slot_dir, agent, branch) {
+        return existing;
+    }
+
+    preferred
+}
+
+fn preferred_lease_path(slot_dir: &Path, agent: &str) -> PathBuf {
+    use sha2::Digest;
+
+    let digest = sha2::Sha256::digest(agent.as_bytes());
+    let short_hash = &hex::encode(digest)[..16];
+    let holder = format!("{}--{short_hash}", safe_component(agent));
+    slot_dir.join(format!("{holder}.json"))
+}
+
+fn legacy_agent_lease_path(slot_dir: &Path, agent: &str) -> PathBuf {
+    slot_dir.join(format!("{}.json", safe_component(agent)))
+}
+
+fn legacy_branch_lease_path(slot_dir: &Path, agent: &str, branch: &str) -> PathBuf {
     let holder = safe_component(&format!("{agent}__{branch}"));
     slot_dir.join(format!("{holder}.json"))
+}
+
+fn existing_agent_lease_path(slot_dir: &Path, agent: &str, branch: &str) -> Option<PathBuf> {
+    let mut same_agent_paths = Vec::new();
+    let entries = std::fs::read_dir(slot_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(lease) = read_lease(&path) else {
+            continue;
+        };
+        if lease.agent != agent {
+            continue;
+        }
+        if lease.branch == branch {
+            return Some(path);
+        }
+        same_agent_paths.push(path);
+    }
+    if same_agent_paths.len() == 1 {
+        same_agent_paths.pop()
+    } else {
+        None
+    }
+}
+
+fn lease_conflicts_with_request(
+    lease: &LeaseRecord,
+    requester_agent: &str,
+    request_exclusive: bool,
+) -> bool {
+    if lease.released_ts.is_some() || lease.agent == requester_agent {
+        return false;
+    }
+    if request_exclusive {
+        true
+    } else {
+        lease.exclusive
+    }
 }
 
 fn safe_component(value: &str) -> String {
@@ -25041,14 +25487,10 @@ fn guard_mode_warn() -> bool {
     )
 }
 
-fn read_active_leases(
-    slot_dir: &Path,
-    agent: &str,
-    branch: &str,
-    shared: bool,
-) -> Vec<LeaseRecord> {
+fn read_active_leases(slot_dir: &Path, agent: &str, shared: bool) -> Vec<LeaseRecord> {
     let mut out = Vec::new();
     let now = Utc::now();
+    let request_exclusive = !shared;
     let entries = match std::fs::read_dir(slot_dir) {
         Ok(e) => e,
         Err(_) => return out,
@@ -25062,12 +25504,18 @@ fn read_active_leases(
             Some(l) => l,
             None => continue,
         };
-        if let Some(exp) = parse_rfc3339(&lease.expires_ts)
-            && exp <= now
-        {
-            continue;
+        match parse_rfc3339(&lease.expires_ts) {
+            Some(exp) if exp <= now => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            Some(_) => {}
+            None => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
         }
-        if lease.exclusive && !shared && !(lease.agent == agent && lease.branch == branch) {
+        if lease_conflicts_with_request(&lease, agent, request_exclusive) {
             out.push(lease);
         }
     }
@@ -25263,6 +25711,26 @@ fn zip_archive_path_for_dir(dir: &Path) -> PathBuf {
     parent.join(format!("{name}.zip"))
 }
 
+fn validate_share_archive_options(zip_enabled: bool, age_recipients: &[String]) -> CliResult<()> {
+    if !age_recipients.is_empty() && !zip_enabled {
+        return Err(CliError::Other(
+            "age encryption requires --zip so there is a single archive to encrypt".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_share_zip_target_absent(bundle_dir: &Path) -> CliResult<Option<PathBuf>> {
+    let zip_path = zip_archive_path_for_dir(bundle_dir);
+    if zip_path.exists() {
+        return Err(CliError::Other(format!(
+            "refusing to overwrite existing ZIP archive {}; remove it first or choose a different bundle path",
+            zip_path.display()
+        )));
+    }
+    Ok(Some(zip_path))
+}
+
 fn sha256_file(path: &Path) -> CliResult<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -25310,6 +25778,8 @@ struct ShareUpdateParams {
 }
 
 fn run_share_export(params: ShareExportParams) -> CliResult<()> {
+    validate_share_archive_options(params.zip, &params.age_recipients)?;
+
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let source_path = cfg
         .sqlite_path()
@@ -25497,11 +25967,17 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     // 11. Clean up snapshot
     let _ = std::fs::remove_file(&snapshot_path);
 
+    let zip_path = if params.zip {
+        ensure_share_zip_target_absent(output)?
+    } else {
+        None
+    };
+
     // 12. ZIP
     let mut archive_path: Option<PathBuf> = None;
     let final_path = if params.zip {
         ftui_runtime::ftui_println!("Packaging as ZIP...");
-        let zip_path = zip_archive_path_for_dir(output);
+        let zip_path = zip_path.expect("zip path preflighted");
         share::package_directory_as_zip(output, &zip_path)?;
         ftui_runtime::ftui_println!("  ZIP: {}", zip_path.display());
         archive_path = Some(zip_path.clone());
@@ -25511,16 +25987,12 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     };
 
     // 13. Encrypt
-    if !params.age_recipients.is_empty() {
-        if let Some(ref archive) = archive_path {
-            ftui_runtime::ftui_println!("Encrypting with age...");
-            let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
-            ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
-        } else {
-            ftui_runtime::ftui_eprintln!(
-                "warning: skipped age encryption because --zip was not enabled."
-            );
-        }
+    if !params.age_recipients.is_empty()
+        && let Some(ref archive) = archive_path
+    {
+        ftui_runtime::ftui_println!("Encrypting with age...");
+        let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
+        ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
     }
 
     ftui_runtime::ftui_println!("Export complete: {}", final_path.display());
@@ -25528,6 +26000,8 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
 }
 
 fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
+    validate_share_archive_options(params.zip, &params.age_recipients)?;
+
     fn copy_file(src: &Path, dst: &Path) -> CliResult<()> {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
@@ -25603,6 +26077,12 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     ftui_runtime::ftui_println!("Source database: {source_path}");
     ftui_runtime::ftui_println!("Updating bundle: {}", params.bundle.display());
     ftui_runtime::ftui_println!("Scrub preset:   {}", params.scrub_preset);
+
+    let zip_path = if params.zip {
+        ensure_share_zip_target_absent(&params.bundle)?
+    } else {
+        None
+    };
 
     let tmp = tempfile::tempdir()?;
     let temp_bundle = tmp.path().join("bundle");
@@ -25784,23 +26264,19 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     let mut archive_path: Option<PathBuf> = None;
     if params.zip {
         ftui_runtime::ftui_println!("Packaging as ZIP...");
-        let zip_path = zip_archive_path_for_dir(&params.bundle);
+        let zip_path = zip_path.expect("zip path preflighted");
         share::package_directory_as_zip(&params.bundle, &zip_path)?;
         ftui_runtime::ftui_println!("  ZIP: {}", zip_path.display());
         archive_path = Some(zip_path);
     }
 
-    // Encrypt (optional). For update parity, warn but do not fail when --zip is not enabled.
-    if !params.age_recipients.is_empty() {
-        if let Some(ref archive) = archive_path {
-            ftui_runtime::ftui_println!("Encrypting with age...");
-            let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
-            ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
-        } else {
-            ftui_runtime::ftui_eprintln!(
-                "warning: skipped age encryption because --zip was not enabled."
-            );
-        }
+    // Encrypt (optional).
+    if !params.age_recipients.is_empty()
+        && let Some(ref archive) = archive_path
+    {
+        ftui_runtime::ftui_println!("Encrypting with age...");
+        let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
+        ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
     }
 
     ftui_runtime::ftui_println!("Update complete: {}", params.bundle.display());
@@ -25987,6 +26463,72 @@ fn next_backup_path(path: &Path, timestamp: &str) -> PathBuf {
     candidate
 }
 
+#[derive(Debug, Clone)]
+struct ArchiveRestoreBackupEntry {
+    original: PathBuf,
+    backup: PathBuf,
+}
+
+fn remove_restore_target_if_exists(path: &Path) -> CliResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn rollback_archive_restore(
+    backup_entries: &[ArchiveRestoreBackupEntry],
+    cleanup_targets: &[PathBuf],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    for entry in backup_entries.iter().rev() {
+        if entry.original.exists()
+            && let Err(error) = remove_restore_target_if_exists(&entry.original)
+        {
+            errors.push(format!(
+                "failed to remove partially restored {}: {error}",
+                entry.original.display()
+            ));
+            continue;
+        }
+        if entry.backup.exists()
+            && let Err(error) = std::fs::rename(&entry.backup, &entry.original)
+        {
+            errors.push(format!(
+                "failed to restore backup {} -> {}: {error}",
+                entry.backup.display(),
+                entry.original.display()
+            ));
+        }
+    }
+
+    for target in cleanup_targets {
+        if !target.exists() {
+            continue;
+        }
+        if let Err(error) = remove_restore_target_if_exists(target) {
+            errors.push(format!(
+                "failed to clean partially restored {}: {error}",
+                target.display()
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 fn sort_json_keys(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -26125,9 +26667,13 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_files(base, &path, out)?;
-        } else if path.is_file()
+        } else if file_type.is_file()
             && let Ok(rel) = path.strip_prefix(base)
         {
             out.push(rel.to_path_buf());
@@ -26504,84 +27050,124 @@ fn archive_restore_state(
         )));
     }
 
-    // Back up existing files/dirs.
-    let mut backup_paths: Vec<PathBuf> = Vec::new();
-    if database_path.exists() {
-        let backup = next_backup_path(&database_path, &timestamp);
-        std::fs::rename(&database_path, &backup)?;
-        backup_paths.push(backup);
-    }
-    for suffix in ["-wal", "-shm"] {
-        let wal_path = PathBuf::from(format!("{}{}", database_path.display(), suffix));
-        if wal_path.exists() {
-            let backup = next_backup_path(&wal_path, &timestamp);
-            std::fs::rename(&wal_path, &backup)?;
-            backup_paths.push(backup);
+    // Back up existing files/dirs, then restore. Roll back from the backups if
+    // any step fails after mutation has started.
+    let database_existed = database_path.exists();
+    let storage_root_existed = storage_root.exists();
+    let mut backup_entries: Vec<ArchiveRestoreBackupEntry> = Vec::new();
+    let restore_result: CliResult<()> = (|| {
+        if database_existed {
+            let backup = next_backup_path(&database_path, &timestamp);
+            std::fs::rename(&database_path, &backup)?;
+            backup_entries.push(ArchiveRestoreBackupEntry {
+                original: database_path.clone(),
+                backup,
+            });
         }
-    }
-    if storage_root.exists() {
-        let backup = next_backup_path(&storage_root, &timestamp);
-        std::fs::rename(&storage_root, &backup)?;
-        backup_paths.push(backup);
-    }
+        for suffix in ["-wal", "-shm"] {
+            let wal_path = PathBuf::from(format!("{}{}", database_path.display(), suffix));
+            if wal_path.exists() {
+                let backup = next_backup_path(&wal_path, &timestamp);
+                std::fs::rename(&wal_path, &backup)?;
+                backup_entries.push(ArchiveRestoreBackupEntry {
+                    original: wal_path,
+                    backup,
+                });
+            }
+        }
+        if storage_root_existed {
+            let backup = next_backup_path(&storage_root, &timestamp);
+            std::fs::rename(&storage_root, &backup)?;
+            backup_entries.push(ArchiveRestoreBackupEntry {
+                original: storage_root.clone(),
+                backup,
+            });
+        }
 
-    // Restore snapshot.
-    if let Some(parent) = database_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    {
-        let mut snapshot_file = archive
-            .by_name(snapshot_entry_name)
-            .map_err(|e| CliError::Other(format!("{e}")))?;
-        let mut out = std::fs::File::create(&database_path)?;
-        std::io::copy(&mut snapshot_file, &mut out)?;
-    }
-
-    // Restore storage repo entries.
-    if let Some(parent) = storage_root.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::create_dir_all(&storage_root)?;
-
-    let prefix_path = Path::new(ARCHIVE_STORAGE_DIRNAME);
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| CliError::Other(format!("{e}")))?;
-        let Some(enclosed) = file.enclosed_name().map(|p| p.to_path_buf()) else {
-            continue;
-        };
-        if !enclosed.starts_with(prefix_path) {
-            continue;
-        }
-        let rel = match enclosed.strip_prefix(prefix_path) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        let out_path = storage_root.join(rel);
-        if file.is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-            continue;
-        }
-        if let Some(parent) = out_path.parent() {
+        // Restore snapshot.
+        if let Some(parent) = database_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
             std::fs::create_dir_all(parent)?;
         }
-        let mut out = std::fs::File::create(&out_path)?;
-        std::io::copy(&mut file, &mut out)?;
-
-        #[cfg(unix)]
-        if let Some(mode) = file.unix_mode() {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+        {
+            let mut snapshot_file = archive
+                .by_name(snapshot_entry_name)
+                .map_err(|e| CliError::Other(format!("{e}")))?;
+            let mut out = std::fs::File::create(&database_path)?;
+            std::io::copy(&mut snapshot_file, &mut out)?;
         }
+
+        // Restore storage repo entries.
+        if let Some(parent) = storage_root.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir_all(&storage_root)?;
+
+        let prefix_path = Path::new(ARCHIVE_STORAGE_DIRNAME);
+        for i in 0..archive.len() {
+            let mut file = archive
+                .by_index(i)
+                .map_err(|e| CliError::Other(format!("{e}")))?;
+            let Some(enclosed) = file.enclosed_name().map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            if !enclosed.starts_with(prefix_path) {
+                continue;
+            }
+            let rel = match enclosed.strip_prefix(prefix_path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let out_path = storage_root.join(rel);
+            if file.is_dir() {
+                std::fs::create_dir_all(&out_path)?;
+                continue;
+            }
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out = std::fs::File::create(&out_path)?;
+            std::io::copy(&mut file, &mut out)?;
+
+            #[cfg(unix)]
+            if let Some(mode) = file.unix_mode() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+            }
+        }
+
+        Ok(())
+    })();
+
+    if let Err(error) = restore_result {
+        let mut cleanup_targets = Vec::new();
+        if !database_existed {
+            cleanup_targets.push(database_path.clone());
+        }
+        if !storage_root_existed {
+            cleanup_targets.push(storage_root.clone());
+        }
+
+        return match rollback_archive_restore(&backup_entries, &cleanup_targets) {
+            Ok(()) => Err(CliError::Other(format!(
+                "restore failed: {error}; rolled back to the previous database/storage state"
+            ))),
+            Err(rollback_error) => Err(CliError::Other(format!(
+                "restore failed: {error}; rollback also failed: {rollback_error}"
+            ))),
+        };
     }
+
+    let backup_paths: Vec<PathBuf> = backup_entries
+        .iter()
+        .map(|entry| entry.backup.clone())
+        .collect();
 
     ftui_runtime::ftui_println!("✓ Restore complete from {}.", archive_path.display());
     if !backup_paths.is_empty() {
@@ -26849,13 +27435,13 @@ fn handle_doctor_repair_with(
         let db_path = cfg.sqlite_path().unwrap_or_default();
         if std::path::Path::new(&db_path).exists() {
             let bak_path = backup_dir.join(&bak_name);
-            std::fs::copy(&db_path, &bak_path)?;
+            copy_sqlite_backup_consistently(Path::new(&db_path), &bak_path)?;
             ftui_runtime::ftui_println!("  Backup: {}", bak_path.display());
 
             // Also create a .bak sibling next to the primary DB so that the
             // pool's auto-recovery (find_healthy_backup) can discover it.
             let sibling_bak = format!("{db_path}.bak");
-            if let Err(e) = std::fs::copy(&db_path, &sibling_bak) {
+            if let Err(e) = std::fs::copy(&bak_path, &sibling_bak) {
                 ftui_runtime::ftui_eprintln!(
                     "  Warning: could not create sibling backup {sibling_bak}: {e}"
                 );
@@ -27003,7 +27589,27 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, yes: bool) -> CliR
         ));
     }
 
-    ftui_runtime::ftui_println!("Restore: {} -> {}", backup_path.display(), dest_path);
+    handle_doctor_restore_to(&backup_path, Path::new(&dest_path), dry_run, yes)
+}
+
+fn handle_doctor_restore_to(
+    backup_path: &Path,
+    dest_path: &Path,
+    dry_run: bool,
+    yes: bool,
+) -> CliResult<()> {
+    if !backup_path.exists() {
+        return Err(CliError::InvalidArgument(format!(
+            "backup not found: {}",
+            backup_path.display()
+        )));
+    }
+
+    ftui_runtime::ftui_println!(
+        "Restore: {} -> {}",
+        backup_path.display(),
+        dest_path.display()
+    );
 
     if dry_run {
         ftui_runtime::ftui_println!("Dry run — no changes made.");
@@ -27021,7 +27627,7 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, yes: bool) -> CliR
         }
     }
 
-    std::fs::copy(&backup_path, &dest_path)?;
+    restore_db_from_backup(dest_path, backup_path)?;
     ftui_runtime::ftui_println!("Database restored from backup.");
     Ok(())
 }
@@ -30447,6 +31053,35 @@ fn clap_parses_self_update_version() {
         }
         _ => panic!("expected SelfUpdate"),
     }
+}
+
+#[test]
+fn handle_self_update_check_result_returns_error_on_failed_check() {
+    let err = handle_self_update_check_result(&UpdateCheckResult::CheckFailed {
+        reason: "network unavailable".to_string(),
+    })
+    .expect_err("failed update checks should return an error");
+    assert!(format!("{err}").contains("update check failed"));
+}
+
+#[test]
+fn validate_share_archive_options_requires_zip_for_age() {
+    let err = validate_share_archive_options(false, &["age1example".to_string()])
+        .expect_err("age recipients without zip should fail");
+    assert!(format!("{err}").contains("--zip"));
+}
+
+#[test]
+fn ensure_share_zip_target_absent_rejects_existing_archive() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = temp.path().join("bundle");
+    std::fs::create_dir_all(&bundle).expect("create bundle dir");
+    let zip_path = zip_archive_path_for_dir(&bundle);
+    std::fs::write(&zip_path, b"existing archive").expect("seed existing archive");
+
+    let err = ensure_share_zip_target_absent(&bundle)
+        .expect_err("existing zip archive should fail preflight");
+    assert!(format!("{err}").contains("refusing to overwrite existing ZIP archive"));
 }
 
 #[test]

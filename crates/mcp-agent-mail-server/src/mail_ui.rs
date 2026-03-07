@@ -5,6 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use asupersync::Cx;
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::config::Config;
@@ -12,7 +15,7 @@ use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
 use mcp_agent_mail_db::pool::DbPool;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, micros_to_naive, now_micros};
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
-use mcp_agent_mail_storage::{self as storage, ensure_archive, ensure_archive_root};
+use mcp_agent_mail_storage::{self as storage, ensure_archive_root};
 use serde::Serialize;
 
 use crate::markdown;
@@ -42,13 +45,316 @@ pub fn dispatch(
         "" | "/" | "/unified-inbox" => {
             let limit = extract_query_int(query, "limit", 10000);
             let filter_importance = extract_query_str(query, "filter_importance");
-            render_unified_inbox(&cx, &pool, limit, filter_importance.as_deref())
+            render_unified_inbox(
+                &cx,
+                &pool,
+                limit,
+                filter_importance.as_deref(),
+                is_static_export_request(query),
+            )
         }
         // Explicit projects list route (legacy Python: GET /mail/projects).
         "/projects" => render_projects_list(&cx, &pool),
         _ if sub.starts_with("/api/") => handle_api_route(sub, query, method, body, &cx, &pool),
         _ if sub.starts_with("/archive/") => render_archive_route(sub, query, method, &cx, &pool),
         _ => dispatch_project_route(sub, method, body, &cx, &pool, query),
+    }
+}
+
+#[cfg(test)]
+fn initialized_test_pool(prefix: &str) -> DbPool {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let db_path = std::env::temp_dir().join(format!("{prefix}-{nonce}.sqlite3"));
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+        .expect("test sqlite file should initialize");
+    conn.execute_raw("PRAGMA journal_mode=WAL")
+        .expect("test sqlite journal mode should initialize");
+    let cfg = DbPoolConfig {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        ..DbPoolConfig::default()
+    };
+    get_or_create_pool(&cfg).expect("test pool should initialize")
+}
+
+#[cfg(test)]
+mod route_regressions {
+    use super::*;
+    use asupersync::Outcome;
+    use std::collections::BTreeSet;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
+        match outcome {
+            Outcome::Ok(value) => value,
+            Outcome::Err(err) => panic!("db error: {err}"),
+            Outcome::Cancelled(_) => panic!("db operation cancelled"),
+            Outcome::Panicked(panic) => panic!("db operation panicked: {}", panic.message()),
+        }
+    }
+
+    fn unique_nonce() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    }
+
+    fn make_test_pool(label: &str) -> DbPool {
+        initialized_test_pool(&format!("mail-ui-{label}"))
+    }
+
+    #[test]
+    fn unified_message_view_populates_client_fields() {
+        let aggregate = UnifiedMessageAggregate {
+            id: 7,
+            subject: "Weekly update".to_string(),
+            body_md: "# Hello\nThis is the body".to_string(),
+            created_ts: now_micros(),
+            importance: "high".to_string(),
+            thread_id: "br-7".to_string(),
+            project_slug: "demo".to_string(),
+            project_name: "Demo".to_string(),
+            sender: "GreenCastle".to_string(),
+            recipients: BTreeSet::from(["BlueLake".to_string(), "AmberPeak".to_string()]),
+            all_read: true,
+        };
+
+        let view = aggregate.into_view();
+        assert_eq!(view.recipients, "AmberPeak, BlueLake");
+        assert!(view.read);
+        assert!(view.excerpt.contains("Hello"));
+        assert!(!view.created_full.is_empty());
+        assert!(!view.created_relative.is_empty());
+    }
+
+    #[test]
+    fn unified_api_message_value_preserves_client_fields() {
+        let message = UnifiedMessageAggregate {
+            id: 9,
+            subject: "API parity".to_string(),
+            body_md: "Body for unified inbox parity".to_string(),
+            created_ts: now_micros(),
+            importance: "normal".to_string(),
+            thread_id: "br-unified".to_string(),
+            project_slug: "demo".to_string(),
+            project_name: "Demo".to_string(),
+            sender: "GreenCastle".to_string(),
+            recipients: BTreeSet::from(["BlueLake".to_string()]),
+            all_read: false,
+        }
+        .into_view();
+
+        let payload = unified_api_message_value(&message);
+        assert_eq!(payload["recipients"], "BlueLake");
+        assert_eq!(payload["read"], false);
+        assert!(
+            payload["excerpt"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    fn render_attachments_lists_message_attachments() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("attachments");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-attachments-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            "Attachment delivery",
+            "See attached artifact",
+            Some("br-attachments"),
+            "normal",
+            false,
+            r#"[{"name":"artifact.txt","path":"attachments/demo.txt","content_type":"text/plain","size":"128"}]"#,
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+
+        let html = render_attachments(&cx, &pool, &project.slug)
+            .expect("attachments render should succeed")
+            .expect("attachments route should return html");
+        assert!(html.contains("artifact.txt"));
+        assert!(html.contains("128"));
+    }
+
+    #[test]
+    fn parse_attachment_views_accepts_content_type_and_size_aliases() {
+        let attachments = parse_attachment_views(
+            r#"[{"name":"artifact.txt","path":"attachments/demo.txt","content_type":"text/plain","size":"128"}]"#,
+        );
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name.as_deref(), Some("artifact.txt"));
+        assert_eq!(attachments[0].path.as_deref(), Some("attachments/demo.txt"));
+        assert_eq!(attachments[0].media_type.as_deref(), Some("text/plain"));
+        assert_eq!(attachments[0].bytes, Some(128));
+    }
+
+    #[test]
+    fn render_message_renders_sender_recipients_and_thread_preview() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("message");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-message-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+        )));
+        let blue = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+        let amber = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "AmberPeak",
+            "test",
+            "test",
+            None,
+            None,
+        )));
+
+        let root = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            "Thread root",
+            "First message",
+            Some("br-message"),
+            "high",
+            false,
+            "[]",
+            &[(blue.id.unwrap_or(0), "to"), (amber.id.unwrap_or(0), "cc")],
+        )));
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            blue.id.unwrap_or(0),
+            "Thread reply",
+            "Reply body",
+            Some("br-message"),
+            "normal",
+            false,
+            "[]",
+            &[(sender.id.unwrap_or(0), "to")],
+        )));
+
+        let html = render_message(&cx, &pool, &project.slug, root.id.unwrap_or(0))
+            .expect("message render should succeed")
+            .expect("message route should return html");
+        assert!(html.contains("GreenCastle"));
+        assert!(html.contains("BlueLake"));
+        assert!(html.contains("AmberPeak"));
+        assert!(html.contains("Part of a Conversation Thread"));
+    }
+
+    #[test]
+    fn render_message_root_seed_uses_numeric_thread_reference() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("message-root-thread");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-message-root-thread-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+
+        let root = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            "Numeric thread root",
+            "Kickoff",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+        let root_id = root.id.unwrap_or(0);
+        let root_thread_ref = root_id.to_string();
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            recipient.id.unwrap_or(0),
+            "Numeric thread reply",
+            "Reply",
+            Some(&root_thread_ref),
+            "normal",
+            false,
+            "[]",
+            &[(sender.id.unwrap_or(0), "to")],
+        )));
+
+        let html = render_message(&cx, &pool, &project.slug, root_id)
+            .expect("message render should succeed")
+            .expect("message route should return html");
+        assert!(html.contains(&format!("/mail/{}/thread/{root_id}", project.slug)));
+        assert!(html.contains("Part of a Conversation Thread"));
+    }
+
+    #[test]
+    fn render_unified_inbox_static_export_marks_snapshot_mode() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("unified-static");
+        let html = render_unified_inbox(&cx, &pool, 10, None, true)
+            .expect("unified inbox render should succeed")
+            .expect("unified inbox should return html");
+        assert!(html.contains("Static export snapshot"));
     }
 }
 
@@ -102,6 +408,10 @@ fn extract_query_int(query: &str, key: &str, default: usize) -> usize {
     extract_query_str(query, key)
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn is_static_export_request(query: &str) -> bool {
+    extract_query_str(query, "__static_export").is_some()
 }
 
 fn is_valid_project_slug(slug: &str) -> bool {
@@ -379,6 +689,30 @@ mod utility_tests {
     }
 
     #[test]
+    fn run_command_stdout_with_timeout_returns_stdout_for_fast_command() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf '42K /tmp/archive\\n'"]);
+        let stdout =
+            run_command_stdout_with_timeout(&mut command, std::time::Duration::from_millis(250))
+                .expect("stdout");
+        assert_eq!(stdout, "42K /tmp/archive\n");
+    }
+
+    #[test]
+    fn run_command_stdout_with_timeout_kills_hung_command() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        let started = std::time::Instant::now();
+        let stdout =
+            run_command_stdout_with_timeout(&mut command, std::time::Duration::from_millis(50));
+        assert!(stdout.is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "timeout helper should return promptly instead of waiting for the full child runtime"
+        );
+    }
+
+    #[test]
     fn time_travel_timestamp_rejects_invalid_separators() {
         assert!(!is_valid_time_travel_timestamp("2026/02/11T05:43"));
         assert!(!is_valid_time_travel_timestamp("2026-02-11 05:43"));
@@ -409,19 +743,9 @@ mod utility_tests {
 #[cfg(test)]
 mod route_hardening_tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_pool() -> DbPool {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let db_path = std::env::temp_dir().join(format!("mail-ui-route-{nonce}.sqlite3"));
-        let cfg = DbPoolConfig {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            ..DbPoolConfig::default()
-        };
-        get_or_create_pool(&cfg).expect("test pool")
+        initialized_test_pool("mail-ui-route")
     }
 
     // F2: Malformed project slugs are rejected with 400 before DB access.
@@ -514,19 +838,9 @@ mod route_hardening_tests {
 #[cfg(test)]
 mod auth_route_hardening_regression_suite {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_pool() -> DbPool {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let db_path = std::env::temp_dir().join(format!("mail-ui-f4-{nonce}.sqlite3"));
-        let cfg = DbPoolConfig {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            ..DbPoolConfig::default()
-        };
-        get_or_create_pool(&cfg).expect("test pool")
+        initialized_test_pool("mail-ui-f4")
     }
 
     // -- Slug validation regression (F2 scope) --
@@ -842,6 +1156,7 @@ struct UnifiedInboxCtx {
     total_agents: usize,
     total_messages: usize,
     filter_importance: String,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -849,6 +1164,7 @@ struct UnifiedProject {
     id: i64,
     slug: String,
     human_key: String,
+    created_at: String,
     agent_count: usize,
     agents: Vec<UnifiedAgent>,
 }
@@ -869,12 +1185,119 @@ struct UnifiedMessage {
     body_md: String,
     body_html: String,
     created: String,
+    created_full: String,
+    created_relative: String,
     importance: String,
     thread_id: String,
     project_slug: String,
     project_name: String,
     sender: String,
     recipients: String,
+    read: bool,
+    excerpt: String,
+}
+
+#[derive(Debug)]
+struct UnifiedMessageAggregate {
+    id: i64,
+    subject: String,
+    body_md: String,
+    created_ts: i64,
+    importance: String,
+    thread_id: String,
+    project_slug: String,
+    project_name: String,
+    sender: String,
+    recipients: std::collections::BTreeSet<String>,
+    all_read: bool,
+}
+
+impl UnifiedMessageAggregate {
+    fn from_inbox_row(project: &ProjectRow, recipient_name: &str, row: &queries::InboxRow) -> Self {
+        let message = &row.message;
+        let mut recipients = std::collections::BTreeSet::new();
+        recipients.insert(recipient_name.to_string());
+        Self {
+            id: message.id.unwrap_or(0),
+            subject: message.subject.clone(),
+            body_md: message.body_md.clone(),
+            created_ts: message.created_ts,
+            importance: message.importance.clone(),
+            thread_id: message.thread_id.clone().unwrap_or_default(),
+            project_slug: project.slug.clone(),
+            project_name: project.human_key.clone(),
+            sender: row.sender_name.clone(),
+            recipients,
+            all_read: row.read_ts.is_some(),
+        }
+    }
+
+    fn absorb(&mut self, recipient_name: &str, row: &queries::InboxRow) {
+        self.recipients.insert(recipient_name.to_string());
+        self.all_read &= row.read_ts.is_some();
+    }
+
+    fn into_view(self) -> UnifiedMessage {
+        let recipients = self.recipients.into_iter().collect::<Vec<_>>().join(", ");
+        let created = ts_display(self.created_ts);
+        UnifiedMessage {
+            id: self.id,
+            subject: self.subject,
+            body_html: markdown::render_markdown_to_safe_html(&self.body_md),
+            excerpt: body_excerpt(&self.body_md, 150),
+            body_md: self.body_md,
+            created_full: ts_display_full(self.created_ts),
+            created_relative: ts_display_relative(self.created_ts),
+            created,
+            importance: self.importance,
+            thread_id: self.thread_id,
+            project_slug: self.project_slug,
+            project_name: self.project_name,
+            sender: self.sender,
+            recipients,
+            read: self.all_read,
+        }
+    }
+}
+
+fn collect_unified_message_aggregates(
+    cx: &Cx,
+    pool: &DbPool,
+    projects_rows: &[ProjectRow],
+    limit: usize,
+    filter_importance: Option<&str>,
+) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
+    let mut messages = BTreeMap::new();
+
+    for project in projects_rows {
+        let pid = project.id.unwrap_or(0);
+        let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
+        for agent in &agents_rows {
+            let aid = agent.id.unwrap_or(0);
+            let inbox = block_on_outcome(
+                cx,
+                queries::fetch_inbox(cx, pool, pid, aid, false, None, limit),
+            )?;
+            for row in inbox {
+                let message = &row.message;
+                if !matches_importance_filter(&message.importance, filter_importance) {
+                    continue;
+                }
+                let Some(message_id) = message.id else {
+                    continue;
+                };
+                let entry = messages.entry(message_id).or_insert_with(|| {
+                    UnifiedMessageAggregate::from_inbox_row(project, &agent.name, &row)
+                });
+                entry.absorb(&agent.name, &row);
+            }
+        }
+    }
+
+    let mut out: Vec<UnifiedMessageAggregate> = messages.into_values().collect();
+    out.sort_by(|a, b| b.created_ts.cmp(&a.created_ts).then(b.id.cmp(&a.id)));
+    out.truncate(limit);
+    Ok(out)
 }
 
 fn render_unified_inbox(
@@ -882,6 +1305,7 @@ fn render_unified_inbox(
     pool: &DbPool,
     limit: usize,
     filter_importance: Option<&str>,
+    static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let normalized_filter = filter_importance
         .map(str::trim)
@@ -912,48 +1336,22 @@ fn render_unified_inbox(
             id: pid,
             slug: p.slug.clone(),
             human_key: p.human_key.clone(),
+            created_at: ts_display(p.created_at),
             agent_count: agents.len(),
             agents,
         });
     }
 
-    // Fetch recent messages across all projects.
-    // We iterate projects and collect messages, applying limit.
-    let mut messages = Vec::new();
-    for p in &projects_rows {
-        let pid = p.id.unwrap_or(0);
-        let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
-        for agent in &agents_rows {
-            let aid = agent.id.unwrap_or(0);
-            let inbox = block_on_outcome(
-                cx,
-                queries::fetch_inbox(cx, pool, pid, aid, false, None, limit),
-            )?;
-            for row in inbox {
-                let m = &row.message;
-                if !matches_importance_filter(&m.importance, normalized_filter.as_deref()) {
-                    continue;
-                }
-                messages.push(UnifiedMessage {
-                    id: m.id.unwrap_or(0),
-                    subject: m.subject.clone(),
-                    body_md: m.body_md.clone(),
-                    body_html: markdown::render_markdown_to_safe_html(&m.body_md),
-                    created: ts_display(m.created_ts),
-                    importance: m.importance.clone(),
-                    thread_id: m.thread_id.clone().unwrap_or_default(),
-                    project_slug: p.slug.clone(),
-                    project_name: p.human_key.clone(),
-                    sender: row.sender_name.clone(),
-                    recipients: String::new(),
-                });
-            }
-        }
-        // Do not break early: messages from later projects may be newer.
-        // Sorting and truncation happen after the loop.
-    }
-    messages.sort_by(|a, b| b.created.cmp(&a.created));
-    messages.truncate(limit);
+    let messages = collect_unified_message_aggregates(
+        cx,
+        pool,
+        &projects_rows,
+        limit,
+        normalized_filter.as_deref(),
+    )?
+    .into_iter()
+    .map(UnifiedMessageAggregate::into_view)
+    .collect::<Vec<_>>();
 
     let total_messages = messages.len();
     render(
@@ -964,12 +1362,36 @@ fn render_unified_inbox(
             total_agents,
             total_messages,
             filter_importance: normalized_filter.unwrap_or_default(),
+            static_export,
         },
     )
 }
 
 fn matches_importance_filter(message_importance: &str, filter_importance: Option<&str>) -> bool {
     filter_importance.is_none_or(|filter| message_importance.eq_ignore_ascii_case(filter))
+}
+
+fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
+    let body_length = message.body_md.len();
+    serde_json::json!({
+        "id": message.id,
+        "subject": message.subject,
+        "body_md": message.body_md,
+        "body_html": message.body_html,
+        "body_length": body_length,
+        "excerpt": message.excerpt,
+        "created": message.created,
+        "created_ts": message.created,
+        "created_full": message.created_full,
+        "created_relative": message.created_relative,
+        "importance": message.importance,
+        "thread_id": message.thread_id,
+        "sender": message.sender,
+        "recipients": message.recipients,
+        "project_slug": message.project_slug,
+        "project_name": message.project_name,
+        "read": message.read,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -980,6 +1402,7 @@ fn matches_importance_filter(message_importance: &str, filter_importance: Option
 struct ProjectCtx {
     project: ProjectView,
     agents: Vec<AgentView>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -1020,7 +1443,12 @@ fn agent_view(a: &AgentRow) -> AgentView {
     }
 }
 
-fn render_project(cx: &Cx, pool: &DbPool, slug: &str) -> Result<Option<String>, (u16, String)> {
+fn render_project(
+    cx: &Cx,
+    pool: &DbPool,
+    slug: &str,
+    static_export: bool,
+) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
     let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
     render(
@@ -1028,6 +1456,7 @@ fn render_project(cx: &Cx, pool: &DbPool, slug: &str) -> Result<Option<String>, 
         ProjectCtx {
             project: project_view(&p),
             agents: agents.iter().map(agent_view).collect(),
+            static_export,
         },
     )
 }
@@ -1046,6 +1475,7 @@ struct InboxCtx {
     total: usize,
     prev_page: Option<usize>,
     next_page: Option<usize>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -1059,6 +1489,7 @@ struct InboxMessage {
     created: String,
     ack_required: bool,
     acked: bool,
+    read: bool,
 }
 
 fn render_inbox(
@@ -1068,6 +1499,7 @@ fn render_inbox(
     agent_name: &str,
     limit: usize,
     page: usize,
+    static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
@@ -1101,6 +1533,7 @@ fn render_inbox(
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
                 acked: row.ack_ts.is_some(),
+                read: row.read_ts.is_some(),
             }
         })
         .collect();
@@ -1123,6 +1556,7 @@ fn render_inbox(
             total,
             prev_page,
             next_page,
+            static_export,
         },
     )
 }
@@ -1135,8 +1569,11 @@ fn render_inbox(
 struct MessageCtx {
     project: ProjectView,
     message: MessageView,
-    sender_name: String,
-    recipients: Vec<String>,
+    recipients: Vec<MessageRecipientView>,
+    thread_items: Vec<MessageThreadPreview>,
+    other_thread_items: Vec<MessageThreadPreview>,
+    extra_thread_count: usize,
+    commit_sha: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1149,6 +1586,20 @@ struct MessageView {
     thread_id: String,
     created: String,
     ack_required: bool,
+    sender: String,
+}
+
+#[derive(Serialize)]
+struct MessageRecipientView {
+    kind: String,
+    name: String,
+}
+
+#[derive(Clone, Serialize)]
+struct MessageThreadPreview {
+    id: i64,
+    from: String,
+    subject: String,
 }
 
 fn render_message(
@@ -1163,28 +1614,73 @@ fn render_message(
     if m.project_id != pid {
         return Err((404, "Message not found".to_string()));
     }
+    let current_message_id = m.id.unwrap_or(0);
     let sender = block_on_outcome(cx, queries::get_agent_by_id(cx, pool, m.sender_id))?;
     let recipients = block_on_outcome(
         cx,
-        queries::list_message_recipient_names_for_messages(cx, pool, pid, &[message_id]),
+        queries::list_message_recipients_by_message(cx, pool, pid, message_id),
     )?;
+    let stored_thread_ref = m
+        .thread_id
+        .as_deref()
+        .filter(|thread| !thread.is_empty())
+        .map(str::to_string);
+    let candidate_thread_ref = stored_thread_ref
+        .clone()
+        .or_else(|| (current_message_id > 0).then(|| current_message_id.to_string()));
+    let thread_items = if let Some(thread_id) = candidate_thread_ref.as_deref() {
+        block_on_outcome(
+            cx,
+            queries::list_thread_messages(cx, pool, pid, thread_id, None),
+        )?
+        .into_iter()
+        .map(|item| MessageThreadPreview {
+            id: item.id,
+            from: item.from,
+            subject: item.subject,
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+    let other_thread_items = thread_items
+        .iter()
+        .filter(|item| item.id != current_message_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra_thread_count = other_thread_items.len().saturating_sub(5);
+    let thread_ref = if stored_thread_ref.is_some() || thread_items.len() > 1 {
+        candidate_thread_ref.unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     render(
         "mail_message.html",
         MessageCtx {
             project: project_view(&p),
             message: MessageView {
-                id: m.id.unwrap_or(0),
+                id: current_message_id,
                 subject: m.subject.clone(),
                 body_md: m.body_md.clone(),
                 body_html: markdown::render_markdown_to_safe_html(&m.body_md),
                 importance: m.importance.clone(),
-                thread_id: m.thread_id.clone().unwrap_or_default(),
+                thread_id: thread_ref,
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
+                sender: sender.name,
             },
-            sender_name: sender.name,
-            recipients,
+            recipients: recipients
+                .into_iter()
+                .map(|recipient| MessageRecipientView {
+                    kind: recipient.kind,
+                    name: recipient.name,
+                })
+                .collect(),
+            thread_items,
+            other_thread_items,
+            extra_thread_count,
+            commit_sha: None,
         },
     )
 }
@@ -1205,16 +1701,7 @@ mod message_route_authorization_tests {
     }
 
     fn make_test_pool() -> DbPool {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
-            .as_nanos();
-        let db_path = std::env::temp_dir().join(format!("mail-ui-idor-{nonce}.sqlite3"));
-        let cfg = DbPoolConfig {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            ..DbPoolConfig::default()
-        };
-        get_or_create_pool(&cfg).expect("test pool should initialize")
+        initialized_test_pool("mail-ui-idor")
     }
 
     #[test]
@@ -1357,6 +1844,8 @@ struct SearchCtx {
     project: ProjectView,
     q: String,
     results: Vec<WebSearchResult>,
+    static_export: bool,
+    static_search_index_path: String,
     // Facet state (round-trips through URL params)
     order: String,
     scope: String,
@@ -1554,6 +2043,7 @@ fn render_search(
 
     // ── Parse all query parameters ──────────────────────────────────
     let q = extract_query_str(query_str, "q").unwrap_or_default();
+    let static_export = is_static_export_request(query_str);
     let limit = extract_query_int(query_str, "limit", 50);
     let order = extract_query_str(query_str, "order").unwrap_or_else(|| "relevance".to_string());
     let scope = extract_query_str(query_str, "scope").unwrap_or_default();
@@ -1682,6 +2172,8 @@ fn render_search(
             project: project_view(&p),
             q,
             results,
+            static_export,
+            static_search_index_path: "../../../search-index.json".to_string(),
             order,
             scope,
             boost,
@@ -1822,6 +2314,83 @@ fn render_file_reservations(
 #[derive(Serialize)]
 struct AttachmentsCtx {
     project: ProjectView,
+    items: Vec<AttachmentMessageView>,
+}
+
+#[derive(Serialize)]
+struct AttachmentMessageView {
+    id: i64,
+    subject: String,
+    created: String,
+    attachments: Vec<AttachmentView>,
+}
+
+#[derive(Serialize)]
+struct AttachmentView {
+    name: Option<String>,
+    media_type: Option<String>,
+    path: Option<String>,
+    bytes: Option<u64>,
+}
+
+fn parse_attachment_views(attachments_json: &str) -> Vec<AttachmentView> {
+    serde_json::from_str::<Vec<serde_json::Value>>(attachments_json)
+        .map(|attachments| {
+            attachments
+                .into_iter()
+                .filter_map(|attachment| {
+                    let media_type = attachment
+                        .get("media_type")
+                        .or_else(|| attachment.get("content_type"))
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| {
+                            attachment
+                                .get("type")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|kind| !matches!(*kind, "file" | "inline" | "auto"))
+                        })
+                        .map(str::to_string);
+                    let path = attachment
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let name = attachment
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            path.as_deref().and_then(|attachment_path| {
+                                Path::new(attachment_path)
+                                    .file_name()
+                                    .and_then(std::ffi::OsStr::to_str)
+                                    .map(str::to_string)
+                            })
+                        });
+                    let bytes = attachment
+                        .get("bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .or_else(|| attachment.get("size").and_then(serde_json::Value::as_u64))
+                        .or_else(|| {
+                            attachment
+                                .get("size")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|raw| raw.parse::<u64>().ok())
+                        });
+
+                    if media_type.is_none() && path.is_none() && name.is_none() && bytes.is_none() {
+                        return None;
+                    }
+
+                    Some(AttachmentView {
+                        name,
+                        media_type,
+                        path,
+                        bytes,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn render_attachments(
@@ -1830,10 +2399,56 @@ fn render_attachments(
     project_slug: &str,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let pid = p.id.unwrap_or(0);
+    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
+    let mut items_by_id = BTreeMap::new();
+
+    for agent in &agents {
+        let aid = agent.id.unwrap_or(0);
+        let inbox = block_on_outcome(
+            cx,
+            queries::fetch_inbox(cx, pool, pid, aid, false, None, 10_000),
+        )?;
+        for row in inbox {
+            let message = row.message;
+            let Some(message_id) = message.id else {
+                continue;
+            };
+            items_by_id.entry(message_id).or_insert_with(|| {
+                let attachments = parse_attachment_views(&message.attachments);
+                (
+                    message.created_ts,
+                    AttachmentMessageView {
+                        id: message_id,
+                        subject: message.subject.clone(),
+                        created: ts_display(message.created_ts),
+                        attachments,
+                    },
+                )
+            });
+        }
+    }
+
+    let mut items = items_by_id
+        .into_iter()
+        .filter_map(|(_, (created_ts, item))| {
+            if item.attachments.is_empty() {
+                None
+            } else {
+                Some((created_ts, item))
+            }
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|(left_ts, left_item), (right_ts, right_item)| {
+        right_ts.cmp(left_ts).then(right_item.id.cmp(&left_item.id))
+    });
+    let items = items.into_iter().map(|(_, item)| item).collect();
+
     render(
         "mail_attachments.html",
         AttachmentsCtx {
             project: project_view(&p),
+            items,
         },
     )
 }
@@ -1891,7 +2506,7 @@ fn dispatch_project_route(
     }
 
     match rest {
-        "" => render_project(cx, pool, project_slug),
+        "" => render_project(cx, pool, project_slug, is_static_export_request(query)),
         "search" => render_search(cx, pool, project_slug, query),
         "file_reservations" => render_file_reservations(cx, pool, project_slug),
         "attachments" => render_attachments(cx, pool, project_slug),
@@ -1918,7 +2533,15 @@ fn dispatch_project_route(
                 ("GET", "") => {
                     let limit = extract_query_int(query, "limit", 10000);
                     let page = extract_query_int(query, "page", 1);
-                    render_inbox(cx, pool, project_slug, agent_name, limit, page)
+                    render_inbox(
+                        cx,
+                        pool,
+                        project_slug,
+                        agent_name,
+                        limit,
+                        page,
+                        is_static_export_request(query),
+                    )
                 }
                 ("GET", _) => Ok(None), // Unknown inbox sub-action → 404
                 _ => Err((405, "Method Not Allowed".to_string())),
@@ -1994,42 +2617,10 @@ fn render_api_unified_inbox(
         extract_query_str(query, "include_projects").is_some_and(|v| v == "true" || v == "1");
 
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-    let mut messages = Vec::new();
-    for p in &projects {
-        let pid = p.id.unwrap_or(0);
-        let agents = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
-        for a in &agents {
-            let inbox = block_on_outcome(
-                cx,
-                queries::fetch_inbox(cx, pool, pid, a.id.unwrap_or(0), false, None, limit),
-            )?;
-            for row in inbox {
-                let m = &row.message;
-                messages.push(serde_json::json!({
-                    "id": m.id.unwrap_or(0),
-                    "subject": m.subject,
-                    "body_md": m.body_md,
-                    "body_length": m.body_md.len(),
-                    "excerpt": body_excerpt(&m.body_md, 150),
-                    "created_ts": ts_display(m.created_ts),
-                    "created_full": ts_display_full(m.created_ts),
-                    "created_relative": ts_display_relative(m.created_ts),
-                    "importance": m.importance,
-                    "thread_id": m.thread_id,
-                    "sender": row.sender_name,
-                    "project_slug": p.slug,
-                    "project_name": p.human_key,
-                    "read": false,
-                }));
-            }
-        }
-    }
-    messages.sort_by(|a, b| {
-        let ta = a["created_ts"].as_str().unwrap_or("");
-        let tb = b["created_ts"].as_str().unwrap_or("");
-        tb.cmp(ta)
-    });
-    messages.truncate(limit);
+    let messages = collect_unified_message_aggregates(cx, pool, &projects, limit, None)?
+        .into_iter()
+        .map(|message| unified_api_message_value(&message.into_view()))
+        .collect::<Vec<_>>();
 
     let mut result = serde_json::json!({ "messages": messages });
     if include_projects {
@@ -2080,7 +2671,9 @@ fn get_archive_root() -> Result<std::path::PathBuf, (u16, String)> {
 /// Get a `ProjectArchive` handle for a specific project slug.
 fn get_project_archive(slug: &str) -> Result<storage::ProjectArchive, (u16, String)> {
     let config = Config::from_env();
-    ensure_archive(&config, slug).map_err(|e| (500, format!("Archive error: {e}")))
+    storage::open_archive(&config, slug)
+        .map_err(|e| (500, format!("Archive error: {e}")))?
+        .ok_or_else(|| (404, "Archive not found".to_string()))
 }
 
 fn render_archive_route(
@@ -2123,7 +2716,7 @@ fn render_archive_route(
             // /archive/browser/{project}/file?path=...
             let project_slug = archive_browser_file_project_slug(sub).unwrap_or_default();
             let path = extract_query_str(query, "path").unwrap_or_default();
-            render_archive_browser_file(project_slug, &path)
+            render_archive_browser_file(cx, pool, project_slug, &path)
         }
         _ if sub.starts_with("/archive/commit/") => {
             let sha = sub.strip_prefix("/archive/commit/").unwrap_or("");
@@ -2159,7 +2752,17 @@ fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, 
         |_| ("0".to_string(), "Never".to_string(), "N/A".to_string()),
         |root| {
             // Count commits (cap at 10_000)
-            let commits = storage::get_recent_commits_extended(&root, 10_000).unwrap_or_default();
+            let commits = match storage::get_recent_commits_extended(&root, 10_000) {
+                Ok(commits) => commits,
+                Err(err) => {
+                    tracing::warn!(
+                        archive_root = %root.display(),
+                        error = %err,
+                        "failed to read archive commits for archive guide"
+                    );
+                    Vec::new()
+                }
+            };
             let total = if commits.len() >= 10_000 {
                 "10,000+".to_string()
             } else {
@@ -2201,19 +2804,44 @@ fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, 
 /// Estimate the size of a directory tree, returned as a human-readable string.
 fn estimate_repo_size(path: &std::path::Path) -> String {
     // Try `du -sh` with timeout to prevent server lockup on massive/networked NFS archives.
-    match std::process::Command::new("du")
-        .args(["-sh", &path.display().to_string()])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout
-                .split_whitespace()
-                .next()
-                .unwrap_or("Unknown")
-                .to_string()
+    const DU_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let mut command = std::process::Command::new("du");
+    command.args(["-sh", &path.display().to_string()]);
+    run_command_stdout_with_timeout(&mut command, DU_TIMEOUT)
+        .and_then(|stdout| stdout.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn run_command_stdout_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let output = child.wait_with_output().ok()?;
+                return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
-        _ => "Unknown".to_string(),
     }
 }
 
@@ -2226,7 +2854,8 @@ struct ArchiveActivityCtx {
 
 fn render_archive_activity(limit: usize) -> Result<Option<String>, (u16, String)> {
     let root = get_archive_root()?;
-    let commits = storage::get_recent_commits_extended(&root, limit).unwrap_or_default();
+    let commits = storage::get_recent_commits_extended(&root, limit)
+        .map_err(|e| (500, format!("Archive error: {e}")))?;
     render("archive_activity.html", ArchiveActivityCtx { commits })
 }
 
@@ -2268,7 +2897,8 @@ fn render_archive_timeline(
     // Default to first project if not specified
     let (slug, project_name) = resolve_project_slug(cx, pool, project)?;
 
-    let commits = storage::get_timeline_commits(&root, &slug, 100).unwrap_or_default();
+    let commits = storage::get_timeline_commits(&root, &slug, 100)
+        .map_err(|e| (500, format!("Archive error: {e}")))?;
 
     render(
         "archive_timeline.html",
@@ -2344,6 +2974,8 @@ fn render_archive_browser(
 
 /// JSON API: get file content from archive.
 fn render_archive_browser_file(
+    cx: &Cx,
+    pool: &DbPool,
     project_slug: &str,
     path: &str,
 ) -> Result<Option<String>, (u16, String)> {
@@ -2351,6 +2983,11 @@ fn render_archive_browser_file(
         return json_detail_err(400, "Invalid project identifier");
     }
 
+    if let Err((status, detail)) =
+        block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))
+    {
+        return json_detail_err(status, &detail);
+    }
     let archive = get_project_archive(project_slug)?;
     match storage::get_archive_file_content(&archive, path, 10 * 1024 * 1024) {
         Ok(Some(content)) => {
@@ -2360,9 +2997,22 @@ fn render_archive_browser_file(
             Ok(Some(json))
         }
         Err(storage::StorageError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidInput => {
-            json_detail_err(400, "Invalid file path")
+            if err.to_string().starts_with("File too large:") {
+                json_detail_err(413, "File too large")
+            } else {
+                json_detail_err(400, "Invalid file path")
+            }
         }
-        Ok(None) | Err(_) => json_detail_err(404, "File not found"),
+        Ok(None) => json_detail_err(404, "File not found"),
+        Err(err) => {
+            tracing::warn!(
+                project = %project_slug,
+                path = %path,
+                error = %err,
+                "failed to read archive browser file"
+            );
+            json_detail_err(404, "File not found")
+        }
     }
 }
 
@@ -2383,12 +3033,8 @@ fn render_archive_network(
     let root = get_archive_root()?;
     let (slug, project_name) = resolve_project_slug(cx, pool, project)?;
 
-    let graph = storage::get_communication_graph(&root, &slug, 200).unwrap_or_else(|_| {
-        storage::CommunicationGraph {
-            nodes: Vec::new(),
-            edges: Vec::new(),
-        }
-    });
+    let graph = storage::get_communication_graph(&root, &slug, 200)
+        .map_err(|e| (500, format!("Archive error: {e}")))?;
 
     render(
         "archive_network.html",
@@ -2418,8 +3064,8 @@ fn render_archive_time_travel(cx: &Cx, pool: &DbPool) -> Result<Option<String>, 
 
 /// JSON API: get historical inbox snapshot at a point in time.
 fn render_archive_time_travel_snapshot(
-    _cx: &Cx,
-    _pool: &DbPool,
+    cx: &Cx,
+    pool: &DbPool,
     project_slug: &str,
     agent_name: &str,
     timestamp: &str,
@@ -2437,6 +3083,11 @@ fn render_archive_time_travel_snapshot(
         );
     }
 
+    if let Err((status, detail)) =
+        block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))
+    {
+        return json_detail_err(status, &detail);
+    }
     let archive = get_project_archive(project_slug)?;
     let snapshot =
         match storage::get_historical_inbox_snapshot(&archive, agent_name, timestamp, 200) {
@@ -2724,8 +3375,8 @@ fn handle_overseer_send(
 fn handle_sibling_update(
     _cx: &Cx,
     _pool: &DbPool,
-    project_id: i64,
-    other_id: i64,
+    _project_id: i64,
+    _other_id: i64,
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
     let payload: serde_json::Value =
@@ -2741,24 +3392,10 @@ fn handle_sibling_update(
         return json_err(400, "Invalid action");
     }
 
-    let target_status = match action.as_str() {
-        "confirm" => "confirmed",
-        "dismiss" => "dismissed",
-        "reset" => "suggested",
-        _ => unreachable!(),
-    };
-
-    // Note: The sibling suggestion feature requires a `project_siblings` table
-    // that is not yet part of the Rust schema. Return a stub response that acknowledges
-    // the action. When the schema is added, this handler will execute the DB update.
-    json_ok(&serde_json::json!({
-        "status": target_status,
-        "suggestion": {
-            "project_id": project_id,
-            "other_id": other_id,
-            "status": target_status,
-        },
-    }))
+    json_err(
+        501,
+        "Sibling suggestion updates are not implemented in the Rust server yet",
+    )
 }
 
 /// Render an error page.
@@ -2773,6 +3410,141 @@ fn render_error(message: &str) -> Result<Option<String>, (u16, String)> {
             message: message.to_string(),
         },
     )
+}
+
+#[cfg(test)]
+mod fresh_eyes_regression_tests {
+    use super::*;
+    use asupersync::Outcome;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
+        match outcome {
+            Outcome::Ok(value) => value,
+            Outcome::Err(err) => panic!("db error: {err}"),
+            Outcome::Cancelled(_) => panic!("db operation cancelled"),
+            Outcome::Panicked(panic) => panic!("db operation panicked: {}", panic.message()),
+        }
+    }
+
+    fn make_test_pool(prefix: &str) -> DbPool {
+        initialized_test_pool(prefix)
+    }
+
+    #[test]
+    fn unified_message_aggregation_deduplicates_multi_recipient_mail() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-unified");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-unified",
+        )));
+        let project_id = project.id.expect("project id");
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+        )));
+        let blue = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+        let green = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenField",
+            "test",
+            "test",
+            None,
+            None,
+        )));
+
+        let message = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "Shared subject",
+            "Shared body",
+            Some("shared-thread"),
+            "normal",
+            false,
+            "[]",
+            &[
+                (blue.id.expect("blue id"), "to"),
+                (green.id.expect("green id"), "to"),
+            ],
+        )));
+        let message_id = message.id.expect("message id");
+        outcome_ok(block_on(queries::mark_message_read(
+            &cx,
+            &pool,
+            blue.id.expect("blue id"),
+            message_id,
+        )));
+
+        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
+        let aggregates = collect_unified_message_aggregates(&cx, &pool, &projects, 10, None)
+            .expect("aggregation should succeed");
+
+        assert_eq!(
+            aggregates.len(),
+            1,
+            "multi-recipient mail should deduplicate"
+        );
+        assert_eq!(
+            aggregates[0]
+                .recipients
+                .iter()
+                .cloned()
+                .collect::<Vec<String>>(),
+            vec!["BlueLake".to_string(), "GreenField".to_string()]
+        );
+        assert!(
+            !aggregates[0].all_read,
+            "message should stay unread while any recipient remains unread"
+        );
+    }
+
+    #[test]
+    fn archive_time_travel_snapshot_requires_registered_project() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-time-travel");
+        let missing_slug = format!(
+            "missingfreshsight{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        );
+
+        let (status, detail) = render_archive_time_travel_snapshot(
+            &cx,
+            &pool,
+            &missing_slug,
+            "BlueLake",
+            "2026-02-11T05:43",
+        )
+        .expect_err("missing project should fail before archive lookup");
+
+        assert_eq!(status, 404);
+        assert!(detail.contains("Project"), "unexpected detail: {detail}");
+    }
+
+    #[test]
+    fn sibling_update_route_reports_not_implemented() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-sibling");
+
+        let (status, payload) = handle_sibling_update(&cx, &pool, 1, 2, r#"{"action":"confirm"}"#)
+            .expect_err("route should not pretend to succeed");
+
+        assert_eq!(status, 501);
+        assert!(
+            payload.contains("not implemented"),
+            "unexpected payload: {payload}"
+        );
+    }
 }
 
 #[cfg(test)]

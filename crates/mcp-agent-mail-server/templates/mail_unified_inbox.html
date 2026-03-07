@@ -100,6 +100,12 @@
     </button>
 
     <!-- Refresh Controls -->
+    {% if static_export %}
+    <div class="flex items-center gap-3 rounded-lg border border-primary-200 dark:border-primary-800 bg-primary-50 dark:bg-primary-900/20 px-3 py-2 text-xs font-medium text-primary-700 dark:text-primary-200">
+      <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
+      <span>Static export snapshot</span>
+    </div>
+    {% else %}
     <div class="flex items-center gap-3">
       <button @click="fetchLatestMessages()"
               class="px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium flex items-center gap-2 transition-all duration-200 hover:border-primary-300 dark:hover:border-primary-700 hover:text-primary-700 dark:hover:text-primary-400"
@@ -125,6 +131,7 @@
         <span>Auto-refresh</span>
       </label>
     </div>
+    {% endif %}
 
     <!-- Message Count -->
     <div class="hidden md:flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400">
@@ -655,6 +662,7 @@
 
 <script>
 function unifiedInboxManager() {
+  const staticExport = {{ static_export|tojson }};
   return {
     // Data
     allMessages: {{ messages | tojson if messages else '[]' }},
@@ -667,7 +675,7 @@ function unifiedInboxManager() {
     viewMode: 'split',
     isFullscreen: false,
     autoRefreshSeconds: 45,
-    autoRefreshEnabled: true,
+    autoRefreshEnabled: !staticExport,
     autoRefreshHandle: null,
     isRefreshing: false,
     lastRefreshTime: null,
@@ -720,6 +728,9 @@ function unifiedInboxManager() {
     },
 
     get lastRefreshLabel() {
+      if (staticExport) {
+        return 'Static snapshot';
+      }
       if (this.isRefreshing) {
         return 'Refreshing…';
       }
@@ -748,7 +759,9 @@ function unifiedInboxManager() {
     init() {
       this.filteredMessages = [...this.allMessages];
       this.filterMessages();
-      this.lastRefreshTime = new Date();
+      if (!staticExport) {
+        this.lastRefreshTime = new Date();
+      }
 
       // Setup keyboard shortcuts with proper cleanup
       this._keydownHandler = (e) => {
@@ -948,6 +961,10 @@ function unifiedInboxManager() {
 
     // Refresh helpers
     scheduleAutoRefresh() {
+      if (staticExport) {
+        this.autoRefreshEnabled = false;
+        return;
+      }
       if (this.autoRefreshHandle) {
         clearInterval(this.autoRefreshHandle);
         this.autoRefreshHandle = null;
@@ -961,6 +978,10 @@ function unifiedInboxManager() {
     },
 
     handleAutoRefreshToggle() {
+      if (staticExport) {
+        this.autoRefreshEnabled = false;
+        return;
+      }
       if (this.autoRefreshEnabled) {
         this.scheduleAutoRefresh();
       } else if (this.autoRefreshHandle) {
@@ -971,6 +992,12 @@ function unifiedInboxManager() {
 
     async fetchLatestMessages(options = {}) {
       const { silent = false } = options;
+      if (staticExport) {
+        if (!silent && typeof window.showToast === 'function') {
+          window.showToast('Static export snapshots cannot refresh from the server', 'info');
+        }
+        return;
+      }
       if (this.isRefreshing) {
         return;
       }
