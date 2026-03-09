@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use asupersync::Cx;
@@ -1274,34 +1274,31 @@ struct UnifiedMessageAggregate {
 
 impl UnifiedMessageAggregate {
     fn from_inbox_row(
-        cx: &Cx,
-        pool: &DbPool,
         project: &ProjectRow,
         recipient_name: &str,
         row: &queries::InboxRow,
-    ) -> Result<Self, (u16, String)> {
+        root_ids_with_replies: &HashSet<i64>,
+    ) -> Self {
         let message = &row.message;
         let mut recipients = std::collections::BTreeSet::new();
         recipients.insert(recipient_name.to_string());
-        Ok(Self {
+        Self {
             id: message.id.unwrap_or(0),
             subject: message.subject.clone(),
             body_md: message.body_md.clone(),
             created_ts: message.created_ts,
             importance: message.importance.clone(),
             thread_id: display_thread_ref_for_message(
-                cx,
-                pool,
-                project.id.unwrap_or(0),
                 message.id.unwrap_or(0),
                 message.thread_id.as_deref(),
-            )?,
+                root_ids_with_replies,
+            ),
             project_slug: project.slug.clone(),
             project_name: project.human_key.clone(),
             sender: row.sender_name.clone(),
             recipients,
             all_read: row.read_ts.is_some(),
-        })
+        }
     }
 
     fn absorb(&mut self, recipient_name: &str, row: &queries::InboxRow) {
@@ -1339,30 +1336,32 @@ fn explicit_thread_ref(thread_id: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn display_thread_ref_for_message(
+fn root_ids_with_replies(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
+    root_message_ids: &[i64],
+) -> Result<HashSet<i64>, (u16, String)> {
+    Ok(block_on_outcome(
+        cx,
+        queries::list_numeric_thread_roots_with_replies(cx, pool, project_id, root_message_ids),
+    )?
+    .into_iter()
+    .collect())
+}
+
+fn display_thread_ref_for_message(
     message_id: i64,
     thread_id: Option<&str>,
-) -> Result<String, (u16, String)> {
+    root_ids_with_replies: &HashSet<i64>,
+) -> String {
     if let Some(thread_ref) = explicit_thread_ref(thread_id) {
-        return Ok(thread_ref);
+        return thread_ref;
     }
-    if message_id <= 0 {
-        return Ok(String::new());
+    if message_id > 0 && root_ids_with_replies.contains(&message_id) {
+        return message_id.to_string();
     }
-
-    let candidate_thread_ref = message_id.to_string();
-    let thread_items = block_on_outcome(
-        cx,
-        queries::list_thread_messages(cx, pool, project_id, &candidate_thread_ref, Some(2)),
-    )?;
-    if thread_items.len() > 1 {
-        Ok(candidate_thread_ref)
-    } else {
-        Ok(String::new())
-    }
+    String::new()
 }
 
 fn collect_unified_message_aggregates(
@@ -1377,6 +1376,8 @@ fn collect_unified_message_aggregates(
     for project in projects_rows {
         let pid = project.id.unwrap_or(0);
         let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
+        let mut project_inbox_rows = Vec::new();
+        let mut candidate_root_ids = Vec::new();
         for agent in &agents_rows {
             let aid = agent.id.unwrap_or(0);
             let inbox = block_on_outcome(
@@ -1388,18 +1389,34 @@ fn collect_unified_message_aggregates(
                 if !matches_importance_filter(&message.importance, filter_importance) {
                     continue;
                 }
-                let Some(message_id) = message.id else {
-                    continue;
-                };
-                if let Some(entry) = messages.get_mut(&message_id) {
-                    entry.absorb(&agent.name, &row);
-                    continue;
+                if explicit_thread_ref(message.thread_id.as_deref()).is_none()
+                    && let Some(message_id) = message.id
+                    && message_id > 0
+                {
+                    candidate_root_ids.push(message_id);
                 }
-
-                let aggregate =
-                    UnifiedMessageAggregate::from_inbox_row(cx, pool, project, &agent.name, &row)?;
-                messages.insert(message_id, aggregate);
+                project_inbox_rows.push((agent.name.clone(), row));
             }
+        }
+
+        let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
+        for (agent_name, row) in project_inbox_rows {
+            let message = &row.message;
+            let Some(message_id) = message.id else {
+                continue;
+            };
+            if let Some(entry) = messages.get_mut(&message_id) {
+                entry.absorb(&agent_name, &row);
+                continue;
+            }
+
+            let aggregate = UnifiedMessageAggregate::from_inbox_row(
+                project,
+                &agent_name,
+                &row,
+                &reply_root_ids,
+            );
+            messages.insert(message_id, aggregate);
         }
     }
 
@@ -1622,6 +1639,17 @@ fn render_inbox(
         queries::fetch_inbox(cx, pool, pid, aid, false, None, fetch_limit),
     )?;
     let total = inbox.len();
+    let candidate_root_ids: Vec<i64> = inbox
+        .iter()
+        .filter_map(|row| {
+            if explicit_thread_ref(row.message.thread_id.as_deref()).is_none() {
+                row.message.id.filter(|message_id| *message_id > 0)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
 
     // Offset-based pagination (Python: offset = (page - 1) * limit).
     let page = page.max(1);
@@ -1636,12 +1664,10 @@ fn render_inbox(
             sender: row.sender_name.clone(),
             importance: m.importance.clone(),
             thread_id: display_thread_ref_for_message(
-                cx,
-                pool,
-                pid,
                 m.id.unwrap_or(0),
                 m.thread_id.as_deref(),
-            )?,
+                &reply_root_ids,
+            ),
             created: ts_display(m.created_ts),
             ack_required: m.ack_required_bool(),
             acked: row.ack_ts.is_some(),

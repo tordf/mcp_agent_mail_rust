@@ -3113,6 +3113,70 @@ pub async fn list_thread_messages(
     }
 }
 
+pub async fn list_numeric_thread_roots_with_replies(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    root_message_ids: &[i64],
+) -> Outcome<Vec<i64>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let mut candidate_ids: Vec<i64> = root_message_ids
+        .iter()
+        .copied()
+        .filter(|id| *id > 0)
+        .collect();
+    if candidate_ids.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+    candidate_ids.sort_unstable();
+    candidate_ids.dedup();
+
+    let tracked = tracked(&*conn);
+    let mut roots_with_replies = Vec::new();
+
+    for chunk in candidate_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT DISTINCT m.thread_id \
+             FROM messages m \
+             WHERE m.project_id = ? AND m.thread_id IN ({placeholders})"
+        );
+        let mut params = Vec::with_capacity(chunk.len() + 1);
+        params.push(Value::BigInt(project_id));
+        for root_id in chunk {
+            params.push(Value::Text(root_id.to_string()));
+        }
+
+        let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+        let rows = match rows_out {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        for row in rows {
+            let thread_id: String = match row.get_as(0) {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
+            if let Ok(root_id) = thread_id.parse::<i64>() {
+                roots_with_replies.push(root_id);
+            }
+        }
+    }
+
+    roots_with_replies.sort_unstable();
+    roots_with_replies.dedup();
+    Outcome::Ok(roots_with_replies)
+}
+
 /// List unique recipient agent names for a set of message ids.
 pub async fn list_message_recipient_names_for_messages(
     cx: &Cx,
@@ -8003,6 +8067,125 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].subject, "msg-1");
             assert_eq!(rows[1].subject, "msg-2");
+        });
+    }
+
+    #[test]
+    fn list_numeric_thread_roots_with_replies_returns_only_roots_with_children() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("thread_roots_with_replies.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-thread-roots-with-replies-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let sender_id = sender.id.expect("sender id");
+            let recipient_id = recipient.id.expect("recipient id");
+            let recipients = [(recipient_id, "to")];
+
+            let root_with_reply = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "root-with-reply",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("create root with reply");
+            let root_with_reply_id = root_with_reply.id.expect("root with reply id");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                recipient_id,
+                "reply",
+                "body",
+                Some(&root_with_reply_id.to_string()),
+                "normal",
+                false,
+                "[]",
+                &[(sender_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create reply");
+
+            let root_without_reply = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "root-without-reply",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("create root without reply");
+            let root_without_reply_id = root_without_reply.id.expect("root without reply id");
+
+            let roots = list_numeric_thread_roots_with_replies(
+                &cx,
+                &pool,
+                project_id,
+                &[root_with_reply_id, root_without_reply_id],
+            )
+            .await
+            .into_result()
+            .expect("list numeric thread roots with replies");
+
+            assert_eq!(roots, vec![root_with_reply_id]);
         });
     }
 
