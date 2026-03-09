@@ -110,9 +110,20 @@ pub(crate) fn enqueue_agent_semantic_index(agent: &mcp_agent_mail_db::AgentRow) 
 
 fn is_agent_unique_constraint_error(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
-    normalized.contains("unique constraint failed")
-        && normalized.contains("agents.project_id")
-        && normalized.contains("agents.name")
+    let Some((prefix, columns)) = normalized.split_once(':') else {
+        return false;
+    };
+    if !prefix.contains("unique constraint failed") {
+        return false;
+    }
+
+    let columns = columns
+        .split(',')
+        .map(str::trim)
+        .map(|column| column.rsplit('.').next().unwrap_or(column))
+        .collect::<Vec<_>>();
+    columns.iter().any(|column| *column == "project_id")
+        && columns.iter().any(|column| *column == "name")
 }
 
 fn contact_blocked_error() -> McpError {
@@ -754,11 +765,57 @@ fn normalize_send_message_cc_bcc_argument(
     }
 }
 
-/// Normalize raw `send_message` arguments for parity with the Python reference:
+fn normalize_send_message_aliases(arguments: &mut Value) {
+    let Some(args) = arguments.as_object_mut() else {
+        return;
+    };
+
+    if !args.contains_key("project_key") {
+        if let Some(val) = args
+            .remove("project")
+            .or_else(|| args.remove("project_slug"))
+            .or_else(|| args.remove("human_key"))
+        {
+            args.insert("project_key".to_string(), val);
+        }
+    } else {
+        let _ = args.remove("project");
+        let _ = args.remove("project_slug");
+        let _ = args.remove("human_key");
+    }
+
+    if !args.contains_key("sender_name") {
+        if let Some(val) = args
+            .remove("from")
+            .or_else(|| args.remove("from_agent"))
+            .or_else(|| args.remove("requester"))
+        {
+            args.insert("sender_name".to_string(), val);
+        }
+    } else {
+        let _ = args.remove("from");
+        let _ = args.remove("from_agent");
+        let _ = args.remove("requester");
+    }
+
+    if !args.contains_key("message_id") {
+        if let Some(val) = args.remove("id") {
+            args.insert("message_id".to_string(), val);
+        }
+    } else {
+        let _ = args.remove("id");
+    }
+}
+
+/// Normalize raw `send_message` / `reply_message` arguments for parity with the
+/// Python reference:
+/// - accepts common project/sender/message aliases used in messaging flows
 /// - accepts single-string forms for to/cc/bcc (converts to one-element arrays)
 /// - validates recipient container/item types with parity messages
 /// - rejects `broadcast=true` because broadcast messaging is intentionally disabled
 pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> {
+    normalize_send_message_aliases(arguments);
+
     let Some(args) = arguments.as_object_mut() else {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
@@ -1228,7 +1285,7 @@ pub struct ReplyMessageResponse {
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    If true and `to` is empty, expand recipients to all registered agents in the\n    project (excluding the sender). Mutually exclusive with explicit `to` recipients.\n    Respects contact_policy settings \u{2014} agents with block_all are skipped.\ntopic : Optional[str]\n    Reserved for future topic tags. Non-blank values are currently rejected until\n    topic persistence and filtering are implemented.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```"
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Reserved for future topic tags. Non-blank values are currently rejected until\n    topic persistence and filtering are implemented.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names fail fast; register them first.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```"
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -2996,6 +3053,12 @@ mod tests {
         assert!(is_agent_unique_constraint_error(
             "unique constraint failed: AGENTS.PROJECT_ID, AGENTS.NAME"
         ));
+        assert!(is_agent_unique_constraint_error(
+            "UNIQUE constraint failed: project_id, name"
+        ));
+        assert!(!is_agent_unique_constraint_error(
+            "UNIQUE constraint failed: project_id, project_name"
+        ));
         assert!(!is_agent_unique_constraint_error(
             "UNIQUE constraint failed: projects.slug"
         ));
@@ -3322,6 +3385,24 @@ mod tests {
         assert_eq!(args["to"], json!(["BlueLake"]));
         assert_eq!(args["cc"], json!(["RedCat"]));
         assert_eq!(args["bcc"], json!(["GoldHawk"]));
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_does_not_rewrite_non_message_agent_fields() {
+        let mut args = json!({
+            "project": "/tmp/project",
+            "from_agent": "BlueLake",
+            "id": 42,
+            "target": "RedPeak",
+            "to_agent": "RedPeak",
+        });
+        normalize_send_message_arguments(&mut args).expect("message aliases should normalize");
+        assert_eq!(args["project_key"], json!("/tmp/project"));
+        assert_eq!(args["sender_name"], json!("BlueLake"));
+        assert_eq!(args["message_id"], json!(42));
+        assert_eq!(args["target"], json!("RedPeak"));
+        assert_eq!(args["to_agent"], json!("RedPeak"));
+        assert!(args.get("agent_name").is_none());
     }
 
     #[test]
