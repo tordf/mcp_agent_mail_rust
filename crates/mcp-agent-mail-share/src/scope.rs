@@ -252,6 +252,14 @@ pub fn apply_project_scope(
             ),
             &id_values,
         )?;
+        if table_exists(&conn, "file_reservation_releases")? {
+            exec(
+                &conn,
+                "DELETE FROM file_reservation_releases \
+                 WHERE reservation_id NOT IN (SELECT id FROM file_reservations)",
+                &[],
+            )?;
+        }
 
         // 7. Delete agents
         exec(
@@ -759,6 +767,78 @@ mod tests {
         assert_eq!(result.remaining.messages, 1);
         assert_eq!(result.remaining.recipients, 1);
         assert_eq!(result.remaining.file_reservations, 0);
+    }
+
+    #[test]
+    fn scope_removes_release_markers_for_filtered_out_reservations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("release_ledger.sqlite3");
+        let conn = Conn::open_file(db_path.display().to_string()).unwrap();
+
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at TEXT DEFAULT '')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT DEFAULT '', model TEXT DEFAULT '', task_description TEXT DEFAULT '', inception_ts TEXT DEFAULT '', last_active_ts TEXT DEFAULT '', attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT, subject TEXT DEFAULT '', body_md TEXT DEFAULT '', importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, created_ts TEXT DEFAULT '', attachments TEXT DEFAULT '[]')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT DEFAULT 'to', read_ts TEXT, ack_ts TEXT, PRIMARY KEY(message_id, agent_id))",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, path_pattern TEXT, exclusive INTEGER DEFAULT 1, reason TEXT DEFAULT '', created_ts TEXT DEFAULT '', expires_ts TEXT DEFAULT '', released_ts TEXT)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER NOT NULL)",
+        )
+        .unwrap();
+
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'proj-alpha', '/data/alpha', '')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (2, 'proj-beta', '/data/beta', '')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (1, 1, 'Alpha', '', '', '', '', '', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (2, 2, 'Beta', '', '', '', '', '', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO file_reservations VALUES (10, 1, 1, 'src/a.rs', 1, '', '', '', NULL)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO file_reservations VALUES (20, 2, 2, 'src/b.rs', 1, '', '', '', NULL)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO file_reservation_releases VALUES (10, 111)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO file_reservation_releases VALUES (20, 222)")
+            .unwrap();
+        drop(conn);
+
+        let result = apply_project_scope(&db_path, &["proj-beta".to_string()]).unwrap();
+        assert_eq!(result.remaining.file_reservations, 1);
+
+        let conn = Conn::open_file(db_path.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT reservation_id FROM file_reservation_releases ORDER BY reservation_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let reservation_id: i64 = rows[0].get_named("reservation_id").unwrap();
+        assert_eq!(reservation_id, 20);
     }
 
     #[test]

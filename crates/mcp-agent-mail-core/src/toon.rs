@@ -531,7 +531,7 @@ fn parse_saved_line(line: &str) -> Option<(u64, f64)> {
 
     // Find percentage in parentheses: (N.N%)
     let paren_start = trimmed.find('(')? + 1;
-    let paren_end = trimmed.find('%')?;
+    let paren_end = trimmed[paren_start..].find('%')? + paren_start;
     let pct_str = &trimmed[paren_start..paren_end];
     let pct: f64 = pct_str.parse().ok()?;
 

@@ -77,8 +77,8 @@
     },
     {
       "check": "mcp_config",
-      "detail": "11 config(s) found: 3 Rust, 0 Python, 7 no entry, 1 unreadable",
-      "status": "ok"
+      "detail": "11 config(s) found: 0 HTTP URL, 3 stdio command, 0 legacy Python, 7 no entry, 1 unreadable. Fix: run `am setup` or `am doctor fix` to convert to HTTP URL mode: codex (/home/ubuntu/.codex/config.toml) → stdio command mode, codex (/home/ubuntu/.config/codex/mcp.toml) → stdio command mode, codex (/home/ubuntu/.cache/codex/config.toml) → stdio command mode",
+      "status": "warn"
     },
     {
       "check": "update_available",

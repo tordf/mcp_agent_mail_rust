@@ -240,7 +240,7 @@ impl CandidateBudget {
         config: CandidateBudgetConfig,
     ) -> CandidateBudgetDerivation {
         const SCALE: u64 = 100;
-        let requested_limit = requested_limit.clamp(1, 1_000);
+        let requested_limit = requested_limit.clamp(1, 100_000);
         let decision = derive_budget_decision(mode, query_class);
 
         let (base_lexical_bps, base_semantic_bps) = match mode {
@@ -256,33 +256,72 @@ impl CandidateBudget {
             QueryClass::Empty => (100_u32, 0_u32),
         };
 
-        let lexical_raw =
-            scaled_ceil_limit(requested_limit, base_lexical_bps, class_lexical_bps, SCALE);
-        let semantic_raw = scaled_ceil_limit(
+        let lexical_limit = scaled_ceil_limit(
+            requested_limit,
+            base_lexical_bps,
+            class_lexical_bps,
+            SCALE,
+        )
+        .clamp(config.min_lexical, config.max_lexical.max(requested_limit));
+
+        let semantic_limit = scaled_ceil_limit(
             requested_limit,
             base_semantic_bps,
             class_semantic_bps,
             SCALE,
-        );
+        )
+        .clamp(config.min_semantic, config.max_semantic.max(requested_limit));
 
-        let lexical_limit = lexical_raw.clamp(config.min_lexical, config.max_lexical);
-
-        let semantic_limit = if base_semantic_bps == 0 || class_semantic_bps == 0 {
-            0
+        let final_lexical = if semantic_limit == 0 {
+            // Re-allocate full budget to lexical if semantic is effectively bypassed
+            scaled_ceil_limit(
+                requested_limit,
+                config.lexical_fallback_bps,
+                class_lexical_bps,
+                SCALE,
+            )
+            .clamp(config.min_lexical, config.max_lexical.max(requested_limit))
         } else {
-            semantic_raw.clamp(config.min_semantic, config.max_semantic)
+            lexical_limit
         };
 
-        let combined_limit = requested_limit
+        let final_semantic = if final_lexical == 0 {
+            // Re-allocate full budget to semantic if lexical is effectively bypassed
+            scaled_ceil_limit(
+                requested_limit,
+                config.hybrid_semantic_bps,
+                class_semantic_bps,
+                SCALE,
+            )
+            .clamp(config.min_semantic, config.max_semantic.max(requested_limit))
+        } else {
+            semantic_limit
+        };
+
+        let mut budget = CandidateBudget {
+            lexical_limit: final_lexical,
+            semantic_limit: final_semantic,
+            combined_limit: (final_lexical.saturating_add(final_semantic))
+                .min(config.max_combined.max(requested_limit.saturating_mul(2))),
+        };
+
+        let selected_total = requested_limit
             .max(lexical_limit.saturating_add(semantic_limit))
             .min(config.max_combined);
 
+        let deduped_selected = budget.lexical_limit.saturating_add(budget.semantic_limit);
+        let duplicates_removed = selected_total.saturating_sub(deduped_selected);
+        let counts = CandidateStageCounts {
+            lexical_considered: requested_limit,
+            semantic_considered: requested_limit,
+            lexical_selected: budget.lexical_limit,
+            semantic_selected: budget.semantic_limit,
+            deduped_selected,
+            duplicates_removed,
+        };
+
         CandidateBudgetDerivation {
-            budget: Self {
-                lexical_limit,
-                semantic_limit,
-                combined_limit,
-            },
+            budget,
             decision,
         }
     }

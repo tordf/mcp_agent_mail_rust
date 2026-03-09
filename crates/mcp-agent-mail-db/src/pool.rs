@@ -18,7 +18,7 @@ use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone)]
@@ -994,23 +994,76 @@ impl DbPool {
 static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<OnceCell<()>>>>> =
     OnceLock::new();
 static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<String, Weak<Pool<DbConn>>>>> = OnceLock::new();
+static SQLITE_IDENTITY_PATH_CACHE: OnceLock<Mutex<HashMap<String, SqliteIdentityPathCacheEntry>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct SqliteIdentityPathCacheEntry {
+    normalized: String,
+    validated_at: Instant,
+}
+
+const SQLITE_IDENTITY_PATH_CACHE_MAX_ENTRIES: usize = 256;
+#[cfg(test)]
+const SQLITE_IDENTITY_PATH_CACHE_FRESHNESS: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const SQLITE_IDENTITY_PATH_CACHE_FRESHNESS: Duration = Duration::from_secs(2);
+
+fn sqlite_identity_path_cache() -> &'static Mutex<HashMap<String, SqliteIdentityPathCacheEntry>> {
+    SQLITE_IDENTITY_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sqlite_identity_path_cache_get(path: &str) -> Option<String> {
+    let mut cache = sqlite_identity_path_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = cache.get(path)?;
+    if entry.validated_at.elapsed() <= SQLITE_IDENTITY_PATH_CACHE_FRESHNESS {
+        return Some(entry.normalized.clone());
+    }
+    cache.remove(path);
+    None
+}
+
+fn sqlite_identity_path_cache_insert(path: &str, normalized: &str) {
+    let mut cache = sqlite_identity_path_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !cache.contains_key(path)
+        && cache.len() >= SQLITE_IDENTITY_PATH_CACHE_MAX_ENTRIES
+        && let Some(victim) = cache.keys().next().cloned()
+    {
+        cache.remove(&victim);
+    }
+    cache.insert(
+        path.to_string(),
+        SqliteIdentityPathCacheEntry {
+            normalized: normalized.to_string(),
+            validated_at: Instant::now(),
+        },
+    );
+}
 
 #[must_use]
 fn normalize_sqlite_identity_path(path: &str) -> String {
     if path == ":memory:" {
         return path.to_string();
     }
+    if let Some(cached) = sqlite_identity_path_cache_get(path) {
+        return cached;
+    }
     let as_path = Path::new(path);
-    if let Ok(canonical) = std::fs::canonicalize(as_path) {
-        return canonical.to_string_lossy().into_owned();
-    }
-    if as_path.is_absolute() {
-        return as_path.to_string_lossy().into_owned();
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        return cwd.join(as_path).to_string_lossy().into_owned();
-    }
-    path.to_string()
+    let normalized = if let Ok(canonical) = std::fs::canonicalize(as_path) {
+        canonical.to_string_lossy().into_owned()
+    } else if as_path.is_absolute() {
+        as_path.to_string_lossy().into_owned()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(as_path).to_string_lossy().into_owned()
+    } else {
+        path.to_string()
+    };
+    sqlite_identity_path_cache_insert(path, &normalized);
+    normalized
 }
 
 #[must_use]
@@ -2194,6 +2247,48 @@ pub fn create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_sqlite_identity_path_caches_recent_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("identity_cache.db");
+        let raw_path = db_path.to_string_lossy().into_owned();
+
+        sqlite_identity_path_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        let first = normalize_sqlite_identity_path(&raw_path);
+        let cached = sqlite_identity_path_cache_get(&raw_path);
+        assert_eq!(cached.as_deref(), Some(first.as_str()));
+
+        let second = normalize_sqlite_identity_path(&raw_path);
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn sqlite_identity_path_cache_entries_expire_after_test_freshness_window() {
+        let raw_path = "relative/cache-expiry.db";
+        let normalized = "/tmp/cache-expiry.db";
+
+        sqlite_identity_path_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        sqlite_identity_path_cache_insert(raw_path, normalized);
+        assert_eq!(
+            sqlite_identity_path_cache_get(raw_path).as_deref(),
+            Some(normalized)
+        );
+
+        std::thread::sleep(SQLITE_IDENTITY_PATH_CACHE_FRESHNESS + Duration::from_millis(10));
+        assert!(
+            sqlite_identity_path_cache_get(raw_path).is_none(),
+            "expired entries should be evicted on read"
+        );
+    }
 
     #[test]
     fn test_sqlite_path_parsing() {

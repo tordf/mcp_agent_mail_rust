@@ -283,11 +283,23 @@ fn renewal_filter_matches(
     {
         return false;
     }
-    if let Some(path_patterns) = paths
-        && !path_patterns.is_empty()
-        && !path_patterns.iter().any(|path| path == &row.path_pattern)
-    {
-        return false;
+    if let Some(path_patterns) = paths && !path_patterns.is_empty() {
+        let mut matched = false;
+        for pat in path_patterns {
+            if row.path_pattern == *pat {
+                matched = true;
+                break;
+            }
+            // Use CompiledPattern for robust glob matching parity with creation logic.
+            let cp = mcp_agent_mail_core::pattern_overlap::CompiledPattern::new(pat);
+            if cp.matches(&row.path_pattern) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return false;
+        }
     }
     true
 }
@@ -644,10 +656,23 @@ pub async fn release_file_reservations(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
-    // Convert paths to slice of &str
-    let paths_ref: Option<Vec<&str>> = normalized_paths
-        .as_ref()
-        .map(|p| p.iter().map(String::as_str).collect());
+    let ids_to_release = if normalized_paths.is_some() || file_reservation_ids.is_some() {
+        let existing_rows = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, true)
+                .await,
+        )?;
+        let mut ids = Vec::new();
+        for res in existing_rows {
+            if renewal_filter_matches(&res, agent_id, normalized_paths.as_deref(), file_reservation_ids.as_deref()) {
+                if let Some(rid) = res.id {
+                    ids.push(rid);
+                }
+            }
+        }
+        Some(ids)
+    } else {
+        None
+    };
 
     // Perform the DB release (returns the actual updated rows)
     let released_rows = db_outcome_to_mcp_result(
@@ -656,8 +681,8 @@ pub async fn release_file_reservations(
             &pool,
             project_id,
             agent_id,
-            paths_ref.as_deref(),
-            file_reservation_ids.as_deref(),
+            None, // Pass resolved IDs only
+            ids_to_release.as_deref(),
         )
         .await,
     )?;
@@ -756,7 +781,7 @@ pub async fn renew_file_reservations(
     let agent_id = agent.id.unwrap_or(0);
 
     // Convert paths to slice of &str
-    let paths_ref: Option<Vec<&str>> = normalized_paths
+    let _paths_ref: Option<Vec<&str>> = normalized_paths
         .as_ref()
         .map(|p| p.iter().map(String::as_str).collect());
 
@@ -769,6 +794,7 @@ pub async fn renew_file_reservations(
         normalized_paths.as_deref(),
         file_reservation_ids.as_deref(),
     );
+    let ids_to_renew: Vec<i64> = previous_expires_by_id.keys().copied().collect();
 
     let renewed_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::renew_reservations(
@@ -777,8 +803,8 @@ pub async fn renew_file_reservations(
             project_id,
             agent_id,
             extend,
-            paths_ref.as_deref(),
-            file_reservation_ids.as_deref(),
+            None, // Pass IDs only now that we've resolved globs in the tool layer
+            Some(&ids_to_renew),
         )
         .await,
     )?;

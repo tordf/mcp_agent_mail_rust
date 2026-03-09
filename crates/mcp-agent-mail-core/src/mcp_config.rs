@@ -318,6 +318,12 @@ fn build_updated_server_entry(existing: &Value, rust_binary_path: &Path) -> Valu
         .as_object()
         .cloned()
         .unwrap_or_else(Map::<String, Value>::new);
+    let had_http_transport = entry.contains_key("url")
+        || entry.contains_key("httpUrl")
+        || matches!(
+            entry.get("type"),
+            Some(Value::String(kind)) if matches!(kind.as_str(), "url" | "http" | "remote")
+        );
     let preserved_env = entry.get("env").filter(|value| value.is_object()).cloned();
     let old_args = entry
         .get("args")
@@ -334,6 +340,18 @@ fn build_updated_server_entry(existing: &Value, rust_binary_path: &Path) -> Valu
         Value::String(rust_binary_path.to_string_lossy().into_owned()),
     );
     entry.insert("args".to_string(), Value::Array(rust_args));
+    if had_http_transport {
+        entry.remove("url");
+        entry.remove("httpUrl");
+        entry.remove("headers");
+        entry.remove("enabled");
+        if matches!(
+            entry.get("type"),
+            Some(Value::String(kind)) if matches!(kind.as_str(), "url" | "http" | "remote")
+        ) {
+            entry.remove("type");
+        }
+    }
     if let Some(env) = preserved_env {
         entry.insert("env".to_string(), env);
     }
@@ -1128,6 +1146,65 @@ mod tests {
             doc.get("theme").and_then(Value::as_str),
             Some("dark"),
             "non-MCP top-level keys must remain untouched"
+        );
+    }
+
+    #[test]
+    fn update_config_text_removes_http_transport_fields_when_switching_to_command_mode() {
+        let rust_bin = Path::new("/opt/mcp-agent-mail/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8765/api/",
+      "httpUrl": "http://127.0.0.1:8765/api/",
+      "headers": {
+        "Authorization": "Bearer secret"
+      },
+      "enabled": true,
+      "env": {
+        "STORAGE_ROOT": "/tmp/archive"
+      }
+    }
+  }
+}
+"#;
+
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(update.changed, "target entry should be rewritten");
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid strict JSON");
+        let target = mcp_entry(&doc);
+        assert_eq!(
+            target.get("command").and_then(Value::as_str),
+            Some("/opt/mcp-agent-mail/bin/mcp-agent-mail")
+        );
+        assert_eq!(target.get("args"), Some(&json!([])));
+        assert!(
+            target.get("url").is_none(),
+            "HTTP url field must be removed for command mode"
+        );
+        assert!(
+            target.get("httpUrl").is_none(),
+            "Gemini-style HTTP url field must be removed for command mode"
+        );
+        assert!(
+            target.get("headers").is_none(),
+            "HTTP headers must be removed for command mode"
+        );
+        assert!(
+            target.get("enabled").is_none(),
+            "remote-only enable flag must be removed for command mode"
+        );
+        assert!(
+            target.get("type").is_none(),
+            "HTTP transport type must be removed for command mode"
+        );
+        assert_eq!(
+            target.get("env"),
+            Some(&json!({
+                "STORAGE_ROOT": "/tmp/archive"
+            }))
         );
     }
 

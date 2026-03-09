@@ -293,6 +293,7 @@ pub async fn search_messages_product(
     sender_name: Option<String>,
     importance: Option<String>,
     thread_id: Option<String>,
+    ranking: Option<String>,
     date_start: Option<String>,
     date_end: Option<String>,
     date_from: Option<String>,
@@ -321,6 +322,12 @@ pub async fn search_messages_product(
 
     let pool = get_db_pool()?;
     let max_results = usize::try_from(limit.unwrap_or(20).clamp(1, 1000)).unwrap_or(20);
+
+    // Parse optional ranking mode
+    let ranking_mode = match &ranking {
+        Some(r) => crate::search::parse_search_mode(r)?,
+        None => mcp_agent_mail_db::search_planner::RankingMode::default(),
+    };
 
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
@@ -378,7 +385,7 @@ pub async fn search_messages_product(
         thread_id,
         ack_required: None,
         time_range,
-        ranking: mcp_agent_mail_db::search_planner::RankingMode::default(),
+        ranking: ranking_mode,
         limit: Some(max_results),
         cursor,
         // Collect explain internally to derive deterministic degraded diagnostics.
@@ -491,6 +498,33 @@ pub async fn fetch_inbox_product(
             let msg = row.message;
             let created_ts = msg.created_ts;
             let id = msg.id.unwrap_or(0);
+            let recipients: serde_json::Value =
+                serde_json::from_str(&msg.recipients_json).unwrap_or_else(|_| serde_json::json!({}));
+            let to = recipients["to"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect();
+            let cc = recipients["cc"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect();
+            let bcc = if msg.sender_id == agent.id.unwrap_or(0) {
+                recipients["bcc"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             items.push((
                 created_ts,
                 id,
@@ -503,6 +537,9 @@ pub async fn fetch_inbox_product(
                     importance: msg.importance,
                     ack_required: msg.ack_required != 0,
                     from: row.sender_name,
+                    to,
+                    cc,
+                    bcc,
                     created_ts: Some(micros_to_iso(created_ts)),
                     kind: row.kind,
                     attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),

@@ -801,8 +801,8 @@ impl AgentPlatform {
                 let mut key_values = vec![("url".into(), format!("\"{url}\""))];
                 if !token.is_empty() {
                     key_values.push((
-                        "bearer_token_env_var".into(),
-                        "\"HTTP_BEARER_TOKEN\"".into(),
+                        "http_headers".into(),
+                        format!("{{ Authorization = \"Bearer {token}\" }}"),
                     ));
                 }
                 vec![ConfigAction {
@@ -1588,10 +1588,12 @@ mod tests {
                 key_values,
             } => {
                 assert_eq!(section_header, "[mcp_servers.mcp_agent_mail]");
-                assert!(key_values.contains(&("url".into(), "\"http://127.0.0.1:8765/api/\"".into())));
+                assert!(
+                    key_values.contains(&("url".into(), "\"http://127.0.0.1:8765/api/\"".into()))
+                );
                 assert!(key_values.contains(&(
-                    "bearer_token_env_var".into(),
-                    "\"HTTP_BEARER_TOKEN\"".into(),
+                    "http_headers".into(),
+                    "{ Authorization = \"Bearer tok\" }".into(),
                 )));
             }
             _ => panic!("expected TomlSection"),
@@ -1890,7 +1892,7 @@ mod tests {
             &path,
             r#"[mcp_servers.mcp_agent_mail]
 url = "http://127.0.0.1:8765/api/"
-bearer_token_env_var = "HTTP_BEARER_TOKEN"
+http_headers = { Authorization = "Bearer tok" }
 "#,
         )
         .unwrap();

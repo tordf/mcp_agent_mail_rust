@@ -753,7 +753,7 @@ struct StartupSearchBackfillResetGuard;
 
 impl Drop for StartupSearchBackfillResetGuard {
     fn drop(&mut self) {
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 }
 
@@ -4577,9 +4577,11 @@ impl HttpState {
             return self.error_response(&req, 404, "Not Found");
         }
 
+        let auth_cx = self.request_cx();
+
         // Legacy parity: bearer auth applies to all non-health routes (even unknown paths/methods),
         // so missing/invalid auth yields 401 instead of downstream 404/405/400.
-        if let Some(resp) = self.check_bearer_auth(&req).await {
+        if let Some(resp) = self.check_bearer_auth_with_cx(&auth_cx, &req).await {
             return resp;
         }
 
@@ -4627,7 +4629,10 @@ impl HttpState {
             }
         };
 
-        if let Some(resp) = self.check_rbac_and_rate_limit(&req, &json_rpc).await {
+        if let Some(resp) = self
+            .check_rbac_and_rate_limit_with_cx(&auth_cx, &req, &json_rpc)
+            .await
+        {
             return resp;
         }
 
@@ -4957,7 +4962,21 @@ impl HttpState {
         constant_time_eq(auth, expected_header.as_str())
     }
 
-    async fn check_bearer_auth(&self, req: &Http1Request) -> Option<Http1Response> {
+    fn request_cx(&self) -> Cx {
+        let budget = if self.request_timeout_secs == 0 {
+            Budget::INFINITE
+        } else {
+            let deadline = wall_now() + Duration::from_secs(self.request_timeout_secs);
+            Budget::new().with_deadline(deadline)
+        };
+        Cx::for_request_with_budget(budget)
+    }
+
+    async fn check_bearer_auth_with_cx(
+        &self,
+        cx: &Cx,
+        req: &Http1Request,
+    ) -> Option<Http1Response> {
         if self.config.http_bearer_token.is_none() && !self.config.http_jwt_enabled {
             return None;
         }
@@ -4984,7 +5003,7 @@ impl HttpState {
 
         // When JWT auth is enabled, validate bearer tokens here as an auth gate
         // for all HTTP routes (including /mail/*), not just MCP JSON-RPC routes.
-        if self.config.http_jwt_enabled && self.decode_jwt(req).await.is_ok() {
+        if self.config.http_jwt_enabled && self.decode_jwt_with_cx(cx, req).await.is_ok() {
             return None;
         }
 
@@ -5003,6 +5022,12 @@ impl HttpState {
         }
 
         Some(self.error_response(req, 401, "Unauthorized"))
+    }
+
+    #[cfg(test)]
+    async fn check_bearer_auth(&self, req: &Http1Request) -> Option<Http1Response> {
+        let cx = Cx::for_testing();
+        self.check_bearer_auth_with_cx(&cx, req).await
     }
 
     /// Check whether the request URI contains a `?token=<expected>` query parameter
@@ -5066,7 +5091,7 @@ to skip auth for local requests.</p>
         )
     }
 
-    async fn fetch_jwks(&self, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
+    async fn fetch_jwks_with_cx(&self, cx: &Cx, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
         // Fast path: return cached value if still fresh.
         if force {
             let _ = self.jwks_refreshing.compare_exchange(
@@ -5107,7 +5132,7 @@ to skip auth for local requests.</p>
         }
 
         let result = async {
-            let fut = Box::pin(self.jwks_http_client.get(url));
+            let fut = Box::pin(self.jwks_http_client.get(cx, url));
             let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
                 return Err(());
             };
@@ -5134,6 +5159,12 @@ to skip auth for local requests.</p>
         // Always release the refresh lock.
         self.jwks_refreshing.store(false, Ordering::Release);
         result
+    }
+
+    #[cfg(test)]
+    async fn fetch_jwks(&self, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
+        let cx = Cx::for_testing();
+        self.fetch_jwks_with_cx(&cx, url, force).await
     }
 
     fn parse_bearer_token(req: &Http1Request) -> Result<&str, ()> {
@@ -5167,7 +5198,11 @@ to skip auth for local requests.</p>
         algorithms
     }
 
-    async fn jwt_decoding_key(&self, kid: Option<&str>) -> Result<DecodingKey, ()> {
+    async fn jwt_decoding_key_with_cx(
+        &self,
+        cx: &Cx,
+        kid: Option<&str>,
+    ) -> Result<DecodingKey, ()> {
         if let Some(jwks_url) = self
             .config
             .http_jwt_jwks_url
@@ -5175,12 +5210,12 @@ to skip auth for local requests.</p>
             .filter(|s| !s.is_empty())
         {
             // Cache JWKS fetches; if kid is missing from the cached set, force refresh once.
-            let jwks = self.fetch_jwks(jwks_url, false).await?;
+            let jwks = self.fetch_jwks_with_cx(cx, jwks_url, false).await?;
             let jwk = if let Some(kid) = kid {
                 if let Some(jwk) = jwks.find(kid).cloned() {
                     jwk
                 } else {
-                    let jwks = self.fetch_jwks(jwks_url, true).await?;
+                    let jwks = self.fetch_jwks_with_cx(cx, jwks_url, true).await?;
                     jwks.find(kid).cloned().ok_or(())?
                 }
             } else {
@@ -5277,11 +5312,13 @@ to skip auth for local requests.</p>
             .filter(|s| !s.is_empty())
     }
 
-    async fn decode_jwt(&self, req: &Http1Request) -> Result<JwtContext, ()> {
+    async fn decode_jwt_with_cx(&self, cx: &Cx, req: &Http1Request) -> Result<JwtContext, ()> {
         let token = Self::parse_bearer_token(req)?;
         let algorithms = self.jwt_algorithms();
         let header = jsonwebtoken::decode_header(token).map_err(|_| ())?;
-        let key = self.jwt_decoding_key(header.kid.as_deref()).await?;
+        let key = self
+            .jwt_decoding_key_with_cx(cx, header.kid.as_deref())
+            .await?;
         let validation = Self::jwt_validation(algorithms);
         let token_data =
             jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation).map_err(|_| ())?;
@@ -5366,8 +5403,20 @@ to skip auth for local requests.</p>
             .allow_memory(key, per_minute, burst, now, !has_redis)
     }
 
+    #[cfg(test)]
     async fn check_rbac_and_rate_limit(
         &self,
+        req: &Http1Request,
+        json_rpc: &JsonRpcRequest,
+    ) -> Option<Http1Response> {
+        let cx = Cx::for_testing();
+        self.check_rbac_and_rate_limit_with_cx(&cx, req, json_rpc)
+            .await
+    }
+
+    async fn check_rbac_and_rate_limit_with_cx(
+        &self,
+        cx: &Cx,
         req: &Http1Request,
         json_rpc: &JsonRpcRequest,
     ) -> Option<Http1Response> {
@@ -5378,7 +5427,10 @@ to skip auth for local requests.</p>
             && self.config.http_jwt_enabled
             && !self.has_expected_bearer_header(req)
         {
-            self.decode_jwt(req).await.ok().and_then(|ctx| ctx.sub)
+            self.decode_jwt_with_cx(cx, req)
+                .await
+                .ok()
+                .and_then(|ctx| ctx.sub)
         } else {
             None
         };
@@ -5396,7 +5448,7 @@ to skip auth for local requests.</p>
             if self.has_expected_bearer_header(req) {
                 (vec![self.config.http_rbac_default_role.clone()], None)
             } else {
-                match self.decode_jwt(req).await {
+                match self.decode_jwt_with_cx(cx, req).await {
                     Ok(ctx) => (ctx.roles, ctx.sub),
                     Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
                 }

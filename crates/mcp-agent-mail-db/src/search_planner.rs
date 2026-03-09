@@ -282,7 +282,7 @@ pub struct SearchQuery {
     #[serde(default)]
     pub ranking: RankingMode,
 
-    /// Maximum results to return (clamped to 1..=1000).
+    /// Maximum results to return (clamped to 1..=100_000).
     pub limit: Option<usize>,
 
     /// Cursor for stable pagination (opaque token from previous result).
@@ -346,10 +346,10 @@ impl SearchQuery {
         }
     }
 
-    /// Effective limit, clamped to 1..=1000.
+    /// Effective limit, clamped to 1..=100_000 to support deep pagination offsets.
     #[must_use]
     pub fn effective_limit(&self) -> usize {
-        self.limit.unwrap_or(50).clamp(1, 1000)
+        self.limit.unwrap_or(50).clamp(1, 100_000)
     }
 
     /// Convert query facets to a [`SearchFilter`] for cache key construction.
@@ -447,6 +447,11 @@ pub struct SearchResult {
     pub thread_id: Option<String>,
     pub from_agent: Option<String>,
 
+    pub to: Option<Vec<String>>,
+    pub cc: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bcc: Option<Vec<String>>,
+
     // ── Explain metadata (only populated when explain=true) ──────
     /// Concise reason codes explaining why this result ranked here.
     /// Machine-stable identifiers (e.g. `lexical_bm25`, `semantic_cosine`).
@@ -465,6 +470,31 @@ pub struct SearchResult {
     /// Human-readable reason for redaction (displayed to user).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redaction_reason: Option<String>,
+}
+
+impl Default for SearchResult {
+    fn default() -> Self {
+        Self {
+            doc_kind: DocKind::Message,
+            id: 0,
+            project_id: None,
+            title: String::new(),
+            body: String::new(),
+            score: None,
+            importance: None,
+            ack_required: None,
+            created_ts: None,
+            thread_id: None,
+            from_agent: None,
+            to: None,
+            cc: None,
+            bcc: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+            redacted: false,
+            redaction_reason: None,
+        }
+    }
 }
 
 /// Concise score factor summary for per-result explain output.
@@ -1117,7 +1147,8 @@ pub struct VisibilityContext {
     pub approved_contact_ids: Vec<i64>,
     /// The scope policy in effect.
     pub policy: ScopePolicy,
-    /// Redaction config (defaults to `contact_blocked` if not set).
+    /// Redaction configuration for restricted results.
+    /// If `None`, default redaction rules apply based on scope policy.
     pub redaction: RedactionConfig,
 }
 
@@ -1343,8 +1374,8 @@ mod tests {
         assert_eq!(q.effective_limit(), 50); // default
         q.limit = Some(0);
         assert_eq!(q.effective_limit(), 1); // clamp low
-        q.limit = Some(9999);
-        assert_eq!(q.effective_limit(), 1000); // clamp high
+        q.limit = Some(999999);
+        assert_eq!(q.effective_limit(), 100_000); // clamp high
         q.limit = Some(25);
         assert_eq!(q.effective_limit(), 25);
     }
@@ -2012,7 +2043,7 @@ mod tests {
                 suggestions: vec![RecoverySuggestion {
                     kind: "simplify_query".to_string(),
                     label: "Simplify search terms".to_string(),
-                    detail: Some("Try fewer or broader keywords.".to_string()),
+                    detail: Some("Explanation here.".to_string()),
                 }],
             }),
             audit: vec![],

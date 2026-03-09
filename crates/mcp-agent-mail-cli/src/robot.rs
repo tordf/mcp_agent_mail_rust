@@ -19,7 +19,9 @@ fn legacy_active_reservation_predicate_sql(table_ref: &str) -> String {
     if table_ref.is_empty() || table_ref == "file_reservations" {
         predicate.to_string()
     } else {
-        predicate.replace("released_ts", &format!("{table_ref}.released_ts"))
+        predicate
+            .replace("released_ts", &format!("{table_ref}.released_ts"))
+            .replace("file_reservations.id", &format!("{table_ref}.id"))
     }
 }
 
@@ -71,7 +73,8 @@ fn reservation_released_ts_sql(
     let release_expr = format!(
         "CASE \
              WHEN {table_ref}.released_ts IS NULL THEN NULL \
-             WHEN typeof({table_ref}.released_ts) = 'text' THEN CAST(strftime('%s', {table_ref}.released_ts) AS INTEGER) * 1000000 + \
+             WHEN typeof({table_ref}.released_ts) = 'text' THEN \
+                 CAST(strftime('%s', REPLACE(REPLACE({table_ref}.released_ts, 'T', ' '), 'Z', '')) AS INTEGER) * 1000000 + \
                  CASE WHEN instr({table_ref}.released_ts, '.') > 0 \
                       THEN CAST(substr({table_ref}.released_ts || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
                       ELSE 0 \
@@ -1439,16 +1442,16 @@ fn build_inbox(
     let ack_threshold = now_us - ACK_OVERDUE_THRESHOLD_US;
 
     // Build WHERE filter based on flags
-    let bucket_filter = if ack_overdue_only {
+    let bucket_filter = if urgent_only {
         "AND priority_bucket = 1"
-    } else if urgent_only {
-        "AND priority_bucket <= 2"
+    } else if ack_overdue_only {
+        "AND priority_bucket = 2"
     } else if show_all {
         "" // no filter
     } else if unread_only {
-        "AND priority_bucket <= 5" // unread only (read_ts IS NULL)
+        "AND priority_bucket <= 4" // unread only (read_ts IS NULL)
     } else {
-        "AND priority_bucket <= 6" // include read but un-acked messages
+        "AND priority_bucket <= 5" // include read but un-acked messages
     };
 
     let sql = format!(
@@ -1459,13 +1462,12 @@ fn build_inbox(
              SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required,
                     m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, m.body_md,
                     CASE
-                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ? THEN 1
-                        WHEN m.importance IN ('urgent','high') AND mr.read_ts IS NULL THEN 2
+                        WHEN m.importance IN ('urgent','high') AND mr.read_ts IS NULL THEN 1
+                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ? THEN 2
                         WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND mr.read_ts IS NULL THEN 3
-                        WHEN m.importance = 'high' AND mr.read_ts IS NULL THEN 4
-                        WHEN mr.read_ts IS NULL THEN 5
-                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 6
-                        ELSE 7
+                        WHEN mr.read_ts IS NULL THEN 4
+                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 5
+                        ELSE 6
                     END AS priority_bucket
              FROM message_recipients mr
              JOIN messages m ON m.id = mr.message_id
@@ -1506,12 +1508,11 @@ fn build_inbox(
         let read_ts: Option<i64> = row.get_named("read_ts").ok();
 
         let priority_label = match bucket {
-            1 => "ack-overdue",
-            2 => "urgent",
+            1 => "urgent",
+            2 => "ack-overdue",
             3 => "ack-required",
-            4 => "high",
-            5 => "unread",
-            6 => "read-unacked",
+            4 => "unread",
+            5 => "read-unacked",
             _ => "read",
         };
 
@@ -1519,7 +1520,7 @@ fn build_inbox(
             "none".to_string()
         } else if ack_ts.is_some() {
             "acked".to_string()
-        } else if bucket == 1 {
+        } else if bucket == 2 {
             "overdue".to_string()
         } else if read_ts.is_some() {
             "pending".to_string()
@@ -1529,7 +1530,7 @@ fn build_inbox(
 
         let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
 
-        if bucket == 1 {
+        if bucket == 2 {
             overdue_ids.push(id);
         }
 
@@ -1656,9 +1657,13 @@ fn build_outbox_entries(
     let now_us = mcp_agent_mail_db::now_micros();
     let rows = conn
         .query_sync(
-            "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md
+            "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md,
+                    COUNT(mr.agent_id) AS recipient_count,
+                    SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END) AS acked_count
              FROM messages m
+             LEFT JOIN message_recipients mr ON mr.message_id = m.id
              WHERE m.sender_id = ? AND m.project_id = ?
+             GROUP BY m.id
              ORDER BY m.created_ts DESC
              LIMIT ?",
             &[
@@ -1678,31 +1683,9 @@ fn build_outbox_entries(
         let importance: String = row.get_named("importance").unwrap_or_default();
         let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
-        let ack_rows = conn
-            .query_sync(
-                "SELECT COUNT(*) AS cnt
-                 FROM message_recipients mr
-                 WHERE mr.message_id = ? AND mr.ack_ts IS NOT NULL",
-                &[Value::BigInt(id)],
-            )
-            .map_err(|e| CliError::Other(format!("outbox ack_count query failed: {e}")))?;
-        let acked_count = ack_rows
-            .first()
-            .and_then(|row| row.get_named::<i64>("cnt").ok())
-            .unwrap_or(0);
+        let acked_count = row.get_named::<i64>("acked_count").unwrap_or(0);
+        let recipient_count = row.get_named::<i64>("recipient_count").unwrap_or(0);
 
-        let recipient_rows_count = conn
-            .query_sync(
-                "SELECT COUNT(*) AS cnt
-                 FROM message_recipients mr
-                 WHERE mr.message_id = ?",
-                &[Value::BigInt(id)],
-            )
-            .map_err(|e| CliError::Other(format!("outbox recipient_count query failed: {e}")))?;
-        let recipient_count = recipient_rows_count
-            .first()
-            .and_then(|row| row.get_named::<i64>("cnt").ok())
-            .unwrap_or(0);
         let recipient_names = load_recipient_display_names(conn, id, "outbox")?.join(", ");
         let recipient_names = if recipient_names.is_empty() {
             "(no recipients)".to_string()
@@ -1820,10 +1803,14 @@ fn build_thread(
     ));
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
-                m.sender_id, a_sender.name AS sender_name
+                m.sender_id, a_sender.name AS sender_name,
+                COUNT(mr.agent_id) AS recipient_count,
+                SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END) AS acked_count
          FROM messages m
          JOIN agents a_sender ON a_sender.id = m.sender_id
+         LEFT JOIN message_recipients mr ON mr.message_id = m.id
          WHERE {where_clause}
+         GROUP BY m.id
          ORDER BY m.created_ts DESC, m.id DESC
          LIMIT ?"
     );
@@ -1844,6 +1831,8 @@ fn build_thread(
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
         let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
         let sender: String = row.get_named("sender_name").unwrap_or_default();
+        let recipient_count = row.get_named::<i64>("recipient_count").unwrap_or(0);
+        let acked_count = row.get_named::<i64>("acked_count").unwrap_or(0);
 
         if created_ts > last_ts {
             last_ts = created_ts;
@@ -1855,35 +1844,14 @@ fn build_thread(
         // Check ack status
         let ack_status = if ack_required == 0 {
             "none".to_string()
+        } else if recipient_count > 0 && acked_count >= recipient_count {
+            "done".to_string()
+        } else if recipient_count > 0 && acked_count > 0 {
+            format!("partial ({acked_count}/{recipient_count})")
+        } else if acked_count > 0 {
+            format!("acked ({acked_count})")
         } else {
-            let acked_count = conn
-                .query_sync(
-                    "SELECT COUNT(*) AS cnt FROM message_recipients
-                     WHERE message_id = ? AND ack_ts IS NOT NULL",
-                    &[Value::BigInt(msg_id)],
-                )
-                .map_err(|e| CliError::Other(format!("thread ack-count query failed: {e}")))?
-                .first()
-                .and_then(|r2| r2.get_named::<i64>("cnt").ok())
-                .unwrap_or(0);
-            let total_recipients = conn
-                .query_sync(
-                    "SELECT COUNT(*) AS cnt FROM message_recipients WHERE message_id = ?",
-                    &[Value::BigInt(msg_id)],
-                )
-                .map_err(|e| CliError::Other(format!("thread recipient-count query failed: {e}")))?
-                .first()
-                .and_then(|r2| r2.get_named::<i64>("cnt").ok())
-                .unwrap_or(0);
-            if total_recipients > 0 && acked_count >= total_recipients {
-                "done".to_string()
-            } else if total_recipients > 0 && acked_count > 0 {
-                format!("partial ({acked_count}/{total_recipients})")
-            } else if acked_count > 0 {
-                format!("acked ({acked_count})")
-            } else {
-                "required".to_string()
-            }
+            "required".to_string()
         };
 
         let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
@@ -4929,6 +4897,7 @@ mod tests {
                             score_factors: vec![],
                             redacted: false,
                             redaction_reason: None,
+                            ..PlannerSearchResult::default()
                         },
                         PlannerSearchResult {
                             doc_kind: DocKind::Message,
@@ -4946,6 +4915,7 @@ mod tests {
                             score_factors: vec![],
                             redacted: false,
                             redaction_reason: None,
+                            ..PlannerSearchResult::default()
                         },
                     ],
                     next_cursor: Some("cursor-2".into()),
@@ -4971,6 +4941,7 @@ mod tests {
                         score_factors: vec![],
                         redacted: false,
                         redaction_reason: None,
+                        ..PlannerSearchResult::default()
                     }],
                     next_cursor: None,
                     explain: None,

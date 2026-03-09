@@ -423,10 +423,8 @@ const TRG_INBOX_STATS_INSERT_COMPAT_SQL: &str = "CREATE TRIGGER IF NOT EXISTS tr
                  unread_count = unread_count + 1, \
                  ack_pending_count = ack_pending_count + \
                      COALESCE((SELECT m.ack_required FROM messages m WHERE m.id = NEW.message_id), 0), \
-                 last_message_ts = COALESCE( \
-                     (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id), \
-                     last_message_ts \
-                 ) \
+                 last_message_ts = MAX(COALESCE(last_message_ts, 0), \
+                     COALESCE((SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id), 0)) \
              WHERE agent_id = NEW.agent_id; \
          END";
 
@@ -1154,6 +1152,14 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    migrations.push(Migration::new(
+        "v15_add_recipients_json_to_messages".to_string(),
+        "add recipients_json column to messages table".to_string(),
+        "ALTER TABLE messages ADD COLUMN recipients_json TEXT NOT NULL DEFAULT '{}'"
+            .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -1385,8 +1391,8 @@ async fn enforce_base_mode_cleanup_async<C: Connection>(
         match conn.execute(cx, &migration.up, &[]).await {
             Outcome::Ok(_) => {}
             Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
     }
     Outcome::Ok(())
@@ -1953,7 +1959,12 @@ mod tests {
 
         block_on({
             let conn = &conn;
-            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+            move |cx| async move {
+                migrate_to_latest(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
         });
 
         insert_inbox_stats_test_project(&conn);
@@ -2154,7 +2165,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn enforce_base_mode_cleanup_drops_identity_fts_objects() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("base_cleanup_identity_fts.db");

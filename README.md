@@ -26,7 +26,7 @@ Watch the [23-minute walkthrough](https://youtu.be/68VVcqMEDrs) to see seven AI 
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh?$(date +%s)" | bash
 ```
 
-<p><em>Works on Linux and macOS (x86_64 and aarch64). Auto-detects your platform and downloads the right binary.</em></p>
+<p><em>Works on Linux and macOS (x86_64 and aarch64). Auto-detects your platform, downloads the right binary, and auto-configures detected Codex CLI installs for HTTP MCP.</em></p>
 </div>
 
 ---
@@ -285,7 +285,7 @@ The stress tests live in `crates/mcp-agent-mail-storage/tests/stress_pipeline.rs
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh?$(date +%s)" | bash
 ```
 
-Downloads the right binary for your platform, installs to `~/.local/bin`, and optionally updates your `PATH`. Supports `--verify` for checksum + Sigstore cosign verification.
+Downloads the right binary for your platform, installs to `~/.local/bin`, optionally updates your `PATH`, and auto-configures detected Codex CLI configs for HTTP MCP URL mode. Supports `--verify` for checksum + Sigstore cosign verification.
 
 Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify`, `--easy-mode` (auto-update PATH), `--force`, `--uninstall`, `--yes`, `--purge`.
 
@@ -328,7 +328,7 @@ Requires Rust nightly (see `rust-toolchain.toml`). Also requires sibling workspa
 am
 ```
 
-Auto-detects all installed coding agents (Claude Code, Codex CLI, Gemini CLI, etc.), configures their MCP connections, and starts the HTTP server on `127.0.0.1:8765` with the interactive TUI.
+Auto-detects all installed coding agents (Claude Code, Codex CLI, Gemini CLI, etc.), refreshes their MCP connections as needed, and starts the HTTP server on `127.0.0.1:8765` with the interactive TUI.
 
 ### 2. Agents register and coordinate
 
@@ -371,7 +371,7 @@ macro_contact_handshake(from_project, from_agent, to_project, to_agent)
 
 ## Agent Configuration
 
-The `am` command auto-detects installed agents, but you can also configure them manually.
+The installer and `am` command auto-detect installed agents. If you used the curl installer, detected Codex CLI configs are written automatically in HTTP URL mode; the examples below are the manual fallback.
 
 ### Claude Code
 
@@ -403,11 +403,13 @@ Or for HTTP transport (when the server is already running):
 
 ### Codex CLI
 
-Add to `~/.codex/config.toml`:
+The curl installer writes this automatically for detected Codex CLI installs. For source installs, manual setup, or custom endpoint overrides, add this to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.mcp_agent_mail]
-command = "mcp-agent-mail"
+url = "http://127.0.0.1:8765/mcp/"
+# Add this when HTTP bearer auth is enabled:
+http_headers = { Authorization = "Bearer <HTTP_BEARER_TOKEN>" }
 ```
 
 ### Gemini CLI
@@ -448,7 +450,7 @@ mcp-agent-mail serve --reuse-running    # Reuse existing server on same port
 ### CLI Operator Tool
 
 ```bash
-am                                      # Auto-detect agents, configure MCP, start server + TUI
+am                                      # Auto-detect agents, refresh MCP config, start server + TUI
 am serve-http --port 9000               # Different port
 am serve-http --host 0.0.0.0            # Bind to all interfaces
 am serve-http --no-auth                 # Skip authentication (local dev)

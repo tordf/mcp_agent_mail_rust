@@ -51,6 +51,7 @@ fn make_result(id: i64, project_id: i64) -> SearchResult {
         score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
+        ..SearchResult::default()
     }
 }
 
@@ -885,7 +886,7 @@ fn redaction_all_8_combinations() {
             title: "secret title".to_string(),
             from_agent: Some("Agent007".to_string()),
             thread_id: Some("thread-x".to_string()),
-            ..make_result(1, 99)
+            ..SearchResult::default()
         };
 
         let results = vec![result];

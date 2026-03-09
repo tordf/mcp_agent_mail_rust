@@ -211,6 +211,11 @@ pub struct MessageRow {
 
     pub created_ts: i64,
 
+    /// JSON object containing lists of "to", "cc", and "bcc" recipient names.
+    /// Used for fast rendering of recipient lists in views.
+    #[sqlmodel(default = "'{}'")]
+    pub recipients_json: String,
+
     /// JSON array of attachment metadata
     #[sqlmodel(default = "'[]'")]
     pub attachments: String,
@@ -228,6 +233,7 @@ impl Default for MessageRow {
             importance: "normal".to_string(),
             ack_required: 0,
             created_ts: now_micros(),
+            recipients_json: "{}".to_string(),
             attachments: "[]".to_string(),
         }
     }

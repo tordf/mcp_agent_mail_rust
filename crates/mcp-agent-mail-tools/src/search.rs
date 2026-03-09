@@ -26,6 +26,10 @@ pub struct SearchResult {
     pub created_ts: Option<String>,
     pub thread_id: Option<String>,
     pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bcc: Vec<String>,
     /// Concise reason codes explaining why this result ranked here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reason_codes: Vec<String>,
@@ -141,24 +145,15 @@ pub struct ExampleMessage {
 
 fn is_ordered_prefix(s: &str) -> bool {
     let bytes = s.as_bytes();
-    if bytes.len() < 2 {
+    if bytes.is_empty() {
         return false;
     }
-    matches!(bytes[0], b'1' | b'2' | b'3' | b'4' | b'5') && bytes[1] == b'.'
-}
-
-fn backtick_snippets(s: &str) -> Vec<&str> {
-    let mut snippets = Vec::new();
-    let mut remaining = s;
-    while let Some(start) = remaining.find('`') {
-        let after_start = &remaining[start + 1..];
-        let Some(end) = after_start.find('`') else {
-            break;
-        };
-        snippets.push(&after_start[..end]);
-        remaining = &after_start[end + 1..];
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
     }
-    snippets
+    // Must have at least one digit followed by a dot
+    i > 0 && i < bytes.len() && bytes[i] == b'.'
 }
 
 fn parse_thread_ids(thread_id: &str) -> Vec<String> {
@@ -278,6 +273,9 @@ pub(crate) fn summarize_messages(
     let mut code_references: HashSet<String> = HashSet::with_capacity(8);
     let keywords = ["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"];
 
+    let mut seen_points: HashSet<String> = HashSet::with_capacity(16);
+    let mut seen_actions: HashSet<String> = HashSet::with_capacity(16);
+
     for row in rows {
         participants.insert(row.from.clone());
 
@@ -320,8 +318,10 @@ pub(crate) fn summarize_messages(
                 || stripped.starts_with("* [ ]")
                 || stripped.starts_with("+ [ ]")
             {
-                open_actions += 1;
-                action_items.push(stripped.to_string());
+                if seen_actions.insert(stripped.to_string()) {
+                    open_actions += 1;
+                    action_items.push(stripped.to_string());
+                }
                 continue;
             }
             if stripped.starts_with("- [x]")
@@ -331,8 +331,10 @@ pub(crate) fn summarize_messages(
                 || stripped.starts_with("+ [x]")
                 || stripped.starts_with("+ [X]")
             {
-                done_actions += 1;
-                action_items.push(stripped.to_string());
+                if seen_actions.insert(stripped.to_string()) {
+                    done_actions += 1;
+                    action_items.push(stripped.to_string());
+                }
                 continue;
             }
 
@@ -342,17 +344,25 @@ pub(crate) fn summarize_messages(
                 || stripped.starts_with('+')
                 || is_ordered_prefix(stripped)
             {
-                let cleaned = stripped
-                    .trim_start_matches(&['-', '+', '*', ' '][..])
-                    .to_string();
-                if !cleaned.is_empty() {
-                    key_points.push(cleaned);
+                let mut cleaned = stripped.trim_start_matches(&['-', '+', '*', ' '][..]);
+                if is_ordered_prefix(cleaned) {
+                    let dot_pos = cleaned.find('.').unwrap_or(0);
+                    cleaned = cleaned[dot_pos + 1..].trim_start();
+                }
+                let cleaned_str = cleaned.to_string();
+                if !cleaned_str.is_empty() && seen_points.insert(cleaned_str.clone()) {
+                    key_points.push(cleaned_str);
                 }
             }
 
             let upper = stripped.to_ascii_uppercase();
             if keywords.iter().any(|k| upper.contains(k)) {
-                action_items.push(stripped.to_string());
+                if seen_actions.insert(stripped.to_string()) {
+                    if upper.contains("FIXME") || upper.contains("TODO") || upper.contains("ACTION") {
+                        open_actions += 1;
+                    }
+                    action_items.push(stripped.to_string());
+                }
             }
         }
     }
@@ -650,8 +660,7 @@ pub async fn search_messages(
     } else {
         offset.unwrap_or(0).max(0).unsigned_abs() as usize
     };
-    let planner_limit = max_results.saturating_add(offset_val).min(10_000);
-    let want_explain = explain.unwrap_or(false);
+    let planner_limit = max_results.saturating_add(offset_val);
 
     // Legacy parity: empty query returns an empty result set (no DB call).
     let trimmed = query.trim();
@@ -751,6 +760,9 @@ pub async fn search_messages(
                 created_ts: r.created_ts.map(micros_to_iso),
                 thread_id: r.thread_id,
                 from: r.from_agent.unwrap_or_default(),
+                to: r.to.unwrap_or_default(),
+                cc: r.cc.unwrap_or_default(),
+                bcc: r.bcc.unwrap_or_default(),
                 reason_codes: r.reason_codes,
                 score_factors: r.score_factors,
             }
@@ -768,21 +780,16 @@ pub async fn search_messages(
     );
 
     let diagnostics = derive_search_diagnostics(planner_response.explain.as_ref());
-    let next_cursor = if offset_val == 0 {
-        planner_response.next_cursor
-    } else {
-        None
-    };
     let response = SearchResponse {
         result: results,
         assistance: planner_response.assistance,
         guidance: planner_response.guidance,
-        explain: if want_explain {
+        explain: if explain.unwrap_or(false) {
             planner_response.explain
         } else {
             None
         },
-        next_cursor,
+        next_cursor: planner_response.next_cursor,
         diagnostics,
     };
     serde_json::to_string(&response)
@@ -897,7 +904,7 @@ fn parse_iso_to_micros_with_boundary(
 /// # Parameters
 /// - `project_key`: Project identifier
 /// - `thread_id`: Single ID or comma-separated IDs
-/// - `include_examples`: Include up to 3 sample messages (single-thread only)
+/// - `include_examples`: Include up to 3 sample messages (single-thread mode only)
 /// - `llm_mode`: Refine summary with AI (if enabled)
 /// - `llm_model`: Override model for AI refinement
 /// - `per_thread_limit`: Max messages per thread (multi-thread mode)

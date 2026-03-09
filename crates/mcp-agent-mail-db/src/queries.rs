@@ -359,16 +359,16 @@ pub const ACTIVE_RESERVATION_LEGACY_PREDICATE: &str = "released_ts IS NULL \
 
 /// Active-reservation predicate with sidecar release ledger exclusion.
 pub const ACTIVE_RESERVATION_PREDICATE: &str = "(
-    (released_ts IS NULL \
-      OR (typeof(released_ts) IN ('integer', 'real') AND released_ts <= 0) \
-      OR (typeof(released_ts) = 'text' AND lower(trim(released_ts)) IN ('', '0', 'null', 'none')) \
-      OR (typeof(released_ts) = 'text' \
-        AND length(trim(released_ts)) > 0 \
-        AND trim(released_ts) GLOB '*[0-9]*' \
+    (file_reservations.released_ts IS NULL \
+      OR (typeof(file_reservations.released_ts) IN ('integer', 'real') AND file_reservations.released_ts <= 0) \
+      OR (typeof(file_reservations.released_ts) = 'text' AND lower(trim(file_reservations.released_ts)) IN ('', '0', 'null', 'none')) \
+      OR (typeof(file_reservations.released_ts) = 'text' \
+        AND length(trim(file_reservations.released_ts)) > 0 \
+        AND trim(file_reservations.released_ts) GLOB '*[0-9]*' \
         AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(\
-              trim(released_ts),\
+              trim(file_reservations.released_ts),\
               '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' \
-        AND CAST(trim(released_ts) AS REAL) <= 0)
+        AND CAST(trim(file_reservations.released_ts) AS REAL) <= 0)
     ) \
     AND NOT EXISTS (
         SELECT 1 FROM file_reservation_releases
@@ -2314,6 +2314,7 @@ pub struct ThreadMessageRow {
     pub importance: String,
     pub ack_required: i64,
     pub created_ts: i64,
+    pub recipients: String,
     pub attachments: String,
     pub from: String,
 }
@@ -2556,6 +2557,7 @@ pub async fn create_message(
         importance: importance.to_string(),
         ack_required: i64::from(ack_required),
         created_ts: now,
+        recipients_json: "{}".to_string(),
         attachments: attachments.to_string(),
     };
 
@@ -2735,10 +2737,53 @@ async fn create_message_with_recipients_tx(
     // Use MVCC concurrent transaction for page-level parallelism.
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
 
+    // Fetch recipient names to build recipients_json
+    let mut to_names = Vec::new();
+    let mut cc_names = Vec::new();
+    let mut bcc_names = Vec::new();
+
+    if !recipients.is_empty() {
+        let id_list = recipients
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let lookup_sql = format!("SELECT id, name FROM agents WHERE id IN ({id_list})");
+        let agent_rows = try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(traw_query(cx, tracked, &lookup_sql, &[]).await)
+        );
+        let mut name_map = std::collections::HashMap::new();
+        for r in agent_rows {
+            if let (Ok(id), Ok(name)) = (r.get_as::<i64>(0), r.get_as::<String>(1)) {
+                name_map.insert(id, name);
+            }
+        }
+
+        for (id, kind) in recipients {
+            if let Some(name) = name_map.get(id) {
+                match *kind {
+                    "to" => to_names.push(name.clone()),
+                    "cc" => cc_names.push(name.clone()),
+                    "bcc" => bcc_names.push(name.clone()),
+                    _ => to_names.push(name.clone()),
+                }
+            }
+        }
+    }
+
+    let recipients_json_val = serde_json::json!({
+        "to": to_names,
+        "cc": cc_names,
+        "bcc": bcc_names,
+    })
+    .to_string();
+
     // Insert message using traw_execute and then fetch id.
     let sql = "INSERT INTO messages \
-               (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+               (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
@@ -2748,6 +2793,7 @@ async fn create_message_with_recipients_tx(
         Value::Text(importance.to_string()),
         Value::BigInt(i64::from(ack_required)),
         Value::BigInt(now),
+        Value::Text(recipients_json_val.clone()),
         Value::Text(attachments.to_string()),
     ];
 
@@ -2785,6 +2831,7 @@ async fn create_message_with_recipients_tx(
         importance: importance.to_string(),
         ack_required: i64::from(ack_required),
         created_ts: now,
+        recipients_json: recipients_json_val,
         attachments: attachments.to_string(),
     };
 
@@ -2839,7 +2886,8 @@ pub async fn get_messages_details_by_ids(
         let placeholders = placeholders(chunk.len());
         let sql = format!(
             "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                    m.importance, m.ack_required, m.created_ts, m.attachments, a.name as from_name \
+                    m.importance, m.ack_required, m.created_ts, m.recipients_json, \
+                    m.attachments, a.name as from_name \
              FROM messages m \
              JOIN agents a ON a.id = m.sender_id \
              WHERE m.id IN ({placeholders})"
@@ -2886,11 +2934,15 @@ pub async fn get_messages_details_by_ids(
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let attachments: String = match row.get_as(9) {
+                    let recipients: String = match row.get_as(9) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let from: String = match row.get_as(10) {
+                    let attachments: String = match row.get_as(10) {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let from: String = match row.get_as(11) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
@@ -2904,6 +2956,7 @@ pub async fn get_messages_details_by_ids(
                         importance,
                         ack_required,
                         created_ts,
+                        recipients,
                         attachments,
                         from,
                     });
@@ -2946,7 +2999,8 @@ pub async fn list_thread_messages(
         "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
                 m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
                 m.importance AS importance, m.ack_required AS ack_required, \
-                m.created_ts AS created_ts, m.attachments AS attachments, \
+                m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
+                m.attachments AS attachments, \
                 a.name AS from_name \
          FROM messages m \
          JOIN agents a ON a.id = m.sender_id \
@@ -3021,11 +3075,15 @@ pub async fn list_thread_messages(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(9) {
+                let recipients: String = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let from: String = match row.get_as(10) {
+                let attachments: String = match row.get_as(10) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let from: String = match row.get_as(11) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -3039,6 +3097,7 @@ pub async fn list_thread_messages(
                     importance,
                     ack_required,
                     created_ts,
+                    recipients,
                     attachments,
                     from,
                 });
@@ -3245,10 +3304,10 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
     let tracked = tracked(&*conn);
 
     let sql = "SELECT id, project_id, sender_id, thread_id, subject, body_md, importance, \
-                      ack_required, created_ts, attachments \
-               FROM messages \
-               WHERE id = ? \
-               LIMIT 1";
+                       ack_required, created_ts, recipients_json, attachments \
+                FROM messages \
+                WHERE id = ? \
+                LIMIT 1";
     let params = [Value::BigInt(message_id)];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
@@ -3293,6 +3352,10 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
                 Ok(v) => v,
                 Err(e) => return Outcome::Err(map_sql_error(&e)),
             };
+            let recipients_json: String = match row.get_named("recipients_json") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(map_sql_error(&e)),
+            };
             let attachments: String = match row.get_named("attachments") {
                 Ok(v) => v,
                 Err(e) => return Outcome::Err(map_sql_error(&e)),
@@ -3308,6 +3371,7 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
                 importance,
                 ack_required,
                 created_ts,
+                recipients_json,
                 attachments,
             })
         }
@@ -3410,7 +3474,7 @@ async fn fetch_inbox_impl(
 
     let mut sql = String::from(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                m.importance, m.ack_required, m.created_ts, m.attachments, r.kind, s.name as sender_name, r.read_ts, r.ack_ts \
+                m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, r.kind, s.name as sender_name, r.read_ts, r.ack_ts \
          FROM message_recipients r \
          JOIN messages m ON m.id = r.message_id \
          JOIN agents s ON s.id = m.sender_id \
@@ -3480,23 +3544,27 @@ async fn fetch_inbox_impl(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(9) {
+                let recipients_json: String = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_as(10) {
+                let attachments: String = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_name: String = match row.get_as(11) {
+                let kind: String = match row.get_as(11) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let read_ts: Option<i64> = match row.get_as(12) {
+                let sender_name: String = match row.get_as(12) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_ts: Option<i64> = match row.get_as(13) {
+                let read_ts: Option<i64> = match row.get_as(13) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let ack_ts: Option<i64> = match row.get_as(14) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -3512,6 +3580,7 @@ async fn fetch_inbox_impl(
                         importance,
                         ack_required,
                         created_ts,
+                        recipients_json,
                         attachments,
                     },
                     kind,
@@ -3769,7 +3838,8 @@ pub fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
         if STOPWORDS.contains(&token.to_ascii_uppercase().as_str()) {
             continue;
         }
-        if !terms.iter().any(|t| t == token) {
+        let lower = token.to_lowercase();
+        if !terms.iter().any(|t| t.to_lowercase() == lower) {
             terms.push(token.to_string());
         }
         if terms.len() >= max_terms {
@@ -3880,34 +3950,14 @@ pub async fn search_messages(
     // Sanitize the FTS query; None means "no meaningful results possible"
     let sanitized = sanitize_fts_query(query);
 
-    let rows_out = if let Some(ref fts_query) = sanitized {
-        // FTS5-backed search with relevance ordering.
-        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md \
-                   FROM fts_messages \
-                   JOIN messages m ON m.id = fts_messages.message_id \
-                   JOIN agents a ON a.id = m.sender_id \
-                   WHERE m.project_id = ? AND fts_messages MATCH ? \
-                   ORDER BY bm25(fts_messages, 10.0, 1.0) ASC, m.id ASC \
-                   LIMIT ?";
-        let params = [
-            Value::BigInt(project_id),
-            Value::Text(fts_query.clone()),
-            Value::BigInt(limit_i64),
-        ];
-        let fts_result = traw_query(cx, &tracked, sql, &params).await;
-
-        // On FTS failure, fall back to LIKE with extracted terms
-        match &fts_result {
-            Outcome::Err(_) => {
-                tracing::warn!("FTS query failed for '{}', attempting LIKE fallback", query);
-                let terms = extract_like_terms(query, 5);
-                if terms.is_empty() {
-                    Outcome::Ok(Vec::new())
-                } else {
-                    run_like_fallback(cx, &tracked, project_id, &terms, limit_i64).await
-                }
-            }
-            _ => map_sql_outcome(fts_result),
+    let rows_out = if let Some(_) = sanitized {
+        // FTS5-backed search was decommissioned (br-2tnl.8.4).
+        // Fall back directly to LIKE with extracted terms for legacy/fallback path.
+        let terms = extract_like_terms(query, 5);
+        if terms.is_empty() {
+            Outcome::Ok(Vec::new())
+        } else {
+            run_like_fallback(cx, &tracked, project_id, &terms, limit_i64).await
         }
     } else {
         // Empty/unsearchable query: return empty results
@@ -3992,36 +4042,14 @@ pub async fn search_messages_for_product(
     };
 
     let sanitized = sanitize_fts_query(query);
-    let rows_out = if let Some(ref fts_query) = sanitized {
-        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md, m.project_id \
-                   FROM fts_messages \
-                   JOIN messages m ON m.id = fts_messages.message_id \
-                   JOIN agents a ON a.id = m.sender_id \
-                   JOIN product_project_links ppl ON ppl.project_id = m.project_id \
-                   WHERE ppl.product_id = ? AND fts_messages MATCH ? \
-                   ORDER BY bm25(fts_messages, 10.0, 1.0) ASC, m.id ASC \
-                   LIMIT ?";
-        let params = [
-            Value::BigInt(product_id),
-            Value::Text(fts_query.clone()),
-            Value::BigInt(limit_i64),
-        ];
-        let fts_result = traw_query(cx, &tracked, sql, &params).await;
-
-        match &fts_result {
-            Outcome::Err(_) => {
-                tracing::warn!(
-                    "Product FTS query failed for '{}', attempting LIKE fallback",
-                    query
-                );
-                let terms = extract_like_terms(query, 5);
-                if terms.is_empty() {
-                    Outcome::Ok(Vec::new())
-                } else {
-                    run_like_fallback_product(cx, &tracked, product_id, &terms, limit_i64).await
-                }
-            }
-            _ => map_sql_outcome(fts_result),
+    let rows_out = if let Some(_) = sanitized {
+        // FTS5-backed search was decommissioned (br-2tnl.8.4).
+        // Fall back directly to LIKE with extracted terms for legacy/fallback path.
+        let terms = extract_like_terms(query, 5);
+        if terms.is_empty() {
+            Outcome::Ok(Vec::new())
+        } else {
+            run_like_fallback_product(cx, &tracked, product_id, &terms, limit_i64).await
         }
     } else {
         Outcome::Ok(Vec::new())
@@ -4129,7 +4157,8 @@ pub async fn fetch_inbox_global(
 
     let mut sql = String::from(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                m.importance, m.ack_required, m.created_ts, m.attachments, \
+                m.importance, m.ack_required, m.created_ts, m.recipients_json, \
+                m.attachments, \
                 r.kind, s.name as sender_name, r.ack_ts, p.slug as project_slug \
          FROM message_recipients r \
          JOIN messages m ON m.id = r.message_id \
@@ -4168,11 +4197,12 @@ pub async fn fetch_inbox_global(
                 let importance: String = row.get_as(6).unwrap_or_default();
                 let ack_required: i64 = row.get_as(7).unwrap_or(0);
                 let created_ts: i64 = row.get_as(8).unwrap_or(0);
-                let attachments: String = row.get_as(9).unwrap_or_default();
-                let kind: String = row.get_as(10).unwrap_or_default();
-                let sender_name: String = row.get_as(11).unwrap_or_default();
-                let ack_ts: Option<i64> = row.get_as(12).unwrap_or(None);
-                let project_slug: String = row.get_as(13).unwrap_or_default();
+                let recipients_json: String = row.get_as(9).unwrap_or_default();
+                let attachments: String = row.get_as(10).unwrap_or_default();
+                let kind: String = row.get_as(11).unwrap_or_default();
+                let sender_name: String = row.get_as(12).unwrap_or_default();
+                let ack_ts: Option<i64> = row.get_as(13).unwrap_or(None);
+                let project_slug: String = row.get_as(14).unwrap_or_default();
 
                 out.push(GlobalInboxRow {
                     message: MessageRow {
@@ -4185,6 +4215,7 @@ pub async fn fetch_inbox_global(
                         importance,
                         ack_required,
                         created_ts,
+                        recipients_json,
                         attachments,
                     },
                     kind,
@@ -4301,40 +4332,18 @@ pub async fn search_messages_global(
     };
 
     let sanitized = sanitize_fts_query(query);
-    let rows_out = if let Some(ref fts_query) = sanitized {
-        // FTS5-backed search across all projects.
-        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
-                          m.thread_id, a.name as from_name, m.body_md, \
-                          m.project_id, p.slug as project_slug \
-                   FROM fts_messages \
-                   JOIN messages m ON m.id = fts_messages.message_id \
-                   JOIN agents a ON a.id = m.sender_id \
-                   JOIN projects p ON p.id = m.project_id \
-                   WHERE fts_messages MATCH ? \
-                   ORDER BY bm25(fts_messages, 10.0, 1.0) ASC, m.id ASC \
-                   LIMIT ?";
-        let params = [Value::Text(fts_query.clone()), Value::BigInt(limit_i64)];
-        let fts_result = traw_query(cx, &tracked, sql, &params).await;
-
-        match &fts_result {
-            Outcome::Err(_) => {
-                tracing::warn!(
-                    "Global FTS query failed for '{}', attempting LIKE fallback",
-                    query
-                );
-                let terms = extract_like_terms(query, 5);
-                if terms.is_empty() {
-                    Outcome::Ok(Vec::new())
-                } else {
-                    run_like_fallback_global(cx, &tracked, &terms, limit_i64).await
-                }
-            }
-            _ => map_sql_outcome(fts_result),
+    let rows_out = if let Some(_) = sanitized {
+        // FTS5-backed search was decommissioned (br-2tnl.8.4).
+        // Fall back directly to LIKE with extracted terms for legacy/fallback path.
+        let terms = extract_like_terms(query, 5);
+        if terms.is_empty() {
+            Outcome::Ok(Vec::new())
+        } else {
+            run_like_fallback_global(cx, &tracked, &terms, limit_i64).await
         }
     } else {
         Outcome::Ok(Vec::new())
     };
-
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -4883,6 +4892,7 @@ pub async fn get_active_reservations(
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     let now = now_micros();
+    let active_predicate = active_reservation_predicate_for("fr");
 
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -4894,8 +4904,11 @@ pub async fn get_active_reservations(
     let tracked = tracked(&*conn);
 
     let sql = format!(
-        "{FILE_RESERVATION_SELECT_COLUMNS_SQL} \
-         WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
+        "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                fr.created_ts, fr.expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
+         FROM file_reservations fr \
+         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+         WHERE fr.project_id = ? AND ({active_predicate}) AND fr.expires_ts > ?"
     );
     let params = [Value::BigInt(project_id), Value::BigInt(now)];
 
@@ -5287,9 +5300,14 @@ pub async fn list_file_reservations(
 
     let (sql, params) = if active_only {
         let now = now_micros();
+        let active_predicate = active_reservation_predicate_for("fr");
         (
             format!(
-                "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? ORDER BY id"
+                "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                        fr.created_ts, fr.expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
+                 FROM file_reservations fr \
+                 LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+                 WHERE fr.project_id = ? AND ({active_predicate}) AND fr.expires_ts > ? ORDER BY fr.id"
             ),
             vec![Value::BigInt(project_id), Value::BigInt(now)],
         )
@@ -6680,7 +6698,8 @@ pub async fn fetch_unacked_for_agent(
     };
 
     let sql = "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                      m.importance, m.ack_required, m.created_ts, m.attachments, \
+                      m.importance, m.ack_required, m.created_ts, m.recipients_json, \
+                      m.attachments, \
                       r.kind, s.name AS sender_name, r.read_ts \
                FROM message_recipients r \
                JOIN messages m ON m.id = r.message_id \
@@ -6736,19 +6755,23 @@ pub async fn fetch_unacked_for_agent(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(9) {
+                let recipients_json: String = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_as(10) {
+                let attachments: String = match row.get_as(10) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_name: String = match row.get_as(11) {
+                let kind: String = match row.get_as(11) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let read_ts: Option<i64> = match row.get_as(12) {
+                let sender_name: String = match row.get_as(12) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let read_ts: Option<i64> = match row.get_as(13) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -6764,6 +6787,7 @@ pub async fn fetch_unacked_for_agent(
                         importance,
                         ack_required,
                         created_ts,
+                        recipients_json,
                         attachments,
                     },
                     kind,
@@ -10532,7 +10556,39 @@ mod tests {
         let aliased = active_reservation_predicate_for("fr");
         assert!(aliased.contains("reservation_id = fr.id"));
         assert!(!aliased.contains("reservation_id = file_reservations.id"));
-        assert!(aliased.contains("released_ts IS NULL"));
+        assert!(aliased.contains("fr.released_ts IS NULL"));
+    }
+
+    #[test]
+    fn aliased_active_reservation_queries_use_alias_safe_predicate() {
+        let active_predicate = active_reservation_predicate_for("fr");
+        let get_active_sql = format!(
+            "SELECT fr.id \
+             FROM file_reservations fr \
+             LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+             WHERE fr.project_id = ? AND ({active_predicate}) AND fr.expires_ts > ?"
+        );
+        let list_active_sql = format!(
+            "SELECT fr.id \
+             FROM file_reservations fr \
+             LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+             WHERE fr.project_id = ? AND ({active_predicate}) AND fr.expires_ts > ? ORDER BY fr.id"
+        );
+
+        for sql in [get_active_sql, list_active_sql] {
+            assert!(
+                sql.contains("fr.released_ts"),
+                "expected aliased released_ts in: {sql}"
+            );
+            assert!(
+                sql.contains("reservation_id = fr.id"),
+                "expected aliased ledger join in: {sql}"
+            );
+            assert!(
+                !sql.contains("file_reservations.released_ts"),
+                "raw table-qualified predicate must not leak into aliased query: {sql}"
+            );
+        }
     }
 
     // ─── Global query tests (br-2bbt.14.1) ───────────────────────────────────
@@ -10551,6 +10607,7 @@ mod tests {
                 importance: "normal".to_string(),
                 ack_required: 0,
                 created_ts: 1000,
+                recipients_json: "{}".to_string(),
                 attachments: "[]".to_string(),
             },
             kind: "to".to_string(),

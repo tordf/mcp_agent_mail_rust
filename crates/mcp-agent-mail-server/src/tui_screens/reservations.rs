@@ -1190,6 +1190,10 @@ impl ReservationsScreen {
             return Err("Custom TTL must include a numeric value and suffix (m or h).".to_string());
         }
 
+        if !value.is_char_boundary(value.len() - 1) {
+            return Err("Custom TTL suffix must be 'm' (minutes) or 'h' (hours).".to_string());
+        }
+
         let (num_part, unit_part) = value.split_at(value.len() - 1);
         let qty = num_part
             .trim()

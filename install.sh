@@ -1484,15 +1484,67 @@ generate_bearer_token() {
   fi
 }
 
+normalize_mcp_http_path() {
+  local value="${1:-/mcp/}"
+  case "$value" in
+    mcp|/mcp|/mcp/)
+      printf '/mcp/'
+      ;;
+    api|/api|/api/)
+      printf '/api/'
+      ;;
+    *)
+      if [ -z "$value" ]; then
+        value="/mcp/"
+      fi
+      case "$value" in
+        /*) ;;
+        *) value="/${value}" ;;
+      esac
+      case "$value" in
+        */) ;;
+        *) value="${value}/" ;;
+      esac
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+desired_mcp_http_url() {
+  local host="${HTTP_HOST:-127.0.0.1}"
+  local port="${HTTP_PORT:-8765}"
+  local path
+  path="$(normalize_mcp_http_path "${HTTP_PATH:-/mcp/}")"
+  printf 'http://%s:%s%s' "$host" "$port" "$path"
+}
+
+resolve_setup_http_bearer_token() {
+  if [ -n "${HTTP_BEARER_TOKEN:-}" ]; then
+    printf '%s' "$HTTP_BEARER_TOKEN"
+    return 0
+  fi
+  resolve_migrated_bearer_token
+}
+
 # Insert or create an mcp-agent-mail entry in a TOML config file.
 # Handles Codex CLI's ~/.codex/config.toml with [mcp_servers.mcp_agent_mail].
-# Returns: 0=configured, 1=already present, 2=error.
+# Returns: 0=configured, 1=unchanged, 2=error.
 setup_single_toml_config() {
   local tool="$1"
   local config_path="$2"
-  local binary_path="$3"
-
+  local _binary_path="${3:-}"
   local section_header='[mcp_servers.mcp_agent_mail]'
+  local desired_url
+  desired_url="$(desired_mcp_http_url)"
+  local bearer_token
+  bearer_token="$(resolve_setup_http_bearer_token)"
+  local desired_auth_header=""
+  local tmp_file="${config_path}.tmp.mcp-agent-mail.$$"
+  local backup=""
+
+  if [ -n "$bearer_token" ]; then
+    desired_auth_header="Bearer ${bearer_token}"
+  fi
 
   if [ ! -f "$config_path" ]; then
     # File doesn't exist — create it with just the MCP section
@@ -1502,33 +1554,268 @@ setup_single_toml_config() {
 
     cat > "$config_path" <<TOMLEOF
 ${section_header}
-command = "${binary_path}"
+url = "${desired_url}"
 TOMLEOF
+    if [ -n "$desired_auth_header" ]; then
+      cat >> "$config_path" <<TOMLEOF
+http_headers = { Authorization = "${desired_auth_header}" }
+TOMLEOF
+    fi
     verbose "setup_toml_config:created tool=${tool} path=${config_path}"
     return 0
   fi
 
-  # File exists — check if section already present
-  if grep -q '^\[mcp_servers[.]mcp_agent_mail\]' "$config_path" 2>/dev/null || \
-     grep -q '^\[mcp_servers[.]["]mcp-agent-mail["]\]' "$config_path" 2>/dev/null; then
-    verbose "setup_toml_config:skip_existing tool=${tool} path=${config_path}"
+  if ! awk \
+    -v section_header="$section_header" \
+    -v desired_url="$desired_url" \
+    -v desired_auth_header="$desired_auth_header" '
+    function flush_section() {
+      if (!saw_url_in_section) {
+        print "url = \"" desired_url "\""
+      }
+      if (!saw_http_headers_in_section && desired_auth_header != "") {
+        print "http_headers = { Authorization = \"" desired_auth_header "\" }"
+      }
+    }
+
+    BEGIN {
+      in_section = 0
+      saw_section = 0
+      saw_url_in_section = 0
+      saw_http_headers_in_section = 0
+    }
+
+    /^\[mcp_servers\.mcp_agent_mail\]([[:space:]]*#.*)?[[:space:]]*$/ || /^\[mcp_servers\."mcp-agent-mail"\]([[:space:]]*#.*)?[[:space:]]*$/ {
+      if (in_section) {
+        flush_section()
+      }
+      in_section = 1
+      saw_section = 1
+      saw_url_in_section = 0
+      saw_http_headers_in_section = 0
+      print
+      next
+    }
+
+    /^\[/ {
+      if (in_section) {
+        flush_section()
+      }
+      in_section = 0
+    }
+
+    {
+      if (in_section && $0 ~ /^[[:space:]]*(url|httpUrl)[[:space:]]*=/) {
+        print "url = \"" desired_url "\""
+        saw_url_in_section = 1
+        next
+      }
+      if (in_section && $0 ~ /^[[:space:]]*http_headers[[:space:]]*=/) {
+        if (desired_auth_header != "") {
+          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
+        } else {
+          print
+        }
+        saw_http_headers_in_section = 1
+        next
+      }
+      if (in_section && $0 ~ /^[[:space:]]*bearer_token_env_var[[:space:]]*=/) {
+        if (desired_auth_header != "") {
+          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
+          saw_http_headers_in_section = 1
+        }
+        next
+      }
+      if (in_section && $0 ~ /^[[:space:]]*(command|args)[[:space:]]*=/) {
+        next
+      }
+      print
+    }
+
+    END {
+      if (in_section) {
+        flush_section()
+      }
+      if (!saw_section) {
+        if (NR > 0) {
+          print ""
+        }
+        print section_header
+        print "url = \"" desired_url "\""
+        if (desired_auth_header != "") {
+          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
+        }
+      }
+    }
+  ' "$config_path" > "$tmp_file"; then
+    rm -f "$tmp_file"
+    verbose "setup_toml_config:error tool=${tool} path=${config_path}"
+    return 2
+  fi
+
+  if cmp -s "$config_path" "$tmp_file"; then
+    rm -f "$tmp_file"
+    verbose "setup_toml_config:unchanged tool=${tool} path=${config_path}"
     return 1
   fi
 
-  # Section not present — append it
-  # Ensure a trailing newline before appending
-  if [ -s "$config_path" ] && [ "$(tail -c 1 "$config_path" | wc -l)" -eq 0 ]; then
-    printf '\n' >> "$config_path"
+  backup="${config_path}.$(date -u +%Y%m%d_%H%M%S).bak"
+  cp -p "$config_path" "$backup"
+  chmod --reference="$config_path" "$tmp_file" 2>/dev/null || true
+  mv "$tmp_file" "$config_path"
+  verbose "setup_toml_config:updated tool=${tool} path=${config_path} backup=${backup}"
+  return 0
+}
+
+setup_single_codex_json_config() {
+  local tool="$1"
+  local config_path="$2"
+  local desired_url
+  desired_url="$(desired_mcp_http_url)"
+  local bearer_token
+  bearer_token="$(resolve_setup_http_bearer_token)"
+  local desired_auth_header=""
+
+  if [ -n "$bearer_token" ]; then
+    desired_auth_header="Bearer ${bearer_token}"
   fi
 
-  cat >> "$config_path" <<TOMLEOF
+  if ! command -v python3 >/dev/null 2>&1; then
+    verbose "setup_codex_json:skip_no_python3 tool=${tool} path=${config_path}"
+    return 2
+  fi
 
-${section_header}
-command = "${binary_path}"
-TOMLEOF
+  local result
+  result=$(python3 - "$config_path" "$desired_url" "$desired_auth_header" <<'PY'
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import UTC, datetime
 
-  verbose "setup_toml_config:appended tool=${tool} path=${config_path}"
-  return 0
+config_path, desired_url, desired_auth_header = sys.argv[1:4]
+
+
+def load_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ""
+
+
+def parse_json(text: str):
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    if not text.strip():
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        cleaned = re.sub(r"//.*?\n", "\n", text)
+        cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        return json.loads(cleaned)
+
+
+def dump_json(doc) -> str:
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+text = load_text(config_path)
+doc = parse_json(text)
+if not isinstance(doc, dict):
+    print("ERROR:not_object")
+    raise SystemExit(0)
+
+container_key = None
+for key in ("mcpServers", "servers", "mcp", "mcp_servers"):
+    value = doc.get(key)
+    if isinstance(value, dict):
+        container_key = key
+        break
+if container_key is None:
+    container_key = "mcpServers"
+    doc[container_key] = {}
+
+container = doc[container_key]
+entry_key = "mcp-agent-mail"
+for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+    value = container.get(candidate)
+    if isinstance(value, dict):
+      entry_key = candidate
+      break
+
+existing_entry = container.get(entry_key)
+if not isinstance(existing_entry, dict):
+    existing_entry = {}
+
+new_entry = {
+    key: value
+    for key, value in existing_entry.items()
+    if key not in {"command", "args", "transport", "httpUrl", "bearer_token_env_var"}
+}
+new_entry["type"] = "http"
+new_entry["url"] = desired_url
+
+headers = new_entry.get("headers")
+if headers is not None and not isinstance(headers, dict):
+    headers = None
+if headers is None:
+    headers = {}
+
+if desired_auth_header:
+    headers["Authorization"] = desired_auth_header
+
+if headers:
+    new_entry["headers"] = headers
+else:
+    new_entry.pop("headers", None)
+
+container[entry_key] = new_entry
+new_text = dump_json(doc)
+if new_text == dump_json(parse_json(text)):
+    print("SKIP:unchanged")
+    raise SystemExit(0)
+
+parent_dir = os.path.dirname(config_path)
+if parent_dir:
+    os.makedirs(parent_dir, exist_ok=True)
+if os.path.exists(config_path):
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    backup = f"{config_path}.{stamp}.bak"
+    shutil.copy2(config_path, backup)
+else:
+    backup = ""
+with open(config_path, "w", encoding="utf-8") as handle:
+    handle.write(new_text)
+
+if backup:
+    print(f"OK:updated backup={backup}")
+else:
+    print("OK:created")
+PY
+) || true
+
+  case "$result" in
+    SKIP:unchanged)
+      verbose "setup_codex_json:unchanged tool=${tool} path=${config_path}"
+      return 1
+      ;;
+    OK:*)
+      verbose "setup_codex_json:configured tool=${tool} path=${config_path} ${result}"
+      return 0
+      ;;
+    ERROR:*)
+      verbose "setup_codex_json:error tool=${tool} path=${config_path} ${result}"
+      return 2
+      ;;
+    *)
+      verbose "setup_codex_json:unknown_result tool=${tool} path=${config_path} ${result}"
+      return 2
+      ;;
+  esac
 }
 
 # Insert or create an mcp-agent-mail entry in a JSON config file.
@@ -1549,6 +1836,11 @@ setup_single_mcp_config() {
       return $?
       ;;
   esac
+
+  if [ "$tool" = "codex" ]; then
+    setup_single_codex_json_config "$tool" "$config_path"
+    return $?
+  fi
 
   # Build the server entry JSON
   local env_block=""
@@ -1756,12 +2048,55 @@ setup_mcp_configs() {
   done <<< "$scan"
 
   if [ "$configured" -gt 0 ]; then
-    ok "Configured $configured MCP config(s) (bearer token shared across all)"
+    ok "Configured $configured MCP config(s)"
   fi
   if [ "$skipped" -gt 0 ]; then
     info "$skipped MCP config(s) already had mcp-agent-mail entry"
   fi
   verbose "setup_mcp_configs:done configured=${configured} skipped=${skipped} failed=${failed}"
+}
+
+sync_codex_http_configs() {
+  local binary_path="$1"
+  local scan
+  scan=$(detect_mcp_configs "$PWD" || true)
+  [ -z "$scan" ] && return 0
+
+  local synced=0
+  local failed=0
+  local tool path exists_flag
+
+  while IFS=$'\t' read -r tool path exists_flag; do
+    [ -z "${tool:-}" ] && continue
+    [ "$tool" != "codex" ] && continue
+
+    if [ "$exists_flag" != "1" ]; then
+      local parent_dir
+      parent_dir=$(dirname "$path")
+      local grandparent_dir
+      grandparent_dir=$(dirname "$parent_dir")
+      if [ ! -d "$parent_dir" ] && [ ! -d "$grandparent_dir" ]; then
+        continue
+      fi
+    fi
+
+    if setup_single_mcp_config "$tool" "$path" "$binary_path" "" ""; then
+      synced=$((synced + 1))
+    else
+      local rc=$?
+      if [ "$rc" -ne 1 ]; then
+        failed=$((failed + 1))
+        warn "[codex] Failed to sync HTTP MCP config at $path"
+      fi
+    fi
+  done <<< "$scan"
+
+  if [ "$synced" -gt 0 ]; then
+    ok "[codex] Synced $synced HTTP MCP config(s)"
+  fi
+  if [ "$failed" -gt 0 ]; then
+    warn "[codex] Failed to sync $failed HTTP MCP config(s)"
+  fi
 }
 
 # Update existing MCP configs that point to Python to use the Rust binary.
@@ -1797,7 +2132,7 @@ update_mcp_configs() {
   set +e
   local setup_out
   local setup_token
-  setup_token="$(resolve_migrated_bearer_token)"
+  setup_token="$(resolve_setup_http_bearer_token)"
   if [ -n "$setup_token" ]; then
     setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 2>&1)
   else
@@ -2987,19 +3322,27 @@ if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
   done <<< "$MCP_CONFIG_SCAN"
 fi
 
-# Set up MCP configs for fresh installs (non-interactive, auto-detect)
+# Set up MCP configs for fresh installs (non-interactive, auto-detect).
+# Codex is written directly in HTTP URL mode here so the one-liner does not
+# depend on a particular released `am setup` implementation.
 if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
   setup_mcp_configs "$DEST/$BIN_SERVER"
 fi
 
-# Update existing MCP configs to point to the Rust binary.
-# Uses the newly-installed `am setup run` which handles:
+# Update existing MCP configs via the newly-installed `am setup run`.
+# This still handles the broader non-Codex migration work:
 #   - Python→Rust command rewriting
 #   - env var preservation (bearer token, storage root)
 #   - BOM/JSONC/trailing-comma tolerance
 #   - Backup before modification
 if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
   update_mcp_configs "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"
+fi
+
+# Re-sync Codex last so an older released `am` cannot leave Codex in stdio or
+# mixed transport mode after the installer has already chosen HTTP.
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
+  sync_codex_http_configs "$DEST/$BIN_SERVER"
 fi
 
 collect_migration_counts() {

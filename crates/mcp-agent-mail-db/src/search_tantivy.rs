@@ -422,8 +422,7 @@ fn map_hit_to_search_result(hit: &SearchHit, doc_kind: DocKind) -> SearchResult 
         from_agent,
         redacted: false,
         redaction_reason: None,
-        reason_codes: Vec::new(),
-        score_factors: Vec::new(),
+        ..SearchResult::default()
     }
 }
 
@@ -717,8 +716,7 @@ mod tests {
             from_agent: None,
             redacted: false,
             redaction_reason: None,
-            reason_codes: Vec::new(),
-            score_factors: Vec::new(),
+            ..SearchResult::default()
         }];
         assert!(compute_tantivy_cursor(&results, 50).is_none());
     }

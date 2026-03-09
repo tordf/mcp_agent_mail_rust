@@ -390,7 +390,7 @@ fn lexical_candidate_limit(query: &SearchQuery) -> usize {
         || query.ack_required.is_some()
         || query_needs_recipient_filter(query);
     if needs_extra_candidates {
-        limit.saturating_mul(16).clamp(64, 10_000)
+        limit.saturating_mul(16).clamp(64, 100_000).max(limit)
     } else {
         limit
     }
@@ -406,7 +406,7 @@ fn legacy_candidate_limit(query: &SearchQuery) -> usize {
         || query.ack_required.is_some()
         || !query.time_range.is_empty();
     if needs_extra_candidates {
-        limit.saturating_mul(16).clamp(64, 10_000)
+        limit.saturating_mul(16).clamp(64, 100_000).max(limit)
     } else {
         limit
     }
@@ -652,6 +652,31 @@ async fn canonicalize_message_results(
             continue;
         }
 
+        let recipients: serde_json::Value =
+            serde_json::from_str(&detail.recipients).unwrap_or_else(|_| serde_json::json!({}));
+
+        let to = recipients["to"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let cc = recipients["cc"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let bcc = recipients["bcc"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
         result.project_id = Some(detail.project_id);
         result.title.clone_from(&detail.subject);
         result.body.clone_from(&detail.body_md);
@@ -660,6 +685,9 @@ async fn canonicalize_message_results(
         result.created_ts = Some(detail.created_ts);
         result.thread_id.clone_from(&detail.thread_id);
         result.from_agent = Some(detail.from.clone());
+        result.to = Some(to);
+        result.cc = Some(cc);
+        result.bcc = Some(bcc);
         canonical.push(result);
     }
 
@@ -1093,6 +1121,7 @@ impl SemanticBridge {
                 score_factors: Vec::new(),
                 redacted: false,
                 redaction_reason: None,
+                ..SearchResult::default()
             })
             .collect()
     }
@@ -1240,8 +1269,8 @@ fn scored_results_to_search_results(hits: Vec<ScoredResult>) -> Vec<SearchResult
             score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
-        })
-        .collect()
+            ..SearchResult::default()
+            })        .collect()
 }
 
 #[cfg(feature = "hybrid")]
@@ -3172,8 +3201,8 @@ pub async fn execute_search(
                         score_factors: Vec::new(),
                         redacted: false,
                         redaction_reason: None,
-                    })
-                    .collect(),
+                        ..SearchResult::default()
+                        })                    .collect(),
                 Outcome::Err(err) => return Outcome::Err(err),
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
@@ -3206,8 +3235,8 @@ pub async fn execute_search(
                         score_factors: Vec::new(),
                         redacted: false,
                         redaction_reason: None,
-                    })
-                    .collect(),
+                        ..SearchResult::default()
+                        })                    .collect(),
                 Outcome::Err(err) => return Outcome::Err(err),
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
@@ -3232,8 +3261,8 @@ pub async fn execute_search(
                         score_factors: Vec::new(),
                         redacted: false,
                         redaction_reason: None,
-                    })
-                    .collect(),
+                        ..SearchResult::default()
+                        })                    .collect(),
                 Outcome::Err(err) => return Outcome::Err(err),
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
@@ -3847,6 +3876,7 @@ mod tests {
                 score_factors: Vec::new(),
                 redacted: false,
                 redaction_reason: None,
+                ..SearchResult::default()
             })
             .collect();
         let cursor = compute_next_cursor(&results, 50, RankingMode::Relevance).unwrap();
@@ -4037,6 +4067,7 @@ mod tests {
             importance: importance.to_string(),
             ack_required,
             created_ts,
+            recipients: "{}".to_string(),
             attachments: "[]".to_string(),
             from: from.to_string(),
         }

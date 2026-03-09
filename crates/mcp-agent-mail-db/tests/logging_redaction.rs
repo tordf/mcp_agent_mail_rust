@@ -449,6 +449,7 @@ fn redaction_no_body_leak() {
         score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
+        ..SearchResult::default()
     };
 
     let policy = RedactionPolicy::default();
@@ -855,6 +856,7 @@ fn evaluate_scope_policy_cascade() {
         score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
+        ..SearchResult::default()
     };
 
     // Open policy → Allow
@@ -888,6 +890,7 @@ fn evaluate_scope_policy_cascade() {
         score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
+        ..SearchResult::default()
     };
     let decision = evaluate_scope(&agent_result, &viewer_ctx(2, 1));
     assert_eq!(decision.verdict, ScopeVerdict::Allow);
@@ -915,6 +918,7 @@ fn strict_redaction_replaces_all_fields() {
         score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
+        ..SearchResult::default()
     };
 
     // Strict redaction: body, sender, thread all redacted

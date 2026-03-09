@@ -14,6 +14,7 @@ use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{iso_to_micros, micros_to_iso};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,6 +80,24 @@ fn parse_resource_since_ts(query: &HashMap<String, String>) -> McpResult<Option<
 
 fn parse_attachment_metadata(input: &str) -> Vec<serde_json::Value> {
     serde_json::from_str(input).unwrap_or_default()
+}
+
+fn parse_recipients_json(input: &str) -> Value {
+    serde_json::from_str(input).unwrap_or_else(|_| json!({}))
+}
+
+fn recipient_names(recipients: &Value, key: &str) -> Vec<String> {
+    recipients
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
@@ -1922,6 +1941,10 @@ pub struct MessageDetails {
     pub created_ts: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bcc: Vec<String>,
 }
 
 /// Get full message details.
@@ -1963,6 +1986,11 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, msg.sender_id).await,
     )?;
 
+    let recipients = parse_recipients_json(&msg.recipients_json);
+    let to = recipient_names(&recipients, "to");
+    let cc = recipient_names(&recipients, "cc");
+    let bcc = recipient_names(&recipients, "bcc");
+
     let message = MessageDetails {
         id: msg.id.unwrap_or(0),
         project_id: msg.project_id,
@@ -1975,6 +2003,9 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         created_ts: Some(micros_to_iso(msg.created_ts)),
         attachments: parse_attachment_metadata(&msg.attachments),
         from: sender.name,
+        to,
+        cc,
+        bcc,
     };
 
     tracing::debug!("Getting message details for {}", msg_id);
@@ -1996,6 +2027,10 @@ pub struct ThreadMessageEntry {
     pub created_ts: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bcc: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
 }
@@ -2072,6 +2107,11 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     // Sender names are already materialized by `list_thread_messages`.
     let mut messages: Vec<ThreadMessageEntry> = Vec::with_capacity(rows.len());
     for row in rows {
+        let recipients = parse_recipients_json(&row.recipients);
+        let to = recipient_names(&recipients, "to");
+        let cc = recipient_names(&recipients, "cc");
+        let bcc = recipient_names(&recipients, "bcc");
+
         messages.push(ThreadMessageEntry {
             id: row.id,
             project_id: row.project_id,
@@ -2083,6 +2123,9 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
             created_ts: Some(micros_to_iso(row.created_ts)),
             attachments: parse_attachment_metadata(&row.attachments),
             from: row.from,
+            to,
+            cc,
+            bcc,
             body_md: if include_bodies {
                 Some(row.body_md)
             } else {

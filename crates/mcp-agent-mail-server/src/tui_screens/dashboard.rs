@@ -1807,7 +1807,7 @@ fn ratio_bar(value: u64, max: u64, cells: usize) -> String {
             .min(cells)
     };
     let filled = if value > 0 && filled_raw == 0 {
-        1usize.min(cells)
+        1usize
     } else {
         filled_raw
     };

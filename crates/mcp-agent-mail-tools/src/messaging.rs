@@ -1152,6 +1152,10 @@ pub struct InboxMessage {
     pub importance: String,
     pub ack_required: bool,
     pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bcc: Vec<String>,
     pub created_ts: Option<String>,
     pub kind: String,
     pub attachments: Vec<serde_json::Value>,
@@ -2803,6 +2807,35 @@ pub async fn fetch_inbox(
         .map(|row| {
             let attachments: Vec<serde_json::Value> =
                 serde_json::from_str(&row.message.attachments).unwrap_or_default();
+            let recipients: serde_json::Value =
+                serde_json::from_str(&row.message.recipients_json).unwrap_or_else(|_| json!({}));
+
+            let to = recipients["to"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            let cc = recipients["cc"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            let bcc = if row.message.sender_id == agent_id {
+                recipients["bcc"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
             InboxMessage {
                 id: row.message.id.unwrap_or(0),
                 project_id: row.message.project_id,
@@ -2812,6 +2845,9 @@ pub async fn fetch_inbox(
                 importance: row.message.importance,
                 ack_required: row.message.ack_required != 0,
                 from: row.sender_name,
+                to,
+                cc,
+                bcc,
                 created_ts: Some(micros_to_iso(row.message.created_ts)),
                 kind: row.kind,
                 attachments,

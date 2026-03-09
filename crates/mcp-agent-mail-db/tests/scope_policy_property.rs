@@ -47,6 +47,7 @@ fn msg(id: i64, project_id: i64, from_agent: &str) -> SearchResult {
         score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
+        ..SearchResult::default()
     }
 }
 
@@ -67,6 +68,7 @@ fn agent_result(id: i64, project_id: i64) -> SearchResult {
         score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
+        ..SearchResult::default()
     }
 }
 
@@ -87,6 +89,7 @@ fn project_result(id: i64) -> SearchResult {
         score_factors: Vec::new(),
         redacted: false,
         redaction_reason: None,
+        ..SearchResult::default()
     }
 }
 
@@ -1386,6 +1389,7 @@ fn stress_large_batch_performance() {
                 score_factors: Vec::new(),
                 redacted: false,
                 redaction_reason: None,
+                ..SearchResult::default()
             }
         })
         .collect();

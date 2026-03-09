@@ -284,7 +284,7 @@ fn strip_timezone_suffix(s: &str) -> &str {
     // Strip trailing "Z"
     let s = s.strip_suffix('Z').unwrap_or(s);
     // Strip "+HH:MM" or "-HH:MM" offset at end
-    if s.len() >= 6 {
+    if s.len() >= 6 && s.is_char_boundary(s.len() - 6) {
         let tail = &s[s.len() - 6..];
         if (tail.starts_with('+') || tail.starts_with('-'))
             && tail[1..3].chars().all(|c| c.is_ascii_digit())

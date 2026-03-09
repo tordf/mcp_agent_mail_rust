@@ -643,6 +643,7 @@ mod tests {
             score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
+            ..SearchResult::default()
         }
     }
 
@@ -663,6 +664,7 @@ mod tests {
             score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
+            ..SearchResult::default()
         }
     }
 
@@ -718,6 +720,7 @@ mod tests {
             score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
+            ..SearchResult::default()
         };
         let ctx = viewer_ctx(10, 1);
         let decision = evaluate_scope(&result, &ctx);
@@ -1219,6 +1222,7 @@ mod tests {
             score_factors: Vec::new(),
             redacted: false,
             redaction_reason: None,
+            ..SearchResult::default()
         };
         let ctx = viewer_ctx(10, 1); // different project
         let decision = evaluate_scope(&result, &ctx);

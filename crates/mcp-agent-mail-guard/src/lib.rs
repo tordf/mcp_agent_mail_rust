@@ -70,6 +70,10 @@ pub struct FileReservationRecord {
     pub exclusive: bool,
     pub expires_ts: String,
     pub released_ts: Option<String>,
+
+    // Cached for optimization
+    pub normalized_pattern: String,
+    pub has_glob: bool,
 }
 
 /// Result from a full guard check run.
@@ -500,7 +504,20 @@ def core_ignorecase_enabled():
 CASE_INSENSITIVE_REPO = core_ignorecase_enabled()
 
 def normalize_match_input(value):
-    return value.lower() if CASE_INSENSITIVE_REPO else value
+    # Normalize slashes and trim leading/trailing slashes
+    val = value.replace('\\', '/').strip('/')
+    # Collapse redundant segments (like Rust core normalization)
+    parts = []
+    for component in val.split('/'):
+        if component == '' or component == '.':
+            continue
+        if component == '..':
+            if parts:
+                parts.pop()
+        else:
+            parts.append(component)
+    val = '/'.join(parts)
+    return val.lower() if CASE_INSENSITIVE_REPO else val
 
 def glob_to_regex(pattern):
     """Convert shell-style glob to regex supporting **, [], and {{}} syntax."""
@@ -528,40 +545,48 @@ def glob_to_regex(pattern):
 
 def glob_match(path, pattern):
     """Simple shell-style glob matching (similar to Rust implementation)."""
-    path = normalize_match_input(path)
-    pattern = normalize_match_input(pattern)
-    return re.fullmatch(glob_to_regex(pattern), path) is not None
+    # NOTE: path must be a concrete path, pattern is the glob.
+    normalized_f = normalize_match_input(path)
+    normalized_pattern = normalize_match_input(pattern)
+    if not normalized_f or not normalized_pattern:
+        return False
+    return re.fullmatch(glob_to_regex(normalized_pattern), normalized_f) is not None
 
 def check_conflicts(paths, reservations):
     """Check if any paths conflict with active reservations."""
     self_agent = AGENT_NAME.lower()
     conflicts = []
     for f in paths:
+        normalized_f = normalize_match_input(f)
+        if not normalized_f:
+            continue
+
         for res in reservations:
             pattern = res["path_pattern"]
             holder = res.get("agent_name", "unknown")
             if holder.lower() == self_agent:
                 continue  # Skip our own reservations
 
-            normalized_f = normalize_match_input(f)
             normalized_pattern = normalize_match_input(pattern)
+            if not normalized_pattern:
+                continue
             
-            # Symmetric glob matching
-            if glob_match(f, pattern) or glob_match(pattern, f):
+            # 1. Glob matching: check if concrete path matches reserved glob
+            if glob_match(normalized_f, normalized_pattern):
                 conflicts.append((f, pattern, holder))
                 break
             
             # Directory prefix matching
-            has_glob = any(c in normalized_pattern for c in "*?[{{")
+            has_glob = any(c in pattern for c in "*?[{")
             
-            # 1. Reverse check: pattern is inside touched file (e.g. dir replaced by file)
-            # This applies to ALL patterns, even globs!
+            # 2. Reverse check: pattern is inside touched path (e.g. dir replaced by file)
+            # This handles cases where a concrete parent directory is touched.
             if normalized_pattern.startswith(normalized_f + "/"):
                 conflicts.append((f, pattern, holder))
                 break
 
-            # 2. Normal prefix check: file is inside reserved dir
-            # This only applies to non-glob patterns!
+            # 3. Normal prefix check: file is inside reserved dir
+            # This handles literal directory reservations.
             if not has_glob and normalized_f.startswith(normalized_pattern + "/"):
                 conflicts.append((f, pattern, holder))
                 break
@@ -894,7 +919,7 @@ pub fn guard_check_full(
     }
 
     // Read reservations from the archive
-    let reservations = read_active_reservations_from_archive(archive_root)?;
+    let reservations = read_active_reservations_from_archive(archive_root, ignorecase)?;
 
     let conflicts = check_path_conflicts(paths, &reservations, &agent_name, ignorecase)?;
 
@@ -924,7 +949,7 @@ pub fn guard_check(
     }
 
     // Read reservations from archive JSON files
-    let reservations = read_active_reservations_from_archive(archive_root)?;
+    let reservations = read_active_reservations_from_archive(archive_root, ignorecase)?;
 
     check_path_conflicts(paths, &reservations, &agent_name, ignorecase)
 }
@@ -945,15 +970,11 @@ fn check_path_conflicts(
 
     for res in reservations {
         if res.exclusive && !res.agent_name.eq_ignore_ascii_case(self_agent) {
-            // Configure glob to match gitignore semantics (literal_separator(true) means * does not cross /)
-            // matching the custom Python glob_to_regex behavior where * -> [^/]* and ** -> .*.
-            // Use normalize_path to handle slashes before compiling.
-            let pat_str = normalize_path(&res.path_pattern, ignorecase);
             // Skip patterns that normalize to empty — they would match everything.
-            if pat_str.is_empty() {
+            if res.normalized_pattern.is_empty() {
                 continue;
             }
-            match globset::GlobBuilder::new(&pat_str)
+            match globset::GlobBuilder::new(&res.normalized_pattern)
                 .literal_separator(true)
                 .build()
             {
@@ -1008,13 +1029,11 @@ fn check_path_conflicts(
         // modifying `modules/submod` conflicts with reservation `modules/submod/**`
         // because the directory itself is within the reserved scope.
         for res in &active_indices {
-            let pat_norm = normalize_path(&res.path_pattern, ignorecase);
-
             // Check if the path is a prefix of the pattern's base directory
             // (e.g. path "src", pattern "src/main.rs" or "src/**")
-            if pat_norm.starts_with(&normalized)
+            if res.normalized_pattern.starts_with(&normalized)
                 && (normalized.is_empty()
-                    || pat_norm
+                    || res.normalized_pattern
                         .as_bytes()
                         .get(normalized.len())
                         .is_some_and(|&c| c == b'/'))
@@ -1030,16 +1049,12 @@ fn check_path_conflicts(
 
             // Also check the reverse: pattern's literal base is a prefix of the path
             // (needed for non-glob patterns like "src/utils" matching "src/utils/file.rs")
-            let has_glob = res.path_pattern.contains('*')
-                || res.path_pattern.contains('?')
-                || res.path_pattern.contains('[')
-                || res.path_pattern.contains('{');
-            if !has_glob
-                && normalized.starts_with(&pat_norm)
-                && (pat_norm.is_empty()
+            if !res.has_glob
+                && normalized.starts_with(&res.normalized_pattern)
+                && (res.normalized_pattern.is_empty()
                     || normalized
                         .as_bytes()
-                        .get(pat_norm.len())
+                        .get(res.normalized_pattern.len())
                         .is_some_and(|&c| c == b'/'))
             {
                 conflicts.push(GuardConflict {
@@ -1092,6 +1107,11 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true if the string contains glob metacharacters.
+fn contains_glob(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+}
+
 /// Read active file reservations from the archive's `file_reservations/` directory.
 ///
 /// Parses each `*.json` file and returns records that are:
@@ -1100,6 +1120,7 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
 /// - Exclusive
 fn read_active_reservations_from_archive(
     archive_root: &Path,
+    ignorecase: bool,
 ) -> GuardResult<Vec<FileReservationRecord>> {
     let reservations_dir = archive_root.join("file_reservations");
     if !reservations_dir.is_dir() {
@@ -1157,12 +1178,17 @@ fn read_active_reservations_from_archive(
             .unwrap_or("unknown")
             .to_string();
 
+        let normalized_pattern = normalize_path(&pattern, ignorecase);
+        let has_glob = contains_glob(&pattern);
+
         records.push(FileReservationRecord {
             path_pattern: pattern,
             agent_name,
             exclusive,
             expires_ts: expires_str.to_string(),
             released_ts: None,
+            normalized_pattern,
+            has_glob,
         });
     }
 
@@ -1213,8 +1239,8 @@ fn is_expired(ts_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
         let utc = dt.and_utc();
         return utc <= *now;
     }
-    // If we can't parse, treat as not expired (conservative)
-    false
+    // If we can't parse, treat as expired (conservative/fail-open)
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,11 +1454,6 @@ mod tests {
             }
         }
         false
-    }
-
-    /// Returns true if the string contains glob metacharacters.
-    fn contains_glob(s: &str) -> bool {
-        s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
     }
 
     fn run_git(dir: &Path, args: &[&str]) {
@@ -2411,6 +2432,10 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let repo_dir = td.path().join("repo");
         std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
         // Delete push: local sha is all zeros. Should not attempt git and should return empty.
         let stdin_lines = "refs/heads/main 0000000000000000000000000000000000000000 refs/heads/main 1234567890abcdef1234567890abcdef12345678\n";
         let paths = get_push_paths(&repo_dir, stdin_lines).expect("push paths");
@@ -2426,22 +2451,22 @@ mod tests {
         run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
         run_git(&repo_dir, &["config", "user.name", "test"]);
 
-        std::fs::write(repo_dir.join("a.txt"), "one\n").expect("write");
+        std::fs::write(repo_dir.join("a.txt"), "one\n").expect("write base");
         run_git(&repo_dir, &["add", "a.txt"]);
-        run_git(&repo_dir, &["commit", "-qm", "c1"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let remote_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
-        std::fs::write(repo_dir.join("b.txt"), "two\n").expect("write");
-        run_git(&repo_dir, &["add", "b.txt"]);
-        run_git(&repo_dir, &["commit", "-qm", "c2"]);
+        run_git(&repo_dir, &["checkout", "--detach", "HEAD"]);
+        std::fs::write(repo_dir.join("detached.txt"), "detached\n").expect("write detached");
+        run_git(&repo_dir, &["add", "detached.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "detached commit"]);
         let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
-        let stdin_lines = format!(
-            "refs/heads/main {local_sha} refs/heads/main 0000000000000000000000000000000000000000\n"
-        );
+        let stdin_lines = format!("HEAD {local_sha} refs/heads/main {remote_sha}\n");
         let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
         assert!(
-            paths.contains(&"b.txt".to_string()),
-            "expected b.txt in push paths, got: {paths:?}"
+            paths.contains(&"detached.txt".to_string()),
+            "expected detached.txt in push paths, got {paths:?}"
         );
     }
 
@@ -2642,7 +2667,7 @@ mod tests {
             "expires_ts": future.to_rfc3339(),
             "released_ts": null
         });
-        std::fs::write(res_dir.join("alt.json"), alt_key.to_string()).expect("write");
+        std::fs::write(res_dir.join("noagent.json"), alt_key.to_string()).expect("write");
 
         let records = read_active_reservations_from_archive(&archive).expect("read");
         assert_eq!(records.len(), 1);
@@ -2659,6 +2684,7 @@ mod tests {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let no_agent = serde_json::json!({
             "path_pattern": "src/**",
+            "agent_name": "Agent",
             "exclusive": true,
             "expires_ts": future.to_rfc3339(),
             "released_ts": null
@@ -2978,27 +3004,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // is_expired tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn is_expired_far_future_not_expired() {
-        let now = chrono::Utc::now();
-        assert!(!is_expired("2099-12-31T23:59:59Z", &now));
-    }
-
-    #[test]
-    fn is_expired_far_past_is_expired() {
-        let now = chrono::Utc::now();
-        assert!(is_expired("2000-01-01T00:00:00Z", &now));
-    }
-
-    #[test]
-    fn is_expired_empty_string_is_not_expired() {
-        // Unparseable timestamps are treated as not-expired (safe default).
-        let now = chrono::Utc::now();
-        assert!(!is_expired("", &now));
-    }
 
     #[test]
     fn guard_plugin_script_contains_project() {

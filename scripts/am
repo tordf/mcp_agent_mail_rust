@@ -73,7 +73,11 @@ sync_toml_mcp_url() {
   local desired_url="$2"
   local create_if_missing="${3:-0}"
   local tmp_file="${config_file}.am-sync.$$"
-  local bearer_env_var="HTTP_BEARER_TOKEN"
+  local desired_auth_header=""
+
+  if [[ -n "${HTTP_BEARER_TOKEN:-}" ]]; then
+    desired_auth_header="Bearer ${HTTP_BEARER_TOKEN}"
+  fi
 
   if [[ ! -f "$config_file" ]]; then
     if [[ "$create_if_missing" -ne 1 ]]; then
@@ -83,18 +87,22 @@ sync_toml_mcp_url() {
     cat > "$config_file" <<EOF
 [mcp_servers.mcp_agent_mail]
 url = "${desired_url}"
-bearer_token_env_var = "${bearer_env_var}"
 EOF
+    if [[ -n "$desired_auth_header" ]]; then
+      cat >> "$config_file" <<EOF
+http_headers = { Authorization = "${desired_auth_header}" }
+EOF
+    fi
     echo "am: synced MCP URL to ${desired_url} (${config_file})." >&2
     return 0
   fi
 
-  awk -v desired_url="$desired_url" -v bearer_env_var="$bearer_env_var" -v create_if_missing="$create_if_missing" '
+  awk -v desired_url="$desired_url" -v desired_auth_header="$desired_auth_header" -v create_if_missing="$create_if_missing" '
     BEGIN {
       in_section = 0
       saw_section = 0
       saw_url_in_section = 0
-      saw_bearer_env_var_in_section = 0
+      saw_http_headers_in_section = 0
     }
 
     /^\[mcp_servers\.mcp_agent_mail\][[:space:]]*$/ || /^\[mcp_servers\."mcp-agent-mail"\][[:space:]]*$/ {
@@ -102,14 +110,14 @@ EOF
         if (!saw_url_in_section) {
           print "url = \"" desired_url "\""
         }
-        if (!saw_bearer_env_var_in_section) {
-          print "bearer_token_env_var = \"" bearer_env_var "\""
+        if (!saw_http_headers_in_section && desired_auth_header != "") {
+          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
         }
       }
       in_section = 1
       saw_section = 1
       saw_url_in_section = 0
-      saw_bearer_env_var_in_section = 0
+      saw_http_headers_in_section = 0
       print
       next
     }
@@ -119,8 +127,8 @@ EOF
         if (!saw_url_in_section) {
           print "url = \"" desired_url "\""
         }
-        if (!saw_bearer_env_var_in_section) {
-          print "bearer_token_env_var = \"" bearer_env_var "\""
+        if (!saw_http_headers_in_section && desired_auth_header != "") {
+          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
         }
       }
       in_section = 0
@@ -132,9 +140,11 @@ EOF
         saw_url_in_section = 1
         next
       }
-      if (in_section && $0 ~ /^[[:space:]]*bearer_token_env_var[[:space:]]*=/) {
-        print "bearer_token_env_var = \"" bearer_env_var "\""
-        saw_bearer_env_var_in_section = 1
+      if (in_section && ($0 ~ /^[[:space:]]*bearer_token_env_var[[:space:]]*=/ || $0 ~ /^[[:space:]]*http_headers[[:space:]]*=/)) {
+        if (desired_auth_header != "") {
+          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
+          saw_http_headers_in_section = 1
+        }
         next
       }
       if (in_section && $0 ~ /^[[:space:]]*(command|args)[[:space:]]*=/) {
@@ -148,15 +158,17 @@ EOF
         if (!saw_url_in_section) {
           print "url = \"" desired_url "\""
         }
-        if (!saw_bearer_env_var_in_section) {
-          print "bearer_token_env_var = \"" bearer_env_var "\""
+        if (!saw_http_headers_in_section && desired_auth_header != "") {
+          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
         }
       }
       if (!saw_section && create_if_missing == 1) {
         print ""
         print "[mcp_servers.mcp_agent_mail]"
         print "url = \"" desired_url "\""
-        print "bearer_token_env_var = \"" bearer_env_var "\""
+        if (desired_auth_header != "") {
+          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
+        }
       }
     }
   ' "$config_file" > "$tmp_file"
@@ -508,6 +520,20 @@ done
 resolved_path="$(normalize_http_path "$path_mode")"
 export LOG_RICH_ENABLED="${LOG_RICH_ENABLED:-true}"
 
+if [[ "$no_auth" -eq 1 ]]; then
+  unset HTTP_BEARER_TOKEN
+else
+  if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
+    if token="$(read_env_value "$env_file" "HTTP_BEARER_TOKEN" 2>/dev/null)"; then
+      token="$(printf '%s' "$token" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      token="$(printf '%s' "$token" | sed -e 's/^\"//' -e 's/\"$//' -e \"s/^'//\" -e \"s/'$//\")"
+      if [[ -n "$token" ]]; then
+        export HTTP_BEARER_TOKEN="$token"
+      fi
+    fi
+  fi
+fi
+
 # Reuse an already-running Agent Mail server on the same host/port to avoid
 # clobbering a healthy instance started by another tool/agent.
 if [[ "${AM_REUSE_RUNNING:-1}" == "1" ]]; then
@@ -557,20 +583,6 @@ if [[ "${AM_REUSE_RUNNING:-1}" == "1" ]]; then
     fi
     echo "am: free the port or choose a different one with --port." >&2
     exit 2
-  fi
-fi
-
-if [[ "$no_auth" -eq 1 ]]; then
-  unset HTTP_BEARER_TOKEN
-else
-  if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
-    if token="$(read_env_value "$env_file" "HTTP_BEARER_TOKEN" 2>/dev/null)"; then
-      token="$(printf '%s' "$token" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-      token="$(printf '%s' "$token" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
-      if [[ -n "$token" ]]; then
-        export HTTP_BEARER_TOKEN="$token"
-      fi
-    fi
   fi
 fi
 

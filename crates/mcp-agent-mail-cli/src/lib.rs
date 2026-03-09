@@ -3895,15 +3895,16 @@ fn sqlite_conn_quick_check_ok(conn: &mcp_agent_mail_db::DbConn) -> CliResult<boo
 }
 
 fn sqlite_conn_is_healthy(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
-    match sqlite_conn_quick_check_ok(conn) {
+    retry_sync_sqlite_lock(|| match sqlite_conn_quick_check_ok(conn) {
         Ok(ok) => Ok(ok),
         Err(e) => {
-            if is_sqlite_recovery_error_message(&e.to_string()) {
+            let message = e.to_string();
+            if is_sqlite_recovery_error_message(&message) {
                 return Ok(false);
             }
-            Err(e)
+            Err(sqlite_retryable_error(message.clone(), &message))
         }
-    }
+    })
 }
 
 fn sqlite_conn_quick_check_ok_canonical(
@@ -4410,56 +4411,108 @@ fn resolve_sqlite_path_with_absolute_candidate(path: &str) -> String {
 }
 
 fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    match mcp_agent_mail_db::DbConn::open_file(path) {
+    retry_sync_sqlite_lock(|| match mcp_agent_mail_db::DbConn::open_file(path) {
         Ok(conn) => Ok((conn, path.to_string())),
         Err(primary_err) => {
             let primary_err_text = primary_err.to_string();
             if let Some(fallback_path) = sqlite_absolute_fallback_path(path, &primary_err_text) {
-                let fallback_conn =
-                    mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|fallback_err| {
-                        CliError::Other(format!(
-                            "cannot open DB at {path}: {primary_err}; fallback {fallback_path} failed: {fallback_err}"
-                        ))
-                    })?;
+                let fallback_conn = mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(
+                    |fallback_err| {
+                        sqlite_retryable_error(
+                            format!(
+                                "cannot open DB at {path}: {primary_err}; fallback {fallback_path} failed: {fallback_err}"
+                            ),
+                            &fallback_err.to_string(),
+                        )
+                    },
+                )?;
                 return Ok((fallback_conn, fallback_path));
             }
             if path != ":memory:" && is_sqlite_recovery_error_message(&primary_err_text) {
                 let primary_path = Path::new(path);
                 recover_sqlite_file(primary_path).map_err(|recovery_err| {
-                    CliError::Other(format!(
-                        "cannot open DB at {path}: {primary_err}; auto-recovery failed: {recovery_err}"
-                    ))
+                    sqlite_retryable_error(
+                        format!(
+                            "cannot open DB at {path}: {primary_err}; auto-recovery failed: {recovery_err}"
+                        ),
+                        &recovery_err.to_string(),
+                    )
                 })?;
                 let recovered_conn = mcp_agent_mail_db::DbConn::open_file(path).map_err(|e| {
-                    CliError::Other(format!(
-                        "cannot open DB at {path}: {primary_err}; auto-recovery reopen failed: {e}"
-                    ))
+                    sqlite_retryable_error(
+                        format!(
+                            "cannot open DB at {path}: {primary_err}; auto-recovery reopen failed: {e}"
+                        ),
+                        &e.to_string(),
+                    )
                 })?;
                 return Ok((recovered_conn, path.to_string()));
             }
-            Err(CliError::Other(format!(
-                "cannot open DB at {path}: {primary_err}"
-            )))
+            Err(sqlite_retryable_error(
+                format!("cannot open DB at {path}: {primary_err}"),
+                &primary_err_text,
+            ))
         }
-    }
+    })
 }
 
 fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(path)
-        .map_err(|e| CliError::Other(format!("cannot open DB at {path} for schema init: {e}")))?;
-    conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)
-        .map_err(|e| {
-            CliError::Other(format!(
-                "failed to apply base init PRAGMAs for {path} via canonical sqlite: {e}"
-            ))
+    retry_sync_sqlite_lock(|| {
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path).map_err(|e| {
+            sqlite_retryable_error(
+                format!("cannot open DB at {path} for schema init: {e}"),
+                &e.to_string(),
+            )
         })?;
-    let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
-    conn.execute_raw(&init_sql).map_err(|e| {
-        CliError::Other(format!(
-            "schema init failed for {path} via canonical sqlite: {e}"
-        ))
-    })?;
-    Ok(())
+        conn.execute_raw("PRAGMA busy_timeout = 60000;")
+            .map_err(|e| {
+                sqlite_retryable_error(
+                    format!("failed to apply busy_timeout for {path} via canonical sqlite: {e}"),
+                    &e.to_string(),
+                )
+            })?;
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)
+            .map_err(|e| {
+                sqlite_retryable_error(
+                    format!(
+                        "failed to apply base init PRAGMAs for {path} via canonical sqlite: {e}"
+                    ),
+                    &e.to_string(),
+                )
+            })?;
+        let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
+        conn.execute_raw(&init_sql).map_err(|e| {
+            sqlite_retryable_error(
+                format!("schema init failed for {path} via canonical sqlite: {e}"),
+                &e.to_string(),
+            )
+        })?;
+        Ok(())
+    })
+}
+
+fn sqlite_retryable_error(message: String, detail: &str) -> mcp_agent_mail_db::DbError {
+    if mcp_agent_mail_db::is_lock_error(detail) {
+        mcp_agent_mail_db::DbError::ResourceBusy(message)
+    } else {
+        mcp_agent_mail_db::DbError::Sqlite(message)
+    }
+}
+
+fn retry_sync_sqlite_lock<T, F>(op: F) -> CliResult<T>
+where
+    F: FnMut() -> mcp_agent_mail_db::DbResult<T>,
+{
+    let config = mcp_agent_mail_db::RetryConfig {
+        use_circuit_breaker: false,
+        ..Default::default()
+    };
+    mcp_agent_mail_db::retry_sync(&config, op).map_err(|e| match e {
+        mcp_agent_mail_db::DbError::ResourceBusy(message) => CliError::Other(format!(
+            "Resource is temporarily busy. Wait a moment and try again. ({message})"
+        )),
+        other => CliError::Other(other.to_string()),
+    })
 }
 
 /// Open a synchronous SQLite connection for CLI commands.
@@ -11384,18 +11437,24 @@ fn fix_path_order(home: &Path) -> Result<String, String> {
 const CODEX_HTTP_BEARER_TOKEN_ENV_VAR: &str = "HTTP_BEARER_TOKEN";
 
 /// Update an MCP config file to point `mcp-agent-mail` to HTTP URL mode.
-fn fix_mcp_config_entry(config_path: &Path, desired_url: &str) -> Result<String, String> {
+fn fix_mcp_config_entry(
+    config_path: &Path,
+    desired_url: &str,
+    desired_bearer_token: Option<&str>,
+    tool: mcp_agent_mail_core::mcp_config::McpConfigTool,
+) -> Result<String, String> {
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
     let backup_path = backup_path_for_mcp_config(config_path);
 
     if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
-        let fixed = fix_mcp_config_toml_text(&content, desired_url).ok_or_else(|| {
-            format!(
-                "No mcp-agent-mail TOML section found in {}",
-                config_path.display()
-            )
-        })?;
+        let fixed = fix_mcp_config_toml_text(&content, desired_url, desired_bearer_token)
+            .ok_or_else(|| {
+                format!(
+                    "No mcp-agent-mail TOML section found in {}",
+                    config_path.display()
+                )
+            })?;
         std::fs::copy(config_path, &backup_path).map_err(|e| format!("backup failed: {e}"))?;
         std::fs::write(config_path, fixed).map_err(|e| format!("write failed: {e}"))?;
         return Ok(format!(
@@ -11424,12 +11483,7 @@ fn fix_mcp_config_entry(config_path: &Path, desired_url: &str) -> Result<String,
             else {
                 continue;
             };
-            entry.remove("command");
-            entry.remove("args");
-            entry.insert(
-                "url".to_string(),
-                serde_json::Value::String(desired_url.to_string()),
-            );
+            rewrite_json_mcp_entry_to_http_url(entry, desired_url, desired_bearer_token, tool);
             updated = true;
         }
     }
@@ -11454,6 +11508,95 @@ fn fix_mcp_config_entry(config_path: &Path, desired_url: &str) -> Result<String,
     ))
 }
 
+fn rewrite_json_mcp_entry_to_http_url(
+    entry: &mut serde_json::Map<String, serde_json::Value>,
+    desired_url: &str,
+    desired_bearer_token: Option<&str>,
+    tool: mcp_agent_mail_core::mcp_config::McpConfigTool,
+) {
+    let mut headers = entry
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(token) = desired_bearer_token.filter(|token| !token.trim().is_empty()) {
+        headers.insert(
+            "Authorization".to_string(),
+            serde_json::Value::String(format!("Bearer {token}")),
+        );
+    } else if let Some(token) = entry
+        .get("env")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|env| env.get(CODEX_HTTP_BEARER_TOKEN_ENV_VAR))
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+    {
+        headers.insert(
+            "Authorization".to_string(),
+            serde_json::Value::String(format!("Bearer {token}")),
+        );
+    }
+
+    let enabled = entry
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    entry.remove("command");
+    entry.remove("args");
+    entry.remove("transport");
+    entry.remove("url");
+    entry.remove("httpUrl");
+    entry.remove("type");
+    entry.remove("headers");
+    entry.remove("enabled");
+
+    match tool {
+        mcp_agent_mail_core::mcp_config::McpConfigTool::Gemini => {
+            entry.insert(
+                "httpUrl".to_string(),
+                serde_json::Value::String(desired_url.to_string()),
+            );
+        }
+        mcp_agent_mail_core::mcp_config::McpConfigTool::OpenCode => {
+            entry.insert(
+                "type".to_string(),
+                serde_json::Value::String("remote".to_string()),
+            );
+            entry.insert(
+                "url".to_string(),
+                serde_json::Value::String(desired_url.to_string()),
+            );
+            entry.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
+        }
+        mcp_agent_mail_core::mcp_config::McpConfigTool::FactoryDroid
+        | mcp_agent_mail_core::mcp_config::McpConfigTool::Codex => {
+            entry.insert(
+                "url".to_string(),
+                serde_json::Value::String(desired_url.to_string()),
+            );
+        }
+        mcp_agent_mail_core::mcp_config::McpConfigTool::Claude
+        | mcp_agent_mail_core::mcp_config::McpConfigTool::Cursor
+        | mcp_agent_mail_core::mcp_config::McpConfigTool::GithubCopilot
+        | mcp_agent_mail_core::mcp_config::McpConfigTool::Windsurf
+        | mcp_agent_mail_core::mcp_config::McpConfigTool::Cline => {
+            entry.insert(
+                "type".to_string(),
+                serde_json::Value::String("http".to_string()),
+            );
+            entry.insert(
+                "url".to_string(),
+                serde_json::Value::String(desired_url.to_string()),
+            );
+        }
+    }
+
+    if !headers.is_empty() {
+        entry.insert("headers".to_string(), serde_json::Value::Object(headers));
+    }
+}
+
 fn backup_path_for_mcp_config(config_path: &Path) -> PathBuf {
     let ext = config_path
         .extension()
@@ -11462,13 +11605,19 @@ fn backup_path_for_mcp_config(config_path: &Path) -> PathBuf {
     config_path.with_extension(format!("{ext}.bak"))
 }
 
-fn fix_mcp_config_toml_text(content: &str, desired_url: &str) -> Option<String> {
+fn fix_mcp_config_toml_text(
+    content: &str,
+    desired_url: &str,
+    desired_bearer_token: Option<&str>,
+) -> Option<String> {
     let mut output = Vec::new();
     let mut in_target_section = false;
     let mut saw_target_section = false;
     let mut saw_url_in_section = false;
-    let mut saw_bearer_token_env_var_in_section = false;
+    let mut saw_http_headers_in_section = false;
     let mut replaced_section = false;
+    let desired_http_headers =
+        desired_bearer_token.map(|token| format!("{{ Authorization = \"Bearer {token}\" }}"));
 
     for raw_line in content.lines() {
         if let Some(section) = parse_toml_section_header(raw_line) {
@@ -11476,10 +11625,10 @@ fn fix_mcp_config_toml_text(content: &str, desired_url: &str) -> Option<String> 
                 if !saw_url_in_section {
                     output.push(format!("url = \"{desired_url}\""));
                 }
-                if !saw_bearer_token_env_var_in_section {
-                    output.push(format!(
-                        "bearer_token_env_var = \"{CODEX_HTTP_BEARER_TOKEN_ENV_VAR}\""
-                    ));
+                if !saw_http_headers_in_section
+                    && let Some(headers) = desired_http_headers.as_deref()
+                {
+                    output.push(format!("http_headers = {headers}"));
                     replaced_section = true;
                 }
                 in_target_section = false;
@@ -11493,7 +11642,7 @@ fn fix_mcp_config_toml_text(content: &str, desired_url: &str) -> Option<String> 
                 saw_target_section = true;
                 in_target_section = true;
                 saw_url_in_section = false;
-                saw_bearer_token_env_var_in_section = false;
+                saw_http_headers_in_section = false;
                 output.push(raw_line.to_string());
                 continue;
             }
@@ -11513,11 +11662,13 @@ fn fix_mcp_config_toml_text(content: &str, desired_url: &str) -> Option<String> 
             continue;
         }
 
-        if parse_simple_toml_key(raw_line, "bearer_token_env_var").is_some() {
-            output.push(format!(
-                "bearer_token_env_var = \"{CODEX_HTTP_BEARER_TOKEN_ENV_VAR}\""
-            ));
-            saw_bearer_token_env_var_in_section = true;
+        if parse_simple_toml_key(raw_line, "bearer_token_env_var").is_some()
+            || parse_simple_toml_key(raw_line, "http_headers").is_some()
+        {
+            if let Some(headers) = desired_http_headers.as_deref() {
+                output.push(format!("http_headers = {headers}"));
+                saw_http_headers_in_section = true;
+            }
             replaced_section = true;
             continue;
         }
@@ -11536,10 +11687,8 @@ fn fix_mcp_config_toml_text(content: &str, desired_url: &str) -> Option<String> 
         if !saw_url_in_section {
             output.push(format!("url = \"{desired_url}\""));
         }
-        if !saw_bearer_token_env_var_in_section {
-            output.push(format!(
-                "bearer_token_env_var = \"{CODEX_HTTP_BEARER_TOKEN_ENV_VAR}\""
-            ));
+        if !saw_http_headers_in_section && let Some(headers) = desired_http_headers.as_deref() {
+            output.push(format!("http_headers = {headers}"));
         }
         replaced_section = true;
     }
@@ -11713,7 +11862,9 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
         let locations = detect_mcp_config_locations_default();
         let existing: Vec<_> = locations.iter().filter(|l| l.exists).collect();
         let mut any_fixable = false;
-        let desired_url = check_inbox_server_url(&config.http_host, config.http_port, &config.http_path);
+        let desired_url =
+            check_inbox_server_url(&config.http_host, config.http_port, &config.http_path);
+        let desired_bearer_token = config.http_bearer_token.as_deref();
 
         for loc in &existing {
             let Ok(content) = std::fs::read_to_string(&loc.config_path) else {
@@ -11742,7 +11893,12 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     }));
                     skipped_count += 1;
                 } else {
-                    match fix_mcp_config_entry(&loc.config_path, &desired_url) {
+                    match fix_mcp_config_entry(
+                        &loc.config_path,
+                        &desired_url,
+                        desired_bearer_token,
+                        loc.tool,
+                    ) {
                         Ok(msg) => {
                             ftui_runtime::ftui_eprintln!("[fix] {msg}");
                             results.push(serde_json::json!({
@@ -19052,17 +19208,82 @@ command = "mcp-agent-mail"
         let desired_url = "http://127.0.0.1:8765/api/";
         std::fs::write(
             &config,
-            r#"{"mcpServers": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"]}}}"#,
+            r#"{"mcpServers": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"], "transport": "stdio"}}}"#,
         )
         .unwrap();
-        let result = fix_mcp_config_entry(&config, desired_url);
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("tok123"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Claude,
+        );
         assert!(result.is_ok(), "{result:?}");
         assert!(config.with_extension("json.bak").exists());
         let content = std::fs::read_to_string(&config).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(doc["mcpServers"]["mcp-agent-mail"]["url"], desired_url);
+        assert_eq!(doc["mcpServers"]["mcp-agent-mail"]["type"], "http");
         assert!(doc["mcpServers"]["mcp-agent-mail"].get("command").is_none());
         assert!(doc["mcpServers"]["mcp-agent-mail"].get("args").is_none());
+        assert!(
+            doc["mcpServers"]["mcp-agent-mail"]
+                .get("transport")
+                .is_none()
+        );
+        assert_eq!(
+            doc["mcpServers"]["mcp-agent-mail"]["headers"]["Authorization"],
+            "Bearer tok123"
+        );
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_updates_gemini_json_to_http_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        let desired_url = "http://127.0.0.1:8765/api/";
+        std::fs::write(
+            &config,
+            r#"{"mcpServers": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"], "env": {"HTTP_BEARER_TOKEN": "tok123"}}}}"#,
+        )
+        .unwrap();
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            None,
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Gemini,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&config).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let entry = &doc["mcpServers"]["mcp-agent-mail"];
+        assert_eq!(entry["httpUrl"], desired_url);
+        assert!(entry.get("url").is_none());
+        assert_eq!(entry["headers"]["Authorization"], "Bearer tok123");
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_updates_opencode_json_to_remote_url_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("opencode.json");
+        let desired_url = "http://127.0.0.1:8765/api/";
+        std::fs::write(
+            &config,
+            r#"{"mcp": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"], "enabled": false}}}"#,
+        )
+        .unwrap();
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            None,
+            mcp_agent_mail_core::mcp_config::McpConfigTool::OpenCode,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&config).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let entry = &doc["mcp"]["mcp-agent-mail"];
+        assert_eq!(entry["type"], "remote");
+        assert_eq!(entry["url"], desired_url);
+        assert_eq!(entry["enabled"], false);
     }
 
     #[test]
@@ -19078,13 +19299,18 @@ command = "mcp-agent-mail"
         )
         .unwrap();
 
-        let result = fix_mcp_config_entry(&config, desired_url);
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("testtoken"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Codex,
+        );
         assert!(result.is_ok(), "{result:?}");
         assert!(config.with_extension("toml.bak").exists());
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(content.contains("[mcp_servers.mcp_agent_mail]"));
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
-        assert!(content.contains("bearer_token_env_var = \"HTTP_BEARER_TOKEN\""));
+        assert!(content.contains("http_headers = { Authorization = \"Bearer testtoken\" }"));
         assert!(!content.contains("command = "));
     }
 
@@ -19107,7 +19333,12 @@ command = "node"
         )
         .unwrap();
 
-        let result = fix_mcp_config_entry(&config, desired_url);
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("testtoken"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Codex,
+        );
         assert!(result.is_ok(), "{result:?}");
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(content.contains("# Keep this token for local runs."));
@@ -19115,7 +19346,7 @@ command = "node"
         assert!(content.contains("cwd = \"/tmp/mail\""));
         assert!(content.contains("[mcp_servers.other]"));
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
-        assert!(content.contains("bearer_token_env_var = \"HTTP_BEARER_TOKEN\""));
+        assert!(content.contains("http_headers = { Authorization = \"Bearer testtoken\" }"));
         assert!(!content.contains("command = \"mcp-agent-mail\""));
     }
 
@@ -19132,12 +19363,17 @@ command = "mcp-agent-mail"
         )
         .unwrap();
 
-        let result = fix_mcp_config_entry(&config, desired_url);
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("testtoken"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Codex,
+        );
         assert!(result.is_ok(), "{result:?}");
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(content.contains("[mcp_servers.mcp_agent_mail] # local override"));
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
-        assert!(content.contains("bearer_token_env_var = \"HTTP_BEARER_TOKEN\""));
+        assert!(content.contains("http_headers = { Authorization = \"Bearer testtoken\" }"));
         assert!(!content.contains("command = "));
     }
 
@@ -19146,7 +19382,12 @@ command = "mcp-agent-mail"
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("mcp.json");
         std::fs::write(&config, r#"{"mcpServers": {}}"#).unwrap();
-        let result = fix_mcp_config_entry(&config, "http://127.0.0.1:8765/api/");
+        let result = fix_mcp_config_entry(
+            &config,
+            "http://127.0.0.1:8765/api/",
+            None,
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Claude,
+        );
         assert!(result.is_err());
     }
 
@@ -25149,6 +25390,88 @@ command = "mcp-agent-mail"
             .expect("query marker");
         let marker: String = rows.first().unwrap().get_named("value").unwrap();
         assert_eq!(marker, "from-backup", "should restore from .bak backup");
+    }
+
+    #[test]
+    fn open_db_sync_with_database_url_retries_transient_lock_during_canonical_init() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("transient-lock.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        init_schema_sqlite_canonical(&db_path_str).expect("initialize canonical schema");
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let lock_path = db_path_str.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let lock_conn =
+                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            lock_conn
+                .execute_raw("PRAGMA busy_timeout = 1;")
+                .expect("set lock busy_timeout");
+            lock_conn
+                .execute_raw("BEGIN EXCLUSIVE")
+                .expect("hold exclusive sqlite lock");
+            ready_tx.send(()).expect("signal lock ready");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            lock_conn
+                .execute_raw("ROLLBACK")
+                .expect("release sqlite lock");
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("wait for lock thread");
+
+        let result = open_db_sync_with_database_url(&db_url);
+        lock_thread.join().expect("join lock thread");
+
+        let conn = result.expect("open should retry past transient lock");
+        let rows = conn
+            .query_sync("SELECT 1 AS one", &[])
+            .expect("query after transient lock");
+        let one: i64 = rows.first().expect("row").get_named("one").unwrap_or(0);
+        assert_eq!(one, 1);
+    }
+
+    #[test]
+    fn sqlite_conn_is_healthy_retries_transient_lock_on_existing_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("health-lock.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        init_schema_sqlite_canonical(&db_path_str).expect("initialize canonical schema");
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open shared db");
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let lock_path = db_path_str.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let lock_conn =
+                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            lock_conn
+                .execute_raw("PRAGMA busy_timeout = 1;")
+                .expect("set lock busy_timeout");
+            lock_conn
+                .execute_raw("BEGIN EXCLUSIVE")
+                .expect("hold exclusive sqlite lock");
+            ready_tx.send(()).expect("signal lock ready");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            lock_conn
+                .execute_raw("ROLLBACK")
+                .expect("release sqlite lock");
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("wait for lock thread");
+
+        let health = sqlite_conn_is_healthy(&conn).expect("health probe should retry");
+        lock_thread.join().expect("join lock thread");
+
+        assert!(
+            health,
+            "shared connection should remain healthy after transient lock"
+        );
     }
 
     #[test]

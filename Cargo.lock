@@ -2188,6 +2188,7 @@ dependencies = [
  "fsqlite-vfs",
  "fsqlite-wal",
  "hashbrown 0.14.5",
+ "lru 0.12.5",
  "serde",
  "serde_json",
  "tracing",

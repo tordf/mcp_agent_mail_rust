@@ -607,6 +607,23 @@ impl Runner {
         cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
+
+        let mut stdout_pipe = child.stdout.take().unwrap();
+        let mut stderr_pipe = child.stderr.take().unwrap();
+
+        // Spawn threads to read stdout/stderr so the child doesn't block on full pipe buffers
+        let stdout_handle = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = std::io::copy(&mut stdout_pipe, &mut out);
+            out
+        });
+
+        let stderr_handle = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = std::io::copy(&mut stderr_pipe, &mut out);
+            out
+        });
+
         let mut timed_out = false;
 
         if let Some(timeout) = self.config.timeout {
@@ -626,7 +643,15 @@ impl Runner {
             }
         }
 
-        let output = child.wait_with_output()?;
+        let status = child.wait()?;
+        let stdout = stdout_handle.join().unwrap_or_default();
+        let stderr = stderr_handle.join().unwrap_or_default();
+        let output = std::process::Output {
+            status,
+            stdout,
+            stderr,
+        };
+
         Ok(SuiteExecution { output, timed_out })
     }
 

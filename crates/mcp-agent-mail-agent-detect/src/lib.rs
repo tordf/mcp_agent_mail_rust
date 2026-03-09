@@ -264,10 +264,18 @@ pub fn detect_installed_agents(
 
     validate_known_connectors(&available, only.as_ref(), &overrides)?;
 
-    let mut all_entries: Vec<InstalledAgentDetectionEntry> = KNOWN_CONNECTORS
+    let mut slugs_to_check: Vec<&'static str> = KNOWN_CONNECTORS
         .iter()
         .copied()
         .filter(|slug| only.as_ref().is_none_or(|set| set.contains(*slug)))
+        .collect();
+
+    // Deduplicate in case multiple KNOWN_CONNECTORS alias to the same canonical slug
+    slugs_to_check.sort_unstable();
+    slugs_to_check.dedup();
+
+    let mut all_entries: Vec<InstalledAgentDetectionEntry> = slugs_to_check
+        .into_iter()
         .map(|slug| {
             overrides.get(slug).map_or_else(
                 || entry_from_detect(slug),
