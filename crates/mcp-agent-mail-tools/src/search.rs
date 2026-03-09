@@ -182,6 +182,35 @@ fn is_ordered_prefix(s: &str) -> bool {
     true
 }
 
+fn parse_thread_ids(thread_id: &str) -> Vec<String> {
+    thread_id
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn explain_facet_value<'a>(
+    explain: &'a mcp_agent_mail_db::search_planner::QueryExplain,
+    key: &str,
+) -> Option<&'a str> {
+    explain.facets_applied.iter().find_map(|facet| {
+        let (facet_key, facet_value) = facet.split_once(':')?;
+        if facet_key.eq_ignore_ascii_case(key) {
+            Some(facet_value)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_budget_tier_from_rerank_outcome(rerank_outcome: &str) -> Option<&str> {
+    rerank_outcome
+        .strip_prefix("skipped_by_budget_governor_")
+        .filter(|tier| !tier.is_empty())
+}
+
 pub(crate) fn derive_search_diagnostics(
     explain: Option<&mcp_agent_mail_db::search_planner::QueryExplain>,
 ) -> Option<SearchDiagnostics> {
