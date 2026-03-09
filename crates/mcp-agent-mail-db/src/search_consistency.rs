@@ -379,7 +379,7 @@ pub fn full_reindex(
     progress: &dyn ReindexProgress,
 ) -> SearchResult<ReindexResult> {
     let start = Instant::now();
-    let started_ts = chrono::Utc::now().timestamp_micros();
+    let started_ts = crate::timestamps::now_micros();
 
     // Ensure index directories exist
     layout.ensure_dirs(scope, schema)?;
@@ -435,7 +435,7 @@ pub fn full_reindex(
             schema_hash: schema.clone(),
             docs_indexed: total_applied,
             started_ts,
-            completed_ts: Some(chrono::Utc::now().timestamp_micros()),
+            completed_ts: Some(crate::timestamps::now_micros()),
             max_version,
             success: true,
         };

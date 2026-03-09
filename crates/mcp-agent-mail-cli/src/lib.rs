@@ -9962,7 +9962,7 @@ fn storage_root_write_probe(storage_root: &Path) -> Result<(), std::io::Error> {
     let probe_name = format!(
         ".am-doctor-write-probe-{}-{}",
         std::process::id(),
-        Utc::now().timestamp_micros()
+        mcp_agent_mail_core::timestamps::now_micros()
     );
     let probe_path = storage_root.join(probe_name);
     let file = std::fs::OpenOptions::new()

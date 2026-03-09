@@ -2966,7 +2966,7 @@ fn emit_hybrid_budget_evidence(
     let mode = derivation.decision.mode;
     let decision_id = format!(
         "search.hybrid_budget:{}:{}:{}",
-        chrono::Utc::now().timestamp_micros(),
+        crate::timestamps::now_micros(),
         mode_label(mode),
         query.effective_limit()
     );

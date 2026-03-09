@@ -87,7 +87,7 @@ impl ScreenFilterPresetStore {
     ) {
         let screen_id = screen_id.into();
         let name = name.into();
-        let updated_at_micros = chrono::Utc::now().timestamp_micros();
+        let updated_at_micros = mcp_agent_mail_core::timestamps::now_micros();
         let presets = self.presets_by_screen.entry(screen_id).or_default();
         if let Some(existing) = presets.iter_mut().find(|preset| preset.name == name) {
             existing.description = description;

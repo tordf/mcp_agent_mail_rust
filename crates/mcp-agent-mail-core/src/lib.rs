@@ -32,6 +32,7 @@ pub mod search_types;
 pub mod setup;
 pub mod slo;
 pub mod test_harness;
+pub mod timestamps;
 pub mod toon;
 
 #[cfg(test)]
@@ -102,3 +103,13 @@ pub use search_types::{
     factor_sort_cmp, missing_stage, redact_hit_explanation, redact_report_for_docs,
 };
 pub use slo::{OpClass, PoolHealth};
+pub use test_harness::DeterministicClock;
+pub use timestamps::{
+    ClockSkewMetrics, clock_skew_metrics, clock_skew_reset, iso_to_micros, micros_to_iso,
+    micros_to_naive, naive_to_micros, now_micros, now_micros_raw,
+};
+pub use toon::{
+    EncoderError, EncoderSuccess, FormatDecision, ToonEnvelope, ToonMeta, ToonStats,
+    apply_resource_format, apply_tool_format, apply_toon_format, looks_like_toon_rust_encoder,
+    parse_toon_stats, resolve_encoder, resolve_output_format, run_encoder, validate_encoder,
+};

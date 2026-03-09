@@ -98,7 +98,7 @@ impl ShadowComparison {
             legacy_result_count: legacy_ids.len(),
             v3_result_count: v3_ids.len(),
             query_text: query_text.to_string(),
-            timestamp_us: chrono::Utc::now().timestamp_micros(),
+            timestamp_us: crate::timestamps::now_micros(),
         }
     }
 

@@ -641,7 +641,6 @@ fn merge_toml_section(
                 if let Some(section) = parse_toml_section_header(raw_line) {
                     if in_target_section {
                         merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
-                        in_target_section = false;
                     }
 
                     in_target_section = section == section_header.trim_matches(['[', ']']);
@@ -1059,7 +1058,7 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
     }
 
     // Atomic write: write to unique temp file in same directory, then rename
-    let ts = chrono::Utc::now().timestamp_micros();
+    let ts = crate::timestamps::now_micros();
     let pid = std::process::id();
     let file_name = action
         .file_path

@@ -242,7 +242,7 @@ impl TwoTierIndex {
                 fast_embedder_id: "potion-128m".to_owned(),
                 quality_embedder_id: "minilm-384".to_owned(),
                 doc_count: 0,
-                built_at: chrono::Utc::now().timestamp(),
+                built_at: crate::timestamps::now_micros() / 1_000_000,
                 status: IndexStatus::Complete {
                     fast_latency_ms: 0,
                     quality_latency_ms: 0,
@@ -279,7 +279,7 @@ impl TwoTierIndex {
                     fast_embedder_id: fast_embedder_id.into(),
                     quality_embedder_id: quality_embedder_id.into(),
                     doc_count: 0,
-                    built_at: chrono::Utc::now().timestamp(),
+                    built_at: crate::timestamps::now_micros() / 1_000_000,
                     status: IndexStatus::Complete {
                         fast_latency_ms: 0,
                         quality_latency_ms: 0,
@@ -349,7 +349,7 @@ impl TwoTierIndex {
                 fast_embedder_id: fast_embedder_id.into(),
                 quality_embedder_id: quality_embedder_id.into(),
                 doc_count,
-                built_at: chrono::Utc::now().timestamp(),
+                built_at: crate::timestamps::now_micros() / 1_000_000,
                 status: IndexStatus::Complete {
                     fast_latency_ms: 0,
                     quality_latency_ms: 0,

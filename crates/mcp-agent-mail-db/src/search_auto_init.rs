@@ -170,7 +170,7 @@ impl TwoTierContext {
         let _init_span = tracing::info_span!("two_tier.init").entered();
 
         let init_attempts = next_init_attempt();
-        let init_timestamp = chrono::Utc::now().timestamp();
+        let init_timestamp = crate::timestamps::now_micros() / 1_000_000;
 
         let fast_start = Instant::now();
         let fast_embedder = get_fast_embedder();
