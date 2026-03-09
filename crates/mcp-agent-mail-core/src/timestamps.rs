@@ -89,11 +89,12 @@ pub fn now_micros() -> i64 {
         // Normal forward progress — fetch_max already stored `current`.
         current
     } else {
-        // Clock stood still or went backward; advance by 1 past the
-        // high-water mark to guarantee strict monotonicity.
-        let next = prev + 1;
-        LAST_SYSTEM_TIME_US.fetch_max(next, Ordering::AcqRel);
-        next
+        // Clock stood still or went backward. Atomically increment the
+        // high-water mark to guarantee each concurrent caller gets a
+        // unique value. fetch_add is a single atomic RMW — no TOCTOU
+        // window where two threads could read the same prev and both
+        // compute prev+1.
+        LAST_SYSTEM_TIME_US.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
 
