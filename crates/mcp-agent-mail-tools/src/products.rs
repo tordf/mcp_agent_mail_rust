@@ -9,7 +9,7 @@
 use asupersync::Cx;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{DbPool, ProductRow, micros_to_iso};
+use mcp_agent_mail_db::{DbError, DbPool, ProductRow, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,7 +17,8 @@ use crate::llm;
 use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, SingleThreadResponse};
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent,
+    resolve_project,
 };
 
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -60,12 +61,60 @@ fn generate_product_uid(now_micros: i64) -> String {
     out
 }
 
+fn parse_fetch_inbox_product_limit(limit: Option<i32>) -> McpResult<usize> {
+    let mut msg_limit = limit.unwrap_or(20);
+    if msg_limit <= 0 {
+        return Ok(0);
+    }
+    if msg_limit > 1000 {
+        tracing::info!(
+            "fetch_inbox_product limit {} is very large; capping at 1000",
+            msg_limit
+        );
+        msg_limit = 1000;
+    }
+    usize::try_from(msg_limit).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit exceeds supported range: {msg_limit}"),
+            true,
+            serde_json::json!({ "provided": msg_limit, "min": 1, "max": 1000 }),
+        )
+    })
+}
+
+fn parse_product_since_ts(since_ts: Option<&str>) -> Option<i64> {
+    match since_ts {
+        None => None,
+        Some(raw) => {
+            let parsed = mcp_agent_mail_db::iso_to_micros(raw);
+            if parsed.is_none() {
+                tracing::debug!(
+                    since_ts = raw,
+                    "ignoring invalid fetch_inbox_product since_ts to preserve Python parity"
+                );
+            }
+            parsed
+        }
+    }
+}
+
+fn parse_product_thread_limit(per_thread_limit: Option<i32>) -> Option<usize> {
+    per_thread_limit.and_then(|limit| {
+        if limit <= 0 {
+            None
+        } else {
+            usize::try_from(limit).ok()
+        }
+    })
+}
+
 async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Option<ProductRow>> {
     use mcp_agent_mail_db::sqlmodel::{Model, Value};
 
     let conn = match pool.acquire(cx).await {
         Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Err(McpError::internal_error(e.to_string())),
+        Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
         Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
         Outcome::Panicked(p) => {
             return Err(McpError::internal_error(format!(
@@ -80,13 +129,22 @@ async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Opti
     let rows = conn.query_sync(sql, &params);
     let elapsed = mcp_agent_mail_db::elapsed_us(start);
     mcp_agent_mail_db::tracking::record_query(sql, elapsed);
-    let rows = rows.map_err(|e| McpError::internal_error(e.to_string()))?;
+    let rows = rows.map_err(|e| product_lookup_db_error_to_mcp_error(e.to_string()))?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(None);
     };
     let product =
         ProductRow::from_row(&row).map_err(|e| McpError::internal_error(e.to_string()))?;
     Ok(Some(product))
+}
+
+fn product_lookup_db_error_to_mcp_error(message: String) -> McpError {
+    let db_error = if mcp_agent_mail_db::is_lock_error(&message) {
+        DbError::ResourceBusy(message)
+    } else {
+        DbError::Sqlite(message)
+    };
+    db_error_to_mcp_error(db_error)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,20 +518,15 @@ pub async fn fetch_inbox_product(
         mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
     )?;
 
-    let raw_limit = limit.unwrap_or(20);
-    let max_messages = if raw_limit == 0 {
-        usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-    } else {
-        usize::try_from(raw_limit.abs()).unwrap_or(20)
-    };
+    let max_messages = parse_fetch_inbox_product_limit(limit)?;
+    if max_messages == 0 {
+        return Ok("[]".to_string());
+    }
     let urgent = urgent_only.unwrap_or(false);
     let with_bodies = include_bodies.unwrap_or(false);
-    let since_micros = since_ts
-        .as_deref()
-        .and_then(mcp_agent_mail_db::iso_to_micros);
+    let since_micros = parse_product_since_ts(since_ts.as_deref());
 
-    let mut items: Vec<(i64, i64, InboxMessage)> =
-        Vec::with_capacity(usize::try_from(limit.unwrap_or(20).abs()).unwrap_or(20)); // (created_ts, id, msg)
+    let mut items: Vec<(i64, i64, InboxMessage)> = Vec::with_capacity(max_messages); // (created_ts, id, msg)
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         // Skip if agent doesn't exist in this project.
@@ -498,8 +551,8 @@ pub async fn fetch_inbox_product(
             let msg = row.message;
             let created_ts = msg.created_ts;
             let id = msg.id.unwrap_or(0);
-            let recipients: serde_json::Value =
-                serde_json::from_str(&msg.recipients_json).unwrap_or_else(|_| serde_json::json!({}));
+            let recipients: serde_json::Value = serde_json::from_str(&msg.recipients_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
             let to = recipients["to"]
                 .as_array()
                 .cloned()
@@ -595,18 +648,18 @@ pub async fn summarize_thread_product(
         mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
     )?;
 
+    let msg_limit = parse_product_thread_limit(per_thread_limit);
     let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> =
-        Vec::with_capacity(usize::try_from(per_thread_limit.unwrap_or(50).abs()).unwrap_or(50));
+        Vec::with_capacity(msg_limit.unwrap_or(50));
     for p in projects {
         let project_id = p.id.unwrap_or(0);
-        let limit = per_thread_limit.and_then(|v| usize::try_from(v.abs()).ok());
         let msgs = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::list_thread_messages(
                 ctx.cx(),
                 &pool,
                 project_id,
                 &thread_id,
-                limit,
+                msg_limit,
             )
             .await,
         )?;
@@ -1055,6 +1108,55 @@ mod tests {
         assert!(json.contains("\"next_cursor\":\"cursor-1\""));
         let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.next_cursor.as_deref(), Some("cursor-1"));
+    }
+
+    #[test]
+    fn fetch_inbox_product_non_positive_limit_returns_empty_result_window() {
+        assert_eq!(
+            parse_fetch_inbox_product_limit(Some(0)).expect("zero limit should be accepted"),
+            0
+        );
+        assert_eq!(
+            parse_fetch_inbox_product_limit(Some(-5))
+                .expect("negative limit should collapse to empty window"),
+            0
+        );
+    }
+
+    #[test]
+    fn fetch_inbox_product_limit_caps_large_values() {
+        assert_eq!(
+            parse_fetch_inbox_product_limit(Some(5_000)).expect("large limit should cap"),
+            1000
+        );
+    }
+
+    #[test]
+    fn fetch_inbox_product_invalid_since_ts_is_ignored() {
+        assert_eq!(parse_product_since_ts(Some("2026/03/09 12:00:00")), None);
+    }
+
+    #[test]
+    fn summarize_thread_product_non_positive_limit_means_unbounded() {
+        assert_eq!(parse_product_thread_limit(Some(0)), None);
+        assert_eq!(parse_product_thread_limit(Some(-5)), None);
+        assert_eq!(parse_product_thread_limit(Some(7)), Some(7));
+    }
+
+    #[test]
+    fn product_lookup_lock_error_maps_to_resource_busy() {
+        let err = product_lookup_db_error_to_mcp_error("database is locked".to_string());
+        let data = err.data.expect("expected data payload");
+        assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+        assert_eq!(data["error"]["recoverable"], true);
+    }
+
+    #[test]
+    fn product_lookup_generic_sqlite_error_stays_database_error() {
+        let err = product_lookup_db_error_to_mcp_error("constraint violation".to_string());
+        let data = err.data.expect("expected data payload");
+        assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+        assert_eq!(data["error"]["recoverable"], true);
     }
 
     // -----------------------------------------------------------------------

@@ -91,16 +91,20 @@ pub const VALID_CONTACT_POLICIES: &[&str] = &["open", "auto", "contacts_only", "
 
 /// Normalize a contact policy string.
 ///
-/// Trims whitespace, lowercases, and returns the value if it matches a known
-/// policy. Unknown values log a warning and default to `"auto"`.
+/// Trims whitespace and lowercases without changing semantic intent.
 #[must_use]
 pub fn normalize_contact_policy(raw: &str) -> String {
-    let norm = raw.trim().to_ascii_lowercase();
+    raw.trim().to_ascii_lowercase()
+}
+
+fn parse_contact_policy(raw: &str) -> String {
+    let norm = normalize_contact_policy(raw);
     if VALID_CONTACT_POLICIES.contains(&norm.as_str()) {
         norm
     } else {
         tracing::warn!(
             raw = raw,
+            normalized = norm,
             "unknown contact policy {raw:?}, defaulting to \"auto\"; \
              valid policies: {VALID_CONTACT_POLICIES:?}"
         );
@@ -559,7 +563,7 @@ pub async fn set_contact_policy(
     agent_name: String,
     policy: String,
 ) -> McpResult<String> {
-    let policy_norm = normalize_contact_policy(&policy);
+    let policy_norm = parse_contact_policy(&policy);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -622,14 +626,30 @@ mod tests {
     }
 
     #[test]
-    fn unknown_policies_default_to_auto() {
-        assert_eq!(normalize_contact_policy(""), "auto");
-        assert_eq!(normalize_contact_policy("invalid"), "auto");
-        assert_eq!(normalize_contact_policy("reject"), "auto");
-        assert_eq!(normalize_contact_policy("allow"), "auto");
-        assert_eq!(normalize_contact_policy("block"), "auto");
-        assert_eq!(normalize_contact_policy("none"), "auto");
-        assert_eq!(normalize_contact_policy("contacts-only"), "auto");
+    fn unknown_policies_are_not_silently_coerced() {
+        assert_eq!(normalize_contact_policy(""), "");
+        assert_eq!(normalize_contact_policy("invalid"), "invalid");
+        assert_eq!(normalize_contact_policy("reject"), "reject");
+        assert_eq!(normalize_contact_policy("allow"), "allow");
+        assert_eq!(normalize_contact_policy("block"), "block");
+        assert_eq!(normalize_contact_policy("none"), "none");
+        assert_eq!(normalize_contact_policy("contacts-only"), "contacts-only");
+    }
+
+    #[test]
+    fn parse_contact_policy_coerces_invalid_values_to_auto() {
+        for raw in [
+            "",
+            "invalid",
+            "reject",
+            "allow",
+            "block",
+            "none",
+            "contacts-only",
+        ] {
+            let parsed = parse_contact_policy(raw);
+            assert_eq!(parsed, "auto", "unexpected coercion result for {raw:?}");
+        }
     }
 
     // ── Response type serialization ──
@@ -799,14 +819,13 @@ mod tests {
 
     #[test]
     fn policy_normalization_rejects_hyphenated_variants() {
-        // Users might try hyphenated versions — these should default to auto
-        assert_eq!(normalize_contact_policy("block-all"), "auto");
-        assert_eq!(normalize_contact_policy("contacts-only"), "auto");
+        assert_eq!(normalize_contact_policy("block-all"), "block-all");
+        assert_eq!(normalize_contact_policy("contacts-only"), "contacts-only");
     }
 
     #[test]
     fn policy_normalization_rejects_null_byte() {
-        assert_eq!(normalize_contact_policy("open\0"), "auto");
+        assert_eq!(normalize_contact_policy("open\0"), "open\0");
     }
 
     #[test]
