@@ -455,6 +455,17 @@ mod route_regressions {
         assert!(html.contains(r#"@change="handleImportanceFilterChange()""#));
         assert!(html.contains("async handleImportanceFilterChange()"));
     }
+
+    #[test]
+    fn render_unified_inbox_mark_read_feedback_accounts_for_already_read() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("unified-mark-read-feedback");
+        let html = render_unified_inbox(&cx, &pool, 10, None, false)
+            .expect("unified inbox render should succeed")
+            .expect("unified inbox should return html");
+        assert!(html.contains("alreadyReadCount"));
+        assert!(html.contains("selected recipient message(s) were already read"));
+    }
 }
 
 fn get_pool() -> Result<DbPool, (u16, String)> {

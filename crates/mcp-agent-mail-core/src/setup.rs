@@ -1362,11 +1362,7 @@ fn normalize_status_url_path(path: &str) -> String {
     if !normalized.ends_with('/') {
         normalized.push('/');
     }
-    if normalized == "/api/" || normalized == "/mcp/" {
-        "/mcp-api/".to_string()
-    } else {
-        normalized
-    }
+    normalized
 }
 
 // ---------------------------------------------------------------------------
@@ -2297,7 +2293,7 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
-    fn check_config_file_treats_api_and_mcp_paths_as_equivalent() {
+    fn check_config_file_distinguishes_api_and_mcp_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.json");
         let content = merge_mcp_server(
@@ -2311,7 +2307,7 @@ http_headers = { Authorization = "Bearer tok" }
 
         let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
         assert!(has_server);
-        assert!(url_matches);
+        assert!(!url_matches);
     }
 
     #[test]
@@ -2322,7 +2318,7 @@ http_headers = { Authorization = "Bearer tok" }
             None,
             "mcpServers",
             "mcp-agent-mail",
-            json!({"url": "http://localhost:8765/api/"}),
+            json!({"url": "http://localhost:8765/mcp/"}),
         )
         .unwrap();
         std::fs::write(&path, &content).unwrap();

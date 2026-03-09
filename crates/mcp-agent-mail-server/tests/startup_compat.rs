@@ -6,8 +6,8 @@
 //! change has been introduced and requires explicit approval + migration rationale.
 //!
 //! Contract surface:
-//!   - Default port 8765, default host 127.0.0.1
-//!   - Default MCP path `/mcp/` (serve binary) and `/api/` (config default)
+//!   - Default port 8765, default host 0.0.0.0
+//!   - Default MCP path `/mcp/` across CLI, setup, and serve
 //!   - Path aliasing: `/api/*` ↔ `/mcp/*` interchangeable
 //!   - Health endpoints bypass auth: `/health/liveness`, `/health/readiness`, `/healthz`
 //!   - OAuth well-known at `/.well-known/oauth-authorization-server`
@@ -36,23 +36,22 @@ fn compat_default_port_is_8765() {
 }
 
 #[test]
-fn compat_default_host_is_localhost() {
+fn compat_default_host_is_wildcard() {
     let config = Config::default();
     assert_eq!(
-        config.http_host, "127.0.0.1",
-        "COMPAT LOCK: Default host MUST be 127.0.0.1 (IPv4 localhost). \
-         Binding to 0.0.0.0 or :: would expose the server to the network."
+        config.http_host, "0.0.0.0",
+        "COMPAT LOCK: Default host MUST be 0.0.0.0. \
+         Operators use the built-in mail UI remotely, so wildcard bind is intentional."
     );
 }
 
 #[test]
-fn compat_default_config_path_is_api() {
+fn compat_default_config_path_is_mcp() {
     let config = Config::default();
     assert_eq!(
-        config.http_path, "/api/",
-        "COMPAT LOCK: Config default path MUST be /api/. \
-         The serve binary overrides this to /mcp/ via ServeDefault, \
-         but the config layer must remain /api/ for backward compatibility."
+        config.http_path, "/mcp/",
+        "COMPAT LOCK: Config default path MUST be /mcp/. \
+         Diverging config/setup defaults from the live server path breaks MCP clients."
     );
 }
 
@@ -352,16 +351,10 @@ fn compat_rate_limit_disabled_by_default() {
 #[test]
 fn compat_serve_default_path_is_mcp() {
     // When no --path, --transport=auto, and no HTTP_PATH env var,
-    // the serve binary MUST default to /mcp/ (not /api/).
-    // This is the critical compatibility contract for existing agent configs.
-    //
-    // Note: We can't call resolve_serve_http_path directly since it's in the
-    // binary crate, but we verify the contract indirectly through config.
-    // The serve binary tests in main.rs verify the exact resolution logic.
+    // the CLI/server shared config MUST default to /mcp/.
+    // This keeps `am`, `mcp-agent-mail serve`, and generated MCP configs aligned.
     let config = Config::default();
-    // Config default is /api/, but serve binary overrides to /mcp/.
-    // We verify the config default hasn't silently changed.
-    assert_eq!(config.http_path, "/api/");
+    assert_eq!(config.http_path, "/mcp/");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

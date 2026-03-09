@@ -4807,6 +4807,7 @@ pub fn process_markdown_images(
     let mut result = body_md.to_string();
     let mut all_meta = Vec::new();
     let mut all_rel_paths = Vec::new();
+    let mut seen_attachment_fingerprints = std::collections::HashSet::new();
 
     for (full_match, alt, stored_result) in converted {
         let stored = stored_result?;
@@ -4824,8 +4825,18 @@ pub fn process_markdown_images(
         // since the base64 string is already fully embedded in the markdown body above.
         let mut meta = stored.meta;
         meta.data_base64 = None;
-        all_meta.push(meta);
+        let fingerprint = (
+            meta.sha1.clone(),
+            meta.kind.clone(),
+            meta.path.clone(),
+            meta.original_path.clone(),
+        );
+        if seen_attachment_fingerprints.insert(fingerprint) {
+            all_meta.push(meta);
+        }
     }
+    let mut seen_rel_paths = std::collections::HashSet::new();
+    all_rel_paths.retain(|path| seen_rel_paths.insert(path.clone()));
 
     Ok((result, all_meta, all_rel_paths))
 }
@@ -8650,6 +8661,42 @@ mod tests {
         // Should be replaced with data URI
         assert!(new_body.contains("data:image/webp;base64,"));
         assert!(!new_body.contains("diagram.png"));
+    }
+
+    #[test]
+    fn test_process_markdown_images_deduplicates_repeated_references() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "md-repeat-proj").unwrap();
+
+        let img_path = archive.root.join("diagram.png");
+        create_test_png(&img_path);
+
+        let body = "One ![diagram](diagram.png)\nTwo ![diagram](diagram.png)";
+        let (new_body, meta, rel_paths) =
+            process_markdown_images(&archive, &config, &archive.root, body, EmbedPolicy::File)
+                .unwrap();
+
+        assert_eq!(
+            new_body.matches("attachments/").count(),
+            2,
+            "both markdown image references should still be rewritten"
+        );
+        assert_eq!(
+            meta.len(),
+            1,
+            "repeated references to the same stored attachment should not duplicate metadata"
+        );
+
+        let unique_rel_paths = rel_paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            rel_paths.len(),
+            unique_rel_paths.len(),
+            "relative archive paths should be deduplicated"
+        );
     }
 
     #[test]

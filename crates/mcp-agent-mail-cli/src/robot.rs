@@ -3396,6 +3396,82 @@ enum NavigateResult {
     },
 }
 
+fn build_navigate_file_reservations(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    query: &std::collections::HashMap<String, String>,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let active_only = query
+        .get("active_only")
+        .is_none_or(|value| parse_resource_bool(Some(value)));
+    let now_us = mcp_agent_mail_db::now_micros();
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    let released_ts_sql = reservation_released_ts_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+
+    let (sql, params) = if active_only {
+        (
+            format!(
+                "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
+                 FROM file_reservations fr{active_reservation_join}
+                 JOIN agents a ON a.id = fr.agent_id
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
+                 ORDER BY fr.created_ts DESC LIMIT 50"
+            ),
+            vec![Value::BigInt(project_id), Value::BigInt(now_us)],
+        )
+    } else {
+        (
+            format!(
+                "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
+                 FROM file_reservations fr{active_reservation_join}
+                 JOIN agents a ON a.id = fr.agent_id
+                 WHERE fr.project_id = ?
+                 ORDER BY fr.created_ts DESC LIMIT 50"
+            ),
+            vec![Value::BigInt(project_id)],
+        )
+    };
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|e| CliError::Other(format!("navigate reservations query failed: {e}")))?;
+
+    let reservations: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "path": r.get_named::<String>("path_pattern").unwrap_or_default(),
+                "agent": r.get_named::<String>("name").unwrap_or_default(),
+                "exclusive": r.get_named::<i64>("exclusive").unwrap_or(0) == 1,
+                "expires_ts": r.get_named::<i64>("expires_ts").unwrap_or(0),
+                "released": reservation_is_released(r.get_named::<i64>("released_ts").ok()),
+            })
+        })
+        .collect();
+
+    Ok((
+        NavigateResult::Generic {
+            resource_type: "file_reservations".to_string(),
+            data: serde_json::json!({ "reservations": reservations }),
+        },
+        Some(project_slug.to_string()),
+    ))
+}
+
 fn build_navigate(
     conn: &DbConn,
     uri: &str,
@@ -3457,6 +3533,13 @@ fn build_navigate(
             Ok((
                 NavigateResult::Agents { agents },
                 Some(resolved_project_slug),
+            ))
+        }
+        ["agents"] => {
+            let agents = build_agents(conn, effective_project_id, false, None)?;
+            Ok((
+                NavigateResult::Agents { agents },
+                Some(effective_project_slug.clone()),
             ))
         }
         ["inbox", agent_name] => {
@@ -3522,77 +3605,21 @@ fn build_navigate(
                 Some(effective_project_slug.clone()),
             ))
         }
-        ["file_reservations", project_key] => {
+        ["file_reservations"] | ["reservations"] => build_navigate_file_reservations(
+            conn,
+            effective_project_id,
+            &effective_project_slug,
+            &query,
+        ),
+        ["file_reservations", project_key] | ["reservations", project_key] => {
             let (resolved_project_id, resolved_project_slug) =
                 resolve_project_sync(conn, project_key)?;
-            let active_only = query
-                .get("active_only")
-                .is_none_or(|value| parse_resource_bool(Some(value)));
-            let now_us = mcp_agent_mail_db::now_micros();
-            let has_release_ledger = has_file_reservation_release_ledger(conn);
-            let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-            let active_reservation_join =
-                active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-            let active_reservation_predicate = active_reservation_filter_sql(
-                has_release_ledger,
-                has_legacy_released_ts_column,
-                "fr",
-                "rr",
-            );
-            let released_ts_sql = reservation_released_ts_sql(
-                has_release_ledger,
-                has_legacy_released_ts_column,
-                "fr",
-                "rr",
-            );
-
-            let (sql, params) = if active_only {
-                (
-                    format!(
-                        "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
-                         FROM file_reservations fr{active_reservation_join}
-                         JOIN agents a ON a.id = fr.agent_id
-                         WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
-                         ORDER BY fr.created_ts DESC LIMIT 50"
-                    ),
-                    vec![Value::BigInt(resolved_project_id), Value::BigInt(now_us)],
-                )
-            } else {
-                (
-                    format!(
-                        "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
-                     FROM file_reservations fr{active_reservation_join}
-                     JOIN agents a ON a.id = fr.agent_id
-                     WHERE fr.project_id = ?
-                     ORDER BY fr.created_ts DESC LIMIT 50"
-                    ),
-                    vec![Value::BigInt(resolved_project_id)],
-                )
-            };
-            let rows = conn
-                .query_sync(&sql, &params)
-                .map_err(|e| CliError::Other(format!("navigate reservations query failed: {e}")))?;
-
-            let reservations: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "path": r.get_named::<String>("path_pattern").unwrap_or_default(),
-                        "agent": r.get_named::<String>("name").unwrap_or_default(),
-                        "exclusive": r.get_named::<i64>("exclusive").unwrap_or(0) == 1,
-                        "expires_ts": r.get_named::<i64>("expires_ts").unwrap_or(0),
-                        "released": reservation_is_released(r.get_named::<i64>("released_ts").ok()),
-                    })
-                })
-                .collect();
-
-            Ok((
-                NavigateResult::Generic {
-                    resource_type: "file_reservations".to_string(),
-                    data: serde_json::json!({ "reservations": reservations }),
-                },
-                Some(resolved_project_slug),
-            ))
+            build_navigate_file_reservations(
+                conn,
+                resolved_project_id,
+                &resolved_project_slug,
+                &query,
+            )
         }
         ["mailbox", agent_name] => {
             let agent_opt = resolve_agent_id(conn, effective_project_id, Some(agent_name))?;
@@ -3654,10 +3681,14 @@ fn build_navigate(
              - resource://projects\n\
              - resource://project/<slug>\n\
              - resource://agents/<slug>\n\
+             - resource://agents?project=<slug>\n\
              - resource://inbox/<agent>\n\
              - resource://message/<id>\n\
              - resource://thread/<id>\n\
              - resource://file_reservations/<slug>\n\
+             - resource://file_reservations?project=<slug>\n\
+             - resource://reservations/<slug>\n\
+             - resource://reservations?project=<slug>\n\
              - resource://mailbox/<agent>\n\
              - resource://outbox/<agent>"
         ))),
@@ -6643,6 +6674,23 @@ mod tests {
         }
         assert_eq!(agents_scope.as_deref(), Some("proj"));
 
+        let (agents_query_result, agents_query_scope) = build_navigate(
+            &conn,
+            &format!("resource://agents?project={encoded_project_key}"),
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate agents by query-scoped project");
+        match agents_query_result {
+            NavigateResult::Agents { agents } => {
+                assert_eq!(agents.len(), 1);
+                assert_eq!(agents[0].name, "Sender");
+            }
+            other => panic!("unexpected agents query result: {other:?}"),
+        }
+        assert_eq!(agents_query_scope.as_deref(), Some("proj"));
+
         let (reservations_result, reservations_scope) = build_navigate(
             &conn,
             &format!("resource://file_reservations/{encoded_project_key}"),
@@ -6662,6 +6710,46 @@ mod tests {
             other => panic!("unexpected reservations result: {other:?}"),
         }
         assert_eq!(reservations_scope.as_deref(), Some("proj"));
+
+        let (reservations_query_result, reservations_query_scope) = build_navigate(
+            &conn,
+            &format!("resource://file_reservations?project={encoded_project_key}"),
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate query-scoped reservations");
+        match reservations_query_result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "file_reservations");
+                assert_eq!(data["reservations"].as_array().map(Vec::len), Some(1));
+            }
+            other => panic!("unexpected query reservations result: {other:?}"),
+        }
+        assert_eq!(reservations_query_scope.as_deref(), Some("proj"));
+
+        let (reservations_alias_result, reservations_alias_scope) = build_navigate(
+            &conn,
+            &format!("resource://reservations?project={encoded_project_key}"),
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate reservations alias");
+        match reservations_alias_result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "file_reservations");
+                assert_eq!(data["reservations"].as_array().map(Vec::len), Some(1));
+            }
+            other => panic!("unexpected reservations alias result: {other:?}"),
+        }
+        assert_eq!(reservations_alias_scope.as_deref(), Some("proj"));
 
         conn.query_sync(
             "UPDATE file_reservations SET released_ts = 3000 WHERE id = 1",

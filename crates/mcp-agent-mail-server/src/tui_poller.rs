@@ -1171,65 +1171,186 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-const RESERVATION_LEGACY_SCAN_SQL: &str = "SELECT \
-   fr.id, \
-   fr.project_id AS raw_project_id, \
-   COALESCE(p.slug, '[unknown-project]') AS project_slug, \
-   COALESCE(a.name, '[unknown-agent]') AS agent_name, \
-   fr.path_pattern, \
-   fr.\"exclusive\", \
-   fr.created_ts AS raw_created_ts, \
-   fr.expires_ts AS raw_expires_ts, \
-   fr.released_ts AS raw_released_ts \
- FROM file_reservations fr \
- LEFT JOIN projects p ON p.id = fr.project_id \
- LEFT JOIN agents a ON a.id = fr.agent_id";
-
-static RESERVATION_ACTIVE_FAST_SQL: OnceLock<String> = OnceLock::new();
-static RESERVATION_ACTIVE_FAST_COUNTS_SQL: OnceLock<String> = OnceLock::new();
-
-fn reservation_active_fast_snapshots_sql() -> &'static str {
-    RESERVATION_ACTIVE_FAST_SQL
-        .get_or_init(|| {
-            let active_reservation_predicate =
-                mcp_agent_mail_db::queries::active_reservation_predicate_for("fr");
-            format!(
-                "SELECT \
-                   fr.id, \
-                   fr.project_id AS raw_project_id, \
-                   COALESCE(p.slug, '[unknown-project]') AS project_slug, \
-                   COALESCE(a.name, '[unknown-agent]') AS agent_name, \
-                   fr.path_pattern, \
-                   fr.\"exclusive\", \
-                   fr.created_ts AS raw_created_ts, \
-                   fr.expires_ts AS raw_expires_ts, \
-                   fr.released_ts AS raw_released_ts \
-                 FROM file_reservations fr \
-                 LEFT JOIN projects p ON p.id = fr.project_id \
-                 LEFT JOIN agents a ON a.id = fr.agent_id \
-                 WHERE ({active_reservation_predicate}) AND expires_ts > ? \
-                 ORDER BY fr.expires_ts ASC, fr.id ASC \
-                 LIMIT {MAX_RESERVATIONS}"
-            )
+fn has_file_reservations_released_ts_column(conn: &DbConn) -> bool {
+    conn.query_sync("PRAGMA table_info(file_reservations)", &[])
+        .ok()
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.get_named::<String>("name").ok().as_deref() == Some("released_ts"))
         })
-        .as_str()
 }
 
-fn reservation_active_fast_counts_sql() -> &'static str {
-    RESERVATION_ACTIVE_FAST_COUNTS_SQL
-        .get_or_init(|| {
-            let active_reservation_predicate =
-                mcp_agent_mail_db::queries::active_reservation_predicate_for("fr");
-            format!(
-                "SELECT \
-                   fr.project_id AS raw_project_id, \
-                   COUNT(*) AS active_count \
-                 FROM file_reservations fr \
-                 WHERE ({active_reservation_predicate}) AND expires_ts > ? \
-                 GROUP BY fr.project_id"
-            )
-        })
-        .as_str()
+fn has_file_reservation_release_ledger(conn: &DbConn) -> bool {
+    conn.query_sync(
+        "SELECT 1
+         FROM sqlite_master
+         WHERE type = 'table' AND name = 'file_reservation_releases'
+         LIMIT 1",
+        &[],
+    )
+    .ok()
+    .is_some_and(|rows| !rows.is_empty())
+}
+
+fn active_reservation_release_join_sql(
+    has_release_ledger: bool,
+    table_ref: &str,
+    release_alias: &str,
+) -> String {
+    if has_release_ledger {
+        format!(
+            " LEFT JOIN file_reservation_releases {release_alias} ON {release_alias}.reservation_id = {table_ref}.id"
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn legacy_active_reservation_predicate_sql(
+    table_ref: &str,
+    has_legacy_released_ts_column: bool,
+) -> String {
+    if !has_legacy_released_ts_column {
+        return "1 = 1".to_string();
+    }
+    let table_ref = table_ref.trim().trim_end_matches('.');
+    let predicate = mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE;
+    if table_ref.is_empty() || table_ref == "file_reservations" {
+        predicate.to_string()
+    } else {
+        predicate.replace("released_ts", &format!("{table_ref}.released_ts"))
+    }
+}
+
+fn active_reservation_filter_sql(
+    has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
+    table_ref: &str,
+    release_alias: &str,
+) -> String {
+    let legacy = legacy_active_reservation_predicate_sql(table_ref, has_legacy_released_ts_column);
+    match (has_release_ledger, has_legacy_released_ts_column) {
+        (true, true) => format!("({legacy}) AND {release_alias}.reservation_id IS NULL"),
+        (true, false) => format!("{release_alias}.reservation_id IS NULL"),
+        (false, _) => legacy,
+    }
+}
+
+fn reservation_released_ts_sql(
+    has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
+    table_ref: &str,
+    release_alias: &str,
+) -> String {
+    let table_ref = table_ref.trim().trim_end_matches('.');
+    let legacy_release_expr = has_legacy_released_ts_column.then(|| {
+        format!(
+            "CASE \
+                 WHEN {table_ref}.released_ts IS NULL THEN NULL \
+                 WHEN typeof({table_ref}.released_ts) = 'text' THEN \
+                     CAST(strftime('%s', REPLACE(REPLACE({table_ref}.released_ts, 'T', ' '), 'Z', '')) AS INTEGER) * 1000000 + \
+                     CASE WHEN instr({table_ref}.released_ts, '.') > 0 \
+                          THEN CAST(substr({table_ref}.released_ts || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
+                          ELSE 0 \
+                     END \
+                 ELSE {table_ref}.released_ts \
+             END"
+        )
+    });
+    match (has_release_ledger, legacy_release_expr) {
+        (true, Some(legacy_release_expr)) => {
+            format!("COALESCE({release_alias}.released_ts, {legacy_release_expr})")
+        }
+        (true, None) => format!("{release_alias}.released_ts"),
+        (false, Some(legacy_release_expr)) => legacy_release_expr,
+        (false, None) => "NULL".to_string(),
+    }
+}
+
+fn reservation_legacy_scan_sql(
+    has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
+) -> String {
+    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let released_ts_sql = reservation_released_ts_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    format!(
+        "SELECT \
+           fr.id, \
+           fr.project_id AS raw_project_id, \
+           COALESCE(p.slug, '[unknown-project]') AS project_slug, \
+           COALESCE(a.name, '[unknown-agent]') AS agent_name, \
+           fr.path_pattern, \
+           fr.\"exclusive\", \
+           fr.created_ts AS raw_created_ts, \
+           fr.expires_ts AS raw_expires_ts, \
+           {released_ts_sql} AS raw_released_ts \
+         FROM file_reservations fr{release_join} \
+         LEFT JOIN projects p ON p.id = fr.project_id \
+         LEFT JOIN agents a ON a.id = fr.agent_id"
+    )
+}
+
+fn reservation_active_fast_snapshots_sql(
+    has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
+) -> String {
+    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    let released_ts_sql = reservation_released_ts_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    format!(
+        "SELECT \
+           fr.id, \
+           fr.project_id AS raw_project_id, \
+           COALESCE(p.slug, '[unknown-project]') AS project_slug, \
+           COALESCE(a.name, '[unknown-agent]') AS agent_name, \
+           fr.path_pattern, \
+           fr.\"exclusive\", \
+           fr.created_ts AS raw_created_ts, \
+           fr.expires_ts AS raw_expires_ts, \
+           {released_ts_sql} AS raw_released_ts \
+         FROM file_reservations fr{release_join} \
+         LEFT JOIN projects p ON p.id = fr.project_id \
+         LEFT JOIN agents a ON a.id = fr.agent_id \
+         WHERE ({active_reservation_predicate}) AND expires_ts > ? \
+         ORDER BY fr.expires_ts ASC, fr.id ASC \
+         LIMIT {MAX_RESERVATIONS}"
+    )
+}
+
+fn reservation_active_fast_counts_sql(
+    has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
+) -> String {
+    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    format!(
+        "SELECT \
+           fr.project_id AS raw_project_id, \
+           COUNT(*) AS active_count \
+         FROM file_reservations fr{release_join} \
+         WHERE ({active_reservation_predicate}) AND expires_ts > ? \
+         GROUP BY fr.project_id"
+    )
 }
 
 fn reservation_scan_mode(conn: &DbConn, sqlite_path: Option<&str>) -> ReservationScanMode {
@@ -1376,13 +1497,23 @@ fn try_fetch_reservation_snapshot_bundle(
     now: i64,
     sqlite_path: Option<&str>,
 ) -> Option<ReservationSnapshotBundle> {
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let scan_mode = reservation_scan_mode(conn, sqlite_path);
     if scan_mode == ReservationScanMode::ActiveFast {
-        return try_fetch_reservation_snapshot_bundle_fast(conn, now);
+        return try_fetch_reservation_snapshot_bundle_fast(
+            conn,
+            now,
+            has_release_ledger,
+            has_legacy_released_ts_column,
+        );
     }
     let rows = match scan_mode {
         ReservationScanMode::ActiveFast => unreachable!("handled by fast-path early return"),
-        ReservationScanMode::FullLegacy => conn.query_sync(RESERVATION_LEGACY_SCAN_SQL, &[]),
+        ReservationScanMode::FullLegacy => conn.query_sync(
+            &reservation_legacy_scan_sql(has_release_ledger, has_legacy_released_ts_column),
+            &[],
+        ),
     };
     let rows = match rows {
         Ok(rows) => rows,
@@ -1473,19 +1604,23 @@ fn try_fetch_reservation_snapshot_bundle(
 fn try_fetch_reservation_snapshot_bundle_fast(
     conn: &DbConn,
     now: i64,
+    has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
 ) -> Option<ReservationSnapshotBundle> {
-    let count_rows =
-        match conn.query_sync(reservation_active_fast_counts_sql(), &[Value::BigInt(now)]) {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::debug!(
-                    mode = ?ReservationScanMode::ActiveFast,
-                    error = ?err,
-                    "tui_poller.fetch_reservation_snapshots count query failed"
-                );
-                return None;
-            }
-        };
+    let count_rows = match conn.query_sync(
+        &reservation_active_fast_counts_sql(has_release_ledger, has_legacy_released_ts_column),
+        &[Value::BigInt(now)],
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::debug!(
+                mode = ?ReservationScanMode::ActiveFast,
+                error = ?err,
+                "tui_poller.fetch_reservation_snapshots count query failed"
+            );
+            return None;
+        }
+    };
 
     let mut active_count = 0_u64;
     let mut active_counts_by_project: HashMap<i64, u64> = HashMap::new();
@@ -1514,7 +1649,7 @@ fn try_fetch_reservation_snapshot_bundle_fast(
     }
 
     let snapshot_rows = match conn.query_sync(
-        reservation_active_fast_snapshots_sql(),
+        &reservation_active_fast_snapshots_sql(has_release_ledger, has_legacy_released_ts_column),
         &[Value::BigInt(now)],
     ) {
         Ok(rows) => rows,
@@ -2956,6 +3091,128 @@ mod tests {
 
         let counts = DbStatQueryBatcher::new(&conn).fetch_counts();
         assert_eq!(counts.file_reservations, 4);
+    }
+
+    #[test]
+    fn reservation_snapshot_bundle_supports_release_ledger_without_legacy_released_ts_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservation_release_ledger_only.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync(
+            "CREATE TABLE file_reservation_releases (
+                reservation_id INTEGER PRIMARY KEY,
+                released_ts INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create release ledger");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'proj')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts)
+             VALUES
+                (1, 1, 1, 'src/**', 1, 1000, 4102444800000000),
+                (2, 1, 1, 'docs/**', 1, 1000, 4102444800000000)",
+            &[],
+        )
+        .expect("insert reservations");
+        conn.execute_sync(
+            "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (2, 2000)",
+            &[],
+        )
+        .expect("insert release");
+
+        assert_eq!(
+            detect_reservation_scan_mode(&conn),
+            ReservationScanMode::FullLegacy
+        );
+
+        let bundle = fetch_reservation_snapshot_bundle(&conn, now_micros(), None);
+        assert_eq!(bundle.active_count, 1);
+        assert_eq!(bundle.snapshots.len(), 1);
+        assert_eq!(bundle.snapshots[0].path_pattern, "src/**");
+    }
+
+    #[test]
+    fn reservation_snapshot_bundle_fast_path_supports_legacy_schema_without_release_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_reservation_no_release_ledger.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                exclusive INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER,
+                released_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'proj')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, exclusive, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/**', 1, 1000, 4102444800000000, NULL),
+                (2, 1, 1, 'docs/**', 1, 1000, 4102444800000000, 2000)",
+            &[],
+        )
+        .expect("insert reservations");
+
+        assert_eq!(
+            detect_reservation_scan_mode(&conn),
+            ReservationScanMode::ActiveFast
+        );
+
+        let bundle = fetch_reservation_snapshot_bundle(&conn, now_micros(), None);
+        assert_eq!(bundle.active_count, 1);
+        assert_eq!(bundle.snapshots.len(), 1);
+        assert_eq!(bundle.snapshots[0].path_pattern, "src/**");
     }
 
     // ── Additional coverage tests ────────────────────────────────────

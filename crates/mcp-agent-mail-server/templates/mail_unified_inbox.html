@@ -1383,6 +1383,7 @@ function unifiedInboxManager() {
 
         const successfulRecipientsByMessage = new Map();
         let markedCount = 0;
+        let alreadyReadCount = 0;
         let failedRequestCount = 0;
         for (const outcome of settledRequests) {
           if (outcome.status !== 'fulfilled') {
@@ -1391,8 +1392,12 @@ function unifiedInboxManager() {
           }
           const { request, payload } = outcome.value;
           const marked = Number(payload?.marked_count ?? 0);
+          const alreadyRead = Number(payload?.already_read_count ?? 0);
           if (Number.isFinite(marked)) {
             markedCount += marked;
+          }
+          if (Number.isFinite(alreadyRead)) {
+            alreadyReadCount += alreadyRead;
           }
           for (const messageId of request.messageIds) {
             if (!successfulRecipientsByMessage.has(messageId)) {
@@ -1468,11 +1473,23 @@ function unifiedInboxManager() {
         }
 
         if (typeof window.showToast === 'function') {
+          const markReadSummary = () => {
+            if (markedCount > 0 && alreadyReadCount > 0) {
+              return `Marked ${markedCount} recipient message(s) as read; ${alreadyReadCount} already read`;
+            }
+            if (markedCount > 0) {
+              return `Marked ${markedCount} recipient message(s) as read`;
+            }
+            if (alreadyReadCount > 0) {
+              return `All ${alreadyReadCount} selected recipient message(s) were already read`;
+            }
+            return 'No recipient message(s) changed';
+          };
           if (failedRequestCount === 0) {
-            window.showToast(`Marked ${markedCount} recipient message(s) as read`, 'success');
+            window.showToast(markReadSummary(), markedCount > 0 ? 'success' : 'info');
           } else {
             window.showToast(
-              `Marked ${markedCount} recipient message(s) as read; ${failedRequestCount} request group(s) failed`,
+              `${markReadSummary()}; ${failedRequestCount} request group(s) failed`,
               'warning'
             );
           }

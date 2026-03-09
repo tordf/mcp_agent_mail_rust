@@ -644,7 +644,7 @@ impl Default for Config {
             // HTTP
             http_host: "0.0.0.0".to_string(),
             http_port: 8765,
-            http_path: "/api/".to_string(),
+            http_path: "/mcp/".to_string(),
             http_bearer_token: None,
             http_allow_localhost_unauthenticated: true,
             http_request_log_enabled: false,
@@ -3126,6 +3126,18 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("HTTP_PATH", "api")]);
         let config = Config::from_env();
         assert_eq!(config.http_path, "/api/");
+    }
+
+    #[test]
+    fn default_http_path_is_mcp() {
+        let config = Config::default();
+        assert_eq!(config.http_path, "/mcp/");
+    }
+
+    #[test]
+    fn default_http_host_is_wildcard() {
+        let config = Config::default();
+        assert_eq!(config.http_host, "0.0.0.0");
     }
 
     // -----------------------------------------------------------------------
