@@ -1155,8 +1155,7 @@ pub fn schema_migrations() -> Vec<Migration> {
     migrations.push(Migration::new(
         "v15_add_recipients_json_to_messages".to_string(),
         "add recipients_json column to messages table".to_string(),
-        "ALTER TABLE messages ADD COLUMN recipients_json TEXT NOT NULL DEFAULT '{}'"
-            .to_string(),
+        "ALTER TABLE messages ADD COLUMN recipients_json TEXT NOT NULL DEFAULT '{}'".to_string(),
         String::new(),
     ));
 
@@ -1959,12 +1958,7 @@ mod tests {
 
         block_on({
             let conn = &conn;
-            move |cx| async move {
-                migrate_to_latest(&cx, conn)
-                    .await
-                    .into_result()
-                    .unwrap()
-            }
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
         });
 
         insert_inbox_stats_test_project(&conn);

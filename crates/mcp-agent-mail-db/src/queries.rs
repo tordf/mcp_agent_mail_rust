@@ -1544,8 +1544,8 @@ pub async fn register_agent(
                 let insert_sql = "INSERT INTO agents \
                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                let attach_pol = attachments_policy
-                    .map_or_else(|| "auto".to_string(), |ap| ap.to_string());
+                let attach_pol =
+                    attachments_policy.map_or_else(|| "auto".to_string(), |ap| ap.to_string());
                 let insert_params = [
                     Value::BigInt(project_id),
                     Value::Text(name_s),
@@ -3018,7 +3018,7 @@ pub async fn list_thread_messages(
                  WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
                  ORDER BY created_ts DESC, id DESC \
                  LIMIT ?",
-                 true
+                true,
             )
         }
         (true, None) => (
@@ -3032,7 +3032,7 @@ pub async fn list_thread_messages(
              JOIN agents a ON a.id = m.sender_id \
              WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
              ORDER BY created_ts ASC, id ASC",
-             false
+            false,
         ),
         (false, Some(lim)) => {
             let Ok(limit_i64) = i64::try_from(lim) else {
@@ -3051,7 +3051,7 @@ pub async fn list_thread_messages(
                  WHERE m.project_id = ? AND m.thread_id = ? \
                  ORDER BY created_ts DESC, id DESC \
                  LIMIT ?",
-                 true
+                true,
             )
         }
         (false, None) => (
@@ -3065,7 +3065,7 @@ pub async fn list_thread_messages(
              JOIN agents a ON a.id = m.sender_id \
              WHERE m.project_id = ? AND m.thread_id = ? \
              ORDER BY created_ts ASC, id ASC",
-             false
+            false,
         ),
     };
 

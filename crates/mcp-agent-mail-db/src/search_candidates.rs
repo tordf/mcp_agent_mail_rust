@@ -564,9 +564,8 @@ pub fn prepare_candidates(
         .take(budget.semantic_limit)
         .collect::<Vec<_>>();
 
-    let mut map: HashMap<i64, PreparedCandidate> = HashMap::with_capacity(
-        lexical_trimmed.len().saturating_add(semantic_trimmed.len()),
-    );
+    let mut map: HashMap<i64, PreparedCandidate> =
+        HashMap::with_capacity(lexical_trimmed.len().saturating_add(semantic_trimmed.len()));
 
     for (idx, hit) in lexical_trimmed.iter().enumerate() {
         map.entry(hit.doc_id)
