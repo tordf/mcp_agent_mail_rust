@@ -1227,7 +1227,7 @@ mod tests {
   "from": "Alice",
   "to": ["Bob"],
   "cc": [],
-  "bcc": [],
+  "bcc": ["Carol"],
   "thread_id": "TEST-1",
   "subject": "Hello Bob",
   "importance": "normal",
@@ -1248,11 +1248,11 @@ Hello Bob, this is a test message.
         let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
         assert_eq!(stats.projects, 1);
         assert_eq!(
-            stats.agents, 1,
-            "Alice from profile; Bob auto-created as placeholder"
+            stats.agents, 2,
+            "Alice from profile; Bob and Carol auto-created as placeholders"
         );
         assert_eq!(stats.messages, 1);
-        assert_eq!(stats.recipients, 1);
+        assert_eq!(stats.recipients, 2);
         assert_eq!(stats.parse_errors, 0);
 
         // Verify the message was inserted correctly
@@ -1269,7 +1269,11 @@ Hello Bob, this is a test message.
         let agent_rows = conn
             .query_sync("SELECT name, program FROM agents ORDER BY name", &[])
             .unwrap();
-        assert_eq!(agent_rows.len(), 2, "Alice + Bob should both exist");
+        assert_eq!(
+            agent_rows.len(),
+            3,
+            "Alice, Bob, and Carol should all exist"
+        );
         // Verify Alice has the correct program from profile
         let alice_rows = conn
             .query_sync("SELECT program FROM agents WHERE name = 'Alice'", &[])
@@ -1280,6 +1284,45 @@ Hello Bob, this is a test message.
             .query_sync("SELECT program FROM agents WHERE name = 'Bob'", &[])
             .unwrap();
         assert!(!bob_rows.is_empty());
+        let carol_rows = conn
+            .query_sync("SELECT program FROM agents WHERE name = 'Carol'", &[])
+            .unwrap();
+        assert!(!carol_rows.is_empty());
+
+        let recipient_rows = conn
+            .query_sync(
+                "SELECT a.name AS name, mr.kind AS kind
+                 FROM message_recipients mr
+                 JOIN agents a ON a.id = mr.agent_id
+                 ORDER BY mr.kind, a.name",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(recipient_rows.len(), 2);
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("kind")
+                .expect("first recipient kind"),
+            "bcc"
+        );
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("name")
+                .expect("first recipient name"),
+            "Carol"
+        );
+        assert_eq!(
+            recipient_rows[1]
+                .get_named::<String>("kind")
+                .expect("second recipient kind"),
+            "to"
+        );
+        assert_eq!(
+            recipient_rows[1]
+                .get_named::<String>("name")
+                .expect("second recipient name"),
+            "Bob"
+        );
     }
 
     #[test]

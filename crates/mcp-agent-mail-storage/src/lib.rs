@@ -4001,6 +4001,24 @@ pub fn message_paths(
     })
 }
 
+fn render_message_bundle_content(message: &serde_json::Value, body_md: &str) -> Result<String> {
+    let frontmatter = serde_json::to_string_pretty(message)?;
+    Ok(format!("---json\n{frontmatter}\n---\n\n{body_md}"))
+}
+
+fn redact_message_bcc_for_inbox(message: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = message.clone();
+    if let Some(obj) = redacted.as_object_mut()
+        && obj
+            .get("bcc")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|bcc| !bcc.is_empty())
+    {
+        obj.insert("bcc".to_string(), serde_json::Value::Array(vec![]));
+    }
+    redacted
+}
+
 /// Write a message bundle to the archive: canonical, outbox, and inbox copies.
 ///
 /// The message is written with JSON frontmatter followed by the markdown body.
@@ -4035,22 +4053,29 @@ pub fn write_message_bundle(
             .unwrap_or(0),
     )?;
 
-    // Build frontmatter content
-    let frontmatter = serde_json::to_string_pretty(message)?;
-    let content = format!("---json\n{frontmatter}\n---\n\n{body_md}");
+    // Canonical/outbox copies preserve the full frontmatter for auditability.
+    // Recipient inbox copies must redact BCC so hidden recipients stay hidden.
+    let full_content = render_message_bundle_content(message, body_md)?;
+    let inbox_message = redact_message_bcc_for_inbox(message);
+    let inbox_content = if inbox_message == *message {
+        None
+    } else {
+        Some(render_message_bundle_content(&inbox_message, body_md)?)
+    };
+    let inbox_content_ref = inbox_content.as_deref().unwrap_or(&full_content);
 
     // Create directories and write files
     let mut rel_paths = Vec::new();
 
     // Canonical (ensure_parent_dir handled inside write_text)
-    write_text(&paths.canonical, &content)?;
+    write_text(&paths.canonical, &full_content)?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &paths.canonical,
     )?);
 
     // Outbox
-    write_text(&paths.outbox, &content)?;
+    write_text(&paths.outbox, &full_content)?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &paths.outbox,
@@ -4058,7 +4083,7 @@ pub fn write_message_bundle(
 
     // Inbox copies
     for inbox_path in &paths.inbox {
-        write_text(inbox_path, &content)?;
+        write_text(inbox_path, inbox_content_ref)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
     }
 
@@ -7482,7 +7507,7 @@ mod tests {
             "project": "proj",
             "to": ["VisibleAgent"],
             "cc": [],
-            "bcc": [],
+            "bcc": ["HiddenAgent"],
         });
 
         write_message_bundle(
@@ -7502,6 +7527,34 @@ mod tests {
             hidden_inbox_dir.exists(),
             "bcc recipient should still get inbox copy"
         );
+
+        let canonical_path = fs::read_dir(archive.root.join("messages/2026/01"))
+            .unwrap()
+            .find_map(|entry| entry.ok().map(|entry| entry.path()))
+            .expect("canonical path");
+        let outbox_path = fs::read_dir(archive.root.join("agents/SenderAgent/outbox/2026/01"))
+            .unwrap()
+            .find_map(|entry| entry.ok().map(|entry| entry.path()))
+            .expect("outbox path");
+        let hidden_inbox_path = fs::read_dir(&hidden_inbox_dir)
+            .unwrap()
+            .find_map(|entry| entry.ok().map(|entry| entry.path()))
+            .expect("hidden inbox path");
+
+        let (canonical_frontmatter, _) = read_message_file(&canonical_path).unwrap();
+        assert_eq!(
+            canonical_frontmatter["bcc"],
+            serde_json::json!(["HiddenAgent"])
+        );
+
+        let (outbox_frontmatter, _) = read_message_file(&outbox_path).unwrap();
+        assert_eq!(
+            outbox_frontmatter["bcc"],
+            serde_json::json!(["HiddenAgent"])
+        );
+
+        let (hidden_inbox_frontmatter, _) = read_message_file(&hidden_inbox_path).unwrap();
+        assert_eq!(hidden_inbox_frontmatter["bcc"], serde_json::json!([]));
 
         let digest = archive.root.join("messages/threads/tkt-bcc.md");
         let digest_body = fs::read_to_string(&digest).unwrap();
