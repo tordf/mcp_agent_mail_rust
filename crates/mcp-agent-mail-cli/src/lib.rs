@@ -3012,10 +3012,14 @@ fn handle_serve_http(
         ));
     }
     auto_clear_port(&config.http_host, config.http_port)?;
-    if !no_tui {
+    if config.tui_enabled {
         emit_pre_tui_startup_banner(&config);
     }
-    mcp_agent_mail_server::run_http_with_tui(&config)?;
+    if config.tui_enabled {
+        mcp_agent_mail_server::run_http_with_tui(&config)?;
+    } else {
+        mcp_agent_mail_server::run_http(&config)?;
+    }
     Ok(())
 }
 

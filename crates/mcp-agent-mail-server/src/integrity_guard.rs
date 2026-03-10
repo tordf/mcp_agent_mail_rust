@@ -6,7 +6,7 @@
 //! - periodic quick integrity checks
 //! - periodic full integrity checks (configurable)
 //! - proactive backup refresh on healthy cycles
-//! - automatic file/archive-aware recovery on recoverable failures
+//! - diagnostic surfacing for recoverable failures without mutating the live DB
 
 #![forbid(unsafe_code)]
 
@@ -15,8 +15,7 @@ use mcp_agent_mail_core::disk::{
     is_sqlite_memory_database_url, sqlite_file_path_from_database_url,
 };
 use mcp_agent_mail_db::{
-    DbPool, DbPoolConfig, ensure_sqlite_file_healthy, ensure_sqlite_file_healthy_with_archive,
-    is_corruption_error_message, is_sqlite_recovery_error_message,
+    DbPool, DbPoolConfig, is_corruption_error_message, is_sqlite_recovery_error_message,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -304,25 +303,14 @@ fn handle_integrity_error(
     }
     *last_recovery_attempt = Some(now);
 
-    let recovery_result = if storage_root.is_dir() {
-        ensure_sqlite_file_healthy_with_archive(sqlite_path, storage_root)
-    } else {
-        ensure_sqlite_file_healthy(sqlite_path)
-    };
-
-    match recovery_result {
-        Ok(()) => tracing::warn!(
-            phase,
-            path = %sqlite_path.display(),
-            "integrity guard auto-recovered sqlite file"
-        ),
-        Err(err) => tracing::warn!(
-            phase,
-            path = %sqlite_path.display(),
-            error = %err,
-            "integrity guard recovery failed"
-        ),
-    }
+    let storage_root_present = storage_root.is_dir();
+    tracing::warn!(
+        phase,
+        path = %sqlite_path.display(),
+        error = %error_message,
+        storage_root_present,
+        "integrity guard detected recoverable sqlite corruption, but automatic server-side recovery is disabled"
+    );
 }
 
 #[cfg(test)]

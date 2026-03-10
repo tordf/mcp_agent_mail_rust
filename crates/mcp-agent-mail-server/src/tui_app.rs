@@ -1775,7 +1775,7 @@ impl MailAppModel {
             });
             return;
         };
-        let Ok(conn) = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path) else {
+        let Ok(conn) = crate::open_server_sync_db_connection(&path) else {
             self.record_action_outcome(ActionOutcome::Failure {
                 operation: "rethread_message".to_string(),
                 error: format!("failed to open database at {path}"),
@@ -5182,7 +5182,7 @@ fn query_palette_agent_metadata(
     let Ok(path) = cfg.sqlite_path() else {
         return HashMap::new();
     };
-    let Ok(conn) = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path) else {
+    let Ok(conn) = crate::open_server_sync_db_connection(&path) else {
         return HashMap::new();
     };
 
@@ -5227,7 +5227,7 @@ fn query_palette_recent_messages(
     let Ok(path) = cfg.sqlite_path() else {
         return Vec::new();
     };
-    let Ok(conn) = mcp_agent_mail_db::open_sqlite_file_with_recovery(&path) else {
+    let Ok(conn) = crate::open_server_sync_db_connection(&path) else {
         return Vec::new();
     };
 

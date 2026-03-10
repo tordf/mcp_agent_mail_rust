@@ -1354,16 +1354,9 @@ async fn initialize_sqlite_file_once(
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
-    if let Err(err) = recover_sqlite_file(path) {
-        if !should_retry_sqlite_init_error(&err) {
-            return Outcome::Err(err);
-        }
-        tracing::warn!(
-            path = %path.display(),
-            error = %err,
-            "sqlite pre-init recovery probe hit retryable error; continuing with init retry path"
-        );
-    }
+    // Do not run archive-aware recovery before the first real initialization attempt.
+    // On live databases this can turn normal startup into an expensive or destructive
+    // recovery path before we've observed any concrete corruption signal.
 
     match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
         ok @ Outcome::Ok(()) => ok,
@@ -1662,6 +1655,18 @@ where
 #[allow(clippy::result_large_err)]
 fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
+}
+
+#[allow(clippy::result_large_err)]
+fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), SqlError> {
+    if !sqlite_file_has_live_sidecars(primary_path) {
+        return Ok(());
+    }
+
+    Err(SqlError::Custom(format!(
+        "refusing automatic sqlite recovery for {} while live WAL/SHM sidecars are present; stop the server and run explicit repair",
+        primary_path.display()
+    )))
 }
 
 #[must_use]
@@ -2041,6 +2046,9 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
         return Ok(());
     }
     if exists {
+        refuse_auto_recovery_with_live_sidecars(primary_path)?;
+    }
+    if exists {
         match try_repair_index_only_corruption(primary_path) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
@@ -2095,6 +2103,9 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     let had_primary = primary_path.exists();
     if had_primary && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
+    }
+    if had_primary {
+        refuse_auto_recovery_with_live_sidecars(primary_path)?;
     }
     if had_primary {
         match try_repair_index_only_corruption(primary_path) {
@@ -3596,6 +3607,45 @@ mod tests {
         assert!(
             !healthy,
             "compatibility probe failure should mark file unhealthy"
+        );
+    }
+
+    #[test]
+    fn ensure_sqlite_file_healthy_refuses_auto_recovery_with_live_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let wal = dir.path().join("storage.sqlite3-wal");
+        let shm = dir.path().join("storage.sqlite3-shm");
+        std::fs::write(&primary, b"not-a-sqlite-db").expect("write corrupt primary");
+        std::fs::write(&wal, b"x").expect("write wal");
+        std::fs::write(&shm, b"x").expect("write shm");
+
+        let err = ensure_sqlite_file_healthy(&primary).expect_err("must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing automatic sqlite recovery"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn ensure_sqlite_file_healthy_with_archive_refuses_auto_recovery_with_live_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let wal = dir.path().join("storage.sqlite3-wal");
+        let shm = dir.path().join("storage.sqlite3-shm");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("mkdir storage root");
+        std::fs::write(&primary, b"not-a-sqlite-db").expect("write corrupt primary");
+        std::fs::write(&wal, b"x").expect("write wal");
+        std::fs::write(&shm, b"x").expect("write shm");
+
+        let err = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing automatic sqlite recovery"),
+            "unexpected error: {message}"
         );
     }
 

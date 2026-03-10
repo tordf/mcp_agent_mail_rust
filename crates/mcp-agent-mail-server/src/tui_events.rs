@@ -3209,10 +3209,7 @@ mod tests {
         // Fill to 7 (under threshold) — all events should be accepted
         for i in 0..7 {
             let seq = ring.try_push(sample_http(&format!("/{i}"), 200));
-            assert!(
-                seq.is_ok(),
-                "event {i} should be accepted under threshold"
-            );
+            assert!(seq.is_ok(), "event {i} should be accepted under threshold");
         }
         assert_eq!(ring.stats().sampled_drops, 0);
 

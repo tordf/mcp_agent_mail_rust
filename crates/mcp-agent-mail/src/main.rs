@@ -453,20 +453,21 @@ fn main() {
 
     let cli = Cli::parse();
 
-    // MCP mode: initialize logging and proceed with the server binary behavior.
-    let suppress_runtime_logs_for_tui =
-        matches!(cli.command, Some(Commands::Serve { no_tui: false, .. }))
-            && std::io::stdout().is_terminal();
+    // Load configuration and stamp interface mode (binary-level, per ADR-001).
+    let mut config = Config::from_env();
+    config.interface_mode = InterfaceMode::Mcp;
+
+    // MCP mode: initialize logging after env config is loaded so headless env
+    // toggles like `TUI_ENABLED=false` suppress TUI log routing correctly.
+    let suppress_runtime_logs_for_tui = matches!(&cli.command, Some(Commands::Serve { no_tui, .. }) if !*no_tui)
+        && config.tui_enabled
+        && std::io::stdout().is_terminal();
     let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
-
-    // Load configuration and stamp interface mode (binary-level, per ADR-001).
-    let mut config = Config::from_env();
-    config.interface_mode = InterfaceMode::Mcp;
 
     if cli.verbose {
         tracing::info!("Configuration loaded: {:?}", config);
@@ -574,7 +575,12 @@ fn main() {
             };
             eprintln!("{}", summary.format(mode));
 
-            if let Err(err) = mcp_agent_mail_server::run_http_with_tui(&config) {
+            let run_result = if config.tui_enabled {
+                mcp_agent_mail_server::run_http_with_tui(&config)
+            } else {
+                mcp_agent_mail_server::run_http(&config)
+            };
+            if let Err(err) = run_result {
                 tracing::error!("HTTP server failed: {err}");
                 std::process::exit(1);
             }

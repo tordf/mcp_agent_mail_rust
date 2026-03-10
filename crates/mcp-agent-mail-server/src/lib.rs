@@ -76,13 +76,17 @@ mod tui_ws_state;
 
 use asupersync::channel::mpsc;
 use asupersync::http::h1::HttpClient;
-use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig};
+use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig, Http1ListenerStats};
 use asupersync::http::h1::server::Http1Config;
 use asupersync::http::h1::types::{
     Method as Http1Method, Request as Http1Request, Response as Http1Response, default_reason,
 };
 use asupersync::messaging::RedisClient;
+#[cfg(not(target_os = "linux"))]
+#[cfg(not(target_os = "linux"))]
 use asupersync::runtime::reactor::create_reactor;
+#[cfg(target_os = "linux")]
+use asupersync::runtime::reactor::{EpollReactor, IoUringReactor, Reactor};
 use asupersync::runtime::{JoinHandle as AsyncJoinHandle, Runtime, RuntimeBuilder, RuntimeHandle};
 use asupersync::time::{sleep, timeout, wall_now};
 use asupersync::{Budget, Cx};
@@ -932,7 +936,7 @@ fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, erro
     else {
         tracing::warn!(
             database_url = %config.database_url,
-            "[startup-search] cannot recover sqlite for backfill retry: unresolved sqlite path"
+            "[startup-search] background backfill hit sqlite recovery error, but automatic server-side recovery is disabled"
         );
         return false;
     };
@@ -941,32 +945,12 @@ fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, erro
             sqlite_path.to_string_lossy().as_ref(),
         ));
 
-    let recovery = if config.storage_root.is_dir() {
-        mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
-            &sqlite_path,
-            &config.storage_root,
-        )
-    } else {
-        mcp_agent_mail_db::ensure_sqlite_file_healthy(&sqlite_path)
-    };
-
-    match recovery {
-        Ok(()) => {
-            tracing::warn!(
-                sqlite = %sqlite_path.display(),
-                "[startup-search] sqlite auto-recovery succeeded; retrying backfill once"
-            );
-            true
-        }
-        Err(recovery_err) => {
-            tracing::warn!(
-                sqlite = %sqlite_path.display(),
-                error = %recovery_err,
-                "[startup-search] sqlite auto-recovery failed; skipping backfill retry"
-            );
-            false
-        }
-    }
+    tracing::warn!(
+        sqlite = %sqlite_path.display(),
+        error = %error,
+        "[startup-search] background backfill needs sqlite recovery, but automatic server-side recovery is disabled"
+    );
+    false
 }
 
 fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
@@ -1292,6 +1276,61 @@ fn resolve_http_runtime_worker_threads() -> usize {
         .clamp(HTTP_RUNTIME_MIN_WORKERS, HTTP_RUNTIME_MAX_WORKERS)
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRuntimeReactorPreference {
+    Epoll,
+    Auto,
+    IoUring,
+}
+
+#[cfg(target_os = "linux")]
+impl HttpRuntimeReactorPreference {
+    fn from_env() -> std::io::Result<Self> {
+        let Some(raw) = std::env::var("AM_HTTP_REACTOR").ok() else {
+            // Default to epoll on Linux until the io_uring accept-path wakeup
+            // loss is fixed. Stability matters more than theoretical wins here.
+            return Ok(Self::Epoll);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "epoll" => Ok(Self::Epoll),
+            "auto" => Ok(Self::Auto),
+            "io_uring" | "uring" => Ok(Self::IoUring),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid AM_HTTP_REACTOR value '{other}' (expected epoll, auto, or io_uring)"
+                ),
+            )),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_http_reactor() -> std::io::Result<(Arc<dyn Reactor>, &'static str)> {
+    match HttpRuntimeReactorPreference::from_env()? {
+        HttpRuntimeReactorPreference::Epoll => Ok((Arc::new(EpollReactor::new()?), "epoll")),
+        HttpRuntimeReactorPreference::Auto => {
+            if let Ok(reactor) = IoUringReactor::new() {
+                return Ok((Arc::new(reactor), "io_uring"));
+            }
+            Ok((Arc::new(EpollReactor::new()?), "epoll"))
+        }
+        HttpRuntimeReactorPreference::IoUring => {
+            let reactor = IoUringReactor::new().map_err(|err| {
+                std::io::Error::other(format!("failed to initialize io_uring reactor: {err}"))
+            })?;
+            Ok((Arc::new(reactor), "io_uring"))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_http_reactor()
+-> std::io::Result<(Arc<dyn asupersync::runtime::reactor::Reactor>, &'static str)> {
+    Ok((create_reactor()?, "default"))
+}
+
 fn hardened_http_listener_config() -> Http1ListenerConfig {
     let http_config = Http1Config::default()
         // Keep-alive is allowed for polling clients, but with bounded reuse.
@@ -1346,7 +1385,8 @@ async fn probe_http_healthz(
 }
 
 fn build_http_runtime() -> std::io::Result<Runtime> {
-    let reactor = create_reactor()?;
+    let (reactor, reactor_name) = build_http_reactor()?;
+    tracing::info!(reactor = reactor_name, "HTTP runtime reactor selected");
     RuntimeBuilder::new()
         .with_reactor(reactor)
         .worker_threads(resolve_http_runtime_worker_threads())
@@ -1392,22 +1432,11 @@ fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
 
-    // Force DB initialization (including migrations + integrity recovery) during
-    // startup so HTTP/TUI surfaces that open direct sync connections never
-    // observe an uninitialized or recoverable-but-not-yet-recovered SQLite file.
-    readiness_check(config).map_err(std::io::Error::other)?;
-
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
     Ok(())
-}
-
-fn note_startup_integrity_probe_if_enabled(config: &mcp_agent_mail_core::Config) {
-    if config.integrity_check_on_startup {
-        integrity_guard::note_startup_integrity_probe_completed();
-    }
 }
 
 const STARTUP_READINESS_FAST_PATH_GRACE: Duration = Duration::from_secs(1);
@@ -1437,6 +1466,13 @@ fn startup_readiness_fast_path_active() -> bool {
         }
         None => false,
     }
+}
+
+pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+    let conn = DbConn::open_file(path)
+        .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
+    let _ = conn.execute_raw("PRAGMA busy_timeout = 60000;");
+    Ok(conn)
 }
 
 fn tui_readiness_warmup_failure_message(error: &str) -> String {
@@ -1699,9 +1735,6 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
-    // readiness_check() already performed the first integrity verification.
-    // Avoid immediately repeating the same expensive check in the guard loop.
-    note_startup_integrity_probe_if_enabled(config);
     integrity_guard::start(config);
     disk_monitor::start(config);
     start_advisory_consistency_probe(config);
@@ -1879,6 +1912,126 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 struct HttpServerInstance {
     join: AsyncJoinHandle<std::io::Result<()>>,
     shutdown: asupersync::server::shutdown::ShutdownSignal,
+    connection_manager: asupersync::server::connection::ConnectionManager,
+    listener_stats: Arc<Http1ListenerStats>,
+    request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
+}
+
+#[derive(Debug, Clone)]
+struct HttpRequestRuntimeDiagnosticsSnapshot {
+    started_total: u64,
+    completed_total: u64,
+    last_started_at_ms: u64,
+    last_completed_at_ms: u64,
+    last_started_method: String,
+    last_started_path: String,
+    last_completed_method: String,
+    last_completed_path: String,
+    last_completed_status: u16,
+}
+
+#[derive(Debug, Default)]
+struct HttpRequestRuntimeDiagnostics {
+    started_total: AtomicU64,
+    completed_total: AtomicU64,
+    last_started_at_ms: AtomicU64,
+    last_completed_at_ms: AtomicU64,
+    last_completed_status: AtomicU64,
+    last_started_method: Mutex<String>,
+    last_started_path: Mutex<String>,
+    last_completed_method: Mutex<String>,
+    last_completed_path: Mutex<String>,
+}
+
+impl HttpRequestRuntimeDiagnostics {
+    fn record_started(&self, method: &str, path: &str) {
+        self.started_total.fetch_add(1, Ordering::Relaxed);
+        self.last_started_at_ms
+            .store(http_runtime_diag_now_ms(), Ordering::Relaxed);
+        *lock_mutex(&self.last_started_method) = method.to_string();
+        *lock_mutex(&self.last_started_path) = path.to_string();
+    }
+
+    fn record_completed(&self, method: &str, path: &str, status: u16) {
+        self.completed_total.fetch_add(1, Ordering::Relaxed);
+        self.last_completed_at_ms
+            .store(http_runtime_diag_now_ms(), Ordering::Relaxed);
+        self.last_completed_status
+            .store(u64::from(status), Ordering::Relaxed);
+        *lock_mutex(&self.last_completed_method) = method.to_string();
+        *lock_mutex(&self.last_completed_path) = path.to_string();
+    }
+
+    fn snapshot(&self) -> HttpRequestRuntimeDiagnosticsSnapshot {
+        HttpRequestRuntimeDiagnosticsSnapshot {
+            started_total: self.started_total.load(Ordering::Relaxed),
+            completed_total: self.completed_total.load(Ordering::Relaxed),
+            last_started_at_ms: self.last_started_at_ms.load(Ordering::Relaxed),
+            last_completed_at_ms: self.last_completed_at_ms.load(Ordering::Relaxed),
+            last_started_method: lock_mutex(&self.last_started_method).clone(),
+            last_started_path: lock_mutex(&self.last_started_path).clone(),
+            last_completed_method: lock_mutex(&self.last_completed_method).clone(),
+            last_completed_path: lock_mutex(&self.last_completed_path).clone(),
+            last_completed_status: self.last_completed_status.load(Ordering::Relaxed) as u16,
+        }
+    }
+}
+
+fn http_runtime_diag_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn http_runtime_diag_age_ms(last_ms: u64, now_ms: u64) -> Option<u64> {
+    (last_ms != 0).then_some(now_ms.saturating_sub(last_ms))
+}
+
+fn log_http_runtime_snapshot(instance: &HttpServerInstance, reason: &str) {
+    let now_ms = http_runtime_diag_now_ms();
+    let listener = instance.listener_stats.snapshot();
+    let requests = instance.request_diagnostics.snapshot();
+    let last_started_method = if requests.last_started_method.is_empty() {
+        "-"
+    } else {
+        requests.last_started_method.as_str()
+    };
+    let last_started_path = if requests.last_started_path.is_empty() {
+        "-"
+    } else {
+        requests.last_started_path.as_str()
+    };
+    let last_completed_method = if requests.last_completed_method.is_empty() {
+        "-"
+    } else {
+        requests.last_completed_method.as_str()
+    };
+    let last_completed_path = if requests.last_completed_path.is_empty() {
+        "-"
+    } else {
+        requests.last_completed_path.as_str()
+    };
+    tracing::warn!(
+        reason = reason,
+        active_connections = instance.connection_manager.active_count(),
+        listener_accepted_total = listener.accepted_total,
+        listener_transient_accept_errors_total = listener.transient_accept_errors_total,
+        listener_spawn_failures_total = listener.spawn_failures_total,
+        listener_last_accept_age_ms = ?http_runtime_diag_age_ms(listener.last_accept_at_ms, now_ms),
+        requests_started_total = requests.started_total,
+        requests_completed_total = requests.completed_total,
+        request_gap = requests.started_total.saturating_sub(requests.completed_total),
+        requests_last_started_age_ms = ?http_runtime_diag_age_ms(requests.last_started_at_ms, now_ms),
+        requests_last_completed_age_ms = ?http_runtime_diag_age_ms(requests.last_completed_at_ms, now_ms),
+        last_started_method,
+        last_started_path,
+        last_completed_method,
+        last_completed_path,
+        last_completed_status = requests.last_completed_status,
+        "HTTP runtime snapshot"
+    );
 }
 
 struct PanicAsIoFuture<F> {
@@ -2001,11 +2154,13 @@ async fn spawn_http_server_instance(
     let server_capabilities = server.capabilities().clone();
     let router = Arc::new(server.into_router());
     let addr = format!("{}:{}", config.http_host, config.http_port);
+    let request_diagnostics = Arc::new(HttpRequestRuntimeDiagnostics::default());
     let state = Arc::new(HttpState::new(
         router,
         server_info,
         server_capabilities,
         config.clone(),
+        Arc::clone(&request_diagnostics),
     ));
 
     let handler_state = Arc::clone(&state);
@@ -2021,6 +2176,8 @@ async fn spawn_http_server_instance(
 
     let local_addr = listener.local_addr()?;
     let shutdown = listener.shutdown_signal();
+    let connection_manager = listener.connection_manager().clone();
+    let listener_stats = listener.stats_handle();
     let listener_runtime_handle = runtime_handle.clone();
     let join = runtime_handle
         .clone()
@@ -2035,7 +2192,16 @@ async fn spawn_http_server_instance(
         updated_config.http_port = local_addr.port();
     }
 
-    Ok((updated_config, HttpServerInstance { join, shutdown }))
+    Ok((
+        updated_config,
+        HttpServerInstance {
+            join,
+            shutdown,
+            connection_manager,
+            listener_stats,
+            request_diagnostics,
+        },
+    ))
 }
 
 async fn stop_http_server_instance(instance: HttpServerInstance) -> std::io::Result<()> {
@@ -2052,7 +2218,7 @@ async fn stop_http_server_instance_with_timeouts(
     join_timeout: Duration,
     force_close_timeout: Duration,
 ) -> std::io::Result<()> {
-    let HttpServerInstance { join, shutdown } = instance;
+    let HttpServerInstance { join, shutdown, .. } = instance;
     let mut join = Box::pin(join);
     let _ = shutdown.begin_drain(HTTP_LISTENER_DRAIN_TIMEOUT);
     match timeout(wall_now(), join_timeout, &mut join).await {
@@ -2196,6 +2362,7 @@ async fn run_http_server_supervisor(
         }
 
         if instance.join.is_finished() {
+            log_http_runtime_snapshot(&instance, "unexpected-exit-before-restart");
             tracing::warn!("HTTP server instance exited unexpectedly; restarting");
             record_http_server_shutdown(tui_state.as_deref());
             if let Err(err) = stop_http_server_instance(instance).await {
@@ -2308,6 +2475,7 @@ async fn run_http_server_supervisor(
         }
 
         liveness_failures = liveness_failures.saturating_add(1);
+        log_http_runtime_snapshot(&instance, "liveness-probe-failed");
         tracing::warn!(
             failures = liveness_failures,
             threshold = HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD,
@@ -2320,6 +2488,7 @@ async fn run_http_server_supervisor(
             continue;
         }
 
+        log_http_runtime_snapshot(&instance, "forcing-restart-after-liveness-failures");
         tracing::warn!("HTTP server unresponsive; forcing supervised restart");
         record_http_server_shutdown(tui_state.as_deref());
         if let Err(err) = stop_http_server_instance(instance).await {
@@ -2957,9 +3126,17 @@ struct StartupDashboard {
     last_render_stamp: Mutex<Option<DashboardRenderStamp>>,
 }
 
+fn startup_dashboard_enabled(config: &mcp_agent_mail_core::Config) -> bool {
+    config.tui_enabled && config.log_rich_enabled
+}
+
+fn dashboard_console_interactivity_enabled(config: &mcp_agent_mail_core::Config) -> bool {
+    startup_dashboard_enabled(config) && config.console_interactive_enabled
+}
+
 impl StartupDashboard {
     fn maybe_start(config: &mcp_agent_mail_core::Config) -> Option<Arc<Self>> {
-        if !config.log_rich_enabled || !std::io::stdout().is_terminal() {
+        if !startup_dashboard_enabled(config) || !std::io::stdout().is_terminal() {
             return None;
         }
         if degenerate_stty_size().is_some() {
@@ -2969,6 +3146,7 @@ impl StartupDashboard {
         let term_width = parse_env_u16("COLUMNS", 120).max(80);
         let term_height = parse_env_u16("LINES", 36).max(20);
         let mut console_layout = ConsoleLayoutState::from_config(config);
+        console_layout.interactive_enabled = dashboard_console_interactivity_enabled(config);
         let term_caps = ftui::TerminalCapabilities::detect();
         let console_caps = console::ConsoleCaps::from_capabilities(&term_caps);
         let allow_inline_in_mux = env_truthy("CONSOLE_MUX_INLINE_OK");
@@ -4513,7 +4691,13 @@ fn dashboard_open_connection(database_url: &str) -> Option<DbConn> {
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
-    mcp_agent_mail_db::open_sqlite_file_with_recovery(&path).ok()
+    // The operator dashboard is observability-only. It must not trigger archive-aware
+    // recovery against the live runtime database just to render counts.
+    if path == ":memory:" {
+        DbConn::open_memory().ok()
+    } else {
+        DbConn::open_file(&path).ok()
+    }
 }
 
 fn fetch_dashboard_db_stats_cached(
@@ -4715,6 +4899,7 @@ struct HttpState {
     web_root: Option<static_files::WebRoot>,
     /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
     ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
+    request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
 }
 
 impl HttpState {
@@ -4723,6 +4908,7 @@ impl HttpState {
         server_info: fastmcp_protocol::ServerInfo,
         server_capabilities: fastmcp_protocol::ServerCapabilities,
         config: mcp_agent_mail_core::Config,
+        request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
     ) -> Self {
         let handler = Arc::new(HttpRequestHandler::with_config(HttpHandlerConfig {
             base_path: config.http_path.clone(),
@@ -4763,6 +4949,7 @@ impl HttpState {
             jwks_refreshing: AtomicBool::new(false),
             web_root,
             ws_state_fallback,
+            request_diagnostics,
         }
     }
 
@@ -4775,6 +4962,10 @@ impl HttpState {
         let tui = tui_state_handle();
         let needs_request_log =
             self.config.http_request_log_enabled || dashboard.is_some() || tui.is_some();
+        let method_name = req.method.as_str().to_string();
+        let (path_for_diag, _query) = split_path_query(&req.uri);
+        self.request_diagnostics
+            .record_started(&method_name, &path_for_diag);
 
         let start = Instant::now();
         let (method, path, client_ip) = if needs_request_log {
@@ -4789,6 +4980,8 @@ impl HttpState {
         };
 
         let resp = self.handle_inner(req).await;
+        self.request_diagnostics
+            .record_completed(&method_name, &path_for_diag, resp.status);
         let elapsed = start.elapsed();
         let latency_us =
             u64::try_from(elapsed.as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
@@ -5016,14 +5209,15 @@ impl HttpState {
                 if !matches!(req.method, Http1Method::Get) {
                     return Some(self.error_response(req, 405, "Method Not Allowed"));
                 }
-                // Headless HTTP startup already completed full readiness preflight
-                // before binding. During the first startup second, avoid rebuilding
-                // a fresh one-connection readiness pool on every probe.
+                // Freshly bound listeners should answer quickly even while the
+                // DB warm path is still settling. Report a transient warmup
+                // state instead of blocking readiness probes on immediate pool
+                // initialization right after bind.
                 if startup_readiness_fast_path_active() {
                     return Some(self.health_json_response(
                         req,
-                        200,
-                        &serde_json::json!({"status":"ready"}),
+                        503,
+                        &serde_json::json!({"status":"warming_up"}),
                     ));
                 }
                 if let Err(err) = readiness_check_quick(&self.config) {
@@ -7206,72 +7400,32 @@ fn readiness_check_with_integrity(
     };
 
     let cx = Cx::for_testing();
-    let mut pool = create_pool(&db_config).map_err(|e| e.to_string())?;
-    let mut conn;
-    let mut retry_after_recovery = false;
-
-    loop {
-        match block_on(pool.acquire(&cx)) {
-            asupersync::Outcome::Ok(c) => {
-                conn = c;
-                if let Err(e) = conn.query_sync("SELECT 1", &[]) {
-                    if !retry_after_recovery
-                        && run_integrity_check
-                        && mcp_agent_mail_db::is_corruption_error_message(&e.to_string())
-                    {
-                        // Fall through to recovery
-                    } else {
-                        return Err(e.to_string());
-                    }
-                } else {
-                    break; // Success!
-                }
-            }
-            asupersync::Outcome::Err(e) => {
-                if !retry_after_recovery
-                    && run_integrity_check
-                    && mcp_agent_mail_db::is_corruption_error_message(&e.to_string())
-                {
-                    // Fall through to recovery
-                } else {
-                    return Err(e.to_string());
-                }
-            }
-            asupersync::Outcome::Cancelled(_) => return Err("readiness cancelled".to_string()),
-            asupersync::Outcome::Panicked(p) => {
-                return Err(format!("readiness panic: {}", p.message()));
-            }
-        }
-
-        // We only reach here if we hit a corruption error and haven't retried yet.
-        retry_after_recovery = true;
-        tracing::warn!(
-            "SQLite corruption detected during readiness check; attempting automatic recovery"
-        );
-        if let Some(sqlite_path) =
-            mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
-        {
-            let storage_root = std::path::Path::new(&config.storage_root);
-            let recovery_res = if storage_root.is_dir() {
-                mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
-                    &sqlite_path,
-                    storage_root,
-                )
-            } else {
-                mcp_agent_mail_db::ensure_sqlite_file_healthy(&sqlite_path)
-            };
-            if let Err(rec_e) = recovery_res {
+    let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
+    let conn = match block_on(pool.acquire(&cx)) {
+        asupersync::Outcome::Ok(c) => c,
+        asupersync::Outcome::Err(e) => {
+            let error = e.to_string();
+            if run_integrity_check && mcp_agent_mail_db::is_corruption_error_message(&error) {
                 return Err(format!(
-                    "SQLite corruption detected and automatic recovery failed: {rec_e}"
+                    "SQLite corruption detected during readiness check; automatic server-side recovery is disabled: {error}"
                 ));
             }
-            // Recreate pool because old connections might be broken/stale
-            pool = create_pool(&db_config).map_err(|e| e.to_string())?;
-        } else {
-            return Err(
-                "SQLite corruption detected but unable to resolve database path".to_string(),
-            );
+            return Err(error);
         }
+        asupersync::Outcome::Cancelled(_) => return Err("readiness cancelled".to_string()),
+        asupersync::Outcome::Panicked(p) => {
+            return Err(format!("readiness panic: {}", p.message()));
+        }
+    };
+
+    if let Err(e) = conn.query_sync("SELECT 1", &[]) {
+        let error = e.to_string();
+        if run_integrity_check && mcp_agent_mail_db::is_corruption_error_message(&error) {
+            return Err(format!(
+                "SQLite corruption detected during readiness check; automatic server-side recovery is disabled: {error}"
+            ));
+        }
+        return Err(error);
     }
 
     let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
@@ -8649,7 +8803,29 @@ mod tests {
         let server_info = server.info().clone();
         let server_capabilities = server.capabilities().clone();
         let router = Arc::new(server.into_router());
-        HttpState::new(router, server_info, server_capabilities, config)
+        HttpState::new(
+            router,
+            server_info,
+            server_capabilities,
+            config,
+            Arc::new(HttpRequestRuntimeDiagnostics::default()),
+        )
+    }
+
+    fn test_http_server_instance(
+        join: AsyncJoinHandle<std::io::Result<()>>,
+        shutdown: asupersync::server::shutdown::ShutdownSignal,
+    ) -> HttpServerInstance {
+        HttpServerInstance {
+            join,
+            connection_manager: asupersync::server::connection::ConnectionManager::new(
+                None,
+                shutdown.clone(),
+            ),
+            listener_stats: Arc::new(Http1ListenerStats::default()),
+            request_diagnostics: Arc::new(HttpRequestRuntimeDiagnostics::default()),
+            shutdown,
+        }
     }
 
     fn with_serialized_tool_dispatch_env<F, T>(f: F) -> T
@@ -8913,6 +9089,44 @@ mod tests {
         caps.in_mux = true;
         layout.split_mode = ConsoleSplitMode::Left;
         assert!(!should_force_mux_left_split(&layout, &caps, false));
+    }
+
+    #[test]
+    fn startup_dashboard_enabled_tracks_tui_mode() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.log_rich_enabled = true;
+        config.tui_enabled = true;
+        assert!(startup_dashboard_enabled(&config));
+
+        config.tui_enabled = false;
+        assert!(!startup_dashboard_enabled(&config));
+    }
+
+    #[test]
+    fn startup_dashboard_enabled_respects_rich_logging_flag() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.tui_enabled = true;
+        config.log_rich_enabled = false;
+        assert!(!startup_dashboard_enabled(&config));
+    }
+
+    #[test]
+    fn dashboard_console_interactivity_tracks_tui_mode() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.console_interactive_enabled = true;
+        config.tui_enabled = true;
+        assert!(dashboard_console_interactivity_enabled(&config));
+
+        config.tui_enabled = false;
+        assert!(!dashboard_console_interactivity_enabled(&config));
+    }
+
+    #[test]
+    fn dashboard_console_interactivity_respects_console_disable_flag() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.tui_enabled = true;
+        config.console_interactive_enabled = false;
+        assert!(!dashboard_console_interactivity_enabled(&config));
     }
 
     #[test]
@@ -18758,14 +18972,14 @@ mod tests {
     #[test]
     fn stop_http_server_instance_returns_join_result_when_task_exits() {
         let runtime = build_http_runtime().expect("build test HTTP runtime");
-        let instance = HttpServerInstance {
-            join: runtime
+        let instance = test_http_server_instance(
+            runtime
                 .handle()
                 .clone()
                 .try_spawn(async { Ok::<(), std::io::Error>(()) })
                 .expect("spawn joinable task"),
-            shutdown: asupersync::server::shutdown::ShutdownSignal::new(),
-        };
+            asupersync::server::shutdown::ShutdownSignal::new(),
+        );
 
         runtime.block_on(async {
             stop_http_server_instance(instance)
@@ -18779,8 +18993,8 @@ mod tests {
         let runtime = build_http_runtime().expect("build test HTTP runtime");
         let shutdown = asupersync::server::shutdown::ShutdownSignal::new();
         let task_shutdown = shutdown.clone();
-        let instance = HttpServerInstance {
-            join: runtime
+        let instance = test_http_server_instance(
+            runtime
                 .handle()
                 .clone()
                 .try_spawn(async move {
@@ -18793,7 +19007,7 @@ mod tests {
                 })
                 .expect("spawn force-close aware task"),
             shutdown,
-        };
+        );
 
         runtime.block_on(async {
             stop_http_server_instance_with_timeouts(
@@ -18809,8 +19023,8 @@ mod tests {
     #[test]
     fn stop_http_server_instance_times_out_when_task_never_completes() {
         let runtime = build_http_runtime().expect("build test HTTP runtime");
-        let instance = HttpServerInstance {
-            join: runtime
+        let instance = test_http_server_instance(
+            runtime
                 .handle()
                 .clone()
                 .try_spawn(async {
@@ -18818,8 +19032,8 @@ mod tests {
                     Ok::<(), std::io::Error>(())
                 })
                 .expect("spawn blocking task"),
-            shutdown: asupersync::server::shutdown::ShutdownSignal::new(),
-        };
+            asupersync::server::shutdown::ShutdownSignal::new(),
+        );
 
         let join_timeout = Duration::from_millis(50);
         let force_close_timeout = Duration::from_millis(50);
@@ -18865,13 +19079,13 @@ mod tests {
                     } else {
                         Ok((
                             cfg,
-                            HttpServerInstance {
-                                join: runtime_handle
+                            test_http_server_instance(
+                                runtime_handle
                                     .clone()
                                     .try_spawn(async { Ok::<(), std::io::Error>(()) })
                                     .expect("spawn joinable retry task"),
-                                shutdown: asupersync::server::shutdown::ShutdownSignal::new(),
-                            },
+                                asupersync::server::shutdown::ShutdownSignal::new(),
+                            ),
                         ))
                     })
                 },

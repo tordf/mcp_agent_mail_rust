@@ -16,13 +16,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::is_sqlite_recovery_error_message;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
-use mcp_agent_mail_db::{
-    ensure_sqlite_file_healthy, ensure_sqlite_file_healthy_with_archive,
-    is_sqlite_recovery_error_message, open_sqlite_file_with_recovery,
-};
 
 use crate::tui_bridge::{DbWarmupState, TuiSharedState};
 use crate::tui_events::{
@@ -56,12 +53,9 @@ const MAX_CONTACTS: usize = 200;
 const MAX_RESERVATIONS: usize = 1000;
 /// Maximum silent interval before a heartbeat `HealthPulse` is emitted.
 const HEALTH_PULSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-/// Minimum interval between poller-triggered sqlite recovery attempts per path.
-const POLLER_RECOVERY_MIN_INTERVAL: Duration = Duration::from_secs(15);
 /// Re-evaluate legacy reservation scan mode periodically (per DB path).
 #[allow(clippy::duration_suboptimal_units)]
 const RESERVATION_SCAN_MODE_CACHE_TTL: Duration = Duration::from_secs(300);
-static POLLER_RECOVERY_GATES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 static RESERVATION_SCAN_MODE_CACHE: OnceLock<Mutex<HashMap<String, ReservationScanCacheEntry>>> =
     OnceLock::new();
 
@@ -153,7 +147,11 @@ impl<'a> DbStatQueryBatcher<'a> {
             return;
         }
         if let Some(path) = self.sqlite_path {
-            maybe_attempt_sqlite_recovery(path, &message);
+            tracing::warn!(
+                path = %path,
+                error = %message,
+                "tui poller observed recoverable sqlite error; skipping automatic recovery from observability path"
+            );
         }
     }
 
@@ -569,51 +567,6 @@ where
     std::panic::catch_unwind(fetcher)
 }
 
-fn maybe_attempt_sqlite_recovery(sqlite_path: &str, reason: &str) {
-    if sqlite_path == ":memory:" {
-        return;
-    }
-
-    let gates = POLLER_RECOVERY_GATES.get_or_init(|| Mutex::new(HashMap::new()));
-    let now = Instant::now();
-    {
-        let mut guard = match gates.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(last_attempt) = guard.get(sqlite_path)
-            && now.duration_since(*last_attempt) < POLLER_RECOVERY_MIN_INTERVAL
-        {
-            return;
-        }
-        guard.insert(sqlite_path.to_string(), now);
-    }
-
-    let sqlite_path_buf = Path::new(sqlite_path).to_path_buf();
-    let config = mcp_agent_mail_core::Config::from_env();
-    let root_path = config.storage_root.as_path();
-
-    let recovery_result = if root_path.is_dir() {
-        ensure_sqlite_file_healthy_with_archive(&sqlite_path_buf, root_path)
-    } else {
-        ensure_sqlite_file_healthy(&sqlite_path_buf)
-    };
-
-    match recovery_result {
-        Ok(()) => tracing::warn!(
-            path = %sqlite_path,
-            reason = %reason,
-            "tui poller auto-recovered sqlite file after recoverable query error"
-        ),
-        Err(err) => tracing::warn!(
-            path = %sqlite_path,
-            reason = %reason,
-            error = %err,
-            "tui poller attempted sqlite recovery but it failed"
-        ),
-    }
-}
-
 /// Fetch a complete [`DbStatSnapshot`] from the database.
 ///
 /// Opens a fresh sync connection, runs aggregate queries, and returns
@@ -803,19 +756,9 @@ fn open_sync_connection_with_path(database_url: &str) -> Option<(DbConn, String)
             path = absolute_candidate.to_string_lossy().into_owned();
         }
     }
-    match open_sqlite_file_with_recovery(&path) {
-        Ok(conn) => Some((conn, path)),
-        Err(err) => {
-            let err_msg = err.to_string();
-            if is_sqlite_recovery_error_message(&err_msg) {
-                maybe_attempt_sqlite_recovery(&path, &err_msg);
-                open_sqlite_file_with_recovery(&path)
-                    .ok()
-                    .map(|conn| (conn, path))
-            } else {
-                None
-            }
-        }
+    match path.as_str() {
+        ":memory:" => None,
+        _ => DbConn::open_file(&path).ok().map(|conn| (conn, path)),
     }
 }
 
@@ -831,7 +774,11 @@ fn query_data_version(conn: &DbConn, sqlite_path: Option<&str>) -> Option<i64> {
             if is_sqlite_recovery_error_message(&message)
                 && let Some(path) = sqlite_path
             {
-                maybe_attempt_sqlite_recovery(path, &message);
+                tracing::warn!(
+                    path = %path,
+                    error = %message,
+                    "tui poller data-version probe hit recoverable sqlite error; skipping automatic recovery from observability path"
+                );
             }
             None
         }

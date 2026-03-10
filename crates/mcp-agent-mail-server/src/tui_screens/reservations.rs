@@ -615,7 +615,7 @@ impl ReservationsScreen {
             }
         };
 
-        let conn = match mcp_agent_mail_db::open_sqlite_file_with_recovery(&path) {
+        let conn = match crate::open_server_sync_db_connection(&path) {
             Ok(conn) => conn,
             Err(err) => {
                 self.fallback_issue = Some(format!(
