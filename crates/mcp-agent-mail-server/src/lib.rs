@@ -1007,11 +1007,13 @@ const HTTP_RUNTIME_DEFAULT_WORKERS_CAP: usize = 4;
 const HTTP_RUNTIME_MAX_WORKERS: usize = 64;
 const HTTP_LISTENER_MAX_CONNECTIONS: usize = 4096;
 const HTTP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+// Keep-alive must outlive the supervisor probe cadence and normal MCP bursts.
+// A 1s idle timeout caused stale keep-alive reuse and false liveness failures.
+const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD: u32 = 3;
 const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
-const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_SUPERVISOR_CONTROL_CHANNEL_CAPACITY: usize = 32;
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS: u64 = 200;
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
@@ -1288,8 +1290,8 @@ enum HttpRuntimeReactorPreference {
 impl HttpRuntimeReactorPreference {
     fn from_env() -> std::io::Result<Self> {
         let Some(raw) = std::env::var("AM_HTTP_REACTOR").ok() else {
-            // Default to epoll on Linux until the io_uring accept-path wakeup
-            // loss is fixed. Stability matters more than theoretical wins here.
+            // Default to epoll on Linux until the io_uring accept/rearm path
+            // is proven stable under sustained MCP-over-HTTP load.
             return Ok(Self::Epoll);
         };
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -1366,12 +1368,17 @@ fn format_http_authority_host(host: &str) -> String {
 
 async fn probe_http_healthz(
     cx: &Cx,
-    client: &HttpClient,
     config: &mcp_agent_mail_core::Config,
-) -> bool {
+) -> Result<(), HttpHealthProbeFailure> {
+    let client = HttpClient::builder()
+        .max_connections_per_host(1)
+        .max_total_connections(1)
+        .idle_timeout(Duration::ZERO)
+        .build();
     let probe_host = normalized_probe_host(&config.http_host);
     let authority_host = format_http_authority_host(probe_host);
     let url = format!("http://{authority_host}:{}{}", config.http_port, "/healthz");
+    let started_at = Instant::now();
     match timeout(
         wall_now(),
         HTTP_SUPERVISOR_PROBE_TIMEOUT,
@@ -1379,9 +1386,26 @@ async fn probe_http_healthz(
     )
     .await
     {
-        Ok(Ok(response)) => response.status == 200,
-        Ok(Err(_)) | Err(_) => false,
+        Ok(Ok(response)) if response.status == 200 => Ok(()),
+        Ok(Ok(response)) => Err(HttpHealthProbeFailure::Status {
+            status: response.status,
+            elapsed_ms: started_at.elapsed().as_millis(),
+        }),
+        Ok(Err(err)) => Err(HttpHealthProbeFailure::Transport {
+            error: err.to_string(),
+            elapsed_ms: started_at.elapsed().as_millis(),
+        }),
+        Err(_) => Err(HttpHealthProbeFailure::Timeout {
+            elapsed_ms: started_at.elapsed().as_millis(),
+        }),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HttpHealthProbeFailure {
+    Timeout { elapsed_ms: u128 },
+    Status { status: u16, elapsed_ms: u128 },
+    Transport { error: String, elapsed_ms: u128 },
 }
 
 fn build_http_runtime() -> std::io::Result<Runtime> {
@@ -2336,10 +2360,6 @@ async fn run_http_server_supervisor(
         ),
     );
 
-    let probe_client = HttpClient::builder()
-        .max_connections_per_host(1)
-        .max_total_connections(2)
-        .build();
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) = reset_probe_state();
 
@@ -2466,7 +2486,8 @@ async fn run_http_server_supervisor(
         }
         next_probe_at = now + HTTP_SUPERVISOR_PROBE_INTERVAL;
 
-        if probe_http_healthz(cx, &probe_client, &config).await {
+        let probe_result = probe_http_healthz(cx, &config).await;
+        if probe_result.is_ok() {
             liveness_failures = 0;
             continue;
         }
@@ -2476,7 +2497,9 @@ async fn run_http_server_supervisor(
 
         liveness_failures = liveness_failures.saturating_add(1);
         log_http_runtime_snapshot(&instance, "liveness-probe-failed");
+        let probe_failure = probe_result.expect_err("probe_result checked above");
         tracing::warn!(
+            ?probe_failure,
             failures = liveness_failures,
             threshold = HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD,
             host = %config.http_host,
@@ -14749,6 +14772,14 @@ mod tests {
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(body["status"], "ready");
+    }
+
+    #[test]
+    fn http_probe_timing_does_not_undercut_keep_alive() {
+        assert!(
+            HTTP_IDLE_TIMEOUT > HTTP_SUPERVISOR_PROBE_INTERVAL,
+            "server keep-alive must outlive supervisor probe cadence"
+        );
     }
 
     #[test]
