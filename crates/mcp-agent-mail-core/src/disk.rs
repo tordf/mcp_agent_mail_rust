@@ -171,16 +171,17 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
     }
 
     // After stripping, examples:
-    // - /./path.db        -> ./path.db
-    // - //abs/path.db     -> /abs/path.db
-    // - /relative/path.db -> relative/path.db
-    // - relative/path.db  -> relative/path.db
+    // - /./path.db         -> ./path.db
+    // - /../path.db        -> ../path.db
+    // - //abs/path.db      -> /abs/path.db
+    // - /var/data/db.sqlite3 -> /var/data/db.sqlite3
+    // - relative/path.db   -> relative/path.db
     let mut path = stripped.to_string();
     if path.starts_with("//") {
         // Absolute path (sqlite:////abs/path.db).
         path.remove(0);
-    } else if path.starts_with('/') {
-        // Relative path (sqlite:///relative/path.db).
+    } else if path.starts_with("/./") || path.starts_with("/../") {
+        // Explicitly relative path (sqlite:///./path.db or sqlite:///../path.db).
         path.remove(0);
     }
 
@@ -341,13 +342,19 @@ mod tests {
             sqlite_file_path_from_database_url("sqlite:///storage.sqlite3")
                 .unwrap()
                 .to_string_lossy(),
-            "storage.sqlite3"
+            "/storage.sqlite3"
         );
         assert_eq!(
             sqlite_file_path_from_database_url("sqlite:///storage.sqlite3?mode=rwc")
                 .unwrap()
                 .to_string_lossy(),
-            "storage.sqlite3"
+            "/storage.sqlite3"
+        );
+        assert_eq!(
+            sqlite_file_path_from_database_url("sqlite:///home/ubuntu/storage.sqlite3")
+                .unwrap()
+                .to_string_lossy(),
+            "/home/ubuntu/storage.sqlite3"
         );
         assert_eq!(
             sqlite_file_path_from_database_url("sqlite:////abs/path.db")
@@ -546,7 +553,7 @@ mod tests {
             sqlite_file_path_from_database_url("sqlite:///db.sqlite3#frag")
                 .unwrap()
                 .to_string_lossy(),
-            "db.sqlite3"
+            "/db.sqlite3"
         );
     }
 

@@ -2340,19 +2340,25 @@ mod tests {
             database_url: "sqlite:///relative/path.db".to_string(),
             ..Default::default()
         };
-        assert_eq!(config.sqlite_path().unwrap(), "relative/path.db");
+        assert_eq!(config.sqlite_path().unwrap(), "/relative/path.db");
 
         let config = DbPoolConfig {
             database_url: "sqlite:///storage.sqlite3?mode=rwc".to_string(),
             ..Default::default()
         };
-        assert_eq!(config.sqlite_path().unwrap(), "storage.sqlite3");
+        assert_eq!(config.sqlite_path().unwrap(), "/storage.sqlite3");
 
         let config = DbPoolConfig {
             database_url: "sqlite:///storage.sqlite3#v1".to_string(),
             ..Default::default()
         };
-        assert_eq!(config.sqlite_path().unwrap(), "storage.sqlite3");
+        assert_eq!(config.sqlite_path().unwrap(), "/storage.sqlite3");
+
+        let config = DbPoolConfig {
+            database_url: "sqlite:///home/ubuntu/storage.sqlite3".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.sqlite_path().unwrap(), "/home/ubuntu/storage.sqlite3");
 
         let config = DbPoolConfig {
             database_url: "postgres://localhost/db".to_string(),

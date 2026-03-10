@@ -119,6 +119,7 @@ pub use query_assistance::{QueryAssistance, parse_query_assistance};
 pub use sqlmodel;
 pub use sqlmodel_core;
 pub use sqlmodel_frankensqlite;
+pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///

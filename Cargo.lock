@@ -2364,6 +2364,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
+ "tracing",
  "xxhash-rust",
 ]
 
