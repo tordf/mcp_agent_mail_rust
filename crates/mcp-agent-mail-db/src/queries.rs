@@ -5649,7 +5649,8 @@ pub async fn list_unreleased_file_reservations(
                  CASE WHEN instr(released_ts, '.') > 0 \
                       THEN CAST(substr(REPLACE(released_ts, 'Z', '') || '000000', instr(released_ts, '.') + 1, 6) AS INTEGER) \
                       ELSE 0 \
-                 END \             ELSE released_ts \
+                 END \
+             ELSE released_ts \
          END AS released_ts \
          FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id"
     );

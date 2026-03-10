@@ -505,7 +505,7 @@ pub async fn file_reservation_paths(
             // Deterministic ordering keeps API output stable across runs
             // even when the index scans hash buckets in different orders.
             let mut holders: Vec<PendingConflictHolder> = conflict_refs
-                .into_iter()
+                .drain(..)
                 .map(|rref| PendingConflictHolder {
                     agent_id: rref.agent_id,
                     path_pattern: rref.path_pattern.clone(),

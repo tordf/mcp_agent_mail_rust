@@ -146,7 +146,7 @@ async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Opti
 
     let conn = match pool.acquire(cx).await {
         Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
+        Outcome::Err(e) => return Err(db_error_to_mcp_error(DbError::Pool(e.to_string()))),
         Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
         Outcome::Panicked(p) => {
             return Err(McpError::internal_error(format!(

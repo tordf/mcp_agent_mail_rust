@@ -1536,7 +1536,7 @@ fn collect_unified_message_aggregates(
     } else {
         limit.max(1)
     };
-    let mut messages = BTreeMap::new();
+    let mut messages: BTreeMap<i64, UnifiedMessageAggregate> = BTreeMap::new();
 
     for project in projects_rows {
         let pid = project.id.unwrap_or(0);

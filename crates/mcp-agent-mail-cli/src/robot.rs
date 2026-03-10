@@ -3698,8 +3698,8 @@ fn build_navigate_tooling(
                         .get("name")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|name| {
-                            mcp_agent_mail_tools::tool_meta(name)
-                                .is_none_or(|meta| config.should_expose_tool(name, meta.cluster))
+                            mcp_agent_mail_tools::tool_cluster(name)
+                                .is_none_or(|cluster| config.should_expose_tool(name, cluster))
                         })
                 });
             }
@@ -3739,7 +3739,7 @@ fn build_navigate_tooling(
         ["tooling", "locks"] => {
             let config = mcp_agent_mail_core::Config::get();
             let lock_info =
-                mcp_agent_mail_storage::collect_lock_status(config).unwrap_or_else(|_err| {
+                mcp_agent_mail_storage::collect_lock_status(&config).unwrap_or_else(|_err| {
                     serde_json::json!({
                         "archive_root": "",
                         "exists": false,

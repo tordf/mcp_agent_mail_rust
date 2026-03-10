@@ -93,7 +93,7 @@ async fn acquire_resource_conn(
 ) -> McpResult<impl std::ops::Deref<Target = mcp_agent_mail_db::DbConn>> {
     match pool.acquire(cx).await {
         Outcome::Ok(conn) => Ok(conn),
-        Outcome::Err(err) => Err(db_error_to_mcp_error(err)),
+        Outcome::Err(err) => Err(db_error_to_mcp_error(DbError::Pool(err.to_string()))),
         Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
         Outcome::Panicked(panic) => Err(McpError::internal_error(format!(
             "Internal panic: {}",
