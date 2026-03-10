@@ -914,8 +914,11 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         ));
     }
 
-    let conn = DbConn::open_file(db_path)
-        .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?;
+    let conn = crate::guard_db_conn(
+        DbConn::open_file(db_path)
+            .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?,
+        "search backfill connection",
+    );
 
     let message_watermark = fetch_db_message_watermark(&conn)?;
     let current_index_fingerprint = index_meta_fingerprint(&bridge);

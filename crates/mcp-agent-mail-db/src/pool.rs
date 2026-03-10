@@ -437,7 +437,7 @@ impl DbPool {
                             "sqlite connection init PRAGMAs failed with recoverable error; attempting automatic recovery"
                         );
 
-                        drop(conn);
+                        crate::close_db_conn(conn, "sqlite connection init before recovery");
                         if let Err(recovery_err) = recover_sqlite_file(Path::new(&sqlite_path)) {
                             return Outcome::Err(recovery_err);
                         }
@@ -523,28 +523,31 @@ impl DbPool {
             });
         }
 
-        let conn = match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
-            Ok(conn) => conn,
-            Err(e) => {
-                if !is_corruption_error_message(&e.to_string()) {
-                    return Err(DbError::Sqlite(format!(
-                        "startup integrity check: open failed: {e}"
-                    )));
+        let conn = crate::guard_db_conn(
+            match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    if !is_corruption_error_message(&e.to_string()) {
+                        return Err(DbError::Sqlite(format!(
+                            "startup integrity check: open failed: {e}"
+                        )));
+                    }
+                    tracing::warn!(
+                        path = %self.sqlite_path,
+                        error = %e,
+                        "startup integrity check failed to open sqlite file; attempting auto-recovery"
+                    );
+                    recover_sqlite_file(Path::new(&self.sqlite_path))
+                        .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
+                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
+                        DbError::Sqlite(format!(
+                            "startup integrity check: open failed after recovery: {reopen}"
+                        ))
+                    })?
                 }
-                tracing::warn!(
-                    path = %self.sqlite_path,
-                    error = %e,
-                    "startup integrity check failed to open sqlite file; attempting auto-recovery"
-                );
-                recover_sqlite_file(Path::new(&self.sqlite_path))
-                    .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
-                open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
-                    DbError::Sqlite(format!(
-                        "startup integrity check: open failed after recovery: {reopen}"
-                    ))
-                })?
-            }
-        };
+            },
+            "startup integrity check connection",
+        );
 
         match integrity::quick_check(&conn) {
             Ok(res) => Ok(res),
@@ -561,11 +564,14 @@ impl DbPool {
                 }
 
                 // Re-open and re-verify
-                let conn = open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
-                    DbError::Sqlite(format!(
-                        "startup integrity check (post-recovery): open failed: {e}"
-                    ))
-                })?;
+                let conn = crate::guard_db_conn(
+                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "startup integrity check (post-recovery): open failed: {e}"
+                        ))
+                    })?,
+                    "startup integrity check post-recovery connection",
+                );
                 integrity::quick_check(&conn)
             }
             Err(e) => Err(e),
@@ -593,29 +599,32 @@ impl DbPool {
             });
         }
 
-        let conn = match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
-            Ok(conn) => conn,
-            Err(e) => {
-                if !is_corruption_error_message(&e.to_string()) {
-                    return Err(DbError::Sqlite(format!(
-                        "full integrity check: open failed: {e}"
-                    )));
+        let conn = crate::guard_db_conn(
+            match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    if !is_corruption_error_message(&e.to_string()) {
+                        return Err(DbError::Sqlite(format!(
+                            "full integrity check: open failed: {e}"
+                        )));
+                    }
+                    tracing::warn!(
+                        path = %self.sqlite_path,
+                        error = %e,
+                        "full integrity check failed to open sqlite file; attempting auto-recovery"
+                    );
+                    recover_sqlite_file(Path::new(&self.sqlite_path)).map_err(|re| {
+                        DbError::Sqlite(format!("full integrity recovery failed: {re}"))
+                    })?;
+                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
+                        DbError::Sqlite(format!(
+                            "full integrity check: open failed after recovery: {reopen}"
+                        ))
+                    })?
                 }
-                tracing::warn!(
-                    path = %self.sqlite_path,
-                    error = %e,
-                    "full integrity check failed to open sqlite file; attempting auto-recovery"
-                );
-                recover_sqlite_file(Path::new(&self.sqlite_path)).map_err(|re| {
-                    DbError::Sqlite(format!("full integrity recovery failed: {re}"))
-                })?;
-                open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
-                    DbError::Sqlite(format!(
-                        "full integrity check: open failed after recovery: {reopen}"
-                    ))
-                })?
-            }
-        };
+            },
+            "full integrity check connection",
+        );
 
         integrity::full_check(&conn)
     }
@@ -637,8 +646,11 @@ impl DbPool {
         // Keep consistency sampling on FrankenSQLite and avoid JOIN-heavy scans:
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
-        let conn = open_sqlite_file_with_lock_retry(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
+        let conn = crate::guard_db_conn(
+            open_sqlite_file_with_lock_retry(&self.sqlite_path)
+                .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?,
+            "consistency probe connection",
+        );
         // This two-phase strategy is materially faster than a three-way JOIN on
         // large mailboxes and reduces startup probe lock contention.
         let message_rows = conn
@@ -796,8 +808,11 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
         }
-        let conn = open_sqlite_file_with_lock_retry(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
+        let conn = crate::guard_db_conn(
+            open_sqlite_file_with_lock_retry(&self.sqlite_path)
+                .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?,
+            "wal checkpoint connection",
+        );
 
         // Apply busy_timeout so the checkpoint waits for active readers/writers.
         conn.execute_raw("PRAGMA busy_timeout = 60000;")
@@ -1121,14 +1136,17 @@ async fn run_sqlite_init_once(
     // malformed-index behavior seen in Franken migration paths on legacy
     // fixtures. Runtime traffic still uses Franken pooled connections.
     if run_migrations {
-        let mig_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
-            Ok(conn) => conn,
-            Err(err) => {
-                return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=open_file_canonical failed: {err}"
-                )));
-            }
-        };
+        let mig_conn = crate::guard_db_conn(
+            match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    return Outcome::Err(SqlError::Custom(format!(
+                        "sqlite init stage=open_file_canonical failed: {err}"
+                    )));
+                }
+            },
+            "sqlite init migration connection",
+        );
 
         if let Err(err) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
             return Outcome::Err(SqlError::Custom(format!(
@@ -1150,14 +1168,17 @@ async fn run_sqlite_init_once(
         drop(mig_conn);
     }
 
-    let runtime_conn = match open_sqlite_file_with_lock_retry(sqlite_path) {
-        Ok(conn) => conn,
-        Err(err) => {
-            return Outcome::Err(SqlError::Custom(format!(
-                "sqlite init stage=open_file_runtime failed: {err}"
-            )));
-        }
-    };
+    let runtime_conn = crate::guard_db_conn(
+        match open_sqlite_file_with_lock_retry(sqlite_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=open_file_runtime failed: {err}"
+                )));
+            }
+        },
+        "sqlite init runtime connection",
+    );
 
     if !run_migrations && let Err(err) = runtime_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
         return Outcome::Err(SqlError::Custom(format!(
@@ -2011,13 +2032,15 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
     }
 
     let path_str = primary_path.to_string_lossy();
-    let conn = open_sqlite_file_with_lock_retry(path_str.as_ref()).map_err(|e| {
-        SqlError::Custom(format!(
-            "failed to initialize fresh sqlite file {}: {e}",
-            primary_path.display()
-        ))
-    })?;
-    drop(conn);
+    let _conn = crate::guard_db_conn(
+        open_sqlite_file_with_lock_retry(path_str.as_ref()).map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to initialize fresh sqlite file {}: {e}",
+                primary_path.display()
+            ))
+        })?,
+        "scratch sqlite reinit connection",
+    );
 
     tracing::warn!(
         primary = %primary_path.display(),
@@ -2358,7 +2381,10 @@ mod tests {
             database_url: "sqlite:///home/ubuntu/storage.sqlite3".to_string(),
             ..Default::default()
         };
-        assert_eq!(config.sqlite_path().unwrap(), "/home/ubuntu/storage.sqlite3");
+        assert_eq!(
+            config.sqlite_path().unwrap(),
+            "/home/ubuntu/storage.sqlite3"
+        );
 
         let config = DbPoolConfig {
             database_url: "postgres://localhost/db".to_string(),
