@@ -282,6 +282,7 @@ dependencies = [
  "asupersync-macros",
  "base64 0.22.1",
  "bincode-next",
+ "crossbeam-deque",
  "crossbeam-queue",
  "franken-decision",
  "franken-evidence",

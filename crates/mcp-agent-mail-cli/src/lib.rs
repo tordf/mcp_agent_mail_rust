@@ -3979,6 +3979,35 @@ fn sqlite_file_is_healthy_canonical(path: &Path) -> CliResult<bool> {
     sqlite_conn_incremental_check_ok_canonical(&conn)
 }
 
+fn handle_sqlite_compatibility_probe_result(
+    path: &Path,
+    result: CliResult<bool>,
+    lock_fallback: bool,
+) -> CliResult<bool> {
+    match result {
+        Ok(ok) => Ok(ok),
+        Err(e) => {
+            eprintln!(
+                "DEBUG: sqlite health probe compatibility check failed for {}: {}",
+                path.display(),
+                e
+            );
+            let msg = e.to_string();
+            if msg.contains("database disk image is malformed") {
+                // rusqlite cannot read frankensqlite's WAL, this is expected
+                return Ok(true);
+            }
+            if is_sqlite_recovery_error_message(&msg) {
+                return Ok(false);
+            }
+            if mcp_agent_mail_db::is_lock_error(&msg) {
+                return Ok(lock_fallback);
+            }
+            Err(e)
+        }
+    }
+}
+
 fn sqlite_file_is_healthy_with_compat_probe<F>(
     path: &Path,
     mut compatibility_probe: F,
@@ -3990,6 +4019,7 @@ where
         return Ok(true);
     }
 
+    let has_live_sidecars = sqlite_file_has_live_sidecars(path);
     let path_string = path.to_string_lossy().into_owned();
     let conn = match mcp_agent_mail_db::DbConn::open_file(&path_string) {
         Ok(conn) => conn,
@@ -4013,33 +4043,18 @@ where
     drop(conn);
 
     if !is_healthy {
+        if !has_live_sidecars {
+            return handle_sqlite_compatibility_probe_result(
+                path,
+                compatibility_probe(path),
+                false,
+            );
+        }
         return Ok(false);
     }
 
-    if sqlite_file_has_live_sidecars(path) {
-        match compatibility_probe(path) {
-            Ok(ok) => return Ok(ok),
-            Err(e) => {
-                eprintln!(
-                    "DEBUG: sqlite health probe compatibility check failed for {}: {}",
-                    path.display(),
-                    e
-                );
-                let msg = e.to_string();
-                if msg.contains("database disk image is malformed") {
-                    // rusqlite cannot read frankensqlite's WAL, this is expected
-                    return Ok(true);
-                }
-                if is_sqlite_recovery_error_message(&msg) {
-                    return Ok(false);
-                }
-                if mcp_agent_mail_db::is_lock_error(&msg) {
-                    // Preserve primary health verdict on transient lock/busy errors.
-                    return Ok(true);
-                }
-                return Err(e);
-            }
-        }
+    if has_live_sidecars {
+        return handle_sqlite_compatibility_probe_result(path, compatibility_probe(path), true);
     }
 
     Ok(true)
@@ -9899,9 +9914,10 @@ struct DoctorForeignKeyViolation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoctorOrphanedMessageRecipient {
-    rowid: i64,
     message_id: i64,
     agent_id: i64,
+    missing_message: bool,
+    missing_agent: bool,
 }
 
 fn doctor_foreign_key_violations(
@@ -9935,26 +9951,33 @@ fn doctor_orphaned_message_recipients(
 ) -> CliResult<Vec<DoctorOrphanedMessageRecipient>> {
     let rows = conn
         .query_sync(
-            "SELECT mr.rowid, mr.message_id, mr.agent_id \
+            "SELECT mr.message_id, mr.agent_id, \
+                    CASE WHEN m.id IS NULL THEN 1 ELSE 0 END AS missing_message, \
+                    CASE WHEN a.id IS NULL THEN 1 ELSE 0 END AS missing_agent \
              FROM message_recipients mr \
              LEFT JOIN messages m ON m.id = mr.message_id \
              LEFT JOIN agents a ON a.id = mr.agent_id \
              WHERE m.id IS NULL OR a.id IS NULL \
-             ORDER BY mr.rowid ASC",
+             ORDER BY mr.message_id ASC, mr.agent_id ASC",
             &[],
         )
         .map_err(|e| CliError::Other(format!("orphaned recipient query failed: {e}")))?;
     let mut recipients = Vec::with_capacity(rows.len());
     for row in rows {
         recipients.push(DoctorOrphanedMessageRecipient {
-            rowid: row
+            message_id: row
                 .get_as(0)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            message_id: row
+            agent_id: row
                 .get_as(1)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            agent_id: row
-                .get_as(2)
+            missing_message: row
+                .get_as::<i64>(2)
+                .map(|value| value != 0)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            missing_agent: row
+                .get_as::<i64>(3)
+                .map(|value| value != 0)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
         });
     }
@@ -10019,16 +10042,17 @@ fn doctor_cleanup_orphaned_message_recipients(
     conn.execute_raw("BEGIN IMMEDIATE")
         .map_err(|e| CliError::Other(format!("failed to begin orphan-recipient cleanup: {e}")))?;
 
-    let cleanup_result = (|| -> CliResult<()> {
-        let delete_sql = "DELETE FROM message_recipients WHERE rowid = ?";
+        let cleanup_result = (|| -> CliResult<()> {
+        let delete_sql = "DELETE FROM message_recipients WHERE message_id = ? AND agent_id = ?";
         for orphan in &orphaned {
-            let params = [mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
-                orphan.rowid,
-            )];
+            let params = [
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.message_id),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.agent_id),
+            ];
             conn.execute_sync(delete_sql, &params).map_err(|e| {
                 CliError::Other(format!(
-                    "failed to delete orphaned recipient row {}: {e}",
-                    orphan.rowid
+                    "failed to delete orphaned recipient (message_id={}, agent_id={}): {e}",
+                    orphan.message_id, orphan.agent_id
                 ))
             })?;
         }
@@ -10160,6 +10184,14 @@ enum McpAgentMailEntryKind {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpAgentMailStatusUrlParts {
+    scheme: &'static str,
+    host: String,
+    port: u16,
+    path: String,
+}
+
 fn parse_json_or_json5(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
@@ -10284,6 +10316,34 @@ fn classify_mcp_agent_mail_toml(content: &str, rust_binary: &Path) -> McpAgentMa
     }
 }
 
+fn extract_mcp_agent_mail_toml_url(content: &str) -> Option<String> {
+    let mut in_target_section = false;
+
+    for raw_line in content.lines() {
+        if let Some(section) = parse_toml_section_header(raw_line) {
+            in_target_section = matches!(
+                section,
+                "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
+            );
+            continue;
+        }
+
+        let line = raw_line.trim();
+
+        if !in_target_section || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(url) = parse_simple_toml_string_value(line, "url")
+            .or_else(|| parse_simple_toml_string_value(line, "httpUrl"))
+        {
+            return Some(url.to_string());
+        }
+    }
+
+    None
+}
+
 fn find_mcp_agent_mail_entry(doc: &serde_json::Value) -> Option<&serde_json::Value> {
     const SERVER_CONTAINER_KEYS: &[&str] = &["mcpServers", "servers", "mcp", "mcp_servers"];
     const SERVER_ENTRY_KEYS: &[&str] = &["mcp-agent-mail", "agent-mail"];
@@ -10303,6 +10363,15 @@ fn find_mcp_agent_mail_entry(doc: &serde_json::Value) -> Option<&serde_json::Val
         }
     }
     None
+}
+
+fn extract_mcp_agent_mail_entry_url(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .as_object()?
+        .get("url")
+        .or_else(|| entry.as_object()?.get("httpUrl"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn classify_mcp_agent_mail_entry(
@@ -10488,6 +10557,120 @@ fn classify_mcp_agent_mail_config(
     Some(classify_mcp_agent_mail_entry(entry, rust_binary))
 }
 
+fn extract_mcp_agent_mail_config_url(config_path: &Path, content: &str) -> Option<String> {
+    if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        return extract_mcp_agent_mail_toml_url(content);
+    }
+
+    let doc = parse_json_or_json5(content)?;
+    let entry = find_mcp_agent_mail_entry(&doc)?;
+    extract_mcp_agent_mail_entry_url(entry)
+}
+
+fn normalize_mcp_config_status_url_host(host: &str) -> &str {
+    if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
+        "127.0.0.1"
+    } else {
+        host
+    }
+}
+
+fn normalize_mcp_config_status_url_path(path: &str) -> String {
+    let truncated = path.split(['?', '#']).next().unwrap_or(path).trim();
+    let mut normalized = if truncated.is_empty() {
+        "/".to_string()
+    } else if truncated.starts_with('/') {
+        truncated.to_string()
+    } else {
+        format!("/{truncated}")
+    };
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
+}
+
+fn parse_mcp_config_status_url_authority(
+    authority: &str,
+    default_port: u16,
+) -> Option<(String, u16)> {
+    if authority.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = if tail.is_empty() {
+            default_port
+        } else {
+            let port_str = tail.strip_prefix(':')?;
+            port_str.parse::<u16>().ok()?
+        };
+        return Some((host.to_string(), port));
+    }
+
+    if authority.matches(':').count() == 1
+        && let Some((host, port_str)) = authority.rsplit_once(':')
+    {
+        let port = port_str.parse::<u16>().ok()?;
+        return Some((host.to_string(), port));
+    }
+
+    Some((authority.to_string(), default_port))
+}
+
+fn parse_mcp_config_status_url(url: &str) -> Option<McpAgentMailStatusUrlParts> {
+    let trimmed = url.trim();
+    let (scheme, remainder, default_port) = if let Some(rest) = trimmed.strip_prefix("http://") {
+        ("http", rest, 80_u16)
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        ("https", rest, 443_u16)
+    } else {
+        return None;
+    };
+
+    let (authority, raw_path) = if let Some((auth, tail)) = remainder.split_once('/') {
+        (auth, format!("/{tail}"))
+    } else {
+        (remainder, "/".to_string())
+    };
+
+    let (host, port) = parse_mcp_config_status_url_authority(authority, default_port)?;
+    let path = normalize_mcp_config_status_url_path(&raw_path);
+
+    Some(McpAgentMailStatusUrlParts {
+        scheme,
+        host,
+        port,
+        path,
+    })
+}
+
+fn mcp_config_urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
+    if actual_url == expected_url {
+        return true;
+    }
+
+    let Some(actual) = parse_mcp_config_status_url(actual_url) else {
+        return false;
+    };
+    let Some(expected) = parse_mcp_config_status_url(expected_url) else {
+        return false;
+    };
+
+    actual.scheme == expected.scheme
+        && normalize_mcp_config_status_url_host(&actual.host)
+            .eq_ignore_ascii_case(normalize_mcp_config_status_url_host(&expected.host))
+        && actual.port == expected.port
+        && actual.path == expected.path
+}
+
+fn mcp_config_url_matches_any_expected(actual_url: &str, expected_urls: &[String]) -> bool {
+    expected_urls
+        .iter()
+        .any(|expected_url| mcp_config_urls_match_for_status(actual_url, expected_url))
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -10663,9 +10846,18 @@ fn handle_doctor_check_with(
                                 .iter()
                                 .take(5)
                                 .map(|row| {
+                                    let mut missing = Vec::new();
+                                    if row.missing_message {
+                                        missing.push("message");
+                                    }
+                                    if row.missing_agent {
+                                        missing.push("agent");
+                                    }
                                     format!(
-                                        "rowid {} (message_id={}, agent_id={})",
-                                        row.rowid, row.message_id, row.agent_id
+                                        "message_id={}, agent_id={} (missing {})",
+                                        row.message_id,
+                                        row.agent_id,
+                                        missing.join("+")
                                     )
                                 })
                                 .collect::<Vec<_>>()
@@ -11218,6 +11410,7 @@ fn handle_doctor_check_with(
     {
         use mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default;
 
+        let config = Config::from_env();
         let rust_binary = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default()
@@ -11236,9 +11429,13 @@ fn handle_doctor_check_with(
             let mut pointing_to_rust = 0u32;
             let mut pointing_to_python = 0u32;
             let mut pointing_to_http_url = 0u32;
+            let mut pointing_to_wrong_http_url = 0u32;
             let mut missing_entry = 0u32;
             let mut parse_errors = 0u32;
             let mut detail_parts: Vec<String> = Vec::new();
+            let desired_urls =
+                check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path);
+            let desired_urls_label = desired_urls.join(" or ");
 
             for loc in &existing {
                 match std::fs::read_to_string(&loc.config_path) {
@@ -11275,7 +11472,34 @@ fn handle_doctor_check_with(
                                 ));
                             }
                             McpAgentMailEntryKind::HttpUrl => {
-                                pointing_to_http_url += 1;
+                                match extract_mcp_agent_mail_config_url(&loc.config_path, &content)
+                                {
+                                    Some(actual_url)
+                                        if mcp_config_url_matches_any_expected(
+                                            &actual_url,
+                                            &desired_urls,
+                                        ) =>
+                                    {
+                                        pointing_to_http_url += 1;
+                                    }
+                                    Some(actual_url) => {
+                                        pointing_to_wrong_http_url += 1;
+                                        detail_parts.push(format!(
+                                            "{} ({}) → wrong HTTP URL {}",
+                                            loc.tool.slug(),
+                                            loc.config_path.display(),
+                                            actual_url
+                                        ));
+                                    }
+                                    None => {
+                                        missing_entry += 1;
+                                        detail_parts.push(format!(
+                                            "{} ({}) → HTTP config without URL",
+                                            loc.tool.slug(),
+                                            loc.config_path.display()
+                                        ));
+                                    }
+                                }
                             }
                             McpAgentMailEntryKind::Unknown => {
                                 missing_entry += 1;
@@ -11293,13 +11517,15 @@ fn handle_doctor_check_with(
                 }
             }
 
-            let mcp_status = if pointing_to_python > 0 || pointing_to_rust > 0 {
-                "warn"
-            } else if pointing_to_http_url > 0 {
-                "ok"
-            } else {
-                "warn"
-            };
+            let mcp_status =
+                if pointing_to_python > 0 || pointing_to_rust > 0 || pointing_to_wrong_http_url > 0
+                {
+                    "warn"
+                } else if pointing_to_http_url > 0 {
+                    "ok"
+                } else {
+                    "warn"
+                };
 
             let summary = format!(
                 "{} config(s) found: {} HTTP URL, {} stdio command, {} legacy Python, {} no entry, {} unreadable",
@@ -11310,11 +11536,20 @@ fn handle_doctor_check_with(
                 missing_entry,
                 parse_errors
             );
+            let summary = if pointing_to_wrong_http_url > 0 {
+                format!("{summary}, {pointing_to_wrong_http_url} wrong HTTP URL")
+            } else {
+                summary
+            };
 
-            let detail = if pointing_to_python > 0 || pointing_to_rust > 0 {
+            let detail = if pointing_to_python > 0
+                || pointing_to_rust > 0
+                || pointing_to_wrong_http_url > 0
+            {
                 format!(
-                    "{}. Fix: run `am setup` or `am doctor fix` to convert to HTTP URL mode: {}",
+                    "{}. Fix: run `am setup` or `am doctor fix` to convert to HTTP URL mode or update the endpoint to {}: {}",
                     summary,
+                    desired_urls_label,
                     detail_parts.join(", ")
                 )
             } else {
@@ -12107,8 +12342,11 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
         let locations = detect_mcp_config_locations_default();
         let existing: Vec<_> = locations.iter().filter(|l| l.exists).collect();
         let mut any_fixable = false;
-        let desired_url =
-            check_inbox_server_url(&config.http_host, config.http_port, &config.http_path);
+        let desired_urls =
+            check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path);
+        let desired_url = desired_urls.first().cloned().unwrap_or_else(|| {
+            check_inbox_server_url(&config.http_host, config.http_port, &config.http_path)
+        });
         let desired_bearer_token = config.http_bearer_token.as_deref();
 
         for loc in &existing {
@@ -12120,21 +12358,35 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
             else {
                 continue;
             };
-            if matches!(
-                kind,
-                McpAgentMailEntryKind::Rust | McpAgentMailEntryKind::Python
-            ) {
+            let repair_reason = match kind {
+                McpAgentMailEntryKind::Rust => Some("convert stdio command mode".to_string()),
+                McpAgentMailEntryKind::Python => {
+                    Some("convert legacy Python launcher mode".to_string())
+                }
+                McpAgentMailEntryKind::HttpUrl => {
+                    let Some(actual_url) =
+                        extract_mcp_agent_mail_config_url(&loc.config_path, &content)
+                    else {
+                        continue;
+                    };
+                    (!mcp_config_url_matches_any_expected(&actual_url, &desired_urls))
+                        .then_some(format!("update wrong HTTP URL {actual_url}"))
+                }
+                McpAgentMailEntryKind::Unknown => None,
+            };
+            if let Some(repair_reason) = repair_reason {
                 any_fixable = true;
                 if dry_run {
                     ftui_runtime::ftui_eprintln!(
-                        "[dry-run] {mode_label}: update {} to use {}",
+                        "[dry-run] {mode_label}: {} in {} to use {}",
+                        repair_reason,
                         loc.config_path.display(),
                         desired_url
                     );
                     results.push(serde_json::json!({
                         "check": "mcp_config",
                         "action": "dry_run",
-                        "detail": format!("Would update {} to {}", loc.config_path.display(), desired_url),
+                        "detail": format!("Would {} in {} to {}", repair_reason, loc.config_path.display(), desired_url),
                     }));
                     skipped_count += 1;
                 } else {
@@ -12170,7 +12422,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
             results.push(serde_json::json!({
                 "check": "mcp_config",
                 "action": "skip",
-                "detail": "No non-HTTP MCP configs found",
+                "detail": "No MCP configs needed repair",
             }));
             skipped_count += 1;
         }
@@ -19560,6 +19812,31 @@ command = "mcp-agent-mail"
     }
 
     #[test]
+    fn fix_mcp_config_entry_updates_existing_toml_http_url_when_port_mismatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let desired_url = "http://127.0.0.1:8765/api/";
+        std::fs::write(
+            &config,
+            r#"[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8767/mcp/"
+"#,
+        )
+        .unwrap();
+
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("testtoken"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Codex,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(content.contains(&format!("url = \"{desired_url}\"")));
+        assert!(!content.contains("8767"));
+    }
+
+    #[test]
     fn fix_mcp_config_entry_preserves_toml_metadata_while_rewriting_transport() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
@@ -19620,6 +19897,36 @@ command = "mcp-agent-mail"
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
         assert!(content.contains("http_headers = { Authorization = \"Bearer testtoken\" }"));
         assert!(!content.contains("command = "));
+    }
+
+    #[test]
+    fn extract_mcp_agent_mail_config_url_reads_toml_http_url() {
+        let content = r#"[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8767/mcp/"
+"#;
+        let url =
+            extract_mcp_agent_mail_config_url(Path::new("/tmp/config.toml"), content).unwrap();
+        assert_eq!(url, "http://127.0.0.1:8767/mcp/");
+    }
+
+    #[test]
+    fn mcp_config_url_matches_any_expected_accepts_aliases_and_rejects_wrong_port() {
+        let expected_urls = vec![
+            "http://127.0.0.1:8765/mcp/".to_string(),
+            "http://127.0.0.1:8765/api/".to_string(),
+        ];
+        assert!(mcp_config_url_matches_any_expected(
+            "http://localhost:8765/api",
+            &expected_urls
+        ));
+        assert!(mcp_config_url_matches_any_expected(
+            "http://127.0.0.1:8765/mcp/",
+            &expected_urls
+        ));
+        assert!(!mcp_config_url_matches_any_expected(
+            "http://127.0.0.1:8767/mcp/",
+            &expected_urls
+        ));
     }
 
     #[test]
@@ -21713,10 +22020,12 @@ command = "mcp-agent-mail"
         let db_path = dir.path().join("doctor_fk_fail.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
 
-        handle_migrate_with_database_url(&db_url).expect("migrate");
-
         let conn =
             mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
         conn.execute_raw("PRAGMA foreign_keys = OFF")
             .expect("disable foreign keys for fixture");
         conn.execute_raw(
@@ -25498,6 +25807,47 @@ command = "mcp-agent-mail"
         assert!(
             !healthy,
             "compatibility probe failure should mark DB unhealthy"
+        );
+    }
+
+    #[test]
+    fn sqlite_file_is_healthy_accepts_orphaned_foreign_keys_without_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("compat_orphan_fk.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'health-fk', '/tmp/health-fk', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES (1, 1, 'BlueRiver', 'codex-cli', 'gpt-5', 'doctor test', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agent");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (999, 1, 'to')",
+        )
+        .expect("insert orphaned recipient");
+        drop(conn);
+
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite3-shm"));
+
+        let healthy = sqlite_file_is_healthy(&db_path).expect("health check");
+        assert!(
+            healthy,
+            "orphaned foreign keys should not be treated as structural corruption"
         );
     }
 
