@@ -4705,6 +4705,7 @@ fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
     let Some(conn) = dashboard_open_connection(database_url) else {
         return DashboardDbStats::default();
     };
+    let conn = mcp_agent_mail_db::guard_db_conn(conn, "dashboard stats snapshot connection");
     fetch_dashboard_db_stats_from_conn(&conn)
 }
 
@@ -4731,7 +4732,9 @@ fn fetch_dashboard_db_stats_cached(
         if conn.query_sync("SELECT 1 AS c", &[]).is_ok() {
             return fetch_dashboard_db_stats_from_conn(conn);
         }
-        *conn_state = None;
+        if let Some(old_conn) = conn_state.take() {
+            mcp_agent_mail_db::close_db_conn(old_conn, "dashboard cached connection");
+        }
     }
 
     *conn_state = dashboard_open_connection(database_url);
@@ -7452,7 +7455,7 @@ fn readiness_check_with_integrity(
     }
 
     let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
-    drop(conn);
+    mcp_agent_mail_db::close_db_conn(conn, "server readiness connection");
 
     let skip_startup_integrity =
         startup_integrity_fingerprint
