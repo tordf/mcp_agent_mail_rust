@@ -4110,6 +4110,7 @@ where
     let mut used_absolute_fallback = false;
     let mut fallback_due_to_missing_configured_path = false;
     let mut sqlite3_probe_failed = false;
+    let mut sqlite3_rescued_primary = false;
 
     if !selected_path.exists() {
         if let Some(absolute_candidate) = sqlite_absolute_candidate_path(db_path) {
@@ -4166,11 +4167,16 @@ where
         }
     }
 
-    if let Some(sqlite3_ok) = sqlite_quick_check_via_cli(selected_path.as_path())?
-        && !sqlite3_ok
-    {
-        sqlite3_probe_failed = true;
-        // Do not force healthy = false; frankensqlite might use formats that standard sqlite3 CLI rejects.
+    if let Some(sqlite3_ok) = sqlite_quick_check_via_cli(selected_path.as_path())? {
+        if sqlite3_ok {
+            if !healthy {
+                healthy = true;
+                sqlite3_rescued_primary = true;
+            }
+        } else {
+            sqlite3_probe_failed = true;
+            // Do not force healthy = false; frankensqlite might use formats that standard sqlite3 CLI rejects.
+        }
     }
 
     let file_size = selected_path.metadata().map(|m| m.len()).map_err(|e| {
@@ -4188,7 +4194,9 @@ where
         ));
     }
 
-    let sqlite3_note = if sqlite3_probe_failed {
+    let sqlite3_note = if sqlite3_rescued_primary {
+        "; sqlite3 quick_check rescued failed primary probe".to_string()
+    } else if sqlite3_probe_failed {
         "; sqlite3 quick_check failed".to_string()
     } else {
         String::new()
@@ -25848,6 +25856,49 @@ url = "http://127.0.0.1:8767/mcp/"
         assert!(
             healthy,
             "orphaned foreign keys should not be treated as structural corruption"
+        );
+    }
+
+    #[test]
+    fn sqlite_doctor_file_sanity_accepts_orphaned_foreign_keys_with_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("doctor_orphan_fk.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'doctor-sidecar-fk', '/tmp/doctor-sidecar-fk', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES (1, 1, 'BlueForest', 'codex-cli', 'gpt-5', 'doctor test', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agent");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (999, 1, 'to')",
+        )
+        .expect("insert orphaned recipient");
+        drop(conn);
+
+        let (healthy, detail, _used_absolute_fallback, _fallback_due_to_missing_path) =
+            sqlite_doctor_file_sanity(&db_path_str).expect("doctor file sanity");
+        assert!(
+            healthy,
+            "orphaned foreign keys with WAL sidecars should not fail db file sanity: {detail}"
+        );
+        assert!(
+            detail.contains("sqlite3 quick_check"),
+            "expected sqlite3 note in detail, got: {detail}"
         );
     }
 

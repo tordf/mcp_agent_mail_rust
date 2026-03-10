@@ -333,6 +333,113 @@ fn migrate_then_list_projects_json_smoke() {
 }
 
 #[test]
+fn agents_list_json_by_human_key_smoke() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+
+    let project_root = env.tmp.path().join("project");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let project_key = project_root.display().to_string();
+
+    insert_project(&conn, 1, "tmp-project", &project_key);
+    insert_agent(&conn, 1, 1, "BlueLake", "codex-cli", "gpt-5");
+    drop(conn);
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["agents", "list", "-p", &project_key, "--json"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "agents_list_json_by_human_key",
+            &["agents", "list", "-p", &project_key, "--json"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let rows = value.as_array().expect("agents list should be a JSON array");
+    assert_eq!(rows.len(), 1, "expected exactly one agent row");
+    assert_eq!(rows[0]["name"].as_str(), Some("BlueLake"));
+}
+
+#[test]
+fn macros_start_session_json_smoke() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    std::fs::create_dir_all(&env.storage_root).expect("create storage root");
+
+    let project_root = env.tmp.path().join("project");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let project_key = project_root.display().to_string();
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &[
+            "macros",
+            "start-session",
+            "-p",
+            &project_key,
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5",
+            "--task",
+            "integration smoke",
+            "--json",
+        ],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "macros_start_session_json_smoke",
+            &[
+                "macros",
+                "start-session",
+                "-p",
+                &project_key,
+                "--program",
+                "codex-cli",
+                "--model",
+                "gpt-5",
+                "--task",
+                "integration smoke",
+                "--json",
+            ],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["project"]["human_key"].as_str(), Some(project_key.as_str()));
+    assert!(
+        value["agent"]["name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "expected non-empty agent name"
+    );
+    assert!(
+        value["inbox"].is_array(),
+        "expected inbox array in start-session response"
+    );
+}
+
+#[test]
 fn guard_install_status_uninstall_smoke() {
     let env = TestEnv::new();
     let repo = env.tmp.path().join("repo");
