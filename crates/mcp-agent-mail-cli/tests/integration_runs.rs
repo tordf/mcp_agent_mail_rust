@@ -367,7 +367,9 @@ fn agents_list_json_by_human_key_smoke() {
     }
 
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    let rows = value.as_array().expect("agents list should be a JSON array");
+    let rows = value
+        .as_array()
+        .expect("agents list should be a JSON array");
     assert_eq!(rows.len(), 1, "expected exactly one agent row");
     assert_eq!(rows[0]["name"].as_str(), Some("BlueLake"));
 }
@@ -426,7 +428,10 @@ fn macros_start_session_json_smoke() {
     }
 
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    assert_eq!(value["project"]["human_key"].as_str(), Some(project_key.as_str()));
+    assert_eq!(
+        value["project"]["human_key"].as_str(),
+        Some(project_key.as_str())
+    );
     assert!(
         value["agent"]["name"]
             .as_str()

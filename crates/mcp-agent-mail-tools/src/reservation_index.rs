@@ -59,7 +59,9 @@ impl ReservationIndex {
 
             if !compiled.is_glob() {
                 // Exact path: group by first segment for prefix-scoped scans.
-                let prefix = first_segment(compiled.normalized()).unwrap_or("").to_owned();
+                let prefix = first_segment(compiled.normalized())
+                    .unwrap_or("")
+                    .to_owned();
                 exact_by_prefix
                     .entry(prefix)
                     .or_default()
