@@ -231,7 +231,8 @@ fn normalize_client_connect_host(host: &str) -> std::borrow::Cow<'_, str> {
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(trimmed);
     match unbracketed {
-        "0.0.0.0" | "::" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        "0.0.0.0" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        "::" => std::borrow::Cow::Borrowed("[::1]"),
         _ => {
             if unbracketed.contains(':') && !trimmed.starts_with('[') {
                 std::borrow::Cow::Owned(format!("[{unbracketed}]"))
@@ -2127,7 +2128,7 @@ http_headers = { Authorization = "Bearer tok" }
             path: "/mcp/".into(),
             ..Default::default()
         };
-        assert_eq!(params.server_url(), "http://127.0.0.1:8765/mcp/");
+        assert_eq!(params.server_url(), "http://[::1]:8765/mcp/");
 
         let params = SetupParams {
             host: "[::]".into(),
@@ -2135,7 +2136,18 @@ http_headers = { Authorization = "Bearer tok" }
             path: "/mcp/".into(),
             ..Default::default()
         };
-        assert_eq!(params.server_url(), "http://127.0.0.1:8765/mcp/");
+        assert_eq!(params.server_url(), "http://[::1]:8765/mcp/");
+    }
+
+    #[test]
+    fn setup_params_server_url_brackets_explicit_ipv6_hosts() {
+        let params = SetupParams {
+            host: "2001:db8::42".into(),
+            port: 8765,
+            path: "/mcp/".into(),
+            ..Default::default()
+        };
+        assert_eq!(params.server_url(), "http://[2001:db8::42]:8765/mcp/");
     }
 
     #[test]
