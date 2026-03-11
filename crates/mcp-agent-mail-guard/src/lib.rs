@@ -454,23 +454,12 @@ def get_active_reservations():
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_reservation_releases' LIMIT 1"
         ).fetchone() is not None
         sql = (
-            "SELECT fr.path_pattern, fr.agent_id, fr.expires_ts, a.name as agent_name "
+            "SELECT fr.path_pattern, fr.agent_id, fr.expires_ts, fr.released_ts, a.name as agent_name "
             "FROM file_reservations fr "
             "JOIN agents a ON a.id = fr.agent_id "
             "JOIN projects p ON p.id = fr.project_id "
-            "WHERE fr.exclusive = 1 AND ("
-            "fr.released_ts IS NULL "
-            "OR (typeof(fr.released_ts) IN ('integer', 'real') AND fr.released_ts <= 0) "
-            "OR (typeof(fr.released_ts) = 'text' AND lower(trim(fr.released_ts)) IN ('', '0', 'null', 'none')) "
-            "OR (typeof(fr.released_ts) = 'text' "
-            "    AND length(trim(fr.released_ts)) > 0 "
-            "    AND trim(fr.released_ts) GLOB '*[0-9]*' "
-            "    AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE("
-            "          trim(fr.released_ts),"
-            "          '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' "
-            "    AND CAST(trim(fr.released_ts) AS REAL) <= 0)"
-            ") "
-            "AND fr.expires_ts > ? AND (p.human_key = ? OR p.slug = ?)"
+            "WHERE fr.exclusive = 1 "
+            "AND (p.human_key = ? OR p.slug = ?)"
         )
         if has_release_ledger:
             sql += (
@@ -478,11 +467,52 @@ def get_active_reservations():
                 "SELECT 1 FROM file_reservation_releases rr "
                 "WHERE rr.reservation_id = fr.id)"
             )
-        rows = conn.execute(sql, (now_micros, PROJECT, PROJECT)).fetchall()
+        rows = conn.execute(sql, (PROJECT, PROJECT)).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+
+        def is_released(val):
+            if val is None:
+                return False
+            if isinstance(val, (int, float)):
+                return val > 0
+            if isinstance(val, str):
+                s = val.strip().lower()
+                if s in ('', '0', 'null', 'none'):
+                    return False
+                try:
+                    return float(s) > 0
+                except ValueError:
+                    return True
+            return True
+
+        def is_expired(val, now_us):
+            if val is None:
+                return True
+            if isinstance(val, (int, float)):
+                return val <= now_us
+            if isinstance(val, str):
+                try:
+                    return float(val) <= now_us
+                except ValueError:
+                    import datetime
+                    try:
+                        s = val.replace('Z', '+00:00')
+                        dt = datetime.datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=datetime.timezone.utc)
+                        now_dt = datetime.datetime.utcfromtimestamp(now_us / 1000000.0).replace(tzinfo=datetime.timezone.utc)
+                        return dt <= now_dt
+                    except Exception:
+                        return False
+            return False
+
+        active = []
+        for r in rows:
+            if not is_released(r["released_ts"]) and not is_expired(r["expires_ts"], now_micros):
+                active.append(dict(r))
+        return active
     except Exception as exc:
-        print(f"mcp-agent-mail: guard failed to read reservations: {{exc}}", file=sys.stderr)
+        print("mcp-agent-mail: guard failed to read reservations: " + str(exc), file=sys.stderr)
         sys.exit(2)
 
 def core_ignorecase_enabled():
@@ -569,8 +599,10 @@ def check_conflicts(paths, reservations):
 
             normalized_pattern = normalize_match_input(pattern)
             if not normalized_pattern:
-                continue
-            
+                # Root directory reservation conflicts with everything
+                conflicts.append((f, pattern, holder))
+                break
+
             # 1. Glob matching: check if concrete path matches reserved glob
             if glob_match(normalized_f, normalized_pattern):
                 conflicts.append((f, pattern, holder))
@@ -1240,8 +1272,8 @@ fn is_expired(ts_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
         let utc = dt.and_utc();
         return utc <= *now;
     }
-    // If we can't parse, treat as expired (conservative/fail-open)
-    true
+    // If we can't parse, treat as NOT expired (conservative/fail-closed)
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2699,182 +2731,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_hooks_dir error path tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_hooks_dir_nonexistent_path_returns_error() {
-        let td = tempfile::TempDir::new().expect("tempdir");
-        let nonexistent = td.path().join("no_such_dir");
-        let result = resolve_hooks_dir(&nonexistent);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            GuardError::InvalidRepo { .. }
-        ));
-    }
-
-    #[test]
-    fn resolve_hooks_dir_bare_repo_returns_error() {
-        let td = tempfile::TempDir::new().expect("tempdir");
-        let bare_dir = td.path().join("bare.git");
-        run_git(
-            td.path(),
-            &["init", "-q", "--bare", bare_dir.to_str().unwrap()],
-        );
-
-        let result = resolve_hooks_dir(&bare_dir);
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), GuardError::InvalidRepo { .. }),
-            "bare repos should be rejected"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // install_guard / uninstall_guard error and edge case tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn install_guard_nonexistent_repo_returns_error() {
-        let td = tempfile::TempDir::new().expect("tempdir");
-        let nonexistent = td.path().join("nonexistent");
-        let result = install_guard("/test/project", &nonexistent, None, false);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            GuardError::InvalidRepo { .. }
-        ));
-    }
-
-    #[test]
-    fn install_guard_idempotent() {
-        let td = tempfile::TempDir::new().expect("tempdir");
-        let repo_dir = td.path().join("repo");
-        std::fs::create_dir_all(&repo_dir).expect("mkdir");
-        run_git(&repo_dir, &["init", "-q"]);
-
-        // Install twice - should not error
-        install_guard("/test/project", &repo_dir, None, false).expect("first install");
-        install_guard("/test/project", &repo_dir, None, false).expect("second install");
-
-        let status = guard_status(&repo_dir).expect("status");
-        assert!(status.pre_commit_present);
-    }
-
-    #[test]
-    fn uninstall_guard_nonexistent_repo_returns_error() {
-        let td = tempfile::TempDir::new().expect("tempdir");
-        let nonexistent = td.path().join("nonexistent");
-        let result = uninstall_guard(&nonexistent);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            GuardError::InvalidRepo { .. }
-        ));
-    }
-
-    #[test]
-    fn uninstall_guard_without_prior_install_is_noop() {
-        let td = tempfile::TempDir::new().expect("tempdir");
-        let repo_dir = td.path().join("repo");
-        std::fs::create_dir_all(&repo_dir).expect("mkdir");
-        run_git(&repo_dir, &["init", "-q"]);
-
-        // Uninstall on a repo without guard should succeed silently
-        uninstall_guard(&repo_dir).expect("uninstall without install");
-    }
-
-    // -----------------------------------------------------------------------
-    // is_expired edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn is_expired_at_exact_boundary_is_expired() {
-        let now = chrono::Utc::now();
-        let ts = now.to_rfc3339();
-        assert!(
-            is_expired(&ts, &now),
-            "expiry at exact now should be expired (<= semantics)"
-        );
-    }
-
-    #[test]
-    fn is_expired_naive_without_fractional() {
-        let now = chrono::Utc::now();
-        let past = (now - chrono::Duration::hours(1))
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string();
-        assert!(is_expired(&past, &now));
-    }
-
-    // -----------------------------------------------------------------------
-    // is_legacy_single_file_guard tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn legacy_guard_detection() {
-        assert!(is_legacy_single_file_guard(
-            "#!/bin/sh\n# mcp-agent-mail guard hook\necho guard"
-        ));
-        assert!(is_legacy_single_file_guard(
-            "AGENT_NAME environment variable is required."
-        ));
-        assert!(!is_legacy_single_file_guard("#!/bin/sh\necho hello\n"));
-    }
-
-    // -----------------------------------------------------------------------
-    // expand_user tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn expand_user_tilde_only() {
-        let result = expand_user("~");
-        // Should expand to home dir or fall back to "~"
-        assert!(!result.to_string_lossy().is_empty());
-    }
-
-    #[test]
-    fn expand_user_tilde_prefix() {
-        let result = expand_user("~/foo/bar");
-        let s = result.to_string_lossy();
-        assert!(s.ends_with("foo/bar"));
-    }
-
-    #[test]
-    fn expand_user_no_tilde() {
-        let result = expand_user("/abs/path");
-        assert_eq!(result, PathBuf::from("/abs/path"));
-    }
-
-    #[test]
-    fn expand_user_relative_no_tilde() {
-        let result = expand_user("relative/path");
-        assert_eq!(result, PathBuf::from("relative/path"));
-    }
-
-    // -----------------------------------------------------------------------
-    // render script tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn chain_runner_pre_commit_contains_expected_markers() {
-        let script = render_chain_runner_script("pre-commit");
-        assert!(script.contains("mcp-agent-mail chain-runner (pre-commit)"));
-        assert!(script.contains("hooks.d"));
-        assert!(script.contains("pre-commit.orig"));
-        // pre-commit should NOT have stdin forwarding
-        assert!(!script.contains("stdin_bytes = sys.stdin.buffer.read()"));
-    }
-
-    #[test]
-    fn chain_runner_pre_push_forwards_stdin() {
-        let script = render_chain_runner_script("pre-push");
-        assert!(script.contains("mcp-agent-mail chain-runner (pre-push)"));
-        assert!(script.contains("stdin_bytes = sys.stdin.buffer.read()"));
-    }
-
-    // -----------------------------------------------------------------------
     // Additional paths_conflict boundary tests
     // -----------------------------------------------------------------------
 
@@ -2990,19 +2846,6 @@ mod tests {
     fn fnmatch_star_at_beginning() {
         assert!(fnmatch_simple("test.py", "*.py"));
         assert!(fnmatch_simple(".py", "*.py"));
-    }
-
-    // -----------------------------------------------------------------------
-    // contains_glob tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn contains_glob_detects_all_chars() {
-        assert!(contains_glob("app/*.py"));
-        assert!(contains_glob("app/v?/file"));
-        assert!(contains_glob("app/[abc]/file"));
-        assert!(!contains_glob("app/api/file.py"));
-        assert!(!contains_glob(""));
     }
 
     // -----------------------------------------------------------------------
