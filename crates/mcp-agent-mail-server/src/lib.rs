@@ -7455,7 +7455,7 @@ fn readiness_check_with_integrity(
     }
 
     let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
-    mcp_agent_mail_db::close_db_conn(conn, "server readiness connection");
+    drop(conn);
 
     let skip_startup_integrity =
         startup_integrity_fingerprint

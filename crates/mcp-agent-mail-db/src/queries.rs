@@ -1171,7 +1171,7 @@ fn is_mvcc_error(e: &DbError) -> bool {
 /// Sleep with exponential backoff for MVCC retry.
 ///
 /// Base: 10 ms, max: 200 ms, ±25 % jitter (via existing LCG in `retry` module).
-async fn mvcc_backoff(attempt: u32) {
+async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(10),
@@ -2623,7 +2623,7 @@ pub async fn create_message_with_recipients(
                             error = %e,
                             "MVCC write conflict in create_message, retrying"
                         );
-                        mvcc_backoff(attempt).await;
+                        mvcc_backoff(cx, attempt).await;
                     }
                     Outcome::Err(e) if is_mvcc_error(&e) => {
                         MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
