@@ -151,7 +151,6 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-uring-fs = { path = "vendor/uring-fs" }
 asupersync = { path = "../asupersync" }
 asupersync-macros = { path = "../asupersync/asupersync-macros" }
 franken-kernel = { path = "../asupersync/franken_kernel" }
