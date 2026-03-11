@@ -638,8 +638,8 @@ fn fetch_db_stats_with_connection(
         );
         return DbPollSnapshotUpdate::Snapshot(update);
     }
-    let snapshot =
-        DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot(Some(previous));
+    let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
+        .fetch_snapshot(Some(previous));
     state.last_data_version = data_version;
     update_reservation_snapshot_gap_refresh_state(
         state,

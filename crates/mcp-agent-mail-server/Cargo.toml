@@ -34,6 +34,7 @@ chrono.workspace = true
 glob.workspace = true
 walkdir.workspace = true
 sha2.workspace = true
+fs2.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "../mcp-agent-mail-db" }
 mcp-agent-mail-share = { path = "../mcp-agent-mail-share" }

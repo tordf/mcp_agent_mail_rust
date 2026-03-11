@@ -4845,6 +4845,7 @@ dependencies = [
  "fastmcp-rust",
  "fastmcp-server",
  "fastmcp-transport",
+ "fs2",
  "ftui",
  "ftui-extras",
  "ftui-harness",

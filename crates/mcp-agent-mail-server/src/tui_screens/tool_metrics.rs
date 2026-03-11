@@ -567,17 +567,28 @@ impl ToolMetricsScreen {
 
                 tool_stats.calls = metric.calls;
                 tool_stats.errors = metric.errors.min(metric.calls);
-                if (previous_calls < metric.calls || tool_stats.recent_latencies.is_empty())
-                    && let Some(latency) = metric.latency
-                {
-                    tool_stats.total_duration_ms =
-                        total_duration_ms_from_avg(latency.avg_ms, metric.calls);
-                    tool_stats.recent_latencies = synthesize_recent_latency_samples(
-                        latency.avg_ms,
-                        latency.p50_ms,
-                        latency.p95_ms,
-                        latency.p99_ms,
-                    );
+                match metric.latency {
+                    Some(latency)
+                        if previous_calls < metric.calls
+                            || tool_stats.recent_latencies.is_empty() =>
+                    {
+                        tool_stats.total_duration_ms =
+                            total_duration_ms_from_avg(latency.avg_ms, metric.calls);
+                        tool_stats.recent_latencies = synthesize_recent_latency_samples(
+                            latency.avg_ms,
+                            latency.p50_ms,
+                            latency.p95_ms,
+                            latency.p99_ms,
+                        );
+                    }
+                    None if previous_calls < metric.calls => {
+                        // The runtime snapshot is authoritative. If calls advanced but the
+                        // latency histogram is empty, drop stale local samples rather than
+                        // mixing them with a larger call count and underreporting latency.
+                        tool_stats.total_duration_ms = 0;
+                        tool_stats.recent_latencies.clear();
+                    }
+                    _ => {}
                 }
             } else {
                 let mut tool_stats = ToolStats::new(metric.name.clone());
@@ -608,7 +619,7 @@ impl ToolMetricsScreen {
         let previous_selected_name = self.selected_tool_name().map(|name| name.to_owned());
         let mut tools: Vec<&ToolStats> = self.tool_map.values().collect();
         tools.sort_by(|a, b| {
-            let cmp = match self.sort_col {
+            let primary = match self.sort_col {
                 COL_NAME => super::cmp_ci(&a.name, &b.name),
                 COL_CALLS => a.calls.cmp(&b.calls),
                 COL_ERRORS => a.errors.cmp(&b.errors),
@@ -620,7 +631,16 @@ impl ToolMetricsScreen {
                 COL_CP => a.change_point_count().cmp(&b.change_point_count()),
                 _ => std::cmp::Ordering::Equal,
             };
-            if self.sort_asc { cmp } else { cmp.reverse() }
+            let primary = if self.sort_asc {
+                primary
+            } else {
+                primary.reverse()
+            };
+            if primary == std::cmp::Ordering::Equal && self.sort_col != COL_NAME {
+                super::cmp_ci(&a.name, &b.name)
+            } else {
+                primary
+            }
         });
         self.sorted_tools = tools.iter().map(|t| t.name.clone()).collect();
 
@@ -651,7 +671,10 @@ impl ToolMetricsScreen {
             return;
         }
         let len = self.sorted_tools.len();
-        let current = self.table_state.selected.unwrap_or(0);
+        let Some(current) = self.table_state.selected else {
+            self.set_selected_index(Some(0));
+            return;
+        };
         let next = if delta > 0 {
             current.saturating_add(delta.unsigned_abs()).min(len - 1)
         } else {
@@ -1948,6 +1971,28 @@ mod tests {
     }
 
     #[test]
+    fn move_selection_from_empty_state_selects_first_row() {
+        let mut screen = ToolMetricsScreen::new();
+        screen.sorted_tools = vec!["alpha".into(), "beta".into()];
+        screen
+            .tool_map
+            .insert("alpha".into(), ToolStats::new("alpha".into()));
+        screen
+            .tool_map
+            .insert("beta".into(), ToolStats::new("beta".into()));
+        screen.detail_scroll = 5;
+
+        screen.move_selection(1);
+
+        assert_eq!(screen.table_state.selected, Some(0));
+        assert_eq!(screen.detail_scroll, 0);
+        match screen.focused_event() {
+            Some(MailEvent::ToolCallEnd { tool_name, .. }) => assert_eq!(tool_name, "alpha"),
+            other => panic!("expected focused alpha tool event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rebuild_sorted_preserves_selected_tool_identity_across_sort_changes() {
         let mut screen = ToolMetricsScreen::new();
         let mut alpha = ToolStats::new("alpha".into());
@@ -1975,6 +2020,25 @@ mod tests {
             Some(MailEvent::ToolCallEnd { tool_name, .. }) => assert_eq!(tool_name, "beta"),
             other => panic!("expected focused beta tool event after sort, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rebuild_sorted_breaks_equal_metric_ties_by_tool_name() {
+        let mut screen = ToolMetricsScreen::new();
+        for name in ["gamma", "alpha", "beta"] {
+            let mut stats = ToolStats::new(name.into());
+            stats.calls = 5;
+            screen.tool_map.insert(name.into(), stats);
+        }
+
+        screen.sort_col = COL_CALLS;
+        screen.sort_asc = false;
+        screen.rebuild_sorted();
+
+        assert_eq!(
+            screen.sorted_tools,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
     }
 
     #[test]
@@ -2166,16 +2230,44 @@ mod tests {
         let mut screen = ToolMetricsScreen::new();
         let mut stats = ToolStats::new("resolve_pane_identity".into());
         let _ = stats.record(42, false);
-        screen.tool_map.insert("resolve_pane_identity".into(), stats);
+        screen
+            .tool_map
+            .insert("resolve_pane_identity".into(), stats);
 
         screen.hydrate_from_runtime_snapshot();
 
         let live_stats = &screen.tool_map["resolve_pane_identity"];
         assert_eq!(live_stats.calls, 1);
         assert_eq!(
-            live_stats.recent_latencies.iter().copied().collect::<Vec<_>>(),
+            live_stats
+                .recent_latencies
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
             vec![42]
         );
+    }
+
+    #[test]
+    fn hydrate_from_runtime_snapshot_clears_stale_latency_when_snapshot_has_none() {
+        let _guard = lock_tool_metrics_runtime_test();
+        reset_tool_metrics();
+        record_call("resolve_pane_identity");
+        record_call("resolve_pane_identity");
+
+        let mut screen = ToolMetricsScreen::new();
+        let mut stats = ToolStats::new("resolve_pane_identity".into());
+        let _ = stats.record(42, false);
+        screen
+            .tool_map
+            .insert("resolve_pane_identity".into(), stats);
+
+        screen.hydrate_from_runtime_snapshot();
+
+        let live_stats = &screen.tool_map["resolve_pane_identity"];
+        assert_eq!(live_stats.calls, 2);
+        assert_eq!(live_stats.total_duration_ms, 0);
+        assert!(live_stats.recent_latencies.is_empty());
     }
 
     #[test]

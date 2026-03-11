@@ -17,6 +17,63 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 // ──────────────────────────────────────────────────────────────────────
+// Database lock detection (br-db-lock)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Result of checking whether the database is available or locked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbLockStatus {
+    /// Database is available and not exclusively locked.
+    Available,
+    /// Database is currently locked by another process (retryable).
+    Locked,
+    /// Database file is missing (not yet initialized).
+    Missing,
+    /// Could not determine database status due to an error.
+    Error(String),
+}
+
+/// Check if the database file is exclusively locked by another process.
+#[must_use]
+pub fn check_db_lock_status(config: &Config) -> DbLockStatus {
+    if is_sqlite_memory_database_url(&config.database_url) {
+        return DbLockStatus::Available;
+    }
+
+    let Some(sqlite_path) = sqlite_file_path_from_database_url(&config.database_url) else {
+        return DbLockStatus::Error("Failed to resolve sqlite path from DATABASE_URL".to_string());
+    };
+
+    if !sqlite_path.exists() {
+        return DbLockStatus::Missing;
+    }
+
+    // Try to open the file with an exclusive flock to see if another am is holding it
+    // during a sensitive operation (like backfill or migration).
+    match std::fs::OpenOptions::new().read(true).write(true).open(&sqlite_path) {
+        Ok(file) => {
+            use fs2::FileExt;
+            // We use try_lock_exclusive() to see if we CAN take it.
+            // If it's already held by another process using flock, this will fail.
+            if file.try_lock_exclusive().is_ok() {
+                let _ = file.unlock();
+                DbLockStatus::Available
+            } else {
+                DbLockStatus::Locked
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("Resource temporarily unavailable") || msg.contains("database is locked") {
+                DbLockStatus::Locked
+            } else {
+                DbLockStatus::Error(msg)
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Port detection types (br-7ri2)
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1241,6 +1298,28 @@ fn probe_fd_limit(_config: &Config) -> ProbeResult {
     ProbeResult::Ok { name: "fd_limit" }
 }
 
+/// Check if the database file is exclusively locked by another process.
+fn probe_db_lock(config: &Config) -> ProbeResult {
+    match check_db_lock_status(config) {
+        DbLockStatus::Available | DbLockStatus::Missing => ProbeResult::Ok { name: "db-lock" },
+        DbLockStatus::Locked => {
+            let Some(sqlite_path) = sqlite_file_path_from_database_url(&config.database_url) else {
+                return ProbeResult::Ok { name: "db-lock" }; // Should be caught by probe_database
+            };
+            ProbeResult::Fail(ProbeFailure {
+                name: "db-lock",
+                problem: format!("Database file {} is exclusively locked by another process", sqlite_path.display()),
+                fix: "Ensure no other 'am' or 'mcp-agent-mail' instances are running with the same database, or wait for background tasks to complete.".into(),
+            })
+        }
+        DbLockStatus::Error(msg) => ProbeResult::Fail(ProbeFailure {
+            name: "db-lock",
+            problem: format!("Database lock probe failed: {msg}"),
+            fix: "Check database file permissions and path validity.".into(),
+        }),
+    }
+}
+
 /// Run all startup probes and return a report.
 ///
 /// The probes are ordered from fastest to slowest, and all probes run
@@ -1251,6 +1330,7 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
         probe_http_path(config),
         probe_auth(config),
         probe_database(config),
+        probe_db_lock(config),
         probe_storage_root(config),
         probe_port(config),
         probe_fd_limit(config),
@@ -1963,5 +2043,57 @@ mod tests {
             matches!(result, ProbeResult::Ok { .. }),
             "healthy DB should pass probe_integrity; got: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // probe_db_lock tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_db_lock_passes_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("available.db");
+        std::fs::write(&db_path, b"data").unwrap();
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+
+        let result = probe_db_lock(&config);
+        assert!(matches!(result, ProbeResult::Ok { name: "db-lock" }));
+    }
+
+    #[test]
+    fn probe_db_lock_passes_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.db");
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+
+        let result = probe_db_lock(&config);
+        assert!(matches!(result, ProbeResult::Ok { name: "db-lock" }));
+    }
+
+    #[test]
+    fn probe_db_lock_fails_when_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("locked.db");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&db_path)
+            .unwrap();
+
+        use fs2::FileExt;
+        file.lock_exclusive().unwrap();
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+
+        let result = probe_db_lock(&config);
+        assert!(matches!(result, ProbeResult::Fail(f) if f.name == "db-lock"));
+
+        file.unlock().unwrap();
     }
 }

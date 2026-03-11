@@ -990,11 +990,28 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
+
+    // Check for resource collisions (e.g. another am process holding locks)
+    let probe_report = startup_checks::run_startup_probes(config);
+    if !probe_report.is_ok() {
+        ftui_runtime::ftui_eprintln!(
+            "warning: startup probes detected potential issues: {}",
+            probe_report.format_errors()
+        );
+    }
+
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
-    heal_storage_lock_artifacts(config);
+    
+    let heal_config = config.clone();
+    let _ = std::thread::Builder::new()
+        .name("startup-heal".into())
+        .spawn(move || {
+            heal_storage_lock_artifacts(&heal_config);
+        });
+
     integrity_guard::start(config);
     disk_monitor::start(config);
     mcp_agent_mail_storage::wbq_start();
@@ -1002,6 +1019,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // Start background backfill for Search V3 if enabled.
     spawn_startup_search_backfill(config);
 
+    tracing::info!("MCP Agent Mail server (stdio) starting transport loop");
     build_server(config).run_stdio();
 
     // run_stdio() returns `!` so the lines below are unreachable today.
@@ -1952,9 +1970,20 @@ fn tui_signal_termination_signal(err: &std::io::Error) -> Option<i32> {
     if err.kind() != std::io::ErrorKind::Interrupted {
         return None;
     }
-    err.to_string()
-        .strip_prefix("terminated by signal ")
-        .and_then(|value| value.trim().parse::<i32>().ok())
+    const SIGNAL_PREFIX: &str = "terminated by signal ";
+
+    let message = err.to_string();
+    let suffix = message
+        .find(SIGNAL_PREFIX)
+        .map(|index| &message[index + SIGNAL_PREFIX.len()..])?;
+    let digits: String = suffix
+        .chars()
+        .skip_while(|ch| ch.is_ascii_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    (!digits.is_empty())
+        .then_some(digits)
+        .and_then(|value| value.parse::<i32>().ok())
 }
 
 fn combine_tui_and_supervisor_results(
@@ -1983,9 +2012,15 @@ mod tui_result_tests {
 
     #[test]
     fn signal_termination_is_detected_from_interrupted_error() {
+        let err = std::io::Error::new(std::io::ErrorKind::Interrupted, "terminated by signal 15");
+        assert_eq!(tui_signal_termination_signal(&err), Some(15));
+    }
+
+    #[test]
+    fn signal_termination_detects_embedded_signal_phrase() {
         let err = std::io::Error::new(
             std::io::ErrorKind::Interrupted,
-            "terminated by signal 15",
+            "fullscreen renderer terminated by signal 15 while shutting down",
         );
         assert_eq!(tui_signal_termination_signal(&err), Some(15));
     }
@@ -2012,20 +2047,35 @@ mod tui_result_tests {
             Err(std::io::Error::other("listener failed")),
         );
         assert_eq!(
-            result.expect_err("supervisor error should surface").to_string(),
+            result
+                .expect_err("supervisor error should surface")
+                .to_string(),
             "listener failed"
         );
     }
 
     #[test]
     fn non_signal_tui_error_still_fails() {
-        let result = combine_tui_and_supervisor_results(
-            Err(std::io::Error::other("render failed")),
-            Ok(()),
-        );
+        let result =
+            combine_tui_and_supervisor_results(Err(std::io::Error::other("render failed")), Ok(()));
         assert_eq!(
             result.expect_err("tui error should surface").to_string(),
             "render failed"
+        );
+    }
+
+    #[test]
+    fn interrupted_non_signal_tui_error_still_fails() {
+        let result = combine_tui_and_supervisor_results(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "stdin poll interrupted",
+            )),
+            Ok(()),
+        );
+        assert_eq!(
+            result.expect_err("non-signal interrupt should surface").to_string(),
+            "stdin poll interrupted"
         );
     }
 }
@@ -7507,11 +7557,17 @@ fn readiness_check_with_integrity(
         }
     }
 
-    let pool_timeout_ms = config
-        .database_pool_timeout
-        .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
-            v.saturating_mul(1000)
-        });
+    let pool_timeout_ms = if run_integrity_check {
+        config
+            .database_pool_timeout
+            .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
+                v.saturating_mul(1000)
+            })
+    } else {
+        // Quick check: use a much shorter timeout (2s) to avoid delaying startup
+        // if the DB is busy with a long backfill or migration.
+        2000
+    };
     // Keep readiness initialization intentionally minimal: we only need one
     // successful acquire/query path to force migration initialization. Building
     // a large auto-sized pool here causes avoidable startup churn on big hosts.

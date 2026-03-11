@@ -2629,18 +2629,13 @@ fn render_dashboard_query_bar(
     let agent_matches = db_snapshot
         .agents_list
         .iter()
-        .filter(|agent| {
-            fields_match_query_terms(&[&agent.name, &agent.program], &query_terms)
-        })
+        .filter(|agent| fields_match_query_terms(&[&agent.name, &agent.program], &query_terms))
         .count();
     let project_matches = db_snapshot
         .projects_list
         .iter()
         .filter(|project| {
-            fields_match_query_terms(
-                &[&project.slug, &project.human_key],
-                &query_terms,
-            )
+            fields_match_query_terms(&[&project.slug, &project.human_key], &query_terms)
         })
         .count();
     let reservation_matches = db_snapshot
@@ -2649,7 +2644,9 @@ fn render_dashboard_query_bar(
         .filter(|reservation| {
             fields_match_query_terms(
                 &[
-                    &reservation.project_slug, &reservation.agent_name, &reservation.path_pattern
+                    &reservation.project_slug,
+                    &reservation.agent_name,
+                    &reservation.path_pattern,
                 ],
                 &query_terms,
             )
@@ -3281,9 +3278,7 @@ fn render_agents_snapshot_panel(
     let query_terms = parse_query_terms(query_text);
     let mut rows: Vec<&AgentSummary> = agents
         .iter()
-        .filter(|agent| {
-            fields_match_query_terms(&[&agent.name, &agent.program], &query_terms)
-        })
+        .filter(|agent| fields_match_query_terms(&[&agent.name, &agent.program], &query_terms))
         .collect();
     rows.sort_by_key(|agent| std::cmp::Reverse(agent.last_active_ts));
 
@@ -3400,7 +3395,7 @@ fn render_contacts_snapshot_panel(
                     &contact.from_project_slug,
                     &contact.to_project_slug,
                     &contact.status,
-                    &contact.reason
+                    &contact.reason,
                 ],
                 &query_terms,
             )
@@ -3518,10 +3513,7 @@ fn render_projects_snapshot_panel(
     let mut rows: Vec<&ProjectSummary> = projects
         .iter()
         .filter(|project| {
-            fields_match_query_terms(
-                &[&project.slug, &project.human_key],
-                &query_terms,
-            )
+            fields_match_query_terms(&[&project.slug, &project.human_key], &query_terms)
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -3627,10 +3619,7 @@ fn render_project_load_panel(
     let mut rows: Vec<(&ProjectSummary, u64)> = projects
         .iter()
         .filter(|project| {
-            fields_match_query_terms(
-                &[&project.slug, &project.human_key],
-                &query_terms,
-            )
+            fields_match_query_terms(&[&project.slug, &project.human_key], &query_terms)
         })
         .map(|project| {
             let load_score = project
@@ -3741,7 +3730,9 @@ fn render_reservation_watch_panel(
         .filter(|reservation| {
             fields_match_query_terms(
                 &[
-                    &reservation.project_slug, &reservation.agent_name, &reservation.path_pattern
+                    &reservation.project_slug,
+                    &reservation.agent_name,
+                    &reservation.path_pattern,
                 ],
                 &query_terms,
             )
@@ -3885,7 +3876,9 @@ fn render_reservation_ttl_buckets_panel(
         .filter(|reservation| {
             fields_match_query_terms(
                 &[
-                    &reservation.project_slug, &reservation.agent_name, &reservation.path_pattern
+                    &reservation.project_slug,
+                    &reservation.agent_name,
+                    &reservation.path_pattern,
                 ],
                 &query_terms,
             )
@@ -4078,10 +4071,7 @@ fn render_signal_panel(
 
     let mut pushed = 1usize;
     for anomaly in anomalies.iter().filter(|anomaly| {
-        fields_match_query_terms(
-            &[&anomaly.headline, &anomaly.rationale],
-            &query_terms,
-        )
+        fields_match_query_terms(&[&anomaly.headline, &anomaly.rationale], &query_terms)
     }) {
         if pushed >= content_rows {
             break;
@@ -4375,10 +4365,7 @@ fn render_event_mix_panel(
         .iter()
         .copied()
         .filter(|entry| {
-            fields_match_query_terms(
-                &[entry.kind.compact_label(), &entry.summary],
-                &query_terms,
-            )
+            fields_match_query_terms(&[entry.kind.compact_label(), &entry.summary], &query_terms)
         })
         .collect::<Vec<_>>();
 
@@ -4545,10 +4532,7 @@ fn render_recent_activity_panel(
         .rev()
         .copied()
         .filter(|entry| {
-            fields_match_query_terms(
-                &[entry.kind.compact_label(), &entry.summary],
-                &query_terms,
-            )
+            fields_match_query_terms(&[entry.kind.compact_label(), &entry.summary], &query_terms)
         })
         .collect::<Vec<_>>();
 
@@ -4798,10 +4782,7 @@ fn render_runtime_digest_panel(
         .iter()
         .copied()
         .filter(|entry| {
-            fields_match_query_terms(
-                &[entry.kind.compact_label(), &entry.summary],
-                &query_terms,
-            )
+            fields_match_query_terms(&[entry.kind.compact_label(), &entry.summary], &query_terms)
         })
         .collect::<Vec<_>>();
     let total = u64::try_from(filtered.len()).unwrap_or(0).max(1);
@@ -5001,9 +4982,11 @@ fn render_query_matches_panel(
     } else {
         let mut matched_agents = Vec::new();
         let mut matched_agents_total = 0usize;
-        for agent in db_snapshot.agents_list.iter().filter(|agent| {
-            fields_match_query_terms(&[&agent.name, &agent.program], &query_terms)
-        }) {
+        for agent in db_snapshot
+            .agents_list
+            .iter()
+            .filter(|agent| fields_match_query_terms(&[&agent.name, &agent.program], &query_terms))
+        {
             matched_agents_total += 1;
             if matched_agents.len() < TOP_MATCH_SAMPLE_CAP {
                 matched_agents.push(agent.name.as_str());
@@ -5013,10 +4996,7 @@ fn render_query_matches_panel(
         let mut matched_projects = Vec::new();
         let mut matched_projects_total = 0usize;
         for project in db_snapshot.projects_list.iter().filter(|project| {
-            fields_match_query_terms(
-                &[&project.slug, &project.human_key],
-                &query_terms,
-            )
+            fields_match_query_terms(&[&project.slug, &project.human_key], &query_terms)
         }) {
             matched_projects_total += 1;
             if matched_projects.len() < TOP_MATCH_SAMPLE_CAP {
@@ -5030,12 +5010,14 @@ fn render_query_matches_panel(
             .reservation_snapshots
             .iter()
             .filter(|reservation| {
-            fields_match_query_terms(
-                &[
-                    &reservation.project_slug, &reservation.agent_name, &reservation.path_pattern
-                ],
-                &query_terms,
-            )
+                fields_match_query_terms(
+                    &[
+                        &reservation.project_slug,
+                        &reservation.agent_name,
+                        &reservation.path_pattern,
+                    ],
+                    &query_terms,
+                )
             })
         {
             matched_paths_total += 1;
@@ -5053,7 +5035,7 @@ fn render_query_matches_panel(
                     &contact.from_project_slug,
                     &contact.to_project_slug,
                     &contact.status,
-                    &contact.reason
+                    &contact.reason,
                 ],
                 &query_terms,
             )

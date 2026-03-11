@@ -118,12 +118,12 @@ fn sanitize_url_userinfo(value: &str) -> Option<String> {
     // - masks ONLY the password segment
     let scheme_end = value.find("://")?;
     let after_scheme = scheme_end + 3;
-    
+
     // Find the '@' that separates userinfo from host.
     // We must find it AFTER the scheme.
     let at_pos = value[after_scheme..].rfind('@')? + after_scheme;
     let userinfo = &value[after_scheme..at_pos];
-    
+
     let colon_pos = userinfo.find(':')?;
     let user = &userinfo[..colon_pos];
     let pass = &userinfo[(colon_pos + 1)..];

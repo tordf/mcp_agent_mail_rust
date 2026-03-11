@@ -1162,8 +1162,8 @@ fn next_active_reservation_expiry_micros(snapshot: &DbStatSnapshot) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asupersync::channel::mpsc;
     use crate::tui_events::MailEventKind;
+    use asupersync::channel::mpsc;
     use std::thread;
 
     fn config_for_test() -> Config {

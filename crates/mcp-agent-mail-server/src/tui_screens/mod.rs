@@ -52,7 +52,9 @@ pub fn contains_ci(text: &str, query_lower: &str) -> bool {
     }
     if query_lower.is_ascii() {
         let q_bytes = query_lower.as_bytes();
-        text.as_bytes().windows(q_bytes.len()).any(|w| w.eq_ignore_ascii_case(q_bytes))
+        text.as_bytes()
+            .windows(q_bytes.len())
+            .any(|w| w.eq_ignore_ascii_case(q_bytes))
     } else {
         text.to_lowercase().contains(query_lower)
     }

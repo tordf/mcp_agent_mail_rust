@@ -4397,11 +4397,7 @@ pub struct LatencyProvider {
 impl LatencyProvider {
     /// Create a new latency provider.
     #[must_use]
-    pub fn new(
-        ring: Arc<EventRingBuffer>,
-        granularity: Granularity,
-        max_window: Duration,
-    ) -> Self {
+    pub fn new(ring: Arc<EventRingBuffer>, granularity: Granularity, max_window: Duration) -> Self {
         Self {
             ring,
             granularity,
@@ -4491,7 +4487,8 @@ impl ChartDataProvider for LatencyProvider {
         let mut added_any = false;
         for &bucket_start in &self.dirty_buckets {
             if let Some(samples) = self.raw_samples.get_mut(&bucket_start) {
-                samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                samples
+                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let p50 = Self::percentile(samples, 0.50);
                 let p95 = Self::percentile(samples, 0.95);
                 let p99 = Self::percentile(samples, 0.99);
@@ -4500,7 +4497,9 @@ impl ChartDataProvider for LatencyProvider {
                 if let Some(pos) = self.series.buckets.iter().position(|b| b.0 == bucket_start) {
                     self.series.buckets[pos].1 = vec![p50, p95, p99];
                 } else {
-                    self.series.buckets.push((bucket_start, vec![p50, p95, p99]));
+                    self.series
+                        .buckets
+                        .push((bucket_start, vec![p50, p95, p99]));
                     added_any = true;
                 }
             }
@@ -4513,8 +4512,8 @@ impl ChartDataProvider for LatencyProvider {
         self.series.last_seq = self.last_seq;
 
         // Trim old data.
-        let cutoff_micros =
-            self.raw_samples.keys().next_back().copied().unwrap_or(0) - duration_to_micros_i64(self.max_window);
+        let cutoff_micros = self.raw_samples.keys().next_back().copied().unwrap_or(0)
+            - duration_to_micros_i64(self.max_window);
         self.raw_samples.retain(|&start, _| start >= cutoff_micros);
         self.series.trim_to_window(self.max_window);
     }
