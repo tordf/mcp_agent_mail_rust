@@ -187,8 +187,8 @@ pub fn cache_metrics() -> &'static CacheMetrics {
 
 /// In-memory read cache for projects, agents, and inbox stats.
 pub struct ReadCache {
-    projects_by_slug: OrderedRwLock<S3FifoCache<(u64, String), CacheEntry<ProjectRow>>>,
-    projects_by_human_key: OrderedRwLock<S3FifoCache<(u64, String), CacheEntry<ProjectRow>>>,
+    projects_by_slug: OrderedRwLock<S3FifoCache<(u64, InternedStr), CacheEntry<ProjectRow>>>,
+    projects_by_human_key: OrderedRwLock<S3FifoCache<(u64, InternedStr), CacheEntry<ProjectRow>>>,
     agents_by_key: OrderedRwLock<S3FifoCache<(u64, i64, InternedStr), CacheEntry<AgentRow>>>,
     agents_by_id: OrderedRwLock<S3FifoCache<(u64, i64), CacheEntry<AgentRow>>>,
     /// Cached inbox aggregate counters keyed by `(db_scope, agent_id)` (30s TTL).
@@ -255,7 +255,7 @@ impl ReadCache {
     /// Look up a project by slug in a specific DB scope.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_project_scoped(&self, scope: &str, slug: &str) -> Option<ProjectRow> {
-        let key = (scope_fingerprint(scope), slug.to_owned());
+        let key = (scope_fingerprint(scope), InternedStr::new(slug));
         let mut cache = self.projects_by_slug.write();
         let Some(entry) = cache.get_mut(&key) else {
             CACHE_METRICS.record_project_miss();
@@ -294,7 +294,7 @@ impl ReadCache {
         scope: &str,
         human_key: &str,
     ) -> Option<ProjectRow> {
-        let key = (scope_fingerprint(scope), human_key.to_owned());
+        let key = (scope_fingerprint(scope), InternedStr::new(human_key));
         let mut cache = self.projects_by_human_key.write();
         let Some(entry) = cache.get_mut(&key) else {
             CACHE_METRICS.record_project_miss();
@@ -323,14 +323,14 @@ impl ReadCache {
         {
             let mut cache = self.projects_by_slug.write();
             cache.insert(
-                (scope_fp, project.slug.clone()),
+                (scope_fp, InternedStr::new(&project.slug)),
                 CacheEntry::new(project.clone()),
             );
         }
         {
             let mut cache = self.projects_by_human_key.write();
             cache.insert(
-                (scope_fp, project.human_key.clone()),
+                (scope_fp, InternedStr::new(&project.human_key)),
                 CacheEntry::new(project.clone()),
             );
         }
@@ -455,7 +455,7 @@ impl ReadCache {
             let mut cache = self.projects_by_slug.write();
             for project in projects {
                 cache.insert(
-                    (scope_fp, project.slug.clone()),
+                    (scope_fp, InternedStr::new(&project.slug)),
                     CacheEntry::new(project.clone()),
                 );
             }
@@ -464,7 +464,7 @@ impl ReadCache {
             let mut cache = self.projects_by_human_key.write();
             for project in projects {
                 cache.insert(
-                    (scope_fp, project.human_key.clone()),
+                    (scope_fp, InternedStr::new(&project.human_key)),
                     CacheEntry::new(project.clone()),
                 );
             }
@@ -505,28 +505,20 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_inbox_stats_scoped(&self, scope: &str, agent_id: i64) -> Option<InboxStatsRow> {
         let key = (scope_fingerprint(scope), agent_id);
-        
-        // Phase 1: Read lock for hit check and expiry check.
-        // If not in cache, we can return None without a write lock.
-        {
-            let cache = self.inbox_stats.read();
-            match cache.get(&key) {
-                Some(entry) => {
-                    if !entry.is_expired(INBOX_STATS_TTL) {
-                        return Some(entry.value.clone());
-                    }
-                    // Entry exists but is expired; fall through to write lock for cleanup.
-                }
-                None => return None,
-            }
-        }
-
-        // Phase 2: Write lock for removal of expired entry.
         let mut cache = self.inbox_stats.write();
-        if let Some(entry) = cache.get(&key) {
-            if entry.is_expired(INBOX_STATS_TTL) {
-                cache.remove(&key);
+        let expired = match cache.get_mut(&key) {
+            Some(entry) => {
+                if entry.is_expired(INBOX_STATS_TTL) {
+                    true
+                } else {
+                    entry.touch();
+                    return Some(entry.value.clone());
+                }
             }
+            None => return None,
+        };
+        if expired {
+            cache.remove(&key);
         }
         None
     }
@@ -605,8 +597,6 @@ impl ReadCache {
     /// Returns the merged map of `agent_id` → latest timestamp for this scope.
     pub fn drain_touches_scoped(&self, scope: &str) -> HashMap<i64, i64> {
         let scope_fp = scope_fingerprint(scope);
-        // Clear the pending flag BEFORE draining all shards.
-        self.has_pending.store(false, Ordering::Release);
 
         let mut merged = HashMap::new();
         let mut has_remaining = false;
@@ -636,8 +626,12 @@ impl ReadCache {
                 has_remaining = true;
             }
         }
-        if has_remaining {
-            self.has_pending.store(true, Ordering::Release);
+
+        // Clear the pending flag only if NO shard has any entries left.
+        // We do this AFTER the loop to ensure we don't miss any touches added
+        // to a shard we already processed.
+        if !has_remaining {
+            self.has_pending.store(false, Ordering::Release);
         }
 
         let mut last = self.last_touch_flush.lock();

@@ -358,47 +358,12 @@ pub fn evaluate_scope(result: &SearchResult, ctx: &ScopeContext) -> ScopeDecisio
 }
 
 /// Check if the viewer is the sender of this message.
-fn is_sender(result: &SearchResult, viewer: ViewerIdentity, ctx: &ScopeContext) -> bool {
-    // Match by agent name if available (cross-project sender matching).
-    if let Some(ref from_agent) = result.from_agent {
-        // Check sender_policies to find the agent_id for this sender name.
-        for sp in &ctx.sender_policies {
-            if sp.agent_id == viewer.agent_id && sp.project_id == viewer.project_id {
-                // The viewer's own agent_id is in sender_policies — check if
-                // the from_agent matches the viewer.
-                // We don't have the sender's name directly, so use the from_agent field.
-                let _ = from_agent;
-                break;
-            }
+fn is_sender(result: &SearchResult, viewer: ViewerIdentity, _ctx: &ScopeContext) -> bool {
+    if let Some(sender_id) = result.from_agent_id {
+        if sender_id == viewer.agent_id && result.project_id == Some(viewer.project_id) {
+            return true;
         }
     }
-    // Direct agent_id match via sender_policies lookup.
-    // If the sender's agent_id matches the viewer, they're the sender.
-    if let Some(ref from_name) = result.from_agent {
-        for sp in &ctx.sender_policies {
-            if sp.agent_id == viewer.agent_id
-                && sp.project_id == viewer.project_id
-                && from_name_matches_viewer(from_name, viewer, ctx)
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Check if a `from_agent` name corresponds to the viewer's identity.
-///
-/// This is a heuristic: we look up the viewer's `agent_id` in `sender_policies`
-/// to find their associated project+agent pair.
-const fn from_name_matches_viewer(
-    _from_name: &str,
-    _viewer: ViewerIdentity,
-    _ctx: &ScopeContext,
-) -> bool {
-    // In practice, the caller should populate `sender_policies` with
-    // the viewer's own entry so we can match by agent_id.
-    // For now, this is handled by the `viewer_agent_name` field.
     false
 }
 
@@ -419,17 +384,8 @@ fn has_approved_contact(
     ctx: &ScopeContext,
 ) -> bool {
     let sender_project_id = result.project_id.unwrap_or(0);
-    // Look for sender in sender_policies to get their agent_id.
-    for sp in &ctx.sender_policies {
-        if sp.project_id == sender_project_id {
-            // Check if viewer has approved contact with this agent.
-            if ctx
-                .approved_contacts
-                .contains(&(sp.project_id, sp.agent_id))
-            {
-                return true;
-            }
-        }
+    if let Some(sender_id) = result.from_agent_id {
+        return ctx.approved_contacts.contains(&(sender_project_id, sender_id));
     }
     false
 }
@@ -449,10 +405,9 @@ fn has_approved_contact_in_project(
 /// Look up the sender's contact policy from the pre-fetched cache.
 fn lookup_sender_policy(result: &SearchResult, ctx: &ScopeContext) -> ContactPolicyKind {
     let sender_project_id = result.project_id.unwrap_or(0);
-    // Find sender by from_agent name match in sender_policies.
-    if let Some(ref _from_name) = result.from_agent {
+    if let Some(sender_id) = result.from_agent_id {
         for sp in &ctx.sender_policies {
-            if sp.project_id == sender_project_id {
+            if sp.project_id == sender_project_id && sp.agent_id == sender_id {
                 return sp.policy;
             }
         }
@@ -626,7 +581,7 @@ mod tests {
     use super::*;
     use crate::search_planner::DocKind;
 
-    fn make_message_result(id: i64, project_id: i64, from_agent: &str) -> SearchResult {
+    fn make_message_result(id: i64, project_id: i64, from_agent: &str, sender_id: i64) -> SearchResult {
         SearchResult {
             doc_kind: DocKind::Message,
             id,
@@ -639,6 +594,7 @@ mod tests {
             created_ts: Some(1_000_000),
             thread_id: Some("thread-1".to_string()),
             from_agent: Some(from_agent.to_string()),
+            from_agent_id: Some(sender_id),
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
             redacted: false,
@@ -732,7 +688,7 @@ mod tests {
 
     #[test]
     fn operator_sees_everything() {
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let ctx = operator_ctx();
         let decision = evaluate_scope(&result, &ctx);
         assert_eq!(decision.verdict, ScopeVerdict::Allow);
@@ -743,7 +699,7 @@ mod tests {
 
     #[test]
     fn recipient_can_see_message() {
-        let result = make_message_result(42, 1, "BlueLake");
+        let result = make_message_result(42, 1, "BlueLake", 20);
         let mut ctx = viewer_ctx(10, 1);
         ctx.recipient_map.push(RecipientEntry {
             message_id: 42,
@@ -756,7 +712,7 @@ mod tests {
 
     #[test]
     fn non_recipient_checked_further() {
-        let result = make_message_result(42, 1, "BlueLake");
+        let result = make_message_result(42, 1, "BlueLake", 20);
         let mut ctx = viewer_ctx(10, 1);
         ctx.recipient_map.push(RecipientEntry {
             message_id: 42,
@@ -772,7 +728,7 @@ mod tests {
 
     #[test]
     fn contacts_only_denies_unlinked() {
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let mut ctx = viewer_ctx(10, 1);
         ctx.sender_policies.push(SenderPolicy {
             project_id: 1,
@@ -786,7 +742,7 @@ mod tests {
 
     #[test]
     fn block_all_denies() {
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let mut ctx = viewer_ctx(10, 1);
         ctx.sender_policies.push(SenderPolicy {
             project_id: 1,
@@ -800,7 +756,7 @@ mod tests {
 
     #[test]
     fn open_policy_allows() {
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let mut ctx = viewer_ctx(10, 1);
         ctx.sender_policies.push(SenderPolicy {
             project_id: 1,
@@ -816,7 +772,7 @@ mod tests {
 
     #[test]
     fn approved_contact_allows() {
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let mut ctx = viewer_ctx(10, 1);
         ctx.sender_policies.push(SenderPolicy {
             project_id: 1,
@@ -833,7 +789,7 @@ mod tests {
 
     #[test]
     fn cross_project_denied_without_contact() {
-        let result = make_message_result(1, 99, "BlueLake"); // project 99
+        let result = make_message_result(1, 99, "BlueLake", 30); // project 99
         let ctx = viewer_ctx(10, 1); // viewer in project 1
         let decision = evaluate_scope(&result, &ctx);
         assert_eq!(decision.verdict, ScopeVerdict::Deny);
@@ -842,7 +798,7 @@ mod tests {
 
     #[test]
     fn cross_project_allowed_with_contact() {
-        let result = make_message_result(1, 99, "BlueLake");
+        let result = make_message_result(1, 99, "BlueLake", 30);
         let mut ctx = viewer_ctx(10, 1);
         // Viewer has contact in project 99
         ctx.approved_contacts.push((99, 30));
@@ -861,7 +817,7 @@ mod tests {
 
     #[test]
     fn redaction_hides_body() {
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let policy = RedactionPolicy::default();
         let redacted = apply_redaction(result, &policy);
         assert_eq!(
@@ -874,7 +830,7 @@ mod tests {
 
     #[test]
     fn strict_redaction_hides_all() {
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let policy = RedactionPolicy::strict();
         let redacted = apply_redaction(result, &policy);
         assert_eq!(redacted.body, "[Content hidden — access restricted]");
@@ -887,8 +843,8 @@ mod tests {
     #[test]
     fn apply_scope_filters_denied_results() {
         let results = vec![
-            make_message_result(1, 1, "BlueLake"),
-            make_message_result(2, 99, "RedFox"), // cross-project
+            make_message_result(1, 1, "BlueLake", 20),
+            make_message_result(2, 99, "RedFox", 30), // cross-project
             make_agent_result(3),                 // non-message
         ];
         let ctx = viewer_ctx(10, 1);
@@ -907,8 +863,8 @@ mod tests {
     #[test]
     fn apply_scope_operator_allows_all() {
         let results = vec![
-            make_message_result(1, 1, "BlueLake"),
-            make_message_result(2, 99, "RedFox"),
+            make_message_result(1, 1, "BlueLake", 20),
+            make_message_result(2, 99, "RedFox", 30),
         ];
         let ctx = operator_ctx();
         let policy = RedactionPolicy::default();
@@ -992,9 +948,9 @@ mod tests {
     #[test]
     fn audit_summary_counts_correct() {
         let results = vec![
-            make_message_result(1, 1, "BlueLake"),   // allowed
-            make_message_result(2, 99, "RedFox"),    // denied (cross-project)
-            make_message_result(3, 99, "GreenLake"), // denied (cross-project)
+            make_message_result(1, 1, "BlueLake", 20),   // allowed
+            make_message_result(2, 99, "RedFox", 30),    // denied (cross-project)
+            make_message_result(3, 99, "GreenLake", 40), // denied (cross-project)
             make_agent_result(4),                    // allowed (non-message)
         ];
         let ctx = viewer_ctx(10, 1);
@@ -1041,8 +997,8 @@ mod tests {
 
     #[test]
     fn recipient_check_scoped_to_message_id() {
-        let result_a = make_message_result(10, 1, "BlueLake");
-        let result_b = make_message_result(20, 1, "BlueLake");
+        let result_a = make_message_result(10, 1, "BlueLake", 20);
+        let result_b = make_message_result(20, 1, "BlueLake", 20);
         let mut ctx = viewer_ctx(5, 1);
         ctx.recipient_map.push(RecipientEntry {
             message_id: 10,
@@ -1062,10 +1018,10 @@ mod tests {
     #[test]
     fn mixed_batch_all_verdicts() {
         let results = vec![
-            make_message_result(1, 1, "BlueLake"),   // recipient → Allow
-            make_message_result(2, 1, "RedFox"),     // contacts_only → Deny
+            make_message_result(1, 1, "BlueLake", 20),   // recipient → Allow
+            make_message_result(2, 1, "RedFox", 30),     // contacts_only → Deny
             make_agent_result(3),                    // non-message → Allow
-            make_message_result(4, 99, "GreenLake"), // cross-project → Deny
+            make_message_result(4, 99, "GreenLake", 40), // cross-project → Deny
         ];
         let mut ctx = viewer_ctx(10, 1);
         ctx.recipient_map.push(RecipientEntry {
@@ -1150,7 +1106,7 @@ mod tests {
 
     #[test]
     fn scoped_result_includes_scope_decision() {
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let ctx = operator_ctx();
         let policy = RedactionPolicy::default();
         let (visible, _) = apply_scope(vec![result], &ctx, &policy);
@@ -1235,7 +1191,7 @@ mod tests {
     #[test]
     fn auto_policy_default_allows() {
         // No sender_policies → falls back to Auto → Allow
-        let result = make_message_result(1, 1, "BlueLake");
+        let result = make_message_result(1, 1, "BlueLake", 20);
         let ctx = viewer_ctx(10, 1);
         let decision = evaluate_scope(&result, &ctx);
         assert_eq!(decision.verdict, ScopeVerdict::Allow);
@@ -1246,7 +1202,7 @@ mod tests {
 
     #[test]
     fn viewer_among_multiple_recipients() {
-        let result = make_message_result(42, 1, "BlueLake");
+        let result = make_message_result(42, 1, "BlueLake", 20);
         let mut ctx = viewer_ctx(10, 1);
         ctx.recipient_map.push(RecipientEntry {
             message_id: 42,

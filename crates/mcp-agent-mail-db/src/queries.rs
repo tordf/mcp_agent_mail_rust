@@ -6444,13 +6444,29 @@ pub async fn get_product_by_uid(
 /// List projects linked to a product.
 /// Force-release a single file reservation by ID regardless of owner.
 ///
-/// Returns the number of rows affected (0 if already released or not found).
+/// If `expected_expires_ts` is provided, the release is only performed if the
+/// current `expires_ts` matches exactly (prevents concurrent renewal races).
+///
+/// Returns the number of rows affected (0 if already released, not found, or mismatch).
 pub async fn force_release_reservation(
     cx: &Cx,
     pool: &DbPool,
     reservation_id: i64,
+    expected_expires_ts: Option<i64>,
 ) -> Outcome<usize, DbError> {
-    release_reservations_by_ids(cx, pool, &[reservation_id]).await
+    match release_reservations_by_ids_matching_expiry(
+        cx,
+        pool,
+        &[reservation_id],
+        expected_expires_ts,
+    )
+    .await
+    {
+        Outcome::Ok(released) => Outcome::Ok(released.len()),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// Get the most recent mail activity timestamp for an agent.

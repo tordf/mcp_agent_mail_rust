@@ -649,6 +649,16 @@ async fn canonicalize_message_results(
         None
     };
 
+    #[derive(serde::Deserialize, Default)]
+    struct FastRecipients {
+        #[serde(default)]
+        to: Vec<String>,
+        #[serde(default)]
+        cc: Vec<String>,
+        #[serde(default)]
+        bcc: Vec<String>,
+    }
+
     let mut canonical = Vec::with_capacity(deduped.len());
     let mut dropped_missing = 0usize;
     let mut dropped_filter_mismatch = 0usize;
@@ -676,30 +686,8 @@ async fn canonicalize_message_results(
             continue;
         }
 
-        let recipients: serde_json::Value =
-            serde_json::from_str(&detail.recipients).unwrap_or_else(|_| serde_json::json!({}));
-
-        let to = recipients["to"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        let cc = recipients["cc"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        let bcc = recipients["bcc"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
+        let recipients: FastRecipients =
+            serde_json::from_str(&detail.recipients).unwrap_or_default();
 
         result.project_id = Some(detail.project_id);
         result.title.clone_from(&detail.subject);
@@ -710,9 +698,9 @@ async fn canonicalize_message_results(
         result.thread_id.clone_from(&detail.thread_id);
         result.from_agent = Some(detail.from.clone());
         result.from_agent_id = Some(detail.sender_id);
-        result.to = Some(to);
-        result.cc = Some(cc);
-        result.bcc = Some(bcc);
+        result.to = Some(recipients.to);
+        result.cc = Some(recipients.cc);
+        result.bcc = Some(recipients.bcc);
         canonical.push(result);
     }
 
@@ -3553,26 +3541,45 @@ pub async fn execute_search(
         let mut lexical_query = candidate_query.clone();
         lexical_query.limit = Some(plan.derivation.budget.lexical_limit);
 
-        if let Some(lexical_results) = try_tantivy_search(&lexical_query) {
-            // Two-tier semantic candidates are optional; missing bridge degrades
-            // to lexical-only while preserving deterministic fusion behavior.
-            #[cfg(feature = "hybrid")]
-            let (semantic_results, two_tier_telemetry) =
+        // OPTIMIZATION: Execute lexical and semantic candidate retrieval in parallel via asupersync Scope.
+        // This reduces total latency from L_lex + L_sem to max(L_lex, L_sem).
+        let (lexical_outcome, semantic_data_outcome) = cx.scope(|s| {
+            let lex_task = s.spawn(|_| try_tantivy_search(&lexical_query));
+            let sem_task = s.spawn(|cx_inner| {
+                #[cfg(feature = "hybrid")]
                 if plan.derivation.budget.semantic_limit == 0 {
                     (Vec::new(), None)
                 } else {
                     try_two_tier_search_with_cx(
-                        cx,
+                        cx_inner,
                         &candidate_query,
                         plan.derivation.budget.semantic_limit,
                     )
                     .map_or((Vec::new(), None), |outcome| {
                         (outcome.results, Some(outcome.telemetry))
                     })
-                };
-            #[cfg(not(feature = "hybrid"))]
-            let semantic_results = Vec::new();
+                }
+                #[cfg(not(feature = "hybrid"))]
+                (Vec::new(), None)
+            });
+            (lex_task.join(), sem_task.join())
+        });
 
+        // Propagate task-level failures (cancellation or panics)
+        let lexical_results = match lexical_outcome {
+            Outcome::Ok(res) => res,
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            Outcome::Err(_) => unreachable!("try_tantivy_search does not return Result"),
+        };
+        let (semantic_results, two_tier_telemetry) = match semantic_data_outcome {
+            Outcome::Ok(data) => data,
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            Outcome::Err(_) => unreachable!("try_two_tier_search_with_cx logic does not return Result"),
+        };
+
+        if let Some(lexical_results) = lexical_results {
             let (mut raw_results, mut rerank_audit) =
                 orchestrate_hybrid_results_with_optional_rerank(
                     cx,

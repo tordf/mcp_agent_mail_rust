@@ -51,6 +51,10 @@ pub struct S3FifoCache<K, V> {
     main_capacity: usize,
     ghost_capacity: usize,
     ghost_gen: u64,
+    /// Number of entries in `small` that are actually in `index`.
+    small_live_count: usize,
+    /// Number of entries in `main` that are actually in `index`.
+    main_live_count: usize,
 }
 
 impl<K, V> S3FifoCache<K, V>
@@ -80,6 +84,8 @@ where
             main_capacity: main_cap,
             ghost_capacity: capacity,
             ghost_gen: 0,
+            small_live_count: 0,
+            main_live_count: 0,
         }
     }
 
@@ -158,10 +164,12 @@ where
                 self.evict_small_if_full();
                 self.small.push_back(key.clone());
                 self.index.insert(key, Node::Small { value, freq: 0 });
+                self.small_live_count += 1;
             } else {
                 self.evict_main_if_full();
                 self.main.push_back(key.clone());
                 self.index.insert(key, Node::Main { value, freq: 0 });
+                self.main_live_count += 1;
             }
             return;
         }
@@ -169,12 +177,13 @@ where
         self.evict_small_if_full();
         self.small.push_back(key.clone());
         self.index.insert(key, Node::Small { value, freq: 0 });
+        self.small_live_count += 1;
     }
 
     /// Number of live entries (Small + Main, excludes Ghost).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.small.len() + self.main.len()
+        self.small_live_count + self.main_live_count
     }
 
     /// Whether the cache has no live entries.
@@ -200,8 +209,14 @@ where
         Q: std::hash::Hash + Eq + ?Sized,
     {
         match self.index.remove(key) {
-            Some(Node::Small { value, .. }) => Some(value),
-            Some(Node::Main { value, .. }) => Some(value),
+            Some(Node::Small { value, .. }) => {
+                self.small_live_count -= 1;
+                Some(value)
+            }
+            Some(Node::Main { value, .. }) => {
+                self.main_live_count -= 1;
+                Some(value)
+            }
             Some(Node::Ghost { .. }) | None => None,
         }
     }
@@ -210,7 +225,7 @@ where
     ///
     /// Items with `freq >= 1` promote to Main; others go to Ghost.
     fn evict_small_if_full(&mut self) {
-        while self.small.len() >= self.small_capacity {
+        while self.small_live_count >= self.small_capacity {
             let Some(key) = self.small.pop_front() else {
                 break;
             };
@@ -218,6 +233,7 @@ where
             let Some(Node::Small { value, freq }) = self.index.remove(&key) else {
                 continue;
             };
+            self.small_live_count -= 1;
 
             if freq >= 1 {
                 if self.main_capacity == 0 {
@@ -234,6 +250,7 @@ where
                     self.evict_main_if_full();
                     self.main.push_back(key.clone());
                     self.index.insert(key, Node::Main { value, freq: 0 });
+                    self.main_live_count += 1;
                 }
             } else {
                 self.evict_ghost_if_full();
@@ -256,7 +273,9 @@ where
     fn evict_main_if_full(&mut self) {
         if self.main_capacity == 0 {
             while let Some(key) = self.main.pop_front() {
-                self.index.remove(&key);
+                if let Some(Node::Main { .. }) = self.index.remove(&key) {
+                    self.main_live_count -= 1;
+                }
             }
             return;
         }
@@ -265,7 +284,7 @@ where
         // has freq=3, we would need to inspect each item up to 4 times to decrement
         // its frequency to 0 and finally evict it.
         let mut budget = self.main.len() * 4 + 1;
-        while self.main.len() >= self.main_capacity && budget > 0 {
+        while self.main_live_count >= self.main_capacity && budget > 0 {
             budget -= 1;
             let Some(key) = self.main.pop_front() else {
                 break;
@@ -274,6 +293,7 @@ where
             let Some(Node::Main { value, freq }) = self.index.remove(&key) else {
                 continue;
             };
+            self.main_live_count -= 1;
 
             if freq >= 1 {
                 self.main.push_back(key.clone());
@@ -284,6 +304,7 @@ where
                         freq: freq - 1,
                     },
                 );
+                self.main_live_count += 1;
             }
         }
     }
@@ -308,6 +329,8 @@ where
         self.main.clear();
         self.ghost.clear();
         self.index.clear();
+        self.small_live_count = 0;
+        self.main_live_count = 0;
     }
 
     /// Number of entries in the Ghost queue (for diagnostics).
