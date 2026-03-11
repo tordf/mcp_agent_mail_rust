@@ -989,9 +989,18 @@ impl<'a> TwoTierSearchIter<'a> {
         };
 
         if fast_results.is_empty() {
-            self.search_metrics.refined_count = 0;
+            // If the fast search ran but found nothing, it's possible the quality
+            // search (which uses a better model) would find something.
+            // Fall back to full quality search just like the None case above.
+            let _score_span =
+                tracing::debug_span!("two_tier.score_quality_fallback", candidates = 0).entered();
+            let score_start = Instant::now();
+            let results = self.searcher.index.search_quality(query_vec, self.k);
+            self.search_metrics.quality_score_us =
+                u64::try_from(score_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.search_metrics.refined_count = results.len();
             self.search_metrics.was_refined = true;
-            return Vec::new();
+            return results;
         }
 
         let refinement_limit = self
@@ -1192,9 +1201,11 @@ impl Iterator for TwoTierSearchIter<'_> {
                             });
                         }
 
-                        // In quality-only mode, do not emit initial results.
+                        // We already checked quality_only at the start of phase 0,
+                        // but if it somehow reached here, skip initial results.
                         if self.searcher.config.quality_only {
                             self.phase = 2;
+                            drop(_search_fast_span);
                             drop(_embed_fast_span);
                             drop(_search_guard);
                             return Some(self.run_refinement_phase());
@@ -2663,7 +2674,7 @@ mod tests {
                 project_id: Some(1),
                 fast_embedding: vec![f16::from_f32(2.0), f16::from_f32(0.0)],
                 quality_embedding: vec![f16::from_f32(0.0), f16::from_f32(0.0)],
-                has_quality: false,
+                has_quality: true,
             })
             .unwrap();
         index
@@ -2673,7 +2684,7 @@ mod tests {
                 project_id: Some(1),
                 fast_embedding: vec![f16::from_f32(1.0), f16::from_f32(0.0)],
                 quality_embedding: vec![f16::from_f32(0.0), f16::from_f32(0.0)],
-                has_quality: false,
+                has_quality: true,
             })
             .unwrap();
 

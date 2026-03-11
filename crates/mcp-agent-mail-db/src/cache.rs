@@ -506,13 +506,22 @@ impl ReadCache {
     pub fn get_inbox_stats_scoped(&self, scope: &str, agent_id: i64) -> Option<InboxStatsRow> {
         let key = (scope_fingerprint(scope), agent_id);
         let mut cache = self.inbox_stats.write();
-        let entry = cache.get_mut(&key)?;
-        if entry.is_expired(INBOX_STATS_TTL) {
-            cache.remove(&key);
+        let mut should_remove = false;
+        if let Some(entry) = cache.get_mut(&key) {
+            if entry.is_expired(INBOX_STATS_TTL) {
+                should_remove = true;
+            } else {
+                entry.touch();
+                return Some(entry.value.clone());
+            }
+        } else {
             return None;
         }
-        entry.touch();
-        Some(entry.value.clone())
+
+        if should_remove {
+            cache.remove(&key);
+        }
+        None
     }
 
     /// Insert or update cached inbox stats for an agent.
@@ -590,34 +599,32 @@ impl ReadCache {
     pub fn drain_touches_scoped(&self, scope: &str) -> HashMap<i64, i64> {
         let scope_fp = scope_fingerprint(scope);
         // Clear the pending flag BEFORE draining all shards.
-        // If a concurrent enqueue happens after we clear the flag but before we lock
-        // its shard, we will drain the new item.
-        // If it happens after we drain its shard, it will set the flag to true,
-        // which is correct because we missed it in this drain pass.
         self.has_pending.store(false, Ordering::Release);
 
         let mut merged = HashMap::new();
         let mut has_remaining = false;
         for shard in &self.deferred_touch_shards {
             let mut s = shard.lock();
-            let scoped_keys: Vec<(u64, i64)> = s
-                .keys()
-                .copied()
-                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
-                .collect();
-            for key in scoped_keys {
-                if let Some(ts) = s.remove(&key) {
-                    let aid = key.1;
+            
+            // Efficiently remove and collect only the keys for the requested scope.
+            // Using retain() or drain_filter() (if it were stable) would be ideal,
+            // but we'll manually iterate and remove to stay on stable/robust path.
+            s.retain(|&(entry_scope, agent_id), ts| {
+                if entry_scope == scope_fp {
                     merged
-                        .entry(aid)
+                        .entry(agent_id)
                         .and_modify(|existing| {
-                            if ts > *existing {
-                                *existing = ts;
+                            if *ts > *existing {
+                                *existing = *ts;
                             }
                         })
-                        .or_insert(ts);
+                        .or_insert(*ts);
+                    false // Remove from shard
+                } else {
+                    true // Keep in shard
                 }
-            }
+            });
+
             if !s.is_empty() {
                 has_remaining = true;
             }
@@ -1224,7 +1231,7 @@ mod tests {
                 for (i, slug) in slugs.iter().enumerate() {
                     let unique = format!("{slug}-{i}");
                     cache.put_project(&ProjectRow {
-                        id: Some(i as i64),
+                        id: Some(i64::try_from(i).unwrap()),
                         slug: unique.clone(),
                         human_key: format!("/data/{unique}"),
                         created_at: 0,
@@ -1321,7 +1328,7 @@ mod tests {
                     let _ = cache.enqueue_touch(aid, ts);
                 }
                 let drained = cache.drain_touches();
-                // One entry per unique agent
+                // One entry per unique agent_id
                 prop_assert_eq!(
                     drained.len(),
                     expected.len(),

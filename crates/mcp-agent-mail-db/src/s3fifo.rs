@@ -189,32 +189,20 @@ where
         self.small_capacity + self.main_capacity
     }
 
-    /// Remove a key from the cache entirely (including Ghost).
+    /// Remove a key from the cache.
+    ///
+    /// This is an O(1) operation that only removes the key from the index.
+    /// The key will remain in the queues until it reaches the front and is
+    /// lazily evicted.
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
         match self.index.remove(key) {
-            Some(Node::Small { value, .. }) => {
-                if let Some(pos) = self.small.iter().position(|k| k.borrow() == key) {
-                    self.small.remove(pos);
-                }
-                Some(value)
-            }
-            Some(Node::Main { value, .. }) => {
-                if let Some(pos) = self.main.iter().position(|k| k.borrow() == key) {
-                    self.main.remove(pos);
-                }
-                Some(value)
-            }
-            Some(Node::Ghost { .. }) => {
-                if let Some(pos) = self.ghost.iter().position(|(k, _)| k.borrow() == key) {
-                    self.ghost.remove(pos);
-                }
-                None
-            }
-            None => None,
+            Some(Node::Small { value, .. }) => Some(value),
+            Some(Node::Main { value, .. }) => Some(value),
+            Some(Node::Ghost { .. }) | None => None,
         }
     }
 

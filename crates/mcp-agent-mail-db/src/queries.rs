@@ -4670,31 +4670,47 @@ pub async fn mark_all_messages_read_in_project(
     let tracked = tracked(&*conn);
     try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    let sql = "UPDATE message_recipients \
-               SET read_ts = ? \
-               WHERE agent_id = ? AND read_ts IS NULL \
-               AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
-    let params = [
-        Value::BigInt(now),
-        Value::BigInt(agent_id),
-        Value::BigInt(project_id),
-    ];
-    let rows_affected = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-    );
+    // Identify which messages are actually unread for this agent in this project.
+    // We do this explicitly to avoid trusting unreliable rows_affected from UPDATE.
+    let find_sql = "SELECT m.id FROM message_recipients r \
+                    JOIN messages m ON m.id = r.message_id \
+                    WHERE r.agent_id = ? AND r.read_ts IS NULL \
+                    AND m.project_id = ?";
+    let find_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await) {
+        Outcome::Ok(r) => r,
+        Outcome::Err(e) => {
+            let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+            return Outcome::Err(e);
+        }
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let count = rows.len();
+    if count > 0 {
+        let sql = "UPDATE message_recipients \
+                   SET read_ts = ? \
+                   WHERE agent_id = ? AND read_ts IS NULL \
+                   AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
+        let params = [
+            Value::BigInt(now),
+            Value::BigInt(agent_id),
+            Value::BigInt(project_id),
+        ];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
+    }
 
     crate::cache::read_cache().invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
-    let Ok(rows_affected_i64) = i64::try_from(rows_affected) else {
-        return Outcome::Err(DbError::Internal(
-            "rows_affected exceeded i64::MAX while marking project inbox read".to_string(),
-        ));
-    };
-    Outcome::Ok(rows_affected_i64)
+    let count_i64 = count as i64;
+    Outcome::Ok(count_i64)
 }
 
 /// Acknowledge message
@@ -6779,7 +6795,8 @@ pub async fn list_unacknowledged_messages(
     let sql = "SELECT m.id, m.project_id, m.created_ts, mr.agent_id \
                FROM messages m \
                JOIN message_recipients mr ON mr.message_id = m.id \
-               WHERE m.ack_required = 1 AND mr.ack_ts IS NULL";
+               WHERE m.ack_required = 1 AND mr.ack_ts IS NULL \
+               LIMIT 10000";
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
         Outcome::Ok(rows) => {
@@ -6817,7 +6834,8 @@ pub async fn list_overdue_unacknowledged_messages(
                JOIN message_recipients mr ON mr.message_id = m.id \
                WHERE m.ack_required = 1 \
                  AND mr.ack_ts IS NULL \
-                 AND m.created_ts <= ?";
+                 AND m.created_ts <= ? \
+               LIMIT 10000";
     let params = [Value::BigInt(overdue_before_ts)];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {

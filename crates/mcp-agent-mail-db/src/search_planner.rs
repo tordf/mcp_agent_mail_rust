@@ -346,10 +346,11 @@ impl SearchQuery {
         }
     }
 
-    /// Effective limit, clamped to 1..=100_000 to support deep pagination offsets.
+    /// Effective limit, clamped to 1..=5,000 to support deep pagination offsets
+    /// without risking DoS via massive result sets.
     #[must_use]
     pub fn effective_limit(&self) -> usize {
-        self.limit.unwrap_or(50).clamp(1, 100_000)
+        self.limit.unwrap_or(50).clamp(1, 5000)
     }
 
     /// Convert query facets to a [`SearchFilter`] for cache key construction.
@@ -669,11 +670,12 @@ pub fn plan_search(query: &SearchQuery) -> SearchPlan {
         DocKind::Project => plan_project_search(query),
     };
 
-    // Even when we short-circuit execution for empty plans, the planner contract
-    // expects a non-empty, valid SQL string for hostile/non-searchable *non-empty*
-    // inputs. Use a deterministic, schema-independent "empty result" query.
-    if plan.method == PlanMethod::Empty && !query.text.is_empty() && plan.sql.is_empty() {
-        plan.sql = empty_plan_sql(query.doc_kind).to_string();
+    // Use a deterministic "empty result" query for Empty plans with non-empty input.
+    if plan.method == PlanMethod::Empty && plan.sql.is_empty() {
+        let is_hostile = !query.text.is_empty();
+        if is_hostile || has_any_message_facet(query) {
+            plan.sql = empty_plan_sql(query.doc_kind).to_string();
+        }
     }
 
     plan
@@ -1669,6 +1671,9 @@ mod tests {
             created_ts: Some(1000),
             thread_id: Some("t1".to_string()),
             from_agent: Some("Blue".to_string()),
+            to: None,
+            cc: None,
+            bcc: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
             redacted: false,
@@ -1851,6 +1856,9 @@ mod tests {
             created_ts: Some(1000),
             thread_id: Some("t1".to_string()),
             from_agent: Some("BlueLake".to_string()),
+            to: None,
+            cc: None,
+            bcc: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
             redacted: false,
