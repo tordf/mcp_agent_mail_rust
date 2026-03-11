@@ -3713,6 +3713,7 @@ async fn fetch_inbox_impl(
 #[derive(Debug, Clone)]
 pub struct SearchRow {
     pub id: i64,
+    pub sender_id: i64,
     pub subject: String,
     pub importance: String,
     pub ack_required: i64,
@@ -3726,6 +3727,7 @@ pub struct SearchRow {
 #[derive(Debug, Clone)]
 pub struct SearchRowWithProject {
     pub id: i64,
+    pub sender_id: i64,
     pub subject: String,
     pub importance: String,
     pub ack_required: i64,
@@ -3994,7 +3996,7 @@ async fn run_like_fallback(
     params.push(Value::BigInt(limit));
 
     let sql = format!(
-        "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md \
+        "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md \
          FROM messages m \
          JOIN agents a ON a.id = m.sender_id \
          WHERE m.project_id = ? AND ({where_clause}) \
@@ -4028,7 +4030,7 @@ async fn run_like_fallback_product(
     params.push(Value::BigInt(limit));
 
     let sql = format!(
-        "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md, m.project_id \
+        "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md, m.project_id \
          FROM messages m \
          JOIN agents a ON a.id = m.sender_id \
          JOIN product_project_links ppl ON ppl.project_id = m.project_id \
@@ -4083,34 +4085,39 @@ pub async fn search_messages(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_as(1) {
+                let sender_id: i64 = match row.get_as(1) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_as(2) {
+                let subject: String = match row.get_as(2) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_as(3) {
+                let importance: String = match row.get_as(3) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_as(4) {
+                let ack_required: i64 = match row.get_as(4) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let thread_id: Option<String> = match row.get_as(5) {
+                let created_ts: i64 = match row.get_as(5) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let from: String = match row.get_as(6) {
+                let thread_id: Option<String> = match row.get_as(6) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = row.get_as(7).unwrap_or_default();
+                let from: String = match row.get_as(7) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let body_md: String = row.get_as(8).unwrap_or_default();
 
                 out.push(SearchRow {
                     id,
+                    sender_id,
                     subject,
                     importance,
                     ack_required,
@@ -4408,6 +4415,7 @@ pub async fn count_unread_global(
 #[derive(Debug, Clone)]
 pub struct GlobalSearchRow {
     pub id: i64,
+    pub sender_id: i64,
     pub subject: String,
     pub importance: String,
     pub ack_required: i64,
@@ -4514,7 +4522,7 @@ async fn run_like_fallback_global(
     }
 
     let sql = format!(
-        "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
+        "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, \
                 m.thread_id, a.name as from_name, m.body_md, \
                 m.project_id, p.slug as project_slug \
          FROM messages m \
