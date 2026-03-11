@@ -280,6 +280,14 @@ fn should_ignore(name: &str, patterns: &[String]) -> bool {
         let ends_with_star = pat.ends_with('*');
         let core = pat.trim_matches('*');
 
+        if core.is_empty() {
+            // Pattern was just "*" or "**" — matches everything
+            if starts_with_star || ends_with_star {
+                return true;
+            }
+            continue;
+        }
+
         if starts_with_star && ends_with_star {
             if name.contains(core) {
                 return true;

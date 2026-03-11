@@ -363,15 +363,18 @@ impl Widget for HeatmapGrid<'_> {
                 || cache.data_generation != self.data_generation
             {
                 let max_cols = self.data.iter().map(Vec::len).max().unwrap_or(0);
-                #[allow(clippy::cast_possible_truncation)]
                 let label_width: u16 = self.row_labels.map_or(0, |labels| {
-                    labels
-                        .iter()
-                        .map(|l| display_width(l))
-                        .max()
-                        .unwrap_or(0)
-                        .saturating_add(1)
-                }) as u16;
+                    if labels.is_empty() {
+                        0
+                    } else {
+                        labels
+                            .iter()
+                            .map(|l| display_width(l))
+                            .max()
+                            .unwrap_or(0)
+                            .saturating_add(1) as u16
+                    }
+                });
                 let effective_label_width = if label_width > 0 && label_width * 10 > inner.width * 4
                 {
                     0
@@ -1946,9 +1949,9 @@ impl AmbientHealthInput {
             0.0
         };
         let buffer = self.normalized_buffer_utilization() as f32;
-        let buffer_score: f32 = if buffer > AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD as f32 {
-            (buffer - AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD as f32)
-                / (1.0 - AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD as f32)
+        let threshold = AMBIENT_WARNING_EVENT_BUFFER_THRESHOLD as f32;
+        let buffer_score: f32 = if buffer > threshold {
+            (buffer - threshold) / (1.0 - threshold).max(0.001)
         } else {
             0.0
         };
