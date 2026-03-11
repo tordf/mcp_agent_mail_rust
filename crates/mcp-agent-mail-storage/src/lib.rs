@@ -3575,7 +3575,7 @@ pub fn write_project_metadata_with_config(
         return Ok(());
     }
 
-    write_json(&metadata_path, &metadata)?;
+    write_json(&metadata_path, &metadata, true)?;
     let rel = rel_path_cached(&archive.canonical_repo_root, &metadata_path)?;
     enqueue_async_commit(
         &archive.repo_root,
@@ -3641,6 +3641,7 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
              \n\
              # Default behavior\n\
              * text=auto\n",
+            true,
         )?;
     }
 
@@ -3672,7 +3673,7 @@ pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) 
     ensure_dir(&profile_dir)?;
 
     let profile_path = profile_dir.join("profile.json");
-    write_json(&profile_path, agent)?;
+    write_json(&profile_path, agent, true)?;
 
     let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
     enqueue_async_commit(
@@ -3701,7 +3702,7 @@ pub fn write_agent_profile_with_config(
     ensure_dir(&profile_dir)?;
 
     let profile_path = profile_dir.join("profile.json");
-    write_json(&profile_path, agent)?;
+    write_json(&profile_path, agent, true)?;
 
     let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
     enqueue_async_commit(
@@ -3792,13 +3793,13 @@ pub fn write_file_reservation_records(
             hex::encode(hasher.finalize())
         };
         let legacy_path = reservation_dir.join(format!("{digest}.json"));
-        write_json(&legacy_path, &normalized)?;
+        write_json(&legacy_path, &normalized, true)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &legacy_path)?);
 
         // Stable per-reservation artifact: id-<id>.json
         if let Some(id) = normalized.get("id").and_then(serde_json::Value::as_i64) {
             let id_path = reservation_dir.join(format!("id-{id}.json"));
-            write_json(&id_path, &normalized)?;
+            write_json(&id_path, &normalized, true)?;
             rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
         }
 
@@ -4068,14 +4069,14 @@ pub fn write_message_bundle(
     let mut rel_paths = Vec::new();
 
     // Canonical (ensure_parent_dir handled inside write_text)
-    write_text(&paths.canonical, &full_content)?;
+    write_text(&paths.canonical, &full_content, true)?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &paths.canonical,
     )?);
 
     // Outbox
-    write_text(&paths.outbox, &full_content)?;
+    write_text(&paths.outbox, &full_content, true)?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &paths.outbox,
@@ -4083,7 +4084,7 @@ pub fn write_message_bundle(
 
     // Inbox copies
     for inbox_path in &paths.inbox {
-        write_text(inbox_path, inbox_content_ref)?;
+        write_text(inbox_path, inbox_content_ref, true)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
     }
 
@@ -4531,7 +4532,7 @@ pub fn store_attachment(
         .encode(&rgba, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| StorageError::InvalidPath(format!("WebP encode error: {e}")))?;
 
-    atomic_write_bytes(&webp_path, &webp_bytes)?;
+    atomic_write_bytes(&webp_path, &webp_bytes, true)?;
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, &webp_path)?;
     rel_paths.push(webp_rel.clone());
 
@@ -4540,7 +4541,7 @@ pub fn store_attachment(
         let orig_dir = attach_dir.join("originals").join(prefix);
         ensure_dir(&orig_dir)?;
         let orig_path = orig_dir.join(format!("{digest}{original_ext}"));
-        atomic_write_bytes(&orig_path, &original_bytes)?;
+        atomic_write_bytes(&orig_path, &original_bytes, true)?;
         let rel = rel_path_cached(&archive.canonical_repo_root, &orig_path)?;
         rel_paths.push(rel.clone());
         Some(rel)
@@ -4559,7 +4560,7 @@ pub fn store_attachment(
         original_ext: original_ext.clone(),
         original_path: original_rel.clone(),
     };
-    write_json(&manifest_path, &serde_json::to_value(&manifest)?)?;
+    write_json(&manifest_path, &serde_json::to_value(&manifest)?, true)?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &manifest_path,
@@ -4668,7 +4669,7 @@ pub fn store_raw_attachment(
     let target_path = file_dir.join(&filename);
 
     if !target_path.exists() {
-        atomic_write_bytes(&target_path, &bytes)?;
+        atomic_write_bytes(&target_path, &bytes, true)?;
     }
 
     let rel_path = rel_path_cached(&archive.canonical_repo_root, &target_path)?;
@@ -5073,7 +5074,7 @@ pub fn emit_notification_signal(
         });
     }
 
-    write_json(&signal_path, &signal_data).is_ok()
+    write_json(&signal_path, &signal_data, false).is_ok()
 }
 
 /// Clear notification signal for a project/agent.
@@ -6797,47 +6798,52 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
 /// Creates parent directories as needed. The rename is atomic on POSIX
 /// filesystems when source and destination are on the same filesystem,
 /// which they are because we put the temp file in the same directory.
-fn write_text(path: &Path, content: &str) -> Result<()> {
+fn write_text(path: &Path, content: &str, sync: bool) -> Result<()> {
     ensure_parent_dir(path)?;
-    atomic_write_bytes(path, content.as_bytes())
+    atomic_write_bytes(path, content.as_bytes(), sync)
 }
 
 /// Write JSON content to a file atomically (write-to-temp-then-rename).
 ///
 /// Creates parent directories as needed.
-fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+fn write_json(path: &Path, value: &serde_json::Value, sync: bool) -> Result<()> {
     ensure_parent_dir(path)?;
     let content = serde_json::to_string_pretty(value)?;
-    atomic_write_bytes(path, content.as_bytes())
+    atomic_write_bytes(path, content.as_bytes(), sync)
 }
 
 /// Write bytes to a file atomically via a temp file + rename.
 ///
 /// The temp file is created in the same directory as the target so that
 /// `fs::rename` is guaranteed to be atomic (same filesystem).
-fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
+fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     use std::io::Write as _;
     let parent = path.parent().unwrap_or(Path::new("."));
-    // Use pid + thread-id + counter for a unique temp name to avoid collisions
-    // when multiple threads/processes write to the same directory.
+
+    // Use pid + seq + filename-hash for a unique temp name.
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_name = format!(
-        ".tmp-{}-{}-{seq}",
-        std::process::id(),
-        // Include a hash of the target filename for extra uniqueness
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    );
+
+    let name_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut s = std::collections::hash_map::DefaultHasher::new();
+        path.file_name().hash(&mut s);
+        s.finish()
+    };
+
+    let tmp_name = format!(".tmp-{}-{:016x}-{seq}", std::process::id(), name_hash,);
     let tmp_path = parent.join(&tmp_name);
+
     let result = (|| {
         let mut f = fs::File::create(&tmp_path)?;
         f.write_all(data)?;
-        f.sync_data()?;
+        if sync {
+            f.sync_data()?;
+        }
         fs::rename(&tmp_path, path)?;
         Ok(())
     })();
+
     if result.is_err() {
         // Best-effort cleanup of the temp file on any failure
         let _ = fs::remove_file(&tmp_path);

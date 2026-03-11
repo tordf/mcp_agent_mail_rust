@@ -3919,21 +3919,19 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     // Best-effort archive artifact writes for any releases.
     if !release_payloads.is_empty() {
-        match mcp_agent_mail_storage::ensure_archive(config, &project.slug) {
-            Ok(archive) => {
-                let result = mcp_agent_mail_storage::with_project_lock(&archive, || {
-                    mcp_agent_mail_storage::write_file_reservation_records(
-                        &archive,
-                        config,
-                        &release_payloads,
-                    )
-                });
-                if let Err(err) = result {
-                    tracing::warn!("Failed to write released reservation artifacts: {err}");
-                }
-            }
-            Err(err) => {
-                tracing::warn!("Failed to ensure archive for reservation cleanup: {err}");
+        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+            project_slug: project.slug.clone(),
+            config: config.clone(),
+            reservations: release_payloads,
+        };
+        match mcp_agent_mail_storage::wbq_enqueue(op) {
+            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+            | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
+            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                tracing::warn!(
+                    "WBQ enqueue failed; skipping reservation release artifacts archive write project={}",
+                    project.slug
+                );
             }
         }
     }
