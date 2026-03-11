@@ -668,9 +668,49 @@ mod tests {
     }
 
     #[test]
-    fn s3fifo_capacity_returns_total() {
-        let cache: S3FifoCache<&str, i32> = S3FifoCache::new(100);
-        assert_eq!(cache.capacity(), 100);
+    fn s3fifo_tombstone_collision_small_to_main() {
+        // capacity 5 -> small=1, main=4
+        let mut cache = S3FifoCache::new(5);
+
+        // 1. Insert "a" -> goes to small.
+        cache.insert("a", 10);
+        // 2. Promotion: get("a") marks freq=1, then insert("b") forces "a" to promote.
+        cache.get(&"a");
+        cache.insert("b", 20);
+        assert_eq!(cache.main_len(), 1);
+        assert_eq!(cache.small_len(), 1);
+        assert_eq!(cache.get(&"a"), Some(&10));
+
+        // Now "a" is in Main, but a tombstone for "a" is still in Small.
+        // 3. Insert "c" -> small is full ("b" is there), forces eviction.
+        // If the tombstone for "a" is popped from Small, it MUST NOT remove "a" from Main.
+
+        // Fill small queue to force "b" out.
+        cache.insert("c", 30);
+        // "b" should be evicted to ghost (freq=0)
+        assert_eq!(cache.get(&"b"), None);
+        assert!(cache.ghost_len() >= 1);
+
+        // "a" should still be in Main and healthy.
+        assert_eq!(cache.get(&"a"), Some(&10));
+        assert_eq!(cache.main_len(), 1);
+    }
+
+    #[test]
+    fn s3fifo_remove_then_reinsert_collision() {
+        let mut cache = S3FifoCache::new(5);
+
+        cache.insert("a", 1);
+        cache.remove(&"a");
+        cache.insert("a", 2);
+
+        // "a" is in Small queue twice: [tombstone, live].
+        // Force eviction of the tombstone.
+        cache.insert("b", 3);
+
+        // The tombstone for "a" should be skipped, leaving the live "a" alone.
+        assert_eq!(cache.get(&"a"), Some(&2));
+        assert_eq!(cache.small_len(), 1); // "b" is in small
     }
 
     #[test]

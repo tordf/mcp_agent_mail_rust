@@ -261,13 +261,12 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
 
         let shard_idx = Self::shard_index(&key);
 
-        let role = {
+        let (role, inflight_count) = {
             let mut map = self.shards[shard_idx]
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             #[allow(clippy::option_if_let_else)] // map_or_else can't work: else branch mutates map
-            if let Some(slot) = map.get(&key).map(Arc::clone) {
-                drop(map);
+            let role = if let Some(slot) = map.get(&key).map(Arc::clone) {
                 Role::Joiner(slot)
             } else {
                 // We are the leader. Insert our slot.
@@ -286,15 +285,11 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                     }
                 }
                 map.insert(key.clone(), Arc::clone(&slot));
-                drop(map);
                 Role::Leader(slot)
-            }
+            };
+            let len = map.len();
+            (role, len)
         };
-
-        let inflight_count = self.shards[shard_idx]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
 
         match role {
             Role::Joiner(slot) => {
