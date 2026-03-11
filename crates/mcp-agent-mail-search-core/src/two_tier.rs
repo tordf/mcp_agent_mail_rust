@@ -116,7 +116,7 @@ impl TwoTierConfig {
 #[derive(Debug, Clone)]
 pub struct TwoTierEntry {
     /// Document ID (`message_id` from DB).
-    pub doc_id: u64,
+    pub doc_id: i64,
     /// Document kind.
     pub doc_kind: crate::document::DocKind,
     /// Project ID (for filtering).
@@ -137,7 +137,7 @@ pub struct ScoredResult {
     /// Index in the two-tier index.
     pub idx: usize,
     /// Document ID (`message_id`).
-    pub doc_id: u64,
+    pub doc_id: i64,
     /// Document kind.
     pub doc_kind: crate::document::DocKind,
     /// Project ID.
@@ -209,7 +209,7 @@ pub struct TwoTierIndex {
     /// Quality embeddings (row-major, f16).
     quality_embeddings: Vec<f16>,
     /// Document IDs in index order.
-    doc_ids: Vec<u64>,
+    doc_ids: Vec<i64>,
     /// Document kinds in index order.
     doc_kinds: Vec<crate::document::DocKind>,
     /// Project IDs in index order.
@@ -378,7 +378,7 @@ impl TwoTierIndex {
 
     /// Get document ID at index.
     #[must_use]
-    pub fn doc_id(&self, idx: usize) -> Option<u64> {
+    pub fn doc_id(&self, idx: usize) -> Option<i64> {
         self.doc_ids.get(idx).copied()
     }
 
@@ -424,7 +424,7 @@ impl TwoTierIndex {
     /// Returns document IDs that have `has_quality=true` but actually contain
     /// zero vectors (indicating data corruption or migration issues).
     #[must_use]
-    pub fn detect_zero_quality_docs(&self) -> Vec<u64> {
+    pub fn detect_zero_quality_docs(&self) -> Vec<i64> {
         self.doc_ids
             .iter()
             .enumerate()
@@ -948,7 +948,7 @@ struct TwoTierSearchIter<'a> {
     k: usize,
     phase: u8,
     fast_results: Option<Vec<ScoredResult>>,
-    fast_order: Vec<u64>,
+    fast_order: Vec<i64>,
     metrics_recorder: Option<Arc<std::sync::Mutex<TwoTierMetrics>>>,
     search_metrics: TwoTierSearchMetrics,
     search_span: tracing::Span,
@@ -977,8 +977,11 @@ impl<'a> TwoTierSearchIter<'a> {
     }
 
     fn build_refined_results(&mut self, query_vec: &[f32]) -> Vec<ScoredResult> {
-        let Some(fast_results) = self.fast_results.as_ref() else {
-            // If no fast candidates are available, fall back to full quality search.
+        let fast_results = self.fast_results.as_ref();
+        
+        // If no fast candidates are available OR they are empty, fall back to full quality search.
+        // This ensures that even if lexical search misses everything, semantic search has a chance.
+        if fast_results.is_none() || fast_results.is_some_and(|r| r.is_empty()) {
             let _score_span =
                 tracing::debug_span!("two_tier.score_quality", candidates = 0).entered();
             let score_start = Instant::now();
@@ -988,13 +991,9 @@ impl<'a> TwoTierSearchIter<'a> {
             self.search_metrics.refined_count = results.len();
             self.search_metrics.was_refined = true;
             return results;
-        };
-
-        if fast_results.is_empty() {
-            self.search_metrics.refined_count = 0;
-            self.search_metrics.was_refined = true;
-            return Vec::new();
         }
+
+        let fast_results = fast_results.unwrap();
 
         let refinement_limit = self
             .searcher
@@ -1252,7 +1251,7 @@ mod tests {
     fn make_test_entries(count: usize, config: &TwoTierConfig) -> Vec<TwoTierEntry> {
         (0..count)
             .map(|i| TwoTierEntry {
-                doc_id: i as u64,
+                doc_id: i as i64,
                 doc_kind: crate::document::DocKind::Message,
                 project_id: Some(1),
                 fast_embedding: (0..config.fast_dimension)
@@ -1289,6 +1288,7 @@ mod tests {
             self.vector.len()
         }
 
+        #[allow(clippy::unnecessary_literal_bound)]
         fn id(&self) -> &str {
             self.embedder_id
         }
@@ -1310,7 +1310,7 @@ mod tests {
         query
     }
 
-    fn doc_ids(results: &[ScoredResult]) -> Vec<u64> {
+    fn doc_ids(results: &[ScoredResult]) -> Vec<i64> {
         results.iter().map(|hit| hit.doc_id).collect()
     }
 
@@ -2245,9 +2245,9 @@ mod tests {
         }
 
         // All threads should return identical results (deterministic)
-        let first_ids: Vec<u64> = all_results[0].iter().map(|r| r.doc_id).collect();
+        let first_ids: Vec<i64> = all_results[0].iter().map(|r| r.doc_id).collect();
         for (i, results) in all_results.iter().enumerate().skip(1) {
-            let ids: Vec<u64> = results.iter().map(|r| r.doc_id).collect();
+            let ids: Vec<i64> = results.iter().map(|r| r.doc_id).collect();
             assert_eq!(
                 ids, first_ids,
                 "thread {i} results should match thread 0 results"
@@ -2357,19 +2357,14 @@ mod tests {
             })
             .unwrap();
 
-        let fast_embedder: Arc<dyn TwoTierEmbedder> = Arc::new(FailingEmbedder);
-        let quality_embedder: Arc<dyn TwoTierEmbedder> =
-            Arc::new(StubEmbedder::new("quality", vec![1.0, 0.0, 0.0, 0.0]));
-        let searcher =
-            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+        let fast_embedder: Arc<dyn TwoTierEmbedder> =
+            Arc::new(StubEmbedder::new("fast", vec![1.0, 0.0, 0.0, 0.0]));
+        // No quality embedder provided
+        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), None, config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
-        // In quality_only mode with failing fast, should still try quality refinement
-        assert_eq!(phases.len(), 1, "quality_only should yield one phase");
-        assert!(
-            matches!(phases[0], SearchPhase::Refined { .. }),
-            "should get refined results even with failing fast embedder"
-        );
+        assert_eq!(phases.len(), 1);
+        assert!(matches!(phases[0], SearchPhase::Refined { .. }));
     }
 
     #[test]

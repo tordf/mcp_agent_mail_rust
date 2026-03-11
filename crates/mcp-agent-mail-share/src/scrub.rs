@@ -44,8 +44,8 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"(?i)sk-[A-Za-z0-9]{20,}").unwrap_or_else(|_| unreachable!()),
         // Bearer tokens
         Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\./+=]{16,}").unwrap_or_else(|_| unreachable!()),
-        // URL-embedded basic auth credentials
-        Regex::new(r"(?i)https?://[^/\s:@]+:[^@\s/]+@").unwrap_or_else(|_| unreachable!()),
+        // URL-embedded basic auth credentials (broader URI support)
+        Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^/\s@]+:[^@\s/]+@").unwrap_or_else(|_| unreachable!()),
         // Environment-variable references likely to contain secrets
         Regex::new(r"(?i)\$[A-Z_][A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z0-9_]*")
             .unwrap_or_else(|_| unreachable!()),
@@ -437,7 +437,7 @@ fn scrub_structure(value: &Value, depth: usize) -> (Value, i64, i64) {
     // Cap recursion at a high hard limit to avoid stack blow-ups on malicious
     // payloads while still scrubbing realistically deep JSON structures.
     if depth > 256 {
-        return (value.clone(), 0, 0);
+        return (Value::Null, 0, 0); // Return Null for exceeded depth instead of cloning large structure
     }
     match value {
         Value::String(s) => {

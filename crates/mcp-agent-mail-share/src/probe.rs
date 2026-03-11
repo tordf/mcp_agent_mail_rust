@@ -356,207 +356,87 @@ fn probe_single_get(
                     })?
                     .next()
                     .ok_or_else(|| ProbeError::DnsError {
-                        detail: format!("no addresses for {addr}"),
+                        detail: "No addresses found".to_string(),
                     })
-            })
-            .map_err(|e| ProbeError::DnsError {
-                detail: format!("{e}"),
             })?,
         config.timeout,
     )
-    .map_err(|e| categorize_connect_error(e, config.timeout))?;
-
-    stream
-        .set_read_timeout(Some(config.timeout))
-        .map_err(|e| ProbeError::IoError {
-            detail: e.to_string(),
-        })?;
-    stream
-        .set_write_timeout(Some(config.timeout))
-        .map_err(|e| ProbeError::IoError {
-            detail: e.to_string(),
-        })?;
-
-    match parsed.scheme {
-        Scheme::Http => send_and_receive(stream, parsed, config, capture_body),
-        Scheme::Https => {
-            // HTTPS uses curl subprocess to avoid native-tls dependency
-            // (share crate is #![forbid(unsafe_code)])
-            drop(stream);
-            probe_via_curl(parsed, config, capture_body)
-        }
-    }
-}
-
-/// Send an HTTP/1.1 GET request and parse the response.
-fn send_and_receive<S: io::Read + io::Write>(
-    mut stream: S,
-    parsed: &ParsedUrl,
-    config: &ProbeConfig,
-    capture_body: bool,
-) -> Result<RawResponse, ProbeError> {
-    let user_agent = sanitized_header_value(&config.user_agent);
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        parsed.path,
-        parsed.authority(),
-        user_agent,
-    );
-
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| ProbeError::IoError {
-            detail: e.to_string(),
-        })?;
-    stream.flush().map_err(|e| ProbeError::IoError {
+    .map_err(|e| ProbeError::ConnectionError {
         detail: e.to_string(),
     })?;
 
-    let mut reader = BufReader::new(stream);
+    let _ = stream.set_read_timeout(Some(config.timeout));
+    let _ = stream.set_write_timeout(Some(config.timeout));
 
-    // Parse status line
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|e| ProbeError::IoError {
-            detail: e.to_string(),
-        })?;
-
-    let status = parse_status_line(&status_line)?;
-
-    // Parse headers
-    let mut headers = BTreeMap::new();
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| ProbeError::IoError {
-                detail: e.to_string(),
-            })?;
-
-        let trimmed = line.trim_end_matches("\r\n").trim_end_matches('\n');
-        if trimmed.is_empty() {
-            break;
-        }
-
-        if let Some((key, value)) = trimmed.split_once(':') {
-            let key_lower = key.trim().to_lowercase();
-            let value_trimmed = value.trim().to_string();
-
-            if key_lower == "content-length" {
-                content_length = value_trimmed.parse().ok();
-            }
-            if key_lower == "transfer-encoding" && value_trimmed.to_lowercase().contains("chunked")
+    let mut response_buf = Vec::new();
+    let result = (|| -> Result<RawResponse, ProbeError> {
+        if parsed.is_https {
+            #[cfg(feature = "native-tls")]
             {
-                chunked = true;
+                let connector = native_tls::TlsConnector::new().map_err(|e| ProbeError::TlsError {
+                    detail: e.to_string(),
+                })?;
+                let mut tls_stream = connector.connect(&parsed.host, stream).map_err(|e| {
+                    ProbeError::TlsError {
+                        detail: e.to_string(),
+                    }
+                })?;
+
+                tls_stream
+                    .write_all(request.as_bytes())
+                    .map_err(|e| ProbeError::IoError {
+                        detail: e.to_string(),
+                    })?;
+                tls_stream.flush().map_err(|e| ProbeError::IoError {
+                    detail: e.to_string(),
+                })?;
+
+                tls_stream
+                    .read_to_end(&mut response_buf)
+                    .map_err(|e| ProbeError::IoError {
+                        detail: e.to_string(),
+                    })?;
+                
+                // TLS shutdown if possible
+                let _ = tls_stream.shutdown();
             }
-
-            headers.insert(key_lower, value_trimmed);
-        }
-    }
-
-    // Read body
-    let body = if !capture_body {
-        Vec::new()
-    } else if chunked {
-        read_chunked_body(&mut reader)?
-    } else if let Some(len) = content_length {
-        let capped = len.min(BODY_LIMIT);
-        let mut buf = vec![0u8; capped];
-        reader
-            .read_exact(&mut buf)
-            .map_err(|e| ProbeError::IoError {
+            #[cfg(not(feature = "native-tls"))]
+            {
+                return Err(ProbeError::TlsError {
+                    detail: "HTTPS not supported (compile with native-tls feature)".to_string(),
+                });
+            }
+        } else {
+            let mut stream = stream.try_clone().map_err(|e| ProbeError::IoError {
+                detail: format!("Failed to clone stream: {}", e),
+            })?;
+            
+            stream
+                .write_all(request.as_bytes())
+                .map_err(|e| ProbeError::IoError {
+                    detail: e.to_string(),
+                })?;
+            stream.flush().map_err(|e| ProbeError::IoError {
                 detail: e.to_string(),
             })?;
-        buf
-    } else {
-        // Read until EOF (Connection: close)
-        let mut buf = Vec::new();
-        let _ = reader.take(BODY_LIMIT as u64).read_to_end(&mut buf);
-        buf
-    };
 
-    Ok(RawResponse {
-        status,
-        headers,
-        body,
-    })
-}
-
-/// Probe via `curl` subprocess for HTTPS (avoids native TLS dependency).
-fn probe_via_curl(
-    parsed: &ParsedUrl,
-    config: &ProbeConfig,
-    capture_body: bool,
-) -> Result<RawResponse, ProbeError> {
-    let url = parsed.to_url();
-    let user_agent = sanitized_header_value(&config.user_agent);
-
-    let mut command = std::process::Command::new("curl");
-    command
-        .arg("-sS")
-        .arg("-D")
-        .arg("-")
-        .arg("--max-time")
-        .arg(format_curl_timeout(config.timeout))
-        .arg("-A")
-        .arg(user_agent)
-        // Do not follow redirects — we handle them ourselves.
-        .arg(&url);
-    if !capture_body {
-        let discard_target = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        command.args(["--output", discard_target]);
-    }
-    let output = command.output().map_err(|e| ProbeError::ConnectionError {
-        detail: format!("curl not available: {e}"),
-    })?;
-
-    if !output.status.success() {
-        return Err(map_curl_failure(&output, config));
-    }
-
-    parse_curl_http_response(&output.stdout, capture_body)
-}
-
-fn map_curl_failure(output: &std::process::Output, config: &ProbeConfig) -> ProbeError {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let detail = if stderr.is_empty() {
-        format!("curl exited with status {}", output.status)
-    } else {
-        stderr
-    };
-
-    match output.status.code() {
-        Some(6) => ProbeError::DnsError { detail },
-        Some(28) => {
-            #[allow(clippy::cast_possible_truncation)]
-            let timeout_ms = config.timeout.as_millis() as u64;
-            ProbeError::Timeout { timeout_ms }
+            stream
+                .read_to_end(&mut response_buf)
+                .map_err(|e| ProbeError::IoError {
+                    detail: e.to_string(),
+                })?;
+                
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
-        Some(35 | 51 | 58 | 59 | 60 | 64 | 66 | 77 | 80 | 83 | 90 | 91) => {
-            ProbeError::TlsError { detail }
-        }
-        _ => ProbeError::ConnectionError { detail },
-    }
+
+        parse_http_response(&response_buf, capture_body)
+    })();
+    
+    result
 }
 
-fn format_curl_timeout(timeout: Duration) -> String {
-    let millis = timeout.as_millis().max(1);
-    let seconds = millis / 1000;
-    let remainder = millis % 1000;
-    if remainder == 0 {
-        seconds.to_string()
-    } else {
-        format!("{seconds}.{remainder:03}")
-            .trim_end_matches('0')
-            .to_string()
-    }
-}
-
-fn parse_curl_http_response(raw: &[u8], capture_body: bool) -> Result<RawResponse, ProbeError> {
+/// Parse a raw HTTP response.
+fn parse_http_response(raw: &[u8], capture_body: bool) -> Result<RawResponse, ProbeError> {
     let (header_section, body) =
         split_http_response(raw).ok_or_else(|| ProbeError::ProtocolError {
             detail: "curl did not return a complete HTTP response".to_string(),
@@ -1451,7 +1331,7 @@ mod tests {
 
     #[test]
     fn chunked_body_with_extension() {
-        // Chunk extension: "5;ext=val\r\nhello\r\n0\r\n\r\n"
+        // Chunk with extension: "5;ext=val\r\nhello\r\n0\r\n\r\n"
         let data = b"5;ext=val\r\nhello\r\n0\r\n\r\n";
         let mut cursor = std::io::Cursor::new(data.as_ref());
         let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
