@@ -358,10 +358,12 @@ fn escalate(
                     .map(|r| {
                         serde_json::json!({
                             "id": r.id.unwrap_or(0),
+                            "project": &project.human_key,
                             "agent": &holder_agent_name,
                             "path_pattern": &r.path_pattern,
                             "exclusive": r.exclusive != 0,
                             "reason": &r.reason,
+                            "created_ts": micros_to_iso(r.created_ts),
                             "expires_ts": micros_to_iso(r.expires_ts),
                         })
                     })

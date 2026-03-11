@@ -142,7 +142,7 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
 }
 
 fn path_looks_absolute(input: &str) -> bool {
-    if std::path::Path::new(input).is_absolute() {
+    if std::path::Path::new(input).is_absolute() || input.starts_with("~/") || input == "~" {
         return true;
     }
 
@@ -598,6 +598,7 @@ pub async fn file_reservation_paths(
             .map(|r| {
                 serde_json::json!({
                     "id": r.id.unwrap_or(0),
+                    "project": &project.human_key,
                     "agent": &agent.name,
                     "path_pattern": &r.path_pattern,
                     "exclusive": r.exclusive != 0,
@@ -721,6 +722,7 @@ pub async fn release_file_reservations(
             .map(|r| {
                 serde_json::json!({
                     "id": r.id.unwrap_or(0),
+                    "project": &project.human_key,
                     "agent": &agent.name,
                     "path_pattern": &r.path_pattern,
                     "exclusive": r.exclusive != 0,
@@ -837,6 +839,7 @@ pub async fn renew_file_reservations(
             .map(|r| {
                 serde_json::json!({
                     "id": r.id.unwrap_or(0),
+                    "project": &project.human_key,
                     "agent": &agent.name,
                     "path_pattern": &r.path_pattern,
                     "exclusive": r.exclusive != 0,
@@ -1080,6 +1083,7 @@ pub async fn force_release_file_reservation(
     if released_count > 0 {
         let res_json = serde_json::json!({
             "id": reservation.id.unwrap_or(0),
+            "project": &project.human_key,
             "agent": &holder_agent.name,
             "path_pattern": &reservation.path_pattern,
             "exclusive": reservation.exclusive != 0,
@@ -1640,19 +1644,22 @@ mod tests {
     #[test]
     fn reservation_response_serializes() {
         let r = ReservationResponse {
-            granted: vec![GrantedReservation {
-                id: 1,
-                path_pattern: "*.rs".into(),
-                exclusive: true,
-                reason: "test".into(),
-                expires_ts: "2026-02-06T02:00:00Z".into(),
+            granted: vec![],
+            conflicts: vec![ReservationConflict {
+                path: "lib.rs".into(),
+                holders: vec![ConflictHolder {
+                    agent: "GoldHawk".into(),
+                    path_pattern: "lib.rs".into(),
+                    exclusive: true,
+                    expires_ts: "2026-02-06T04:00:00Z".into(),
+                }],
             }],
-            conflicts: vec![],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert_eq!(json["granted"].as_array().unwrap().len(), 1);
-        assert!(json["conflicts"].as_array().unwrap().is_empty());
+        assert!(json["granted"].as_array().unwrap().is_empty());
+        assert_eq!(json["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(json["conflicts"][0]["holders"][0]["agent"], "GoldHawk");
     }
 
     #[test]
