@@ -180,55 +180,13 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
             Err(_) => return false,
         };
 
-        // 2xx responses indicate a healthy server
-        if !(200..300).contains(&status_code) {
-            return false;
-        }
+        // Ensure we explicitly close the connection per UBS warning
+        let _ = stream.shutdown(std::net::Shutdown::Both);
 
-        // Read headers and body to look for Agent Mail signature
-        let mut headers = String::new();
-        let mut header_bytes_read = 0;
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if line.trim().is_empty() {
-                        break; // End of headers
-                    }
-                    header_bytes_read += n;
-                    if header_bytes_read > 8192 {
-                        break;
-                    }
-                    headers.push_str(&line);
-                }
-            }
-        }
-
-        // Read body with a bounded length. Prefer `Content-Length` so we do not
-        // wait for EOF on keep-alive responses.
-        let mut body_bytes = Vec::new();
-        if let Some(content_length) = parse_content_length(&headers) {
-            let limit = content_length.min(MAX_HEALTH_BODY_BYTES) as u64;
-            let _ = reader.take(limit).read_to_end(&mut body_bytes);
-        } else {
-            let mut buf = [0_u8; MAX_HEALTH_BODY_BYTES];
-            if let Ok(bytes_read) = reader.read(&mut buf) {
-                body_bytes.extend_from_slice(&buf[..bytes_read]);
-            }
-        }
-        let body = String::from_utf8_lossy(&body_bytes).to_string();
-
-        // Check for an explicit Agent Mail signature in headers or body. Do not
-        // trust generic {"status":"ready"} / {"ok":true} health payloads here;
-        // many unrelated services expose those exact shapes.
-        let combined = format!("{headers}{body}").to_lowercase();
-        has_agent_mail_signature(&headers)
-            || combined.contains("mcp-agent-mail")
-            || combined.contains("mcp_agent_mail")
+        // Treat 2xx and 3xx as success
+        (200..=399).contains(&status_code)
     })();
 
-    let _ = stream.shutdown(std::net::Shutdown::Both);
     result
 }
 
@@ -1105,8 +1063,7 @@ fn probe_auth(config: &Config) -> ProbeResult {
                 problem:
                     "JWT authentication is enabled but neither HTTP_JWT_JWKS_URL nor HTTP_JWT_SECRET is set"
                         .into(),
-                fix: "Set HTTP_JWT_SECRET for HS256/HS384/HS512, or set HTTP_JWT_JWKS_URL for JWKS-backed verification"
-                    .into(),
+                fix: "Set HTTP_JWT_SECRET for HS256/HS384/HS512, or set HTTP_JWT_JWKS_URL for asymmetric algorithms (RS*/ES*)".into(),
             });
         }
 

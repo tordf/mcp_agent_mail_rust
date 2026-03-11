@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+fastmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 json5.workspace = true

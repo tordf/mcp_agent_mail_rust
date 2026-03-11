@@ -4666,6 +4666,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.28.1",
+ "fastmcp-rust",
  "ftui",
  "ftui-runtime",
  "glob",
