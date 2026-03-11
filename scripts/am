@@ -74,6 +74,7 @@ sync_toml_mcp_url() {
   local create_if_missing="${3:-0}"
   local tmp_file="${config_file}.am-sync.$$"
   local desired_auth_header=""
+  local desired_startup_timeout_sec="30"
 
   if [[ -n "${HTTP_BEARER_TOKEN:-}" ]]; then
     desired_auth_header="Bearer ${HTTP_BEARER_TOKEN}"
@@ -87,6 +88,7 @@ sync_toml_mcp_url() {
     cat > "$config_file" <<EOF
 [mcp_servers.mcp_agent_mail]
 url = "${desired_url}"
+startup_timeout_sec = ${desired_startup_timeout_sec}
 EOF
     if [[ -n "$desired_auth_header" ]]; then
       cat >> "$config_file" <<EOF
@@ -97,11 +99,12 @@ EOF
     return 0
   fi
 
-  awk -v desired_url="$desired_url" -v desired_auth_header="$desired_auth_header" -v create_if_missing="$create_if_missing" '
+  awk -v desired_url="$desired_url" -v desired_auth_header="$desired_auth_header" -v desired_startup_timeout_sec="$desired_startup_timeout_sec" -v create_if_missing="$create_if_missing" '
     BEGIN {
       in_section = 0
       saw_section = 0
       saw_url_in_section = 0
+      saw_startup_timeout_in_section = 0
       saw_http_headers_in_section = 0
     }
 
@@ -110,6 +113,9 @@ EOF
         if (!saw_url_in_section) {
           print "url = \"" desired_url "\""
         }
+        if (!saw_startup_timeout_in_section) {
+          print "startup_timeout_sec = " desired_startup_timeout_sec
+        }
         if (!saw_http_headers_in_section && desired_auth_header != "") {
           print "http_headers = { Authorization = \"" desired_auth_header "\" }"
         }
@@ -117,6 +123,7 @@ EOF
       in_section = 1
       saw_section = 1
       saw_url_in_section = 0
+      saw_startup_timeout_in_section = 0
       saw_http_headers_in_section = 0
       print
       next
@@ -126,6 +133,9 @@ EOF
       if (in_section) {
         if (!saw_url_in_section) {
           print "url = \"" desired_url "\""
+        }
+        if (!saw_startup_timeout_in_section) {
+          print "startup_timeout_sec = " desired_startup_timeout_sec
         }
         if (!saw_http_headers_in_section && desired_auth_header != "") {
           print "http_headers = { Authorization = \"" desired_auth_header "\" }"
@@ -138,6 +148,11 @@ EOF
       if (in_section && $0 ~ /^[[:space:]]*(url|httpUrl)[[:space:]]*=/) {
         print "url = \"" desired_url "\""
         saw_url_in_section = 1
+        next
+      }
+      if (in_section && $0 ~ /^[[:space:]]*startup_timeout_sec[[:space:]]*=/) {
+        print "startup_timeout_sec = " desired_startup_timeout_sec
+        saw_startup_timeout_in_section = 1
         next
       }
       if (in_section && ($0 ~ /^[[:space:]]*bearer_token_env_var[[:space:]]*=/ || $0 ~ /^[[:space:]]*http_headers[[:space:]]*=/)) {
@@ -158,6 +173,9 @@ EOF
         if (!saw_url_in_section) {
           print "url = \"" desired_url "\""
         }
+        if (!saw_startup_timeout_in_section) {
+          print "startup_timeout_sec = " desired_startup_timeout_sec
+        }
         if (!saw_http_headers_in_section && desired_auth_header != "") {
           print "http_headers = { Authorization = \"" desired_auth_header "\" }"
         }
@@ -166,6 +184,7 @@ EOF
         print ""
         print "[mcp_servers.mcp_agent_mail]"
         print "url = \"" desired_url "\""
+        print "startup_timeout_sec = " desired_startup_timeout_sec
         if (desired_auth_header != "") {
           print "http_headers = { Authorization = \"" desired_auth_header "\" }"
         }

@@ -1621,6 +1621,7 @@ setup_single_toml_config() {
   local section_header='[mcp_servers.mcp_agent_mail]'
   local desired_url
   desired_url="$(desired_mcp_http_url)"
+  local desired_startup_timeout_sec="30"
   local bearer_token
   bearer_token="$(resolve_setup_http_bearer_token)"
   local desired_auth_header=""
@@ -1640,6 +1641,7 @@ setup_single_toml_config() {
     cat > "$config_path" <<TOMLEOF
 ${section_header}
 url = "${desired_url}"
+startup_timeout_sec = ${desired_startup_timeout_sec}
 TOMLEOF
     if [ -n "$desired_auth_header" ]; then
       cat >> "$config_path" <<TOMLEOF
@@ -1653,10 +1655,14 @@ TOMLEOF
   if ! awk \
     -v section_header="$section_header" \
     -v desired_url="$desired_url" \
+    -v desired_startup_timeout_sec="$desired_startup_timeout_sec" \
     -v desired_auth_header="$desired_auth_header" '
     function flush_section() {
       if (!saw_url_in_section) {
         print "url = \"" desired_url "\""
+      }
+      if (!saw_startup_timeout_in_section) {
+        print "startup_timeout_sec = " desired_startup_timeout_sec
       }
       if (!saw_http_headers_in_section && desired_auth_header != "") {
         print "http_headers = { Authorization = \"" desired_auth_header "\" }"
@@ -1667,6 +1673,7 @@ TOMLEOF
       in_section = 0
       saw_section = 0
       saw_url_in_section = 0
+      saw_startup_timeout_in_section = 0
       saw_http_headers_in_section = 0
     }
 
@@ -1677,6 +1684,7 @@ TOMLEOF
       in_section = 1
       saw_section = 1
       saw_url_in_section = 0
+      saw_startup_timeout_in_section = 0
       saw_http_headers_in_section = 0
       print
       next
@@ -1693,6 +1701,11 @@ TOMLEOF
       if (in_section && $0 ~ /^[[:space:]]*(url|httpUrl)[[:space:]]*=/) {
         print "url = \"" desired_url "\""
         saw_url_in_section = 1
+        next
+      }
+      if (in_section && $0 ~ /^[[:space:]]*startup_timeout_sec[[:space:]]*=/) {
+        print "startup_timeout_sec = " desired_startup_timeout_sec
+        saw_startup_timeout_in_section = 1
         next
       }
       if (in_section && $0 ~ /^[[:space:]]*http_headers[[:space:]]*=/) {
@@ -1727,6 +1740,7 @@ TOMLEOF
         }
         print section_header
         print "url = \"" desired_url "\""
+        print "startup_timeout_sec = " desired_startup_timeout_sec
         if (desired_auth_header != "") {
           print "http_headers = { Authorization = \"" desired_auth_header "\" }"
         }
@@ -3509,8 +3523,10 @@ extract_migration_error_line() {
   local line
 
   line=$(printf "%s\n" "$output" | awk '
-    BEGIN { IGNORECASE = 1 }
-    /error:|failed|panic|aborted|integrity_check|timestamp conversion failed|unknown timestamp format/ {
+    {
+      lower = tolower($0)
+    }
+    lower ~ /error:|failed|panic|aborted|integrity_check|timestamp conversion failed|unknown timestamp format/ {
       print
       exit
     }
@@ -3583,8 +3599,8 @@ sqlite_text_timestamp_columns_remaining() {
     column="${pair##*:}"
     sqlite_table_exists "$db_path" "$table" || continue
     sqlite_column_exists "$db_path" "$table" "$column" || continue
-    detected=$(sqlite3 "$db_path" "SELECT typeof(${column}) FROM ${table} WHERE ${column} IS NOT NULL LIMIT 1;" 2>/dev/null | head -1 || true)
-    if [ "$detected" = "text" ]; then
+    detected=$(sqlite3 "$db_path" "SELECT 1 FROM ${table} WHERE typeof(${column}) = 'text' LIMIT 1;" 2>/dev/null | head -1 || true)
+    if [ "$detected" = "1" ]; then
       if [ -n "$remaining" ]; then
         remaining="${remaining}, "
       fi
