@@ -50,7 +50,11 @@ pub fn check_db_lock_status(config: &Config) -> DbLockStatus {
 
     // Try to open the file with an exclusive flock to see if another am is holding it
     // during a sensitive operation (like backfill or migration).
-    match std::fs::OpenOptions::new().read(true).write(true).open(&sqlite_path) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&sqlite_path)
+    {
         Ok(file) => {
             use fs2::FileExt;
             // We use try_lock_exclusive() to see if we CAN take it.
@@ -64,7 +68,9 @@ pub fn check_db_lock_status(config: &Config) -> DbLockStatus {
         }
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("Resource temporarily unavailable") || msg.contains("database is locked") {
+            if msg.contains("Resource temporarily unavailable")
+                || msg.contains("database is locked")
+            {
                 DbLockStatus::Locked
             } else {
                 DbLockStatus::Error(msg)
@@ -177,11 +183,35 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
     }
 }
 
+fn normalize_connect_host_for_health_check(host: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return std::borrow::Cow::Borrowed("127.0.0.1");
+    }
+
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed);
+
+    match unbracketed {
+        "0.0.0.0" | "::" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        _ => {
+            if unbracketed.contains(':') && !trimmed.starts_with('[') {
+                std::borrow::Cow::Owned(format!("[{unbracketed}]"))
+            } else {
+                std::borrow::Cow::Borrowed(trimmed)
+            }
+        }
+    }
+}
+
 /// Attempt to connect to a port and verify it's an Agent Mail server via health check.
 ///
 /// Sends a minimal HTTP GET request to `/health` and checks for a valid response.
 fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
-    let addr = format!("{host}:{port}");
+    let connect_host = normalize_connect_host_for_health_check(host);
+    let addr = format!("{connect_host}:{port}");
 
     // Try to connect with a short timeout
     let Ok(stream) = TcpStream::connect_timeout(
@@ -201,7 +231,7 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
     // Send HTTP GET /health request
     let request = format!(
         "GET /health HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
+         Host: {connect_host}:{port}\r\n\
          Connection: close\r\n\
          User-Agent: mcp-agent-mail-startup-check\r\n\
          \r\n"
@@ -1688,6 +1718,48 @@ mod tests {
         });
 
         let status = check_port_status("127.0.0.1", port);
+        assert!(
+            matches!(status, PortStatus::AgentMailServer),
+            "expected AgentMailServer, got {status:?}"
+        );
+
+        server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn check_port_status_detects_agent_mail_server_for_wildcard_host() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).expect("read request line");
+                if bytes == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+
+            let body = r#"{"status":"healthy"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 X-Agent-Mail-Health: 1\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write health response");
+            stream.flush().expect("flush health response");
+        });
+
+        let status = check_port_status("0.0.0.0", port);
         assert!(
             matches!(status, PortStatus::AgentMailServer),
             "expected AgentMailServer, got {status:?}"

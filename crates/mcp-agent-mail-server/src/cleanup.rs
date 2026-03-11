@@ -769,11 +769,11 @@ fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf>
         || pattern.contains('{');
 
     if has_glob {
-        let base_str = base.to_string_lossy();
+        let base_str = base.to_string_lossy().replace('\\', "/");
         let base_escaped = glob::Pattern::escape(&base_str);
         // We use format! instead of Path::join because base_escaped is a string
         // that may contain glob escape sequences that Path::join could mishandle.
-        let full_pattern = if base_str.ends_with('/') || base_str.ends_with('\\') {
+        let full_pattern = if base_str.ends_with('/') {
             format!("{base_escaped}{pattern}")
         } else {
             format!("{base_escaped}/{pattern}")

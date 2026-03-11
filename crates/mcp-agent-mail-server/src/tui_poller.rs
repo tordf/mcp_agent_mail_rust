@@ -849,12 +849,41 @@ fn maybe_reuse_previous_detail_list<T: Clone>(
     *current_rows = previous_rows.to_vec();
 }
 
+fn timestamp_sort_expr(column: &str) -> String {
+    format!(
+        "CASE \
+           WHEN typeof({column}) IN ('integer', 'real') THEN CAST({column} AS INTEGER) \
+           WHEN typeof({column}) = 'text' THEN CASE \
+             WHEN instr(trim({column}), ' ') > 0 \
+               OR instr(trim({column}), ':') > 0 \
+               OR (length(trim({column})) >= 10 \
+                   AND substr(trim({column}), 5, 1) = '-' \
+                   AND substr(trim({column}), 8, 1) = '-') \
+             THEN COALESCE( \
+               CAST(strftime('%s', trim({column})) AS INTEGER) * 1000000 + \
+               CASE \
+                 WHEN instr(trim({column}), '.') > 0 THEN CAST( \
+                   substr(trim({column}) || '000000', instr(trim({column}), '.') + 1, 6) \
+                   AS INTEGER \
+                 ) \
+                 ELSE 0 \
+               END, \
+               0 \
+             ) \
+             ELSE CAST(CAST(trim({column}) AS REAL) AS INTEGER) \
+           END \
+           ELSE 0 \
+         END"
+    )
+}
+
 /// Fetch the agent list ordered by most recently active.
 fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
+    let last_active_sort = timestamp_sort_expr("last_active_ts");
     conn.query_sync(
         &format!(
             "SELECT name, program, last_active_ts FROM agents \
-             ORDER BY CAST(last_active_ts AS INTEGER) DESC, id DESC LIMIT {MAX_AGENTS}"
+             ORDER BY {last_active_sort} DESC, id DESC LIMIT {MAX_AGENTS}"
         ),
         &[],
     )
@@ -865,7 +894,7 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
                 Some(AgentSummary {
                     name: row.get_named::<String>("name").ok()?,
                     program: row.get_named::<String>("program").ok()?,
-                    last_active_ts: row.get_named::<i64>("last_active_ts").ok()?,
+                    last_active_ts: parse_raw_ts(&row, "last_active_ts"),
                 })
             })
             .collect()
@@ -883,11 +912,12 @@ fn fetch_projects_list_with_reservation_counts(
     conn: &DbConn,
     reservation_counts_override: Option<&HashMap<i64, u64>>,
 ) -> Vec<ProjectSummary> {
+    let created_at_sort = timestamp_sort_expr("created_at");
     let sql = format!(
         "WITH recent_projects AS ( \
            SELECT id, slug, human_key, created_at \
            FROM projects \
-           ORDER BY CAST(created_at AS INTEGER) DESC, id DESC \
+           ORDER BY {created_at_sort} DESC, id DESC \
            LIMIT {MAX_PROJECTS} \
          ), \
          agent_counts AS ( \
@@ -908,7 +938,7 @@ fn fetch_projects_list_with_reservation_counts(
          FROM recent_projects p \
          LEFT JOIN agent_counts ac ON ac.project_id = p.id \
          LEFT JOIN message_counts mc ON mc.project_id = p.id \
-         ORDER BY CAST(p.created_at AS INTEGER) DESC, p.id DESC"
+         ORDER BY {created_at_sort} DESC, p.id DESC"
     );
     let fallback_reservation_counts = reservation_counts_override
         .is_none()
@@ -918,35 +948,60 @@ fn fetch_projects_list_with_reservation_counts(
             .as_ref()
             .unwrap_or_else(|| unreachable!("fallback reservation counts should exist"))
     });
+    match conn.query_sync(&sql, &[]) {
+        Ok(rows) => parse_project_summary_rows(rows, reservation_counts),
+        Err(err) => {
+            tracing::debug!(
+                error = ?err,
+                "tui_poller.fetch_projects_list aggregate query failed; falling back to minimal project rows"
+            );
+            fetch_projects_list_minimal(conn, reservation_counts)
+        }
+    }
+}
+
+fn parse_project_summary_rows(
+    rows: Vec<mcp_agent_mail_db::sqlmodel::Row>,
+    reservation_counts: &HashMap<i64, u64>,
+) -> Vec<ProjectSummary> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let project_id = row.get_named::<i64>("id").ok()?;
+            Some(ProjectSummary {
+                id: project_id,
+                slug: row.get_named::<String>("slug").ok()?,
+                human_key: row.get_named::<String>("human_key").ok()?,
+                agent_count: row
+                    .get_named::<i64>("agent_count")
+                    .ok()
+                    .and_then(|v| u64::try_from(v).ok())
+                    .unwrap_or(0),
+                message_count: row
+                    .get_named::<i64>("message_count")
+                    .ok()
+                    .and_then(|v| u64::try_from(v).ok())
+                    .unwrap_or(0),
+                reservation_count: reservation_counts.get(&project_id).copied().unwrap_or(0),
+                created_at: parse_raw_ts(&row, "created_at"),
+            })
+        })
+        .collect()
+}
+
+fn fetch_projects_list_minimal(
+    conn: &DbConn,
+    reservation_counts: &HashMap<i64, u64>,
+) -> Vec<ProjectSummary> {
+    let created_at_sort = timestamp_sort_expr("created_at");
+    let sql = format!(
+        "SELECT id, slug, human_key, created_at \
+         FROM projects \
+         ORDER BY {created_at_sort} DESC, id DESC \
+         LIMIT {MAX_PROJECTS}"
+    );
     conn.query_sync(&sql, &[])
         .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let project_id = row.get_named::<i64>("id").ok()?;
-                    Some(ProjectSummary {
-                        id: project_id,
-                        slug: row.get_named::<String>("slug").ok()?,
-                        human_key: row.get_named::<String>("human_key").ok()?,
-                        agent_count: row
-                            .get_named::<i64>("agent_count")
-                            .ok()
-                            .and_then(|v| u64::try_from(v).ok())
-                            .unwrap_or(0),
-                        message_count: row
-                            .get_named::<i64>("message_count")
-                            .ok()
-                            .and_then(|v| u64::try_from(v).ok())
-                            .unwrap_or(0),
-                        reservation_count: reservation_counts
-                            .get(&project_id)
-                            .copied()
-                            .unwrap_or(0),
-                        created_at: row.get_named::<i64>("created_at").ok().unwrap_or(0),
-                    })
-                })
-                .collect()
-        })
+        .map(|rows| parse_project_summary_rows(rows, reservation_counts))
         .unwrap_or_default()
 }
 
@@ -976,6 +1031,7 @@ fn fetch_active_reservation_counts_by_project(conn: &DbConn, now: i64) -> HashMa
 
 /// Fetch the contact links list with agent names resolved.
 fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
+    let updated_sort = timestamp_sort_expr("al.updated_ts");
     conn.query_sync(
         &format!(
             "SELECT \
@@ -987,7 +1043,7 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
              JOIN agents a2 ON a2.id = al.b_agent_id \
              JOIN projects p1 ON p1.id = al.a_project_id \
              JOIN projects p2 ON p2.id = al.b_project_id \
-             ORDER BY CAST(al.updated_ts AS INTEGER) DESC, al.id DESC \
+             ORDER BY {updated_sort} DESC, al.id DESC \
              LIMIT {MAX_CONTACTS}"
         ),
         &[],
@@ -1003,8 +1059,8 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
                     to_project_slug: row.get_named::<String>("to_project").ok()?,
                     status: row.get_named::<String>("status").ok()?,
                     reason: row.get_named::<String>("reason").ok().unwrap_or_default(),
-                    updated_ts: row.get_named::<i64>("updated_ts").ok().unwrap_or(0),
-                    expires_ts: row.get_named::<i64>("expires_ts").ok(),
+                    updated_ts: parse_raw_ts(&row, "updated_ts"),
+                    expires_ts: parse_optional_raw_ts(&row, "expires_ts"),
                 })
             })
             .collect()
@@ -1030,6 +1086,13 @@ pub(crate) fn parse_raw_ts(row: &Row, col: &str) -> i64 {
         Some(Value::Float(v)) => parse_float_ts(f64::from(*v)),
         Some(Value::Decimal(s) | Value::Text(s)) => parse_text_timestamp(s),
         _ => 0,
+    }
+}
+
+fn parse_optional_raw_ts(row: &Row, col: &str) -> Option<i64> {
+    match row.get_by_name(col) {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(parse_raw_ts(row, col)),
     }
 }
 
@@ -1070,8 +1133,8 @@ fn parse_float_ts(value: f64) -> i64 {
 
 /// Convert a text timestamp to microseconds.
 ///
-/// Recognises pure-numeric strings (microsecond integers stored as text) and
-/// `YYYY-MM-DD HH:MM:SS[.ffffff]` datetime strings.
+/// Mirrors the migration-layer timestamp contract so mixed-format legacy rows
+/// are interpreted consistently across migration, query, and TUI code paths.
 fn parse_text_timestamp(s: &str) -> i64 {
     let s = s.trim();
     if s.is_empty() {
@@ -1085,46 +1148,10 @@ fn parse_text_timestamp(s: &str) -> i64 {
     if let Ok(v) = s.parse::<f64>() {
         return parse_float_ts(v);
     }
-    // Try YYYY-MM-DD HH:MM:SS[.ffffff] format
-    // Split on space → date part + time part
-    let Some((date_part, time_part)) = s.split_once(' ') else {
-        return 0;
-    };
-    let date_parts: Vec<&str> = date_part.split('-').collect();
-    if date_parts.len() != 3 {
-        return 0;
-    }
-    let year: i64 = date_parts[0].parse().unwrap_or(0);
-    let month: i64 = date_parts[1].parse().unwrap_or(0);
-    let day: i64 = date_parts[2].parse().unwrap_or(0);
-    if year == 0 || month == 0 || day == 0 {
-        return 0;
-    }
-    // Parse time part: HH:MM:SS[.ffffff]
-    let (time_hms, frac_str) = match time_part.split_once('.') {
-        Some((hms, frac)) => (hms, frac),
-        None => (time_part, ""),
-    };
-    let time_parts: Vec<&str> = time_hms.split(':').collect();
-    if time_parts.len() != 3 {
-        return 0;
-    }
-    let hour: i64 = time_parts[0].parse().unwrap_or(0);
-    let min: i64 = time_parts[1].parse().unwrap_or(0);
-    let sec: i64 = time_parts[2].parse().unwrap_or(0);
-    // Fractional seconds → microseconds (pad/truncate to 6 digits)
-    let frac_micros: i64 = if frac_str.is_empty() {
-        0
-    } else {
-        let safe_frac: String = frac_str.chars().take(6).collect();
-        let padded = format!("{safe_frac:0<6}");
-        padded.parse().unwrap_or(0)
-    };
-    // Convert to unix timestamp using a simplified calculation
-    // (good enough for display timestamps, not a precise calendar)
-    let epoch_days = days_from_civil(year, month, day);
-    let unix_seconds = epoch_days * 86400 + hour * 3600 + min * 60 + sec;
-    unix_seconds * 1_000_000 + frac_micros
+    mcp_agent_mail_db::migrate::text_to_micros(s, "tui_poller", "timestamp", 0)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
 }
 
 fn is_active_reservation_row(row: &Row, now: i64, expires_col: &str, released_col: &str) -> bool {
@@ -1168,18 +1195,6 @@ fn debug_row_shape(context: &str, row: &Row) {
     let columns: Vec<String> = row.column_names().map(ToString::to_string).collect();
     let values: Vec<Value> = row.values().cloned().collect();
     eprintln!("{context}: columns={columns:?} values={values:?}");
-}
-
-/// Days from civil date (year, month 1-12, day 1-31) to Unix epoch.
-/// Adapted from Howard Hinnant's `days_from_civil` algorithm.
-const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let m = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 fn has_file_reservations_released_ts_column(conn: &DbConn) -> bool {
@@ -1306,6 +1321,30 @@ fn reservation_legacy_scan_sql(
     )
 }
 
+fn reservation_legacy_scan_minimal_sql(
+    has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
+) -> String {
+    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let released_ts_sql = reservation_released_ts_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    format!(
+        "SELECT \
+           fr.id, \
+           fr.project_id AS raw_project_id, \
+           fr.path_pattern, \
+           fr.\"exclusive\", \
+           fr.created_ts AS raw_created_ts, \
+           fr.expires_ts AS raw_expires_ts, \
+           {released_ts_sql} AS raw_released_ts \
+         FROM file_reservations fr{release_join}"
+    )
+}
+
 fn reservation_active_fast_snapshots_sql(
     has_release_ledger: bool,
     has_legacy_released_ts_column: bool,
@@ -1337,6 +1376,39 @@ fn reservation_active_fast_snapshots_sql(
          FROM file_reservations fr{release_join} \
          LEFT JOIN projects p ON p.id = fr.project_id \
          LEFT JOIN agents a ON a.id = fr.agent_id \
+         WHERE ({active_reservation_predicate}) AND expires_ts > ? \
+         ORDER BY fr.expires_ts ASC, fr.id ASC \
+         LIMIT {MAX_RESERVATIONS}"
+    )
+}
+
+fn reservation_active_fast_snapshots_minimal_sql(
+    has_release_ledger: bool,
+    has_legacy_released_ts_column: bool,
+) -> String {
+    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    let released_ts_sql = reservation_released_ts_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    format!(
+        "SELECT \
+           fr.id, \
+           fr.project_id AS raw_project_id, \
+           fr.path_pattern, \
+           fr.\"exclusive\", \
+           fr.created_ts AS raw_created_ts, \
+           fr.expires_ts AS raw_expires_ts, \
+           {released_ts_sql} AS raw_released_ts \
+         FROM file_reservations fr{release_join} \
          WHERE ({active_reservation_predicate}) AND expires_ts > ? \
          ORDER BY fr.expires_ts ASC, fr.id ASC \
          LIMIT {MAX_RESERVATIONS}"
@@ -1532,9 +1604,25 @@ fn try_fetch_reservation_snapshot_bundle(
             tracing::debug!(
                 mode = ?scan_mode,
                 error = ?err,
-                "tui_poller.fetch_reservation_snapshots query failed"
+                "tui_poller.fetch_reservation_snapshots query failed; falling back to minimal reservation rows"
             );
-            return None;
+            match conn.query_sync(
+                &reservation_legacy_scan_minimal_sql(
+                    has_release_ledger,
+                    has_legacy_released_ts_column,
+                ),
+                &[],
+            ) {
+                Ok(rows) => rows,
+                Err(fallback_err) => {
+                    tracing::debug!(
+                        mode = ?scan_mode,
+                        error = ?fallback_err,
+                        "tui_poller.fetch_reservation_snapshots minimal fallback also failed"
+                    );
+                    return None;
+                }
+            }
         }
     };
     #[cfg(test)]
@@ -1668,13 +1756,29 @@ fn try_fetch_reservation_snapshot_bundle_fast(
             tracing::debug!(
                 mode = ?ReservationScanMode::ActiveFast,
                 error = ?err,
-                "tui_poller.fetch_reservation_snapshots snapshot query failed"
+                "tui_poller.fetch_reservation_snapshots snapshot query failed; falling back to minimal reservation rows"
             );
-            return Some(ReservationSnapshotBundle {
-                active_count,
-                active_counts_by_project,
-                snapshots: Vec::new(),
-            });
+            match conn.query_sync(
+                &reservation_active_fast_snapshots_minimal_sql(
+                    has_release_ledger,
+                    has_legacy_released_ts_column,
+                ),
+                &[Value::BigInt(now)],
+            ) {
+                Ok(rows) => rows,
+                Err(fallback_err) => {
+                    tracing::debug!(
+                        mode = ?ReservationScanMode::ActiveFast,
+                        error = ?fallback_err,
+                        "tui_poller.fetch_reservation_snapshots minimal fallback also failed"
+                    );
+                    return Some(ReservationSnapshotBundle {
+                        active_count,
+                        active_counts_by_project,
+                        snapshots: Vec::new(),
+                    });
+                }
+            }
         }
     };
 
@@ -3396,6 +3500,40 @@ mod tests {
     }
 
     #[test]
+    fn reservation_snapshot_bundle_fast_falls_back_to_minimal_rows_when_joins_fail() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                \"exclusive\" INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER,
+                released_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync(
+            "INSERT INTO file_reservations (
+                id, project_id, agent_id, path_pattern, \"exclusive\", created_ts, expires_ts, released_ts
+            ) VALUES (1, 99, 77, 'src/**', 1, 10, 1000000, NULL)",
+            &[],
+        )
+        .expect("insert reservation");
+
+        let bundle = fetch_reservation_snapshot_bundle(&conn, 100, None);
+        assert_eq!(bundle.active_count, 1);
+        assert_eq!(bundle.active_counts_by_project.get(&99), Some(&1));
+        assert_eq!(bundle.snapshots.len(), 1);
+        assert_eq!(bundle.snapshots[0].project_slug, "[unknown-project]");
+        assert_eq!(bundle.snapshots[0].agent_name, "[unknown-agent]");
+        assert_eq!(bundle.snapshots[0].path_pattern, "src/**");
+    }
+
+    #[test]
     fn fetch_agents_list_ordered_by_last_active_desc() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_agents_order.db");
@@ -3445,6 +3583,32 @@ mod tests {
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].name, "Beta");
         assert_eq!(agents[1].name, "Alpha");
+    }
+
+    #[test]
+    fn fetch_agents_list_orders_mixed_text_and_integer_timestamps_by_actual_recency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_agents_order_mixed_types.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts)",
+            &[],
+        )
+        .expect("create");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts) VALUES
+             (1, 'LegacyAgent', 'python', '2026-02-24 15:31:02'),
+             (2, 'FreshAgent', 'rust', 1800000000000000)",
+            &[],
+        )
+        .expect("insert");
+
+        let agents = fetch_agents_list(&conn);
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name, "FreshAgent");
+        assert_eq!(agents[1].name, "LegacyAgent");
+        assert!(agents[1].last_active_ts > 0);
     }
 
     #[test]
@@ -3501,6 +3665,86 @@ mod tests {
         assert_eq!(projects[0].agent_count, 2);
         assert_eq!(projects[0].message_count, 3);
         assert_eq!(projects[0].reservation_count, 1);
+    }
+
+    #[test]
+    fn fetch_projects_list_falls_back_to_minimal_rows_when_aggregate_query_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_projects_minimal_fallback.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (7, 'proj', '/tmp/proj', 100)",
+            &[],
+        )
+        .expect("insert project");
+
+        let projects = fetch_projects_list(&conn);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, 7);
+        assert_eq!(projects[0].slug, "proj");
+        assert_eq!(projects[0].human_key, "/tmp/proj");
+        assert_eq!(projects[0].agent_count, 0);
+        assert_eq!(projects[0].message_count, 0);
+    }
+
+    #[test]
+    fn fetch_projects_list_orders_mixed_text_and_integer_timestamps_by_actual_recency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_projects_order_mixed_types.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, released_ts INTEGER, expires_ts INTEGER)",
+            &[],
+        )
+        .expect("create reservations");
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+             (1, 'legacy', '/p/legacy', '2026-02-24 15:30:00.123456'),
+             (2, 'fresh', '/p/fresh', 1800000000000000)",
+            &[],
+        )
+        .expect("insert projects");
+
+        let projects = fetch_projects_list(&conn);
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].slug, "fresh");
+        assert_eq!(projects[1].slug, "legacy");
+        assert!(projects[1].created_at > 0);
+    }
+
+    #[test]
+    fn parse_text_timestamp_accepts_rfc3339_and_date_only_values() {
+        assert_eq!(
+            parse_text_timestamp("2026-02-24T15:30:00Z"),
+            parse_text_timestamp("2026-02-24 15:30:00")
+        );
+        assert_eq!(
+            parse_text_timestamp("2026-02-24"),
+            parse_text_timestamp("2026-02-24T00:00:00")
+        );
     }
 
     #[test]
@@ -3586,9 +3830,10 @@ mod tests {
     fn fetch_agents_list_sql_has_explicit_limit() {
         // Documents that the agents list query uses ORDER BY + LIMIT.
         // Without LIMIT, the list would grow unbounded with agent count.
+        let last_active_sort = timestamp_sort_expr("last_active_ts");
         let sql = format!(
             "SELECT name, program, last_active_ts FROM agents \
-             ORDER BY last_active_ts DESC, id DESC LIMIT {MAX_AGENTS}"
+             ORDER BY {last_active_sort} DESC, id DESC LIMIT {MAX_AGENTS}"
         );
         assert!(
             sql.contains("LIMIT"),
@@ -3603,9 +3848,10 @@ mod tests {
     #[test]
     fn fetch_projects_list_sql_has_explicit_limit() {
         // Documents that the projects list query uses ORDER BY + LIMIT.
+        let created_at_sort = timestamp_sort_expr("created_at");
         let sql = format!(
             "SELECT id, slug, human_key, created_at FROM projects \
-             ORDER BY created_at DESC, id DESC LIMIT {MAX_PROJECTS}"
+             ORDER BY {created_at_sort} DESC, id DESC LIMIT {MAX_PROJECTS}"
         );
         assert!(
             sql.contains("LIMIT"),

@@ -3589,6 +3589,34 @@ fn check_inbox_server_url(host: &str, port: u16, http_path: &str) -> String {
         .unwrap_or_else(|| format!("http://{host}:{port}/"))
 }
 
+fn normalize_connect_host_for_client_url(host: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return std::borrow::Cow::Borrowed("127.0.0.1");
+    }
+
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed);
+
+    match unbracketed {
+        "0.0.0.0" | "::" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        _ => {
+            if unbracketed.contains(':') && !trimmed.starts_with('[') {
+                std::borrow::Cow::Owned(format!("[{unbracketed}]"))
+            } else {
+                std::borrow::Cow::Borrowed(trimmed)
+            }
+        }
+    }
+}
+
+fn local_server_url_from_parts(host: &str, port: u16, http_path: &str) -> String {
+    let connect_host = normalize_connect_host_for_client_url(host);
+    format!("http://{connect_host}:{port}{http_path}")
+}
+
 fn mcp_base_alias_path(path: &str) -> Option<&'static str> {
     match path {
         "/api/" => Some("/mcp/"),
@@ -3599,9 +3627,10 @@ fn mcp_base_alias_path(path: &str) -> Option<&'static str> {
 
 fn check_inbox_server_urls(host: &str, port: u16, http_path: &str) -> Vec<String> {
     let primary_path = normalize_http_path(http_path);
-    let mut urls = vec![format!("http://{host}:{port}{primary_path}")];
+    let connect_host = normalize_connect_host_for_client_url(host);
+    let mut urls = vec![format!("http://{connect_host}:{port}{primary_path}")];
     if let Some(alias_path) = mcp_base_alias_path(&primary_path) {
-        let alias_url = format!("http://{host}:{port}{alias_path}");
+        let alias_url = format!("http://{connect_host}:{port}{alias_path}");
         if alias_url != urls[0] {
             urls.push(alias_url);
         }
@@ -10287,6 +10316,8 @@ enum McpAgentMailEntryKind {
     Unknown,
 }
 
+const CODEX_STARTUP_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct McpAgentMailStatusUrlParts {
     scheme: &'static str,
@@ -10348,6 +10379,10 @@ fn parse_simple_toml_string_value<'a>(line: &'a str, key: &str) -> Option<&'a st
         return Some(value);
     }
     value.strip_prefix('\'')?.strip_suffix('\'')
+}
+
+fn parse_simple_toml_u64_value(line: &str, key: &str) -> Option<u64> {
+    parse_simple_toml_key(line, key)?.parse::<u64>().ok()
 }
 
 fn parse_toml_section_header(line: &str) -> Option<&str> {
@@ -10447,9 +10482,42 @@ fn extract_mcp_agent_mail_toml_url(content: &str) -> Option<String> {
     None
 }
 
+fn extract_mcp_agent_mail_toml_startup_timeout(content: &str) -> Option<u64> {
+    let mut in_target_section = false;
+
+    for raw_line in content.lines() {
+        if let Some(section) = parse_toml_section_header(raw_line) {
+            in_target_section = matches!(
+                section,
+                "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
+            );
+            continue;
+        }
+
+        let line = raw_line.trim();
+
+        if !in_target_section || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(timeout) = parse_simple_toml_u64_value(line, "startup_timeout_sec") {
+            return Some(timeout);
+        }
+    }
+
+    None
+}
+
+fn codex_toml_startup_timeout_needs_fix(config_path: &Path, content: &str) -> bool {
+    config_path.extension().and_then(|value| value.to_str()) == Some("toml")
+        && extract_mcp_agent_mail_toml_startup_timeout(content)
+            .is_none_or(|timeout| timeout < CODEX_STARTUP_TIMEOUT_SECS)
+}
+
+const JSON_MCP_AGENT_MAIL_ENTRY_KEYS: &[&str] = &["mcp-agent-mail", "mcp_agent_mail", "agent-mail"];
+
 fn find_mcp_agent_mail_entry(doc: &serde_json::Value) -> Option<&serde_json::Value> {
     const SERVER_CONTAINER_KEYS: &[&str] = &["mcpServers", "servers", "mcp", "mcp_servers"];
-    const SERVER_ENTRY_KEYS: &[&str] = &["mcp-agent-mail", "agent-mail"];
 
     let root = doc.as_object()?;
     for container_key in SERVER_CONTAINER_KEYS {
@@ -10459,7 +10527,7 @@ fn find_mcp_agent_mail_entry(doc: &serde_json::Value) -> Option<&serde_json::Val
         else {
             continue;
         };
-        for entry_key in SERVER_ENTRY_KEYS {
+        for entry_key in JSON_MCP_AGENT_MAIL_ENTRY_KEYS {
             if let Some(entry) = container.get(*entry_key) {
                 return Some(entry);
             }
@@ -11533,6 +11601,7 @@ fn handle_doctor_check_with(
             let mut pointing_to_python = 0u32;
             let mut pointing_to_http_url = 0u32;
             let mut pointing_to_wrong_http_url = 0u32;
+            let mut codex_startup_timeout_issues = 0u32;
             let mut missing_entry = 0u32;
             let mut parse_errors = 0u32;
             let mut detail_parts: Vec<String> = Vec::new();
@@ -11583,7 +11652,36 @@ fn handle_doctor_check_with(
                                             &desired_urls,
                                         ) =>
                                     {
-                                        pointing_to_http_url += 1;
+                                        if loc.tool
+                                            == mcp_agent_mail_core::mcp_config::McpConfigTool::Codex
+                                            && codex_toml_startup_timeout_needs_fix(
+                                                &loc.config_path,
+                                                &content,
+                                            )
+                                        {
+                                            codex_startup_timeout_issues += 1;
+                                            let timeout_detail =
+                                                extract_mcp_agent_mail_toml_startup_timeout(
+                                                    &content,
+                                                )
+                                                .map(|timeout| {
+                                                    format!(
+                                                        "startup_timeout_sec {timeout} < {}",
+                                                        CODEX_STARTUP_TIMEOUT_SECS
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    "missing startup_timeout_sec".to_string()
+                                                });
+                                            detail_parts.push(format!(
+                                                "{} ({}) → {}",
+                                                loc.tool.slug(),
+                                                loc.config_path.display(),
+                                                timeout_detail
+                                            ));
+                                        } else {
+                                            pointing_to_http_url += 1;
+                                        }
                                     }
                                     Some(actual_url) => {
                                         pointing_to_wrong_http_url += 1;
@@ -11620,15 +11718,17 @@ fn handle_doctor_check_with(
                 }
             }
 
-            let mcp_status =
-                if pointing_to_python > 0 || pointing_to_rust > 0 || pointing_to_wrong_http_url > 0
-                {
-                    "warn"
-                } else if pointing_to_http_url > 0 {
-                    "ok"
-                } else {
-                    "warn"
-                };
+            let mcp_status = if pointing_to_python > 0
+                || pointing_to_rust > 0
+                || pointing_to_wrong_http_url > 0
+                || codex_startup_timeout_issues > 0
+            {
+                "warn"
+            } else if pointing_to_http_url > 0 {
+                "ok"
+            } else {
+                "warn"
+            };
 
             let summary = format!(
                 "{} config(s) found: {} HTTP URL, {} stdio command, {} legacy Python, {} no entry, {} unreadable",
@@ -11644,10 +11744,16 @@ fn handle_doctor_check_with(
             } else {
                 summary
             };
+            let summary = if codex_startup_timeout_issues > 0 {
+                format!("{summary}, {codex_startup_timeout_issues} Codex startup-timeout issue(s)")
+            } else {
+                summary
+            };
 
             let detail = if pointing_to_python > 0
                 || pointing_to_rust > 0
                 || pointing_to_wrong_http_url > 0
+                || codex_startup_timeout_issues > 0
             {
                 format!(
                     "{}. Fix: run `am setup` or `am doctor fix` to convert to HTTP URL mode or update the endpoint to {}: {}",
@@ -12052,14 +12158,12 @@ fn fix_mcp_config_entry(
         .map_err(|e| format!("cannot parse {}: {e}", config_path.display()))?;
 
     let container_keys = ["mcpServers", "servers", "mcp", "mcp_servers"];
-    let entry_keys = ["mcp-agent-mail", "agent-mail"];
-
     let mut updated = false;
     for ck in &container_keys {
         let Some(container) = doc.get_mut(*ck).and_then(serde_json::Value::as_object_mut) else {
             continue;
         };
-        for ek in &entry_keys {
+        for ek in JSON_MCP_AGENT_MAIL_ENTRY_KEYS {
             let Some(entry) = container
                 .get_mut(*ek)
                 .and_then(serde_json::Value::as_object_mut)
@@ -12197,6 +12301,7 @@ fn fix_mcp_config_toml_text(
     let mut in_target_section = false;
     let mut saw_target_section = false;
     let mut saw_url_in_section = false;
+    let mut saw_startup_timeout_in_section = false;
     let mut saw_http_headers_in_section = false;
     let mut replaced_section = false;
     let desired_http_headers =
@@ -12207,6 +12312,14 @@ fn fix_mcp_config_toml_text(
             if in_target_section {
                 if !saw_url_in_section {
                     output.push(format!("url = \"{desired_url}\""));
+                    replaced_section = true;
+                }
+                if !saw_startup_timeout_in_section {
+                    output.push(format!(
+                        "startup_timeout_sec = {}",
+                        CODEX_STARTUP_TIMEOUT_SECS
+                    ));
+                    replaced_section = true;
                 }
                 if !saw_http_headers_in_section
                     && let Some(headers) = desired_http_headers.as_deref()
@@ -12225,6 +12338,7 @@ fn fix_mcp_config_toml_text(
                 saw_target_section = true;
                 in_target_section = true;
                 saw_url_in_section = false;
+                saw_startup_timeout_in_section = false;
                 saw_http_headers_in_section = false;
                 output.push(raw_line.to_string());
                 continue;
@@ -12241,6 +12355,16 @@ fn fix_mcp_config_toml_text(
         {
             output.push(format!("url = \"{desired_url}\""));
             saw_url_in_section = true;
+            replaced_section = true;
+            continue;
+        }
+
+        if parse_simple_toml_key(raw_line, "startup_timeout_sec").is_some() {
+            output.push(format!(
+                "startup_timeout_sec = {}",
+                CODEX_STARTUP_TIMEOUT_SECS
+            ));
+            saw_startup_timeout_in_section = true;
             replaced_section = true;
             continue;
         }
@@ -12269,11 +12393,19 @@ fn fix_mcp_config_toml_text(
     if in_target_section {
         if !saw_url_in_section {
             output.push(format!("url = \"{desired_url}\""));
+            replaced_section = true;
+        }
+        if !saw_startup_timeout_in_section {
+            output.push(format!(
+                "startup_timeout_sec = {}",
+                CODEX_STARTUP_TIMEOUT_SECS
+            ));
+            replaced_section = true;
         }
         if !saw_http_headers_in_section && let Some(headers) = desired_http_headers.as_deref() {
             output.push(format!("http_headers = {headers}"));
+            replaced_section = true;
         }
-        replaced_section = true;
     }
 
     if !saw_target_section || !replaced_section {
@@ -12467,13 +12599,33 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     Some("convert legacy Python launcher mode".to_string())
                 }
                 McpAgentMailEntryKind::HttpUrl => {
-                    let Some(actual_url) =
-                        extract_mcp_agent_mail_config_url(&loc.config_path, &content)
-                    else {
-                        continue;
-                    };
-                    (!mcp_config_url_matches_any_expected(&actual_url, &desired_urls))
-                        .then_some(format!("update wrong HTTP URL {actual_url}"))
+                    let timeout_fix_needed = loc.tool
+                        == mcp_agent_mail_core::mcp_config::McpConfigTool::Codex
+                        && codex_toml_startup_timeout_needs_fix(&loc.config_path, &content);
+                    match extract_mcp_agent_mail_config_url(&loc.config_path, &content) {
+                        Some(actual_url)
+                            if !mcp_config_url_matches_any_expected(&actual_url, &desired_urls) =>
+                        {
+                            if timeout_fix_needed {
+                                Some(format!(
+                                    "update wrong HTTP URL {actual_url} and set startup_timeout_sec to {}",
+                                    CODEX_STARTUP_TIMEOUT_SECS
+                                ))
+                            } else {
+                                Some(format!("update wrong HTTP URL {actual_url}"))
+                            }
+                        }
+                        Some(_) if timeout_fix_needed => Some(format!(
+                            "set Codex startup_timeout_sec to {}",
+                            CODEX_STARTUP_TIMEOUT_SECS
+                        )),
+                        Some(_) => None,
+                        None if timeout_fix_needed => Some(format!(
+                            "set Codex startup_timeout_sec to {}",
+                            CODEX_STARTUP_TIMEOUT_SECS
+                        )),
+                        None => None,
+                    }
                 }
                 McpAgentMailEntryKind::Unknown => None,
             };
@@ -12824,9 +12976,10 @@ fn handle_mail_status_sync(conn: &mcp_agent_mail_db::DbConn, action: MailCommand
 #[allow(clippy::too_many_lines)]
 async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
-    let server_url = format!(
-        "http://{}:{}{}",
-        server_config.http_host, server_config.http_port, server_config.http_path
+    let server_url = local_server_url_from_parts(
+        &server_config.http_host,
+        server_config.http_port,
+        &server_config.http_path,
     );
     let bearer = server_config.http_bearer_token;
 
@@ -12866,7 +13019,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     .map(str::to_string)
                     .collect()
             });
-            if let Some(payload) = try_call_server_tool(
+            match try_call_server_tool(
                 &server_url,
                 bearer.as_deref(),
                 "send_message",
@@ -12883,26 +13036,38 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }),
             )
             .await
-            .and_then(coerce_tool_result_json)
-            .and_then(server_message_payload_to_cli_json)
             {
-                output::emit_output(&payload, fmt, || {
-                    let message_id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let rendered_to = payload
-                        .get("to")
-                        .and_then(|v| v.as_array())
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| item.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| to.clone());
-                    output::success(&format!("Message sent (id={message_id}) to {rendered_to}"));
-                });
-                return Ok(());
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("send_message", result)?;
+                    let payload = server_message_payload_to_cli_json(payload).ok_or_else(|| {
+                        CliError::Other("unexpected send_message response shape".to_string())
+                    })?;
+                    output::emit_output(&payload, fmt, || {
+                        let message_id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let rendered_to = payload
+                            .get("to")
+                            .and_then(|v| v.as_array())
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|item| item.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| to.clone());
+                        output::success(&format!(
+                            "Message sent (id={message_id}) to {rendered_to}"
+                        ));
+                    });
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "send_message via server failed: {message}"
+                    )));
+                }
             }
 
             let ctx = context::AsyncCliContext::open()?;
@@ -12970,7 +13135,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     .map(str::to_string)
                     .collect()
             });
-            if let Some(payload) = try_call_server_tool(
+            match try_call_server_tool(
                 &server_url,
                 bearer.as_deref(),
                 "reply_message",
@@ -12983,18 +13148,30 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }),
             )
             .await
-            .and_then(coerce_tool_result_json)
-            .and_then(server_message_payload_to_cli_json)
             {
-                output::emit_output(&payload, fmt, || {
-                    let message_id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let thread_id = payload
-                        .get("thread_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    output::success(&format!("Reply sent (id={message_id}, thread={thread_id})"));
-                });
-                return Ok(());
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("reply_message", result)?;
+                    let payload = server_message_payload_to_cli_json(payload).ok_or_else(|| {
+                        CliError::Other("unexpected reply_message response shape".to_string())
+                    })?;
+                    output::emit_output(&payload, fmt, || {
+                        let message_id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let thread_id = payload
+                            .get("thread_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        output::success(&format!(
+                            "Reply sent (id={message_id}, thread={thread_id})"
+                        ));
+                    });
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "reply_message via server failed: {message}"
+                    )));
+                }
             }
 
             let ctx = context::AsyncCliContext::open()?;
@@ -13078,7 +13255,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            if let Some(data) = try_call_server_tool(
+            match try_call_server_tool(
                 &server_url,
                 bearer.as_deref(),
                 "fetch_inbox",
@@ -13092,60 +13269,80 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }),
             )
             .await
-            .and_then(coerce_tool_result_json)
-            .and_then(|payload| server_inbox_payload_to_cli_json(&payload, include_bodies))
             {
-                if data.is_empty() {
-                    output::emit_empty(fmt, "No messages.");
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("fetch_inbox", result)?;
+                    let data = server_inbox_payload_to_cli_json(&payload, include_bodies)
+                        .ok_or_else(|| {
+                            CliError::Other("unexpected fetch_inbox response shape".to_string())
+                        })?;
+                    if data.is_empty() {
+                        output::emit_empty(fmt, "No messages.");
+                        return Ok(());
+                    }
+
+                    output::emit_output(&data, fmt, || {
+                        let mut table = output::CliTable::new(vec![
+                            "ID",
+                            "FROM",
+                            "SUBJECT",
+                            "IMPORTANCE",
+                            "TIME",
+                        ]);
+                        for row in &data {
+                            table.add_row(vec![
+                                row.get("id")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0)
+                                    .to_string(),
+                                row.get("from")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                truncate_str(
+                                    row.get("subject")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default(),
+                                    50,
+                                ),
+                                row.get("importance")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                row.get("created_ts")
+                                    .and_then(|v| v.as_str())
+                                    .map(format_iso_timestamp_short)
+                                    .unwrap_or_default(),
+                            ]);
+                        }
+                        table.render();
+
+                        if include_bodies {
+                            for row in &data {
+                                ftui_runtime::ftui_println!(
+                                    "\n--- #{} {} ---",
+                                    row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+                                    row.get("subject")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                );
+                                ftui_runtime::ftui_println!(
+                                    "{}",
+                                    row.get("body_md")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                );
+                            }
+                        }
+                    });
                     return Ok(());
                 }
-
-                output::emit_output(&data, fmt, || {
-                    let mut table =
-                        output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
-                    for row in &data {
-                        table.add_row(vec![
-                            row.get("id")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0)
-                                .to_string(),
-                            row.get("from")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            truncate_str(
-                                row.get("subject")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default(),
-                                50,
-                            ),
-                            row.get("importance")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            row.get("created_ts")
-                                .and_then(|v| v.as_str())
-                                .map(format_iso_timestamp_short)
-                                .unwrap_or_default(),
-                        ]);
-                    }
-                    table.render();
-
-                    if include_bodies {
-                        for row in &data {
-                            ftui_runtime::ftui_println!(
-                                "\n--- #{} {} ---",
-                                row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                                row.get("subject").and_then(|v| v.as_str()).unwrap_or_default()
-                            );
-                            ftui_runtime::ftui_println!(
-                                "{}",
-                                row.get("body_md").and_then(|v| v.as_str()).unwrap_or_default()
-                            );
-                        }
-                    }
-                });
-                return Ok(());
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "fetch_inbox via server failed: {message}"
+                    )));
+                }
             }
 
             let ctx = context::AsyncCliContext::open()?;
@@ -13218,7 +13415,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             agent_name,
             message_id,
         } => {
-            if let Some(payload) = try_call_server_tool(
+            match try_call_server_tool(
                 &server_url,
                 bearer.as_deref(),
                 "mark_message_read",
@@ -13229,15 +13426,23 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }),
             )
             .await
-            .and_then(coerce_tool_result_json)
             {
-                let read_at = payload
-                    .get("read_at")
-                    .and_then(|v| v.as_str())
-                    .map(format_iso_timestamp)
-                    .unwrap_or_else(|| "unknown".to_string());
-                output::success(&format!("Message {message_id} marked as read at {read_at}"));
-                return Ok(());
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("mark_message_read", result)?;
+                    let read_at = payload
+                        .get("read_at")
+                        .and_then(|v| v.as_str())
+                        .map(format_iso_timestamp)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    output::success(&format!("Message {message_id} marked as read at {read_at}"));
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "mark_message_read via server failed: {message}"
+                    )));
+                }
             }
 
             let ctx = context::AsyncCliContext::open()?;
@@ -13267,7 +13472,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             agent_name,
             message_id,
         } => {
-            if let Some(payload) = try_call_server_tool(
+            match try_call_server_tool(
                 &server_url,
                 bearer.as_deref(),
                 "acknowledge_message",
@@ -13278,23 +13483,31 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }),
             )
             .await
-            .and_then(coerce_tool_result_json)
             {
-                let read_ts = payload
-                    .get("read_at")
-                    .and_then(|v| v.as_str())
-                    .map(format_iso_timestamp)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let ack_ts = payload
-                    .get("acknowledged_at")
-                    .and_then(|v| v.as_str())
-                    .map(format_iso_timestamp)
-                    .unwrap_or_else(|| "unknown".to_string());
-                output::success(&format!(
-                    "Message {message_id} acknowledged (read={}, ack={})",
-                    read_ts, ack_ts
-                ));
-                return Ok(());
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("acknowledge_message", result)?;
+                    let read_ts = payload
+                        .get("read_at")
+                        .and_then(|v| v.as_str())
+                        .map(format_iso_timestamp)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let ack_ts = payload
+                        .get("acknowledged_at")
+                        .and_then(|v| v.as_str())
+                        .map(format_iso_timestamp)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    output::success(&format!(
+                        "Message {message_id} acknowledged (read={}, ack={})",
+                        read_ts, ack_ts
+                    ));
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "acknowledge_message via server failed: {message}"
+                    )));
+                }
             }
 
             let ctx = context::AsyncCliContext::open()?;
@@ -13329,16 +13542,9 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let config = mcp_agent_mail_core::config::Config::from_env();
-            let server_url = format!(
-                "http://{}:{}{}",
-                config.http_host, config.http_port, config.http_path
-            );
-            let bearer = config.http_bearer_token.as_deref();
-
-            let server_result = try_call_server_tool(
+            let payload = match try_call_server_tool(
                 &server_url,
-                bearer,
+                bearer.as_deref(),
                 "summarize_thread",
                 serde_json::json!({
                     "project_key": project_key,
@@ -13349,13 +13555,21 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }),
             )
             .await
-            .and_then(coerce_tool_result_json);
-
-            let Some(payload) = server_result else {
-                ftui_runtime::ftui_println!(
-                    "Server unavailable; summarization requires server tool. Try again when server is running."
-                );
-                return Err(CliError::ExitCode(2));
+            {
+                ServerToolCall::Success(result) => {
+                    coerce_tool_result_json_or_error("summarize_thread", result)?
+                }
+                ServerToolCall::Unavailable(_) => {
+                    ftui_runtime::ftui_println!(
+                        "Server unavailable; summarization requires server tool. Try again when server is running."
+                    );
+                    return Err(CliError::ExitCode(2));
+                }
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "summarize_thread via server failed: {message}"
+                    )));
+                }
             };
 
             if !matches!(fmt, output::CliOutputFormat::Table) {
@@ -13409,6 +13623,8 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
@@ -14560,7 +14776,10 @@ fn server_inbox_payload_to_cli_json(
 
 #[cfg(test)]
 mod mail_server_cli_bridge_tests {
-    use super::{server_inbox_payload_to_cli_json, server_message_payload_to_cli_json};
+    use super::{
+        CliError, ServerToolCall, classify_server_tool_call, coerce_tool_result_json_or_error,
+        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+    };
 
     #[test]
     fn server_message_payload_bridge_uses_first_delivery_payload() {
@@ -14585,8 +14804,14 @@ mod mail_server_cli_bridge_tests {
 
         let bridged = server_message_payload_to_cli_json(payload).expect("bridge result");
         assert_eq!(bridged.get("id").and_then(|v| v.as_i64()), Some(42));
-        assert_eq!(bridged.get("from").and_then(|v| v.as_str()), Some("BlueLake"));
-        assert_eq!(bridged.get("thread_id").and_then(|v| v.as_str()), Some("br-42"));
+        assert_eq!(
+            bridged.get("from").and_then(|v| v.as_str()),
+            Some("BlueLake")
+        );
+        assert_eq!(
+            bridged.get("thread_id").and_then(|v| v.as_str()),
+            Some("br-42")
+        );
         assert_eq!(
             bridged
                 .get("to")
@@ -14618,11 +14843,50 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(without_body.len(), 1);
         assert!(without_body[0].get("body_md").is_none());
 
-        let with_body =
-            server_inbox_payload_to_cli_json(&payload, true).expect("bridge with body");
+        let with_body = server_inbox_payload_to_cli_json(&payload, true).expect("bridge with body");
         assert_eq!(
             with_body[0].get("body_md").and_then(|v| v.as_str()),
             Some("Visible body")
+        );
+    }
+
+    #[test]
+    fn classify_server_tool_call_treats_transport_failures_as_unavailable() {
+        let result = classify_server_tool_call(
+            "send_message",
+            Err(CliError::Other(
+                "transport failure calling http://127.0.0.1:8765/mcp/: connection refused"
+                    .to_string(),
+            )),
+        );
+        assert!(matches!(result, ServerToolCall::Unavailable(_)));
+    }
+
+    #[test]
+    fn classify_server_tool_call_treats_jsonrpc_errors_as_rejected() {
+        let result = classify_server_tool_call(
+            "send_message",
+            Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "error": {
+                    "code": -32000,
+                    "message": "validation failed",
+                    "data": {"field": "to"}
+                }
+            })),
+        );
+        assert!(matches!(result, ServerToolCall::Rejected(_)));
+    }
+
+    #[test]
+    fn coerce_tool_result_json_or_error_rejects_null_result() {
+        let error = coerce_tool_result_json_or_error("send_message", serde_json::Value::Null)
+            .expect_err("null result should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("server returned empty or unparseable result for send_message")
         );
     }
 }
@@ -15332,6 +15596,21 @@ mod tests {
     }
 
     #[test]
+    fn check_inbox_server_urls_normalize_wildcard_bind_host_for_clients() {
+        assert_eq!(
+            check_inbox_server_urls("0.0.0.0", 8765, "mcp"),
+            vec![
+                "http://127.0.0.1:8765/mcp/".to_string(),
+                "http://127.0.0.1:8765/api/".to_string(),
+            ]
+        );
+        assert_eq!(
+            check_inbox_server_url("::", 8765, "api"),
+            "http://127.0.0.1:8765/api/"
+        );
+    }
+
+    #[test]
     fn detect_legacy_am_aliases_in_text_finds_python_aliases() {
         let content = r#"
             # legacy install line
@@ -15539,6 +15818,22 @@ mod tests {
         let kind =
             classify_mcp_agent_mail_entry(entry, Path::new("/home/test/.local/bin/mcp-agent-mail"));
         assert_eq!(kind, McpAgentMailEntryKind::HttpUrl);
+    }
+
+    #[test]
+    fn find_mcp_agent_mail_entry_accepts_underscore_name() {
+        let doc = parse_json_or_json5(
+            r#"{
+                "mcpServers": {
+                    "mcp_agent_mail": {
+                        "url": "http://127.0.0.1:8765/api/"
+                    }
+                }
+            }"#,
+        )
+        .expect("valid config");
+        let entry = find_mcp_agent_mail_entry(&doc).expect("entry present");
+        assert_eq!(entry["url"], "http://127.0.0.1:8765/api/");
     }
 
     #[test]
@@ -20187,6 +20482,40 @@ command = "mcp-agent-mail"
     }
 
     #[test]
+    fn fix_mcp_config_entry_updates_underscore_json_to_http_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp.json");
+        let desired_url = "http://127.0.0.1:8765/api/";
+        std::fs::write(
+            &config,
+            r#"{"mcpServers": {"mcp_agent_mail": {"command": "python", "args": ["-m", "mcp_agent_mail"], "transport": "stdio"}}}"#,
+        )
+        .unwrap();
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("tok123"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Claude,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&config).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(doc["mcpServers"]["mcp_agent_mail"]["url"], desired_url);
+        assert_eq!(doc["mcpServers"]["mcp_agent_mail"]["type"], "http");
+        assert!(doc["mcpServers"]["mcp_agent_mail"].get("command").is_none());
+        assert!(doc["mcpServers"]["mcp_agent_mail"].get("args").is_none());
+        assert!(
+            doc["mcpServers"]["mcp_agent_mail"]
+                .get("transport")
+                .is_none()
+        );
+        assert_eq!(
+            doc["mcpServers"]["mcp_agent_mail"]["headers"]["Authorization"],
+            "Bearer tok123"
+        );
+    }
+
+    #[test]
     fn fix_mcp_config_entry_updates_gemini_json_to_http_url() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("settings.json");
@@ -20260,6 +20589,10 @@ command = "mcp-agent-mail"
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(content.contains("[mcp_servers.mcp_agent_mail]"));
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
+        assert!(content.contains(&format!(
+            "startup_timeout_sec = {}",
+            CODEX_STARTUP_TIMEOUT_SECS
+        )));
         assert!(content.contains("http_headers = { Authorization = \"Bearer testtoken\" }"));
         assert!(!content.contains("command = "));
     }
@@ -20286,6 +20619,10 @@ url = "http://127.0.0.1:8767/mcp/"
         assert!(result.is_ok(), "{result:?}");
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
+        assert!(content.contains(&format!(
+            "startup_timeout_sec = {}",
+            CODEX_STARTUP_TIMEOUT_SECS
+        )));
         assert!(!content.contains("8767"));
     }
 
@@ -20321,6 +20658,10 @@ command = "node"
         assert!(content.contains("cwd = \"/tmp/mail\""));
         assert!(content.contains("[mcp_servers.other]"));
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
+        assert!(content.contains(&format!(
+            "startup_timeout_sec = {}",
+            CODEX_STARTUP_TIMEOUT_SECS
+        )));
         assert!(content.contains("http_headers = { Authorization = \"Bearer testtoken\" }"));
         assert!(!content.contains("command = \"mcp-agent-mail\""));
     }
@@ -20348,8 +20689,39 @@ command = "mcp-agent-mail"
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(content.contains("[mcp_servers.mcp_agent_mail] # local override"));
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
+        assert!(content.contains(&format!(
+            "startup_timeout_sec = {}",
+            CODEX_STARTUP_TIMEOUT_SECS
+        )));
         assert!(content.contains("http_headers = { Authorization = \"Bearer testtoken\" }"));
         assert!(!content.contains("command = "));
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_adds_startup_timeout_to_existing_toml_http_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let desired_url = "http://127.0.0.1:8765/mcp/";
+        std::fs::write(
+            &config,
+            r#"[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8765/mcp/"
+"#,
+        )
+        .unwrap();
+
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            None,
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Codex,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(content.contains(&format!(
+            "startup_timeout_sec = {}",
+            CODEX_STARTUP_TIMEOUT_SECS
+        )));
     }
 
     #[test]
@@ -20360,6 +20732,18 @@ url = "http://127.0.0.1:8767/mcp/"
         let url =
             extract_mcp_agent_mail_config_url(Path::new("/tmp/config.toml"), content).unwrap();
         assert_eq!(url, "http://127.0.0.1:8767/mcp/");
+    }
+
+    #[test]
+    fn extract_mcp_agent_mail_toml_startup_timeout_reads_value() {
+        let content = r#"[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8767/mcp/"
+startup_timeout_sec = 42
+"#;
+        assert_eq!(
+            extract_mcp_agent_mail_toml_startup_timeout(content),
+            Some(42)
+        );
     }
 
     #[test]
@@ -27093,10 +27477,8 @@ struct LeaseRecord {
 
 fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
     let config = Config::from_env();
-    let server_url = format!(
-        "http://{}:{}{}",
-        config.http_host, config.http_port, config.http_path
-    );
+    let server_url =
+        local_server_url_from_parts(&config.http_host, config.http_port, &config.http_path);
     handle_am_run_with(
         &config,
         Some(server_url.as_str()),
@@ -27184,43 +27566,55 @@ fn handle_am_run_with(
                 .build()
                 .map_err(|e| CliError::Other(format!("runtime init failed: {e}")))?;
 
-            let ensure_ok = runtime
-                .block_on(async {
-                    try_call_server_tool(
-                        url,
-                        bearer,
-                        "ensure_project",
-                        serde_json::json!({ "human_key": identity.human_key.clone() }),
-                    )
-                    .await
-                })
-                .is_some();
-
-            if ensure_ok {
-                let acquired = runtime.block_on(async {
-                    try_call_server_tool(
-                        url,
-                        bearer,
-                        "acquire_build_slot",
-                        serde_json::json!({
-                            "project_key": identity.human_key.clone(),
-                            "agent_name": agent_name.clone(),
-                            "slot": args.slot.clone(),
-                            "ttl_seconds": ttl_seconds,
-                            "exclusive": !shared,
-                        }),
-                    )
-                    .await
-                });
-
-                if let Some(result) = acquired.and_then(coerce_tool_result_json) {
-                    backend = LeaseBackend::Server;
-                    acquired_via_server = true;
-                    server_conflicts = result
-                        .get("conflicts")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default();
+            match runtime.block_on(async {
+                try_call_server_tool(
+                    url,
+                    bearer,
+                    "ensure_project",
+                    serde_json::json!({ "human_key": identity.human_key.clone() }),
+                )
+                .await
+            }) {
+                ServerToolCall::Success(_) => {
+                    match runtime.block_on(async {
+                        try_call_server_tool(
+                            url,
+                            bearer,
+                            "acquire_build_slot",
+                            serde_json::json!({
+                                "project_key": identity.human_key.clone(),
+                                "agent_name": agent_name.clone(),
+                                "slot": args.slot.clone(),
+                                "ttl_seconds": ttl_seconds,
+                                "exclusive": !shared,
+                            }),
+                        )
+                        .await
+                    }) {
+                        ServerToolCall::Success(result) => {
+                            let result =
+                                coerce_tool_result_json_or_error("acquire_build_slot", result)?;
+                            backend = LeaseBackend::Server;
+                            acquired_via_server = true;
+                            server_conflicts = result
+                                .get("conflicts")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                        }
+                        ServerToolCall::Unavailable(_) => {}
+                        ServerToolCall::Rejected(message) => {
+                            return Err(CliError::Other(format!(
+                                "acquire_build_slot via server failed: {message}"
+                            )));
+                        }
+                    }
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "ensure_project via server failed: {message}"
+                    )));
                 }
             }
         }
@@ -27406,32 +27800,43 @@ fn handle_am_run_with(
         }
 
         let mut released_locally = false;
+        let mut release_error: Option<CliError> = None;
         if backend == LeaseBackend::Server && acquired_via_server {
             let server_released = if let Some(url) = server_url {
                 use asupersync::runtime::RuntimeBuilder;
                 match RuntimeBuilder::current_thread().build() {
-                    Ok(runtime) => runtime
-                        .block_on(async {
-                            try_call_server_tool(
-                                url,
-                                bearer,
-                                "release_build_slot",
-                                serde_json::json!({
-                                    "project_key": identity.human_key.clone(),
-                                    "agent_name": agent_name.clone(),
-                                    "slot": args.slot.clone(),
-                                }),
-                            )
-                            .await
-                        })
-                        .is_some(),
+                    Ok(runtime) => match runtime.block_on(async {
+                        try_call_server_tool(
+                            url,
+                            bearer,
+                            "release_build_slot",
+                            serde_json::json!({
+                                "project_key": identity.human_key.clone(),
+                                "agent_name": agent_name.clone(),
+                                "slot": args.slot.clone(),
+                            }),
+                        )
+                        .await
+                    }) {
+                        ServerToolCall::Success(_) => true,
+                        ServerToolCall::Unavailable(_) => false,
+                        ServerToolCall::Rejected(message) => {
+                            release_error = Some(CliError::Other(format!(
+                                "release_build_slot via server failed: {message}"
+                            )));
+                            false
+                        }
+                    },
                     Err(_) => false,
                 }
             } else {
                 false
             };
 
-            if !server_released && let Some(path) = lease_path_opt.as_ref() {
+            if release_error.is_none()
+                && !server_released
+                && let Some(path) = lease_path_opt.as_ref()
+            {
                 let now = Utc::now().to_rfc3339();
                 if let Some(mut lease) = read_lease(path) {
                     lease.released_ts = Some(now.clone());
@@ -27452,6 +27857,14 @@ fn handle_am_run_with(
 
         if !released_locally && backend == LeaseBackend::Local {
             // If local lease couldn't be read (should be rare), do not treat as fatal.
+        }
+
+        if let Some(error) = release_error {
+            if exit_code != 0 {
+                ftui_runtime::ftui_eprintln!("{error}");
+            } else {
+                return Err(error);
+            }
         }
     }
 
@@ -27600,7 +28013,15 @@ fn lease_conflicts_with_request(
 }
 
 fn safe_component(value: &str) -> String {
-    let out = value.trim().replace(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' '), "_");
+    let out = value.trim().replace(
+        |c| {
+            matches!(
+                c,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' '
+            )
+        },
+        "_",
+    );
     // Prevent path traversal via special components.
     if out.is_empty() || out == "." || out == ".." {
         "unknown".to_string()
@@ -30775,12 +31196,57 @@ pub fn sanitize_agent_name(name: &str) -> String {
         .collect()
 }
 
+#[derive(Debug, PartialEq)]
+enum ServerToolCall {
+    Success(serde_json::Value),
+    Unavailable(String),
+    Rejected(String),
+}
+
+fn server_tool_error_is_unavailable(error: &CliError) -> bool {
+    match error {
+        CliError::Io(_) => true,
+        CliError::Other(message) => {
+            message.starts_with("transport failure calling ")
+                || (message.starts_with("request to ") && message.contains(" timed out after "))
+        }
+        _ => false,
+    }
+}
+
+fn classify_server_tool_call(
+    tool_name: &str,
+    response: CliResult<serde_json::Value>,
+) -> ServerToolCall {
+    match response {
+        Ok(payload) => {
+            if let Some(error_text) = parse_jsonrpc_error(&payload) {
+                return ServerToolCall::Rejected(error_text);
+            }
+            match payload.get("result").cloned() {
+                Some(result) => ServerToolCall::Success(result),
+                None => ServerToolCall::Rejected(format!(
+                    "missing JSON-RPC result payload for {tool_name}"
+                )),
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if server_tool_error_is_unavailable(&error) {
+                ServerToolCall::Unavailable(message)
+            } else {
+                ServerToolCall::Rejected(message)
+            }
+        }
+    }
+}
+
 async fn try_call_server_tool(
     server_url: &str,
     bearer: Option<&str>,
     tool_name: &str,
     arguments: serde_json::Value,
-) -> Option<serde_json::Value> {
+) -> ServerToolCall {
     let req = serde_json::json!({
         "jsonrpc": "2.0",
         "id": format!("cli-{tool_name}"),
@@ -30790,10 +31256,10 @@ async fn try_call_server_tool(
             "arguments": arguments,
         }
     });
-    let v = post_jsonrpc_request(server_url, bearer, &req, 10)
-        .await
-        .ok()?;
-    v.get("result").cloned()
+    classify_server_tool_call(
+        tool_name,
+        post_jsonrpc_request(server_url, bearer, &req, 10).await,
+    )
 }
 
 fn coerce_tool_result_json(result: serde_json::Value) -> Option<serde_json::Value> {
@@ -30820,6 +31286,17 @@ fn coerce_tool_result_json(result: serde_json::Value) -> Option<serde_json::Valu
         }
         other => Some(other),
     }
+}
+
+fn coerce_tool_result_json_or_error(
+    tool_name: &str,
+    result: serde_json::Value,
+) -> CliResult<serde_json::Value> {
+    coerce_tool_result_json(result).ok_or_else(|| {
+        CliError::Other(format!(
+            "server returned empty or unparseable result for {tool_name}"
+        ))
+    })
 }
 
 async fn get_product_by_key(
@@ -30970,10 +31447,8 @@ fn handle_products(action: ProductsCommand) -> CliResult<()> {
 
 async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
     let config = Config::from_env();
-    let server_url = format!(
-        "http://{}:{}{}",
-        config.http_host, config.http_port, config.http_path
-    );
+    let server_url =
+        local_server_url_from_parts(&config.http_host, config.http_port, &config.http_path);
     let bearer = config.http_bearer_token.as_deref();
 
     let cx = asupersync::Cx::for_request();
@@ -31022,14 +31497,24 @@ async fn handle_products_with(
                 args.insert("name".to_string(), serde_json::Value::String(n.clone()));
             }
             let server_result = if let Some(url) = server_url {
-                try_call_server_tool(
+                match try_call_server_tool(
                     url,
                     bearer,
                     "ensure_product",
                     serde_json::Value::Object(args),
                 )
                 .await
-                .and_then(coerce_tool_result_json)
+                {
+                    ServerToolCall::Success(result) => {
+                        Some(coerce_tool_result_json_or_error("ensure_product", result)?)
+                    }
+                    ServerToolCall::Unavailable(_) => None,
+                    ServerToolCall::Rejected(message) => {
+                        return Err(CliError::Other(format!(
+                            "ensure_product via server failed: {message}"
+                        )));
+                    }
+                }
             } else {
                 None
             };
@@ -31337,10 +31822,9 @@ async fn handle_products_with(
             let urgent_only = resolve_bool(urgent_only, all, false);
             let include_bodies = resolve_bool(include_bodies, no_bodies, false);
 
-            // Prefer server tool, but fall back to local DB if server is unreachable or
-            // returns an empty result set.
-            let server_result = if let Some(url) = server_url {
-                try_call_server_tool(
+            let mut server_answered = false;
+            let mut items: Vec<serde_json::Value> = if let Some(url) = server_url {
+                match try_call_server_tool(
                     url,
                     bearer,
                     "fetch_inbox_product",
@@ -31354,25 +31838,47 @@ async fn handle_products_with(
                     }),
                 )
                 .await
-                .and_then(coerce_tool_result_json)
+                {
+                    ServerToolCall::Success(result) => {
+                        server_answered = true;
+                        let payload =
+                            coerce_tool_result_json_or_error("fetch_inbox_product", result)?;
+                        match payload {
+                            serde_json::Value::Array(items) => items,
+                            serde_json::Value::Object(obj) => {
+                                if let Some(items) =
+                                    obj.get("result").and_then(|r| r.as_array()).cloned()
+                                {
+                                    items
+                                } else if let Some(items) =
+                                    obj.get("messages").and_then(|r| r.as_array()).cloned()
+                                {
+                                    items
+                                } else {
+                                    return Err(CliError::Other(
+                                        "unexpected fetch_inbox_product response shape".to_string(),
+                                    ));
+                                }
+                            }
+                            _ => {
+                                return Err(CliError::Other(
+                                    "unexpected fetch_inbox_product response shape".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    ServerToolCall::Unavailable(_) => Vec::new(),
+                    ServerToolCall::Rejected(message) => {
+                        return Err(CliError::Other(format!(
+                            "fetch_inbox_product via server failed: {message}"
+                        )));
+                    }
+                }
             } else {
-                None
+                Vec::new()
             };
 
-            let mut items: Vec<serde_json::Value> = match server_result {
-                Some(v) => match v {
-                    serde_json::Value::Array(a) => a,
-                    serde_json::Value::Object(obj) => obj
-                        .get("result")
-                        .and_then(|r| r.as_array())
-                        .cloned()
-                        .unwrap_or_default(),
-                    _ => Vec::new(),
-                },
-                None => Vec::new(),
-            };
-
-            if items.is_empty() {
+            if items.is_empty() && !server_answered {
                 // Local fallback.
                 if let Some(prod) = get_product_by_key(cx, pool, product_key.trim()).await? {
                     let prod_id = prod.id.unwrap_or(0);
@@ -31516,8 +32022,8 @@ async fn handle_products_with(
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let server_result = if let Some(url) = server_url {
-                try_call_server_tool(
+            let payload = if let Some(url) = server_url {
+                match try_call_server_tool(
                     url,
                     bearer,
                     "summarize_thread_product",
@@ -31530,12 +32036,23 @@ async fn handle_products_with(
                     }),
                 )
                 .await
-                .and_then(coerce_tool_result_json)
+                {
+                    ServerToolCall::Success(result) => {
+                        coerce_tool_result_json_or_error("summarize_thread_product", result)?
+                    }
+                    ServerToolCall::Unavailable(_) => {
+                        ftui_runtime::ftui_println!(
+                            "Server unavailable; summarization requires server tool. Try again when server is running."
+                        );
+                        return Err(CliError::ExitCode(2));
+                    }
+                    ServerToolCall::Rejected(message) => {
+                        return Err(CliError::Other(format!(
+                            "summarize_thread_product via server failed: {message}"
+                        )));
+                    }
+                }
             } else {
-                None
-            };
-
-            let Some(payload) = server_result else {
                 ftui_runtime::ftui_println!(
                     "Server unavailable; summarization requires server tool. Try again when server is running."
                 );

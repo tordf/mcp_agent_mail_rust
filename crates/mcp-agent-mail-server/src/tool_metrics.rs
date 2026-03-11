@@ -33,6 +33,7 @@ static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
 const TOOL_METRICS_SNAPSHOTS_TABLE: &str = "tool_metrics_snapshots";
 const METRICS_RETENTION_DAYS: i64 = 30;
 const PRUNE_INTERVAL_TICKS: u64 = 60;
+const METRICS_DB_BUSY_TIMEOUT_MS: u64 = 250;
 
 #[derive(Debug, Clone)]
 pub struct PersistedToolMetric {
@@ -241,7 +242,11 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
-    crate::open_server_sync_db_connection(&path).ok()
+    let conn = DbConn::open_file(&path).ok()?;
+    let _ = conn.execute_raw(&format!(
+        "PRAGMA busy_timeout = {METRICS_DB_BUSY_TIMEOUT_MS};"
+    ));
+    Some(conn)
 }
 
 fn ensure_metrics_schema(conn: &DbConn) {
@@ -299,8 +304,11 @@ fn persist_snapshot_rows(
                  latency_avg_ms, latency_min_ms, latency_max_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms, latency_is_slow\
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-    conn.execute_sync("BEGIN IMMEDIATE", &[])
-        .map_err(|e| e.to_string())?;
+    // Metrics persistence is best-effort observability. Use a deferred
+    // transaction so we do not grab a write lock before the first insert, and
+    // pair it with a fast busy timeout on the metrics connection so normal tool
+    // traffic wins immediately under contention.
+    conn.execute_sync("BEGIN", &[]).map_err(|e| e.to_string())?;
 
     for entry in snapshot {
         let capabilities_json =
@@ -327,8 +335,10 @@ fn persist_snapshot_rows(
             return Err(e.to_string());
         }
     }
-    conn.execute_sync("COMMIT", &[])
-        .map_err(|e| e.to_string())?;
+    if let Err(err) = conn.execute_sync("COMMIT", &[]) {
+        let _ = conn.execute_sync("ROLLBACK", &[]);
+        return Err(err.to_string());
+    }
     Ok(())
 }
 
@@ -866,6 +876,88 @@ mod tests {
         ));
         assert!(!is_missing_metrics_table_error(&"no such table: messages"));
         assert!(!is_missing_metrics_table_error(&"database is locked"));
+    }
+
+    #[test]
+    fn metrics_connection_uses_fast_busy_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("busy_timeout.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+
+        let configured = conn
+            .query_sync("PRAGMA busy_timeout", &[])
+            .expect("pragma query")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("timeout")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(configured, METRICS_DB_BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn persist_snapshot_rows_rolls_back_after_commit_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("commit_failure.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+        ensure_metrics_schema(&conn);
+        conn.execute_raw("PRAGMA foreign_keys = ON;")
+            .expect("enable foreign keys");
+        conn.execute_raw("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .expect("create parents");
+        conn.execute_raw(
+            "CREATE TABLE child_refs (\
+                 id INTEGER PRIMARY KEY, \
+                 parent_id INTEGER NOT NULL, \
+                 FOREIGN KEY(parent_id) REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED\
+             )",
+        )
+        .expect("create child_refs");
+        conn.execute_raw(
+            "CREATE TRIGGER tool_metrics_snapshots_commit_guard \
+             AFTER INSERT ON tool_metrics_snapshots \
+             BEGIN \
+               INSERT INTO child_refs (parent_id) VALUES (1); \
+             END;",
+        )
+        .expect("create trigger");
+
+        let snapshot = vec![MetricsSnapshotEntry {
+            name: "send_message".to_string(),
+            calls: 1,
+            errors: 0,
+            cluster: "messaging".to_string(),
+            capabilities: Vec::new(),
+            complexity: "simple".to_string(),
+            latency: None,
+        }];
+
+        let first = persist_snapshot_rows(&conn, 1, &snapshot).expect_err("commit should fail");
+        assert!(
+            first.contains("FOREIGN KEY") || first.contains("foreign key"),
+            "unexpected error: {first}"
+        );
+
+        conn.execute_raw("DROP TRIGGER tool_metrics_snapshots_commit_guard")
+            .expect("drop trigger");
+        conn.execute_raw("INSERT INTO parents (id) VALUES (1)")
+            .expect("insert parent");
+
+        persist_snapshot_rows(&conn, 2, &snapshot).expect("connection should recover");
+
+        let count = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM tool_metrics_snapshots", &[])
+            .expect("count rows")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("cnt").ok())
+            .unwrap_or_default();
+        assert_eq!(count, 1, "failed transaction should have been rolled back");
     }
 
     #[test]

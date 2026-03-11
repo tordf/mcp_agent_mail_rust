@@ -3,7 +3,7 @@
 //! Displays real-time stats, a live event log, and health alarms in a
 //! responsive layout that adapts from 80×24 to 200×50+.
 
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -119,7 +119,6 @@ const ULTRADENSE_BOTTOM_MIN_HEIGHT: u16 = 12;
 const DASHBOARD_6K_MIN_WIDTH: u16 = 220;
 const DASHBOARD_6K_MIN_HEIGHT: u16 = 28;
 const DASHBOARD_6K_TREND_HEIGHT_PERCENT: u16 = 16;
-const DASHBOARD_6K_FOUR_ROW_MIN_HEIGHT: u16 = 22;
 
 /// Anomaly thresholds.
 const ACK_PENDING_WARN: u64 = 3;
@@ -317,9 +316,6 @@ pub struct DashboardScreen {
     /// Cached parsed query terms (query string → lowercased terms). Avoids 15+
     /// redundant `parse_query_terms()` calls per frame across render functions.
     cached_query_terms: RefCell<(String, Vec<String>)>,
-    /// Cached tool latency aggregation. Keyed by event count so it only recomputes
-    /// when the event log changes (not every frame).
-    cached_tool_latency: RefCell<(usize, Vec<ToolLatencyRow>)>,
 }
 
 /// A pre-formatted event log entry.
@@ -489,7 +485,6 @@ impl DashboardScreen {
             cached_heatmap: RefCell::new(None),
             heatmap_event_gen: 0,
             cached_query_terms: RefCell::new((String::new(), Vec::new())),
-            cached_tool_latency: RefCell::new((usize::MAX, Vec::new())),
         }
     }
 
@@ -661,8 +656,6 @@ impl DashboardScreen {
         };
         self.heatmap_event_gen = self.heatmap_event_gen.wrapping_add(1);
         *self.cached_heatmap.borrow_mut() = None;
-        // Invalidate tool latency cache so it recomputes on next frame.
-        self.cached_tool_latency.borrow_mut().0 = usize::MAX;
     }
 
     /// Build the current filter key for cache invalidation.
@@ -714,8 +707,6 @@ impl DashboardScreen {
         };
         *self.cached_visible_indices.borrow_mut() = indices;
         *self.visible_cache_filter_sig.borrow_mut() = current_key;
-        // Invalidate tool latency cache because the visible entries changed.
-        self.cached_tool_latency.borrow_mut().0 = usize::MAX;
     }
 
     /// Visible entries after applying verbosity tier and type filter (cached).
@@ -742,23 +733,13 @@ impl DashboardScreen {
         terms
     }
 
-    /// Return cached tool latency aggregation. Only recomputes when visible
-    /// entries change (event count) or query terms change. Avoids 10+
-    /// redundant O(N log N) aggregation+sort passes per frame.
-    fn cached_tool_latency_rows(&self, entries: &[&EventEntry]) -> Ref<'_, [ToolLatencyRow]> {
-        let entry_count = entries.len();
-        let needs_refresh = {
-            let cache = self.cached_tool_latency.borrow();
-            cache.0 != entry_count
-        };
-        if needs_refresh {
-            let query_terms = self.cached_parsed_query_terms();
-            let rows = compute_tool_latency_rows(entries, &query_terms);
-            *self.cached_tool_latency.borrow_mut() = (entry_count, rows);
-        }
-        Ref::map(self.cached_tool_latency.borrow(), |cache| {
-            cache.1.as_slice()
-        })
+    /// Compute tool latency rows for the current frame.
+    ///
+    /// This intentionally avoids cross-frame caching because the authoritative
+    /// runtime metrics snapshot can advance independently of the event log.
+    fn tool_latency_rows(&self, entries: &[&EventEntry]) -> Vec<ToolLatencyRow> {
+        let query_terms = self.cached_parsed_query_terms();
+        compute_tool_latency_rows(entries, &query_terms)
     }
 
     fn quick_query(&self) -> &str {
@@ -934,10 +915,12 @@ impl DashboardScreen {
         let mut sorted: Vec<f64> = data.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let len = sorted.len();
+        let p95_idx = percentile_sample_index(len, 95);
+        let p99_idx = percentile_sample_index(len, 99);
         PercentileSample {
             p50: sorted[len / 2],
-            p95: sorted[(len * 95 / 100).min(len - 1)],
-            p99: sorted[(len * 99 / 100).min(len - 1)],
+            p95: sorted[p95_idx],
+            p99: sorted[p99_idx],
         }
     }
 
@@ -966,9 +949,9 @@ impl DashboardScreen {
     fn should_render_bottom_rail(
         quick_query: &str,
         preview: Option<&RecentMessagePreview>,
-        force_dense_surface: bool,
+        _force_dense_surface: bool,
     ) -> bool {
-        force_dense_surface || !quick_query.trim().is_empty() || preview.is_some()
+        !quick_query.trim().is_empty() || preview.is_some()
     }
 
     /// Build the `ReactiveLayout` for the main content area.
@@ -1529,7 +1512,7 @@ impl MailScreen for DashboardScreen {
         // Compute tool latency rows once for the whole frame. This avoids 10+
         // redundant O(N log N) aggregation passes across render_insight_rail,
         // render_bottom_rail, and render_insight_panel_slot.
-        let latency_rows = self.cached_tool_latency_rows(&visible_entries);
+        let latency_rows = self.tool_latency_rows(&visible_entries);
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
             render_insight_rail(
                 frame,
@@ -1808,6 +1791,27 @@ fn parse_tool_end_duration(summary: &str) -> Option<(String, u64)> {
     Some((tool_name.to_string(), duration_ms))
 }
 
+fn panel_title_with_total(label: &str, shown: usize, total: u64) -> String {
+    let shown_u64 = u64::try_from(shown).unwrap_or(u64::MAX);
+    if total > shown_u64 {
+        format!("{label} · {shown}/{total}")
+    } else {
+        format!("{label} · {shown}")
+    }
+}
+
+fn percentile_sample_index(sample_count: usize, percentile: usize) -> usize {
+    if sample_count <= 1 {
+        return 0;
+    }
+    sample_count
+        .saturating_sub(1)
+        .saturating_mul(percentile)
+        .checked_div(100)
+        .unwrap_or(0)
+        .min(sample_count.saturating_sub(1))
+}
+
 fn ratio_bar(value: u64, max: u64, cells: usize) -> String {
     if cells == 0 {
         return String::new();
@@ -1956,7 +1960,38 @@ fn split_columns_with_gap(area: Rect, cols: usize, gap: u16) -> Vec<Rect> {
     out
 }
 
-#[derive(Debug, Clone, Copy)]
+fn split_rows_with_gap(area: Rect, rows: usize, gap: u16) -> Vec<Rect> {
+    if rows == 0 || area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let max_rows = usize::from(area.height.max(1));
+    let rows = rows.min(max_rows).max(1);
+    let rows_u16 = u16::try_from(rows).unwrap_or(1);
+    let total_gap = gap.saturating_mul(rows_u16.saturating_sub(1));
+    let usable = area.height.saturating_sub(total_gap);
+    if usable == 0 {
+        return Vec::new();
+    }
+
+    let base_h = usable / rows_u16;
+    let remainder = usize::from(usable % rows_u16);
+    let mut y = area.y;
+    let mut out = Vec::with_capacity(rows);
+
+    for idx in 0..rows {
+        let extra_h = u16::from(idx < remainder);
+        let height = base_h.saturating_add(extra_h).max(1);
+        out.push(Rect::new(area.x, y, area.width, height));
+        y = y.saturating_add(height);
+        if idx + 1 < rows {
+            y = y.saturating_add(gap);
+        }
+    }
+
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum InsightPanelSlot {
     Agents,
     Contacts,
@@ -1972,7 +2007,7 @@ enum InsightPanelSlot {
     RuntimeDigest,
 }
 
-const INSIGHT_TOP_LAYOUT: [InsightPanelSlot; 7] = [
+const INSIGHT_MEGAGRID_LAYOUT: [InsightPanelSlot; 12] = [
     InsightPanelSlot::Agents,
     InsightPanelSlot::Projects,
     InsightPanelSlot::ReservationWatch,
@@ -1980,34 +2015,9 @@ const INSIGHT_TOP_LAYOUT: [InsightPanelSlot; 7] = [
     InsightPanelSlot::EventMix,
     InsightPanelSlot::RecentActivity,
     InsightPanelSlot::ToolLatency,
-];
-
-const INSIGHT_BOTTOM_LAYOUT: [InsightPanelSlot; 7] = [
     InsightPanelSlot::Contacts,
     InsightPanelSlot::ProjectLoad,
     InsightPanelSlot::ReservationTtl,
-    InsightPanelSlot::ToolLatency,
-    InsightPanelSlot::MessageFlow,
-    InsightPanelSlot::RuntimeDigest,
-    InsightPanelSlot::MessageFlow,
-];
-
-const INSIGHT_MID_LAYOUT: [InsightPanelSlot; 7] = [
-    InsightPanelSlot::RecentActivity,
-    InsightPanelSlot::Contacts,
-    InsightPanelSlot::RuntimeDigest,
-    InsightPanelSlot::ToolLatency,
-    InsightPanelSlot::MessageFlow,
-    InsightPanelSlot::EventMix,
-    InsightPanelSlot::ReservationWatch,
-];
-
-const INSIGHT_LOWER_MID_LAYOUT: [InsightPanelSlot; 7] = [
-    InsightPanelSlot::Signals,
-    InsightPanelSlot::ReservationWatch,
-    InsightPanelSlot::ProjectLoad,
-    InsightPanelSlot::EventMix,
-    InsightPanelSlot::ToolLatency,
     InsightPanelSlot::MessageFlow,
     InsightPanelSlot::RuntimeDigest,
 ];
@@ -2031,15 +2041,28 @@ fn render_insight_panel_slot(
             render_contacts_snapshot_panel(frame, area, &db_snapshot.contacts_list, query_text);
         }
         InsightPanelSlot::Projects => {
-            render_projects_snapshot_panel(frame, area, &db_snapshot.projects_list, query_text);
+            render_projects_snapshot_panel(
+                frame,
+                area,
+                db_snapshot.projects,
+                &db_snapshot.projects_list,
+                query_text,
+            );
         }
         InsightPanelSlot::ProjectLoad => {
-            render_project_load_panel(frame, area, &db_snapshot.projects_list, query_text);
+            render_project_load_panel(
+                frame,
+                area,
+                db_snapshot.projects,
+                &db_snapshot.projects_list,
+                query_text,
+            );
         }
         InsightPanelSlot::ReservationWatch => {
             render_reservation_watch_panel(
                 frame,
                 area,
+                db_snapshot.file_reservations,
                 &db_snapshot.reservation_snapshots,
                 query_text,
             );
@@ -2048,6 +2071,7 @@ fn render_insight_panel_slot(
             render_reservation_ttl_buckets_panel(
                 frame,
                 area,
+                db_snapshot.file_reservations,
                 &db_snapshot.reservation_snapshots,
                 query_text,
             );
@@ -2784,113 +2808,20 @@ fn render_insight_rail(
     }
 
     if is_megagrid_insight_area(remaining) {
-        // Dedicated 6k-density pass: expand from fixed 5 columns to adaptive
-        // 6/7/8 columns so large monitors surface substantially more context.
-        let cols = if remaining.width >= DASHBOARD_6K_MIN_WIDTH {
-            8
-        } else if remaining.width >= ULTRADENSE_BOTTOM_MIN_WIDTH {
-            7
-        } else {
-            6
-        };
-        let columns = split_columns_with_gap(remaining, cols, 1);
-        let four_rows = remaining.height >= DASHBOARD_6K_FOUR_ROW_MIN_HEIGHT;
-        let three_rows = !four_rows && remaining.height >= 24;
-        for (idx, col) in columns.iter().enumerate() {
-            let slot_idx = idx.min(INSIGHT_TOP_LAYOUT.len().saturating_sub(1));
-            if four_rows {
-                let (top, rest_rows) = split_height_ratio_with_gap(*col, 0.26, 1);
-                let (mid, rest_rows) = split_height_ratio_with_gap(rest_rows, 0.34, 1);
-                let (lower_mid, bottom) = split_height_ratio_with_gap(rest_rows, 0.5, 1);
+        let row_areas = split_rows_with_gap(remaining, 3, 1);
+        for (row_idx, row_area) in row_areas.iter().enumerate() {
+            let start = row_idx.saturating_mul(4);
+            let end = (start + 4).min(INSIGHT_MEGAGRID_LAYOUT.len());
+            if start >= end {
+                break;
+            }
+            let row_slots = &INSIGHT_MEGAGRID_LAYOUT[start..end];
+            let columns = split_columns_with_gap(*row_area, row_slots.len(), 1);
+            for (slot, cell) in row_slots.iter().zip(columns.into_iter()) {
                 render_insight_panel_slot(
                     frame,
-                    top,
-                    INSIGHT_TOP_LAYOUT[slot_idx],
-                    db_snapshot,
-                    query_text,
-                    anomalies,
-                    entries,
-                    latency_rows,
-                );
-                render_insight_panel_slot(
-                    frame,
-                    mid,
-                    INSIGHT_MID_LAYOUT[slot_idx],
-                    db_snapshot,
-                    query_text,
-                    anomalies,
-                    entries,
-                    latency_rows,
-                );
-                render_insight_panel_slot(
-                    frame,
-                    lower_mid,
-                    INSIGHT_LOWER_MID_LAYOUT[slot_idx],
-                    db_snapshot,
-                    query_text,
-                    anomalies,
-                    entries,
-                    latency_rows,
-                );
-                render_insight_panel_slot(
-                    frame,
-                    bottom,
-                    INSIGHT_BOTTOM_LAYOUT[slot_idx],
-                    db_snapshot,
-                    query_text,
-                    anomalies,
-                    entries,
-                    latency_rows,
-                );
-            } else if three_rows {
-                let (top, rest_rows) = split_height_ratio_with_gap(*col, 0.34, 1);
-                let (mid, bottom) = split_height_ratio_with_gap(rest_rows, 0.5, 1);
-                render_insight_panel_slot(
-                    frame,
-                    top,
-                    INSIGHT_TOP_LAYOUT[slot_idx],
-                    db_snapshot,
-                    query_text,
-                    anomalies,
-                    entries,
-                    latency_rows,
-                );
-                render_insight_panel_slot(
-                    frame,
-                    mid,
-                    INSIGHT_MID_LAYOUT[slot_idx],
-                    db_snapshot,
-                    query_text,
-                    anomalies,
-                    entries,
-                    latency_rows,
-                );
-                render_insight_panel_slot(
-                    frame,
-                    bottom,
-                    INSIGHT_BOTTOM_LAYOUT[slot_idx],
-                    db_snapshot,
-                    query_text,
-                    anomalies,
-                    entries,
-                    latency_rows,
-                );
-            } else {
-                let (top, bottom) = split_height_ratio_with_gap(*col, 0.5, 1);
-                render_insight_panel_slot(
-                    frame,
-                    top,
-                    INSIGHT_TOP_LAYOUT[slot_idx],
-                    db_snapshot,
-                    query_text,
-                    anomalies,
-                    entries,
-                    latency_rows,
-                );
-                render_insight_panel_slot(
-                    frame,
-                    bottom,
-                    INSIGHT_BOTTOM_LAYOUT[slot_idx],
+                    cell,
+                    *slot,
                     db_snapshot,
                     query_text,
                     anomalies,
@@ -2913,17 +2844,31 @@ fn render_insight_rail(
 
         render_agents_snapshot_panel(frame, a_top, &db_snapshot.agents_list, query_text);
         render_contacts_snapshot_panel(frame, a_bottom, &db_snapshot.contacts_list, query_text);
-        render_projects_snapshot_panel(frame, b_top, &db_snapshot.projects_list, query_text);
-        render_project_load_panel(frame, b_bottom, &db_snapshot.projects_list, query_text);
+        render_projects_snapshot_panel(
+            frame,
+            b_top,
+            db_snapshot.projects,
+            &db_snapshot.projects_list,
+            query_text,
+        );
+        render_project_load_panel(
+            frame,
+            b_bottom,
+            db_snapshot.projects,
+            &db_snapshot.projects_list,
+            query_text,
+        );
         render_reservation_watch_panel(
             frame,
             c_top,
+            db_snapshot.file_reservations,
             &db_snapshot.reservation_snapshots,
             query_text,
         );
         render_reservation_ttl_buckets_panel(
             frame,
             c_bottom,
+            db_snapshot.file_reservations,
             &db_snapshot.reservation_snapshots,
             query_text,
         );
@@ -2950,10 +2895,17 @@ fn render_insight_rail(
 
         render_agents_snapshot_panel(frame, a_top, &db_snapshot.agents_list, query_text);
         render_contacts_snapshot_panel(frame, a_bottom, &db_snapshot.contacts_list, query_text);
-        render_projects_snapshot_panel(frame, b_top, &db_snapshot.projects_list, query_text);
+        render_projects_snapshot_panel(
+            frame,
+            b_top,
+            db_snapshot.projects,
+            &db_snapshot.projects_list,
+            query_text,
+        );
         render_reservation_watch_panel(
             frame,
             b_bottom,
+            db_snapshot.file_reservations,
             &db_snapshot.reservation_snapshots,
             query_text,
         );
@@ -2975,6 +2927,7 @@ fn render_insight_rail(
         render_reservation_watch_panel(
             frame,
             bottom,
+            db_snapshot.file_reservations,
             &db_snapshot.reservation_snapshots,
             query_text,
         );
@@ -2986,10 +2939,17 @@ fn render_insight_rail(
     let (bottom_left, bottom_right) = split_width_ratio_with_gap(bottom_row, 0.54, 1);
 
     render_agents_snapshot_panel(frame, top_left, &db_snapshot.agents_list, query_text);
-    render_projects_snapshot_panel(frame, top_right, &db_snapshot.projects_list, query_text);
+    render_projects_snapshot_panel(
+        frame,
+        top_right,
+        db_snapshot.projects,
+        &db_snapshot.projects_list,
+        query_text,
+    );
     render_reservation_watch_panel(
         frame,
         bottom_left,
+        db_snapshot.file_reservations,
         &db_snapshot.reservation_snapshots,
         query_text,
     );
@@ -3034,6 +2994,7 @@ fn render_bottom_rail(
                     render_project_load_panel(
                         frame,
                         ops_bottom,
+                        db_snapshot.projects,
                         &db_snapshot.projects_list,
                         query_text,
                     );
@@ -3046,12 +3007,14 @@ fn render_bottom_rail(
                     render_reservation_ttl_buckets_panel(
                         frame,
                         res_top,
+                        db_snapshot.file_reservations,
                         &db_snapshot.reservation_snapshots,
                         query_text,
                     );
                     render_reservation_watch_panel(
                         frame,
                         res_bottom,
+                        db_snapshot.file_reservations,
                         &db_snapshot.reservation_snapshots,
                         query_text,
                     );
@@ -3059,6 +3022,7 @@ fn render_bottom_rail(
                     render_reservation_ttl_buckets_panel(
                         frame,
                         reservations_col,
+                        db_snapshot.file_reservations,
                         &db_snapshot.reservation_snapshots,
                         query_text,
                     );
@@ -3082,6 +3046,7 @@ fn render_bottom_rail(
                 render_reservation_ttl_buckets_panel(
                     frame,
                     ops_bottom,
+                    db_snapshot.file_reservations,
                     &db_snapshot.reservation_snapshots,
                     query_text,
                 );
@@ -3103,6 +3068,7 @@ fn render_bottom_rail(
                     render_reservation_ttl_buckets_panel(
                         frame,
                         bottom_right,
+                        db_snapshot.file_reservations,
                         &db_snapshot.reservation_snapshots,
                         query_text,
                     );
@@ -3173,6 +3139,7 @@ fn render_bottom_rail(
             render_reservation_ttl_buckets_panel(
                 frame,
                 support_bottom,
+                db_snapshot.file_reservations,
                 &db_snapshot.reservation_snapshots,
                 query_text,
             );
@@ -3201,6 +3168,7 @@ fn render_bottom_rail(
             render_reservation_ttl_buckets_panel(
                 frame,
                 bottom_right,
+                db_snapshot.file_reservations,
                 &db_snapshot.reservation_snapshots,
                 query_text,
             );
@@ -3230,6 +3198,7 @@ fn render_bottom_rail(
             render_reservation_ttl_buckets_panel(
                 frame,
                 bottom_right,
+                db_snapshot.file_reservations,
                 &db_snapshot.reservation_snapshots,
                 query_text,
             );
@@ -3503,6 +3472,7 @@ fn render_contacts_snapshot_panel(
 fn render_projects_snapshot_panel(
     frame: &mut Frame<'_>,
     area: Rect,
+    total_projects: u64,
     projects: &[ProjectSummary],
     query_text: &str,
 ) {
@@ -3523,7 +3493,8 @@ fn render_projects_snapshot_panel(
     });
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Projects · {}", rows.len());
+    let query_active = !query_terms.is_empty();
+    let title = panel_title_with_total("Projects", rows.len(), total_projects);
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
@@ -3535,7 +3506,15 @@ fn render_projects_snapshot_panel(
     }
 
     if rows.is_empty() {
-        Paragraph::new("No matching projects")
+        let message = if total_projects > 0 && projects.is_empty() {
+            format!("Project details unavailable ({total_projects} total)")
+        } else if query_active && total_projects > u64::try_from(projects.len()).unwrap_or(u64::MAX)
+        {
+            "No matching projects in fetched detail rows".to_string()
+        } else {
+            "No matching projects".to_string()
+        };
+        Paragraph::new(message)
             .style(crate::tui_theme::text_meta(&tp))
             .render(inner, frame);
         return;
@@ -3608,6 +3587,7 @@ fn render_projects_snapshot_panel(
 fn render_project_load_panel(
     frame: &mut Frame<'_>,
     area: Rect,
+    total_projects: u64,
     projects: &[ProjectSummary],
     query_text: &str,
 ) {
@@ -3632,7 +3612,8 @@ fn render_project_load_panel(
     rows.sort_by_key(|pair| std::cmp::Reverse(pair.1));
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Project Load · {}", rows.len());
+    let query_active = !query_terms.is_empty();
+    let title = panel_title_with_total("Project Load", rows.len(), total_projects);
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
@@ -3644,7 +3625,15 @@ fn render_project_load_panel(
     }
 
     if rows.is_empty() {
-        Paragraph::new("No matching projects")
+        let message = if total_projects > 0 && projects.is_empty() {
+            format!("Project details unavailable ({total_projects} total)")
+        } else if query_active && total_projects > u64::try_from(projects.len()).unwrap_or(u64::MAX)
+        {
+            "No matching projects in fetched detail rows".to_string()
+        } else {
+            "No matching projects".to_string()
+        };
+        Paragraph::new(message)
             .style(crate::tui_theme::text_meta(&tp))
             .render(inner, frame);
         return;
@@ -3716,6 +3705,7 @@ fn render_project_load_panel(
 fn render_reservation_watch_panel(
     frame: &mut Frame<'_>,
     area: Rect,
+    total_reservations: u64,
     reservations: &[ReservationSnapshot],
     query_text: &str,
 ) {
@@ -3748,7 +3738,16 @@ fn render_reservation_watch_panel(
         .count();
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Reservations · {} (≤5m:{soon_count})", rows.len());
+    let query_active = !query_terms.is_empty();
+    let title = if total_reservations > u64::try_from(rows.len()).unwrap_or(u64::MAX) {
+        format!(
+            "Reservations · {}/{} (≤5m:{soon_count})",
+            rows.len(),
+            total_reservations
+        )
+    } else {
+        format!("Reservations · {} (≤5m:{soon_count})", rows.len())
+    };
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
@@ -3760,7 +3759,18 @@ fn render_reservation_watch_panel(
     }
 
     if rows.is_empty() {
-        Paragraph::new("No active reservations")
+        let message = if total_reservations > 0 && reservations.is_empty() {
+            format!("Reservation details unavailable ({total_reservations} active)")
+        } else if query_active
+            && total_reservations > u64::try_from(reservations.len()).unwrap_or(u64::MAX)
+        {
+            "No matching reservations in fetched detail rows".to_string()
+        } else if query_active {
+            "No matching reservations".to_string()
+        } else {
+            "No active reservations".to_string()
+        };
+        Paragraph::new(message)
             .style(crate::tui_theme::text_meta(&tp))
             .render(inner, frame);
         return;
@@ -3861,6 +3871,7 @@ fn render_reservation_watch_panel(
 fn render_reservation_ttl_buckets_panel(
     frame: &mut Frame<'_>,
     area: Rect,
+    total_reservations: u64,
     reservations: &[ReservationSnapshot],
     query_text: &str,
 ) {
@@ -3886,7 +3897,8 @@ fn render_reservation_ttl_buckets_panel(
         .collect();
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Reservation TTL · {}", filtered.len());
+    let query_active = !query_terms.is_empty();
+    let title = panel_title_with_total("Reservation TTL", filtered.len(), total_reservations);
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
@@ -3898,7 +3910,18 @@ fn render_reservation_ttl_buckets_panel(
     }
 
     if filtered.is_empty() {
-        Paragraph::new("No matching reservations")
+        let message = if total_reservations > 0 && reservations.is_empty() {
+            format!("Reservation details unavailable ({total_reservations} active)")
+        } else if query_active
+            && total_reservations > u64::try_from(reservations.len()).unwrap_or(u64::MAX)
+        {
+            "No matching reservations in fetched detail rows".to_string()
+        } else if query_active {
+            "No matching reservations".to_string()
+        } else {
+            "No active reservations".to_string()
+        };
+        Paragraph::new(message)
             .style(crate::tui_theme::text_meta(&tp))
             .render(inner, frame);
         return;
@@ -4183,9 +4206,7 @@ struct ToolLatencyRow {
     max_ms: u64,
 }
 
-/// Aggregate tool latency data from visible entries. Extracted from
-/// `render_tool_latency_panel` so the result can be cached across the 10+
-/// render calls per frame that display the same aggregation.
+/// Aggregate tool latency data from visible entries.
 fn compute_tool_latency_rows(
     entries: &[&EventEntry],
     query_terms: &[String],
@@ -4207,8 +4228,7 @@ fn compute_tool_latency_rows(
         .into_iter()
         .map(|(tool_name, mut stats)| {
             stats.samples.sort_unstable();
-            let p95_idx =
-                (stats.samples.len() * 95 / 100).min(stats.samples.len().saturating_sub(1));
+            let p95_idx = percentile_sample_index(stats.samples.len(), 95);
             let p95_ms = stats.samples[p95_idx];
             let calls_u64 = u64::try_from(stats.calls).unwrap_or(1).max(1);
             let avg_ms = stats.total_ms.checked_div(calls_u64).unwrap_or(0);
@@ -5958,6 +5978,9 @@ mod tests {
     use super::*;
     use crate::tui_bridge::TuiSharedState;
     use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_tools::{record_call, record_latency, reset_tool_metrics};
+
+    static DASHBOARD_TOOL_METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn rects_overlap(left: Rect, right: Rect) -> bool {
         let left_right = left.x.saturating_add(left.width);
@@ -6335,6 +6358,38 @@ mod tests {
     }
 
     #[test]
+    fn panel_title_with_total_shows_coverage_when_rows_are_partial() {
+        assert_eq!(
+            panel_title_with_total("Projects", 500, 2_534),
+            "Projects · 500/2534"
+        );
+        assert_eq!(panel_title_with_total("Projects", 3, 3), "Projects · 3");
+    }
+
+    #[test]
+    fn tool_latency_rows_do_not_leak_runtime_snapshot_without_visible_tool_events() {
+        let _guard = DASHBOARD_TOOL_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_tool_metrics();
+        record_call("health_check");
+        record_latency("health_check", 250_000);
+
+        let rows = compute_tool_latency_rows(&[], &[]);
+        assert!(rows.is_empty());
+
+        reset_tool_metrics();
+    }
+
+    #[test]
+    fn percentile_sample_index_avoids_promoting_small_sample_p95_to_max() {
+        assert_eq!(percentile_sample_index(1, 95), 0);
+        assert_eq!(percentile_sample_index(2, 95), 0);
+        assert_eq!(percentile_sample_index(5, 95), 3);
+        assert_eq!(percentile_sample_index(20, 95), 18);
+    }
+
+    #[test]
     fn supergrid_breakpoints_detect_large_panels() {
         assert!(!is_supergrid_insight_area(Rect::new(
             0,
@@ -6495,12 +6550,34 @@ mod tests {
     }
 
     #[test]
-    fn dense_surface_forces_bottom_rail_visibility_without_query_or_preview() {
+    fn bottom_rail_requires_query_or_preview_even_on_dense_surface() {
         assert!(!DashboardScreen::should_render_bottom_rail("", None, false));
-        assert!(DashboardScreen::should_render_bottom_rail("", None, true));
+        assert!(!DashboardScreen::should_render_bottom_rail("", None, true));
         assert!(DashboardScreen::should_render_bottom_rail(
             "search", None, false
         ));
+        let preview = RecentMessagePreview {
+            timestamp_micros: 1,
+            direction: "Inbound",
+            timestamp: "12:00".to_string(),
+            from: "A".to_string(),
+            to: "B".to_string(),
+            subject: "subject".to_string(),
+            thread_id: "thread-1".to_string(),
+            project: "project-a".to_string(),
+            body_md: "body".to_string(),
+        };
+        assert!(DashboardScreen::should_render_bottom_rail(
+            "",
+            Some(&preview),
+            true
+        ));
+    }
+
+    #[test]
+    fn insight_megagrid_layout_has_unique_slots() {
+        let unique: HashSet<_> = INSIGHT_MEGAGRID_LAYOUT.into_iter().collect();
+        assert_eq!(unique.len(), INSIGHT_MEGAGRID_LAYOUT.len());
     }
 
     #[test]
@@ -8323,8 +8400,17 @@ mod tests {
         let data: Vec<f64> = (1..=100).map(f64::from).collect();
         let p = DashboardScreen::compute_percentile(&data);
         assert!((p.p50 - 51.0).abs() < f64::EPSILON);
-        assert!((p.p95 - 96.0).abs() < f64::EPSILON);
-        assert!((p.p99 - 100.0).abs() < f64::EPSILON);
+        assert!((p.p95 - 95.0).abs() < f64::EPSILON);
+        assert!((p.p99 - 99.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_percentile_small_sample_does_not_promote_tail_to_max() {
+        let data = [10.0, 20.0, 30.0, 40.0, 50.0];
+        let p = DashboardScreen::compute_percentile(&data);
+        assert!((p.p50 - 30.0).abs() < f64::EPSILON);
+        assert!((p.p95 - 40.0).abs() < f64::EPSILON);
+        assert!((p.p99 - 40.0).abs() < f64::EPSILON);
     }
 
     #[test]

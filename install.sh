@@ -70,6 +70,7 @@ LOG_INITIALIZED=0
 ERROR_TAIL_EMITTED=0
 ORIGINAL_ARGS=("$@")
 UNINSTALL_SUMMARY=()
+REMOTE_HTTP_PROBE_DETAIL=""
 
 # T2.1: Auto-enable easy-mode for pipe installs (stdin is not a terminal)
 # Also auto-enable in CI environments.
@@ -1596,11 +1597,200 @@ normalize_mcp_http_path() {
 }
 
 desired_mcp_http_url() {
-  local host="${HTTP_HOST:-127.0.0.1}"
+  local host
+  host="$(mcp_client_connect_host "${HTTP_HOST:-127.0.0.1}")"
   local port="${HTTP_PORT:-8765}"
   local path
   path="$(normalize_mcp_http_path "${HTTP_PATH:-/mcp/}")"
   printf 'http://%s:%s%s' "$host" "$port" "$path"
+}
+
+mcp_client_connect_host() {
+  local host="${1:-127.0.0.1}"
+  host="${host#"${host%%[![:space:]]*}"}"
+  host="${host%"${host##*[![:space:]]}"}"
+
+  if [ -z "$host" ]; then
+    printf '127.0.0.1'
+    return 0
+  fi
+
+  local unbracketed="$host"
+  if [[ "$host" == \[*\] ]]; then
+    unbracketed="${host#[}"
+    unbracketed="${unbracketed%]}"
+  fi
+
+  case "$unbracketed" in
+    0.0.0.0)
+      printf '127.0.0.1'
+      ;;
+    ::)
+      printf '[::1]'
+      ;;
+    *:*)
+      if [[ "$host" == \[*\] ]]; then
+        printf '%s' "$host"
+      else
+        printf '[%s]' "$unbracketed"
+      fi
+      ;;
+    *)
+      printf '%s' "$host"
+      ;;
+  esac
+}
+
+desired_mcp_http_base_url() {
+  local host
+  host="$(mcp_client_connect_host "${HTTP_HOST:-127.0.0.1}")"
+  local port="${HTTP_PORT:-8765}"
+  printf 'http://%s:%s' "$host" "$port"
+}
+
+desired_service_bind_host() {
+  printf '%s' "${HTTP_HOST:-127.0.0.1}"
+}
+
+desired_service_bind_port() {
+  printf '%s' "${HTTP_PORT:-8765}"
+}
+
+platform_supports_user_service_management() {
+  case "${OS:-$(uname -s | tr 'A-Z' 'a-z')}" in
+    linux|darwin) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+has_remote_http_client_targets() {
+  if command -v codex >/dev/null 2>&1 || [ -d "${HOME}/.codex" ] || [ -d "${HOME}/.config/codex" ]; then
+    return 0
+  fi
+
+  local scan
+  scan="$(detect_mcp_configs "$PWD" 2>/dev/null || true)"
+  [ -z "$scan" ] && return 1
+
+  local tool path exists_flag
+  while IFS=$'\t' read -r tool path exists_flag; do
+    [ -z "${tool:-}" ] && continue
+    [ "$tool" = "codex" ] || continue
+    if [ "$exists_flag" = "1" ] && [ -f "$path" ]; then
+      return 0
+    fi
+  done <<< "$scan"
+
+  return 1
+}
+
+probe_remote_http_endpoint() {
+  REMOTE_HTTP_PROBE_DETAIL=""
+
+  local base_url
+  base_url="$(desired_mcp_http_base_url)"
+  local bearer_token
+  bearer_token="$(resolve_setup_http_bearer_token)"
+  local curl_args=(--silent --show-error --fail --connect-timeout 1 --max-time 4)
+  if [ -n "$bearer_token" ]; then
+    curl_args+=(-H "Authorization: Bearer ${bearer_token}")
+  fi
+
+  local health_url
+  for health_url in "${base_url}/health" "${base_url}/healthz"; do
+    local health_body=""
+    if health_body=$(curl "${curl_args[@]}" "$health_url" 2>/dev/null); then
+      if printf '%s' "$health_body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"(ok|ready)"'; then
+        REMOTE_HTTP_PROBE_DETAIL="healthy via ${health_url}"
+        return 0
+      fi
+      REMOTE_HTTP_PROBE_DETAIL="unexpected health payload from ${health_url}"
+    else
+      REMOTE_HTTP_PROBE_DETAIL="could not reach ${health_url}"
+    fi
+  done
+
+  return 1
+}
+
+wait_for_remote_http_endpoint() {
+  local max_attempts="${1:-20}"
+  local attempt=1
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    if probe_remote_http_endpoint; then
+      return 0
+    fi
+    sleep 0.5
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
+ensure_remote_http_client_readiness() {
+  if ! has_remote_http_client_targets; then
+    verbose "remote_http_readiness:skip reason=no_codex_targets"
+    return 0
+  fi
+
+  local desired_url
+  desired_url="$(desired_mcp_http_url)"
+  info "Verifying local MCP HTTP endpoint for remote clients"
+
+  if probe_remote_http_endpoint; then
+    ok "Remote MCP endpoint ready at ${desired_url}"
+    verbose "remote_http_readiness:healthy detail=${REMOTE_HTTP_PROBE_DETAIL}"
+    return 0
+  fi
+
+  warn "Remote MCP endpoint is not healthy at ${desired_url}"
+  [ -n "${REMOTE_HTTP_PROBE_DETAIL:-}" ] && warn "  Probe detail: ${REMOTE_HTTP_PROBE_DETAIL}"
+
+  if ! platform_supports_user_service_management; then
+    warn "Automatic background service setup is not supported on this platform."
+    warn "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+    return 0
+  fi
+
+  if ! "$DEST/$BIN_CLI" service install --help >/dev/null 2>&1; then
+    warn "This build does not expose 'am service install'; skipping automatic background startup."
+    warn "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+    return 0
+  fi
+
+  info "Installing or restarting the background Agent Mail HTTP service"
+  local service_output=""
+  if service_output=$("$DEST/$BIN_CLI" service install --host "$(desired_service_bind_host)" --port "$(desired_service_bind_port)" 2>&1); then
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "remote_http_readiness:service ${line}"
+    done <<< "$service_output"
+  else
+    warn "Automatic background service setup failed."
+    if [ -n "$service_output" ]; then
+      while IFS= read -r line; do
+        [ -n "$line" ] && warn "  ${line}"
+      done <<< "$service_output"
+    fi
+    warn "You can still start a local HTTP server manually with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+    return 0
+  fi
+
+  if wait_for_remote_http_endpoint 20; then
+    ok "Background Agent Mail HTTP service is ready for remote clients"
+    verbose "remote_http_readiness:service_ready detail=${REMOTE_HTTP_PROBE_DETAIL}"
+    return 0
+  fi
+
+  warn "Background service was installed, but the MCP HTTP endpoint is still not healthy."
+  if service_output=$("$DEST/$BIN_CLI" service status 2>&1); then
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "remote_http_readiness:status ${line}"
+    done <<< "$service_output"
+  fi
+  warn "Open service diagnostics with: ${DEST}/${BIN_CLI} service status"
+  warn "Or start a foreground server manually with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+  return 0
 }
 
 resolve_setup_http_bearer_token() {
@@ -3094,7 +3284,20 @@ print_install_plan() {
     echo ""
   fi
 
-  # Section 5: Verification
+  # Section 5: Remote HTTP readiness for Codex/other HTTP MCP clients
+  if has_remote_http_client_targets; then
+    echo -e "\033[${section_color}m[Remote HTTP]\033[0m"
+    echo "  Connect URL: $(desired_mcp_http_url)"
+    echo "  Will verify the local MCP HTTP endpoint after install"
+    if platform_supports_user_service_management; then
+      echo "  If needed, will install/start a background per-user service automatically"
+    else
+      echo "  Automatic background service management is not supported on this platform"
+    fi
+    echo ""
+  fi
+
+  # Section 6: Verification
   if [ "$VERIFY" -eq 1 ]; then
     echo -e "\033[${section_color}m[Post-install]\033[0m"
     echo "  Will run verification checks after installation"
@@ -3929,6 +4132,8 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   fi
 fi
 
+ensure_remote_http_client_readiness
+
 # T2.4: Post-install verification
 verify_installation() {
   local issues=0
@@ -4047,7 +4252,18 @@ verify_installation() {
     fi
   fi
 
-  # 6. Summary
+  # 6. If remote HTTP MCP clients were configured, verify the local endpoint is healthy.
+  if has_remote_http_client_targets; then
+    if probe_remote_http_endpoint; then
+      ok "VERIFY: remote MCP endpoint ready at $(desired_mcp_http_url)"
+    else
+      warn "VERIFY: remote MCP endpoint is not healthy at $(desired_mcp_http_url)"
+      [ -n "${REMOTE_HTTP_PROBE_DETAIL:-}" ] && warn "  Probe detail: ${REMOTE_HTTP_PROBE_DETAIL}"
+      issues=$((issues + 1))
+    fi
+  fi
+
+  # 7. Summary
   if [ "$issues" -gt 0 ]; then
     warn "Verification found $issues issue(s). See warnings above."
   else

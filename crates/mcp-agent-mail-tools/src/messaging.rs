@@ -455,12 +455,59 @@ fn is_valid_thread_id(tid: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
-/// Validate an explicit `thread_id` passed to `send_message`.
-///
-/// We allow both alphanumeric slugs and bare numeric IDs (which often refer
-/// to root message IDs from reply-seeded threads).
-fn is_valid_explicit_thread_id(tid: &str) -> bool {
-    is_valid_thread_id(tid)
+fn is_bare_numeric_thread_id(tid: &str) -> bool {
+    !tid.is_empty() && tid.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn invalid_thread_id_error(tid: &str, reason: &str) -> McpError {
+    legacy_tool_error(
+        "INVALID_THREAD_ID",
+        format!(
+            "Invalid thread_id: '{tid}'. {reason} \
+             Examples: 'TKT-123', 'bd-42', 'feature-xyz'."
+        ),
+        true,
+        json!({
+            "provided": tid,
+            "examples": ["TKT-123", "bd-42", "feature-xyz"],
+            "reason": reason,
+        }),
+    )
+}
+
+async fn validate_explicit_thread_id_for_send(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    thread_id: &str,
+) -> McpResult<()> {
+    if !is_valid_thread_id(thread_id) {
+        return Err(invalid_thread_id_error(
+            thread_id,
+            "Thread IDs must start with an alphanumeric character and contain only letters, numbers, '.', '_', or '-' (max 128).",
+        ));
+    }
+
+    if !is_bare_numeric_thread_id(thread_id) {
+        return Ok(());
+    }
+
+    let existing_messages = db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_thread_messages(
+        ctx.cx(),
+        pool,
+        project_id,
+        thread_id,
+        Some(1),
+    )
+    .await)?;
+    if existing_messages.is_empty() {
+        return Err(invalid_thread_id_error(
+            thread_id,
+            "Bare numeric IDs are only valid when they refer to an existing reply-seeded thread in this project.",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Defense-in-depth sanitization for `thread_id` values derived from DB rows.
@@ -1288,7 +1335,7 @@ pub struct ReplyMessageResponse {
 /// - `convert_images`: Override image conversion (optional)
 /// - `importance`: Message importance: low, normal, high, urgent (default: normal)
 /// - `ack_required`: Request acknowledgement (default: false)
-/// - `thread_id`: Associate with existing thread (optional; bare numerics are reserved)
+/// - `thread_id`: Associate with existing thread (optional; bare numerics must already exist)
 /// - `topic`: Reserved for future topic tags; non-blank values are currently rejected
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
 #[allow(
@@ -1368,26 +1415,6 @@ pub async fn send_message(
         .filter(|t| !t.is_empty());
     reject_unsupported_topic_argument(topic.as_deref(), "send_message")?;
 
-    // Validate thread_id format if provided
-    if let Some(ref tid) = thread_id
-        && !is_valid_explicit_thread_id(tid)
-    {
-        return Err(legacy_tool_error(
-            "INVALID_THREAD_ID",
-            format!(
-                "Invalid thread_id: '{tid}'. Thread IDs must start with an alphanumeric character and \
-                     contain only letters, numbers, '.', '_', or '-' (max 128). \
-                     Bare numeric IDs are reserved for reply-seeded threads. \
-                     Examples: 'TKT-123', 'bd-42', 'feature-xyz'."
-            ),
-            true,
-            json!({
-                "provided": tid,
-                "examples": ["TKT-123", "bd-42", "feature-xyz"],
-            }),
-        ));
-    }
-
     let config = &Config::get();
 
     // ── Per-message size limits (subject/body) before any DB/archive work ──
@@ -1427,6 +1454,10 @@ effective_free_bytes={free}"
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let base_dir = Path::new(&project.human_key);
+
+    if let Some(ref tid) = thread_id {
+        validate_explicit_thread_id_for_send(ctx, &pool, project_id, tid).await?;
+    }
 
     // Validate attachment + total sizes with project-relative path resolution.
     validate_message_size_limits(
@@ -3098,6 +3129,64 @@ pub async fn acknowledge_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::{Cx, Outcome};
+    use fastmcp::prelude::McpContext;
+    use mcp_agent_mail_db::{AgentRow, DbPool, DbPoolConfig, ProjectRow, queries};
+
+    static MESSAGING_THREAD_ID_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_thread_validation_test<F, Fut>(db_name: &str, f: F)
+    where
+        F: FnOnce(Cx, DbPool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("messaging test tempdir");
+        let db_path = dir.path().join(db_name);
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite://{}", db_path.display()),
+            ..DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&cfg).expect("messaging test pool");
+        let cx = Cx::for_testing();
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(f(cx, pool));
+    }
+
+    async fn ensure_project_row(cx: &Cx, pool: &DbPool, human_key: &str) -> ProjectRow {
+        match queries::ensure_project(cx, pool, human_key).await {
+            Outcome::Ok(project) => project,
+            other => panic!("ensure_project({human_key}) failed: {other:?}"),
+        }
+    }
+
+    async fn register_agent_row(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        name: &str,
+    ) -> AgentRow {
+        match queries::register_agent(
+            cx,
+            pool,
+            project_id,
+            name,
+            "codex-cli",
+            "gpt-5",
+            Some("messaging thread-id test"),
+            None,
+        )
+        .await
+        {
+            Outcome::Ok(agent) => agent,
+            other => panic!("register_agent({name}) failed: {other:?}"),
+        }
+    }
 
     #[test]
     fn agent_unique_constraint_error_detection_matches_expected_sqlite_text() {
@@ -3705,13 +3794,67 @@ mod tests {
     }
 
     #[test]
-    fn explicit_thread_id_all_digits_rejected() {
-        assert!(!is_valid_explicit_thread_id("42"));
+    fn bare_numeric_thread_id_detected() {
+        assert!(is_bare_numeric_thread_id("42"));
+        assert!(!is_bare_numeric_thread_id("123-abc"));
     }
 
     #[test]
-    fn explicit_thread_id_numeric_prefix_with_suffix_allowed() {
-        assert!(is_valid_explicit_thread_id("123-abc"));
+    fn invalid_thread_id_error_mentions_examples() {
+        let err = invalid_thread_id_error("bad id", "reason text");
+        assert!(err.message.contains("reason text"));
+        assert!(err.message.contains("TKT-123"));
+    }
+
+    #[test]
+    fn validate_explicit_thread_id_for_send_allows_existing_numeric_thread() {
+        run_thread_validation_test("messaging_numeric_thread_exists.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/tmp/am-msg-thread-id-existing").await;
+            let project_id = project.id.expect("project id");
+            let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+            let recipient = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+            let message = match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "seed",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            };
+
+            let ctx = McpContext::new(cx.clone(), 1);
+            validate_explicit_thread_id_for_send(
+                &ctx,
+                &pool,
+                project_id,
+                &message.id.expect("message id").to_string(),
+            )
+            .await
+            .expect("existing numeric thread id should be allowed");
+        });
+    }
+
+    #[test]
+    fn validate_explicit_thread_id_for_send_rejects_unknown_numeric_thread() {
+        run_thread_validation_test("messaging_numeric_thread_missing.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/tmp/am-msg-thread-id-missing").await;
+            let project_id = project.id.expect("project id");
+            let ctx = McpContext::new(cx.clone(), 1);
+            let err = validate_explicit_thread_id_for_send(&ctx, &pool, project_id, "424242")
+                .await
+                .expect_err("unknown numeric thread id should be rejected");
+            assert!(err.message.contains("existing reply-seeded thread"));
+        });
     }
 
     // -----------------------------------------------------------------------

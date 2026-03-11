@@ -487,7 +487,7 @@ fn normalize_artifact_path(path: &std::path::Path, base: &std::path::Path) -> St
     path.strip_prefix(base)
         .unwrap_or(path)
         .to_string_lossy()
-        .to_string()
+        .replace('\\', "/")
 }
 
 fn resolve_expected_artifacts(
@@ -499,8 +499,17 @@ fn resolve_expected_artifacts(
 
     for pattern in expected_artifacts {
         if has_glob_tokens(pattern) {
-            let abs_pattern = working_dir.join(pattern);
-            let abs_pattern = abs_pattern.to_string_lossy().to_string();
+            let base_str = working_dir.to_string_lossy().replace('\\', "/");
+            let base_escaped = glob::Pattern::escape(&base_str);
+            // Replace any internal backslashes in the pattern as well (e.g. if the user provided them)
+            let pattern_normalized = pattern.replace('\\', "/");
+
+            let abs_pattern = if base_str.ends_with('/') {
+                format!("{base_escaped}{pattern_normalized}")
+            } else {
+                format!("{base_escaped}/{pattern_normalized}")
+            };
+
             let mut matched = false;
 
             if let Ok(paths) = glob::glob(&abs_pattern) {

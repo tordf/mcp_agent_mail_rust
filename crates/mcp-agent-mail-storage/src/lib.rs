@@ -1914,153 +1914,123 @@ fn coalescer_pool_worker(
         }
 
         // Phase 2: Pick a repo via LRS (least-recently-serviced) scheduling
-        let chosen: Option<(PathBuf, Arc<RepoQueue>)> = {
-            let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
-            let mut best: Option<(PathBuf, Arc<RepoQueue>, u64)> = None;
-            for (path, rq) in repos_guard.iter() {
-                let depth = rq.depth.load(Ordering::Relaxed);
-                if depth == 0 {
-                    continue;
-                }
-                // Skip repos already being processed by another worker
-                if rq.processing.load(Ordering::Relaxed) {
-                    continue;
-                }
-                let serviced = rq.last_serviced_us.load(Ordering::Relaxed);
-                if best
-                    .as_ref()
-                    .is_none_or(|(_, _, best_ts)| serviced < *best_ts)
-                {
-                    best = Some((path.clone(), Arc::clone(rq), serviced));
-                }
-            }
-            best.map(|(p, rq, _)| (p, rq))
-        };
-
-        let Some((repo_root, rq)) = chosen else {
-            continue;
-        };
-
-        // CAS: claim exclusive processing of this repo
-        if rq
-            .processing
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // Another worker beat us to it; try again
-            continue;
-        }
-
-        // RAII guard to ensure processing flag is cleared even on panic
-        struct ProcessingGuard<'a> {
-            rq: &'a Arc<RepoQueue>,
-        }
-        impl<'a> Drop for ProcessingGuard<'a> {
-            fn drop(&mut self) {
-                self.rq.processing.store(false, Ordering::Release);
-            }
-        }
-        let _guard = ProcessingGuard { rq: &rq };
-
-        // Phase 3: Drain queue + spill for this repo
-        let mut batch: Vec<CoalescerCommitFields> = Vec::new();
-        {
-            let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
-            while batch.len() < COALESCER_MAX_BATCH_SIZE {
-                let next = q.front();
-                if let Some(next_fields) = next {
-                    if let Some(first) = batch.first()
-                        && (next_fields.git_author_name != first.git_author_name
-                            || next_fields.git_author_email != first.git_author_email)
-                    {
-                        break;
+        loop {
+            let chosen: Option<(PathBuf, Arc<RepoQueue>)> = {
+                let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
+                let mut best: Option<(PathBuf, Arc<RepoQueue>, u64)> = None;
+                for (path, rq) in repos_guard.iter() {
+                    let depth = rq.depth.load(Ordering::Relaxed);
+                    if depth == 0 {
+                        continue;
                     }
-                    batch.push(q.pop_front().unwrap_or_else(|| unreachable!()));
-                } else {
+                    // Skip repos already being processed by another worker
+                    if rq.processing.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let serviced = rq.last_serviced_us.load(Ordering::Relaxed);
+                    if best
+                        .as_ref()
+                        .is_none_or(|(_, _, best_ts)| serviced < *best_ts)
+                    {
+                        best = Some((path.clone(), Arc::clone(rq), serviced));
+                    }
+                }
+                best.map(|(p, rq, _)| (p, rq))
+            };
+
+            let Some((repo_root, rq)) = chosen else {
+                break; // No more work available; go back to Phase 1
+            };
+
+            // CAS: claim exclusive processing of this repo
+            if rq
+                .processing
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                // Another worker beat us to it; try again immediately
+                continue;
+            }
+
+            // Successfully claimed repo.
+            self_process_repo(
+                &repo_root,
+                &rq,
+                &stats,
+                &batch_sizes,
+                &pending_requests,
+                worker_count,
+                &repos,
+                &work_cv,
+            );
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn self_process_repo(
+    repo_root: &Path,
+    rq: &Arc<RepoQueue>,
+    stats: &Arc<Mutex<CommitQueueStats>>,
+    batch_sizes: &Arc<Mutex<VecDeque<usize>>>,
+    pending_requests: &Arc<AtomicU64>,
+    worker_count: usize,
+    repos: &Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
+    work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>,
+) {
+    // RAII guard to ensure processing flag is cleared even on panic
+    struct ProcessingGuard<'a> {
+        rq: &'a Arc<RepoQueue>,
+    }
+    impl<'a> Drop for ProcessingGuard<'a> {
+        fn drop(&mut self) {
+            self.rq.processing.store(false, Ordering::Release);
+        }
+    }
+    let _guard = ProcessingGuard { rq };
+
+    // Phase 3: Drain queue + spill for this repo
+    let mut batch: Vec<CoalescerCommitFields> = Vec::new();
+    {
+        let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while batch.len() < COALESCER_MAX_BATCH_SIZE {
+            let next = q.front();
+            if let Some(next_fields) = next {
+                if let Some(first) = batch.first()
+                    && (next_fields.git_author_name != first.git_author_name
+                        || next_fields.git_author_email != first.git_author_email)
+                {
                     break;
                 }
-            }
-            if !batch.is_empty() {
-                rq.depth.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+                batch.push(q.pop_front().unwrap_or_else(|| unreachable!()));
+            } else {
+                break;
             }
         }
-
-        // Drain spill if we have room
-        let spilled_work = coalescer_drain_repo_spill(&rq, &repo_root);
-
-        let drained_count =
-            batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
-
-        if drained_count == 0 {
-            // Defensive self-heal: if depth and queue contents diverge, reconcile
-            // once here to avoid repeatedly selecting an empty repo.
-            let _ = coalescer_reconcile_repo_depth(&rq);
-        }
-
-        // Phase 4: Commit
         if !batch.is_empty() {
-            for chunk in batch.chunks(COALESCER_MAX_BATCH_SIZE) {
-                let outcome = coalescer_commit_batch(&repo_root, chunk, &stats, &batch_sizes);
-                let failed_requests = outcome.failed_requests;
-
-                let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
-                let metrics = mcp_agent_mail_core::global_metrics();
-                if outcome.committed_requests > 0 {
-                    metrics
-                        .storage
-                        .commit_drained_total
-                        .add(outcome.committed_requests);
-                    rq.metrics
-                        .drained_total
-                        .fetch_add(outcome.committed_requests, Ordering::Relaxed);
-                }
-                if outcome.committed_commits > 0 {
-                    rq.metrics
-                        .commits_total
-                        .fetch_add(outcome.committed_commits, Ordering::Relaxed);
-                }
-                if !failed_requests.is_empty() {
-                    rq.metrics.errors_total.fetch_add(
-                        u64::try_from(failed_requests.len()).unwrap_or(u64::MAX),
-                        Ordering::Relaxed,
-                    );
-                }
-
-                if outcome.committed_requests == chunk_len {
-                    for req in chunk {
-                        let latency_us = u64::try_from(
-                            req.enqueued_at
-                                .elapsed()
-                                .as_micros()
-                                .min(u128::from(u64::MAX)),
-                        )
-                        .unwrap_or(u64::MAX);
-                        metrics.storage.commit_queue_latency_us.record(latency_us);
-                        rq.metrics
-                            .commit_latency_us_sum
-                            .fetch_add(latency_us, Ordering::Relaxed);
-                        rq.metrics
-                            .commit_latency_us_count
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                if outcome.committed_requests > 0 {
-                    coalescer_update_pending(&pending_requests, outcome.committed_requests);
-                }
-                if !failed_requests.is_empty() {
-                    coalescer_requeue_requests(&rq, failed_requests);
-                }
-            }
+            rq.depth.fetch_sub(batch.len() as u64, Ordering::Relaxed);
         }
+    }
 
-        if let Some(work) = &spilled_work {
-            let outcome = coalescer_commit_spilled_work(work, &stats, &batch_sizes);
-            if let Some(failed_work) = outcome.failed_work {
-                rq.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                coalescer_restore_spilled_work(&rq, failed_work);
-            }
+    // Drain spill if we have room
+    let spilled_work = coalescer_drain_repo_spill(rq, repo_root);
 
+    let drained_count = batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
+
+    if drained_count == 0 {
+        // Defensive self-heal: if depth and queue contents diverge, reconcile
+        // once here to avoid repeatedly selecting an empty repo.
+        let _ = coalescer_reconcile_repo_depth(rq);
+    }
+
+    // Phase 4: Commit
+    if !batch.is_empty() {
+        for chunk in batch.chunks(COALESCER_MAX_BATCH_SIZE) {
+            let outcome = coalescer_commit_batch(repo_root, chunk, stats, batch_sizes);
+            let failed_requests = outcome.failed_requests;
+
+            let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
             let metrics = mcp_agent_mail_core::global_metrics();
             if outcome.committed_requests > 0 {
                 metrics
@@ -2070,50 +2040,105 @@ fn coalescer_pool_worker(
                 rq.metrics
                     .drained_total
                     .fetch_add(outcome.committed_requests, Ordering::Relaxed);
-
-                let latency_us = u64::try_from(
-                    work.earliest_enqueued_at
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX)),
-                )
-                .unwrap_or(u64::MAX);
-                metrics.storage.commit_queue_latency_us.record(latency_us);
-                rq.metrics
-                    .commit_latency_us_sum
-                    .fetch_add(latency_us, Ordering::Relaxed);
-                rq.metrics
-                    .commit_latency_us_count
-                    .fetch_add(1, Ordering::Relaxed);
-
-                coalescer_update_pending(&pending_requests, outcome.committed_requests);
             }
             if outcome.committed_commits > 0 {
                 rq.metrics
                     .commits_total
                     .fetch_add(outcome.committed_commits, Ordering::Relaxed);
             }
-        }
-
-        // Release processing lock (via guard drop) + update last_serviced timestamp
-        rq.last_serviced_us
-            .store(now_micros_u64(), Ordering::Relaxed);
-
-        // If any repo still has work, wake another worker
-        let more_work = {
-            let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
-            repos_guard
-                .values()
-                .any(|r| r.depth.load(Ordering::Relaxed) > 0)
-        };
-        if more_work {
-            let (lock, cvar) = &*work_cv;
-            {
-                let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
-                *wake_tokens = wake_tokens.saturating_add(1).min(worker_count as u64);
+            if !failed_requests.is_empty() {
+                rq.metrics.errors_total.fetch_add(
+                    u64::try_from(failed_requests.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
             }
-            cvar.notify_one();
+
+            if outcome.committed_requests == chunk_len {
+                for req in chunk {
+                    let latency_us = u64::try_from(
+                        req.enqueued_at
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX)),
+                    )
+                    .unwrap_or(u64::MAX);
+                    metrics.storage.commit_queue_latency_us.record(latency_us);
+                    rq.metrics
+                        .commit_latency_us_sum
+                        .fetch_add(latency_us, Ordering::Relaxed);
+                    rq.metrics
+                        .commit_latency_us_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            if outcome.committed_requests > 0 {
+                coalescer_update_pending(pending_requests, outcome.committed_requests);
+            }
+            if !failed_requests.is_empty() {
+                coalescer_requeue_requests(rq, failed_requests);
+            }
         }
+    }
+
+    if let Some(work) = &spilled_work {
+        let outcome = coalescer_commit_spilled_work(work, stats, batch_sizes);
+        if let Some(failed_work) = outcome.failed_work {
+            rq.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            coalescer_restore_spilled_work(rq, failed_work);
+        }
+
+        let metrics = mcp_agent_mail_core::global_metrics();
+        if outcome.committed_requests > 0 {
+            metrics
+                .storage
+                .commit_drained_total
+                .add(outcome.committed_requests);
+            rq.metrics
+                .drained_total
+                .fetch_add(outcome.committed_requests, Ordering::Relaxed);
+
+            let latency_us = u64::try_from(
+                work.earliest_enqueued_at
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)),
+            )
+            .unwrap_or(u64::MAX);
+            metrics.storage.commit_queue_latency_us.record(latency_us);
+            rq.metrics
+                .commit_latency_us_sum
+                .fetch_add(latency_us, Ordering::Relaxed);
+            rq.metrics
+                .commit_latency_us_count
+                .fetch_add(1, Ordering::Relaxed);
+
+            coalescer_update_pending(pending_requests, outcome.committed_requests);
+        }
+        if outcome.committed_commits > 0 {
+            rq.metrics
+                .commits_total
+                .fetch_add(outcome.committed_commits, Ordering::Relaxed);
+        }
+    }
+
+    // Release processing lock (via guard drop) + update last_serviced timestamp
+    rq.last_serviced_us.store(now_micros_u64(), Ordering::Relaxed);
+
+    // If any repo still has work, wake another worker
+    let more_work = {
+        let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
+        repos_guard
+            .values()
+            .any(|r| r.depth.load(Ordering::Relaxed) > 0)
+    };
+    if more_work {
+        let (lock, cvar) = &**work_cv;
+        {
+            let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *wake_tokens = wake_tokens.saturating_add(1).min(worker_count as u64);
+        }
+        cvar.notify_one();
     }
 }
 

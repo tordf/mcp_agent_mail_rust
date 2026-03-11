@@ -930,7 +930,7 @@ pub fn setup_mcp_config_file(
 pub fn preferred_config_path(tool: McpConfigTool, home: &Path) -> PathBuf {
     match tool {
         McpConfigTool::Claude => home.join(".claude").join("settings.json"),
-        McpConfigTool::Codex => home.join(".codex").join("config.json"),
+        McpConfigTool::Codex => home.join(".codex").join("config.toml"),
         McpConfigTool::Cursor => home.join(".cursor").join("mcp.json"),
         McpConfigTool::Gemini => home.join(".gemini").join("settings.json"),
         McpConfigTool::GithubCopilot => home
@@ -1645,6 +1645,10 @@ mod tests {
         assert_eq!(
             preferred_config_path(McpConfigTool::Claude, home),
             PathBuf::from("/home/user/.claude/settings.json")
+        );
+        assert_eq!(
+            preferred_config_path(McpConfigTool::Codex, home),
+            PathBuf::from("/home/user/.codex/config.toml")
         );
         assert_eq!(
             preferred_config_path(McpConfigTool::Cursor, home),
