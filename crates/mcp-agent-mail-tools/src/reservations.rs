@@ -1072,6 +1072,21 @@ pub async fn force_release_file_reservation(
         ));
     }
 
+    // Double-check: if we are force-releasing because of expiry only,
+    // ensure we don't accidentally release a reservation that was JUST renewed
+    // by another agent while we were calculating heuristics.
+    if is_expired {
+        let current_now = mcp_agent_mail_db::now_micros();
+        if reservation.expires_ts > current_now {
+             return Err(legacy_tool_error(
+                "CONFLICT",
+                "Reservation was renewed by another agent while heuristics were being calculated.",
+                true,
+                json!({ "file_reservation_id": file_reservation_id }),
+            ));
+        }
+    }
+
     // Actually release the reservation in DB
     let released_count = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::force_release_reservation(ctx.cx(), &pool, file_reservation_id)

@@ -589,26 +589,29 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
     })?;
 
     // Write JSON to stdin; propagate write failures explicitly.
-    let Some(mut stdin) = child.stdin.take() else {
+    let mut stdin = child.stdin.take().ok_or_else(|| {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(EncoderError::OsError(
-            "TOON encoder stdin unavailable".to_string(),
-        ));
-    };
-    if let Err(e) = stdin.write_all(json_payload.as_bytes()) {
-        // Ensure subprocess is not left running if stdin write fails early.
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(EncoderError::OsError(format!(
-            "TOON encoder stdin write failed: {e}"
-        )));
-    }
-    drop(stdin);
+        EncoderError::OsError("TOON encoder stdin unavailable".to_string())
+    })?;
+
+    let json_payload_owned = json_payload.to_string();
+    let stdin_thread = std::thread::spawn(move || {
+        stdin.write_all(json_payload_owned.as_bytes())
+    });
 
     let output = child
         .wait_with_output()
         .map_err(|e| EncoderError::OsError(format!("TOON encoder failed: {e}")))?;
+
+    // Join stdin thread to catch write errors
+    if let Err(e) = stdin_thread.join().unwrap_or_else(|_| {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "stdin writer thread panicked"))
+    }) {
+        return Err(EncoderError::OsError(format!(
+            "TOON encoder stdin write failed: {e}"
+        )));
+    }
 
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);

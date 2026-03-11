@@ -2760,36 +2760,7 @@ pub fn flush_async_commits() {
 // ---------------------------------------------------------------------------
 
 /// Determine the commit lock path based on project-scoped rel_paths.
-pub fn commit_lock_path(repo_root: &Path, rel_paths: &[&str]) -> PathBuf {
-    if rel_paths.is_empty() {
-        return repo_root.join(".commit.lock");
-    }
-
-    // Check if all paths are under the same project
-    let mut project_slug: Option<&str> = None;
-    let mut same_project = true;
-
-    for rel_path in rel_paths {
-        let parts: Vec<&str> = rel_path.split('/').collect();
-        if parts.len() < 2 || parts[0] != "projects" {
-            same_project = false;
-            break;
-        }
-        let slug = parts[1];
-        match project_slug {
-            None => project_slug = Some(slug),
-            Some(prev) if prev != slug => {
-                same_project = false;
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    if same_project && let Some(slug) = project_slug {
-        return repo_root.join("projects").join(slug).join(".commit.lock");
-    }
-
+pub fn commit_lock_path(repo_root: &Path, _rel_paths: &[&str]) -> PathBuf {
     repo_root.join(".commit.lock")
 }
 
