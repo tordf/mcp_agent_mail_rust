@@ -492,15 +492,20 @@ async fn validate_explicit_thread_id_for_send(
         return Ok(());
     }
 
-    let existing_messages = db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_thread_messages(
-        ctx.cx(),
-        pool,
-        project_id,
-        thread_id,
-        Some(1),
-    )
-    .await)?;
-    if existing_messages.is_empty() {
+    let existing_messages = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_thread_messages(
+            ctx.cx(),
+            pool,
+            project_id,
+            thread_id,
+            Some(1),
+        )
+        .await,
+    )?;
+    let has_exact_thread = existing_messages
+        .iter()
+        .any(|row| row.thread_id.as_deref() == Some(thread_id));
+    if !has_exact_thread {
         return Err(invalid_thread_id_error(
             thread_id,
             "Bare numeric IDs are only valid when they refer to an existing reply-seeded thread in this project.",
@@ -1268,9 +1273,11 @@ pub struct InboxMessage {
     pub importance: String,
     pub ack_required: bool,
     pub from: String,
+    #[serde(default, skip_serializing)]
     pub to: Vec<String>,
+    #[serde(default, skip_serializing)]
     pub cc: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub bcc: Vec<String>,
     pub created_ts: Option<String>,
     pub kind: String,
@@ -3165,12 +3172,7 @@ mod tests {
         }
     }
 
-    async fn register_agent_row(
-        cx: &Cx,
-        pool: &DbPool,
-        project_id: i64,
-        name: &str,
-    ) -> AgentRow {
+    async fn register_agent_row(cx: &Cx, pool: &DbPool, project_id: i64, name: &str) -> AgentRow {
         match queries::register_agent(
             cx,
             pool,
@@ -3808,12 +3810,84 @@ mod tests {
 
     #[test]
     fn validate_explicit_thread_id_for_send_allows_existing_numeric_thread() {
-        run_thread_validation_test("messaging_numeric_thread_exists.db", |cx, pool| async move {
-            let project = ensure_project_row(&cx, &pool, "/tmp/am-msg-thread-id-existing").await;
+        run_thread_validation_test(
+            "messaging_numeric_thread_exists.db",
+            |cx, pool| async move {
+                let project =
+                    ensure_project_row(&cx, &pool, "/tmp/am-msg-thread-id-existing").await;
+                let project_id = project.id.expect("project id");
+                let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+                let root_message = match queries::create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.expect("sender id"),
+                    "seed",
+                    "body",
+                    None,
+                    "normal",
+                    false,
+                    "[]",
+                    &[(recipient.id.expect("recipient id"), "to")],
+                )
+                .await
+                {
+                    Outcome::Ok(message) => message,
+                    other => panic!("create_message_with_recipients failed: {other:?}"),
+                };
+                let numeric_thread_id = root_message.id.expect("message id").to_string();
+                match queries::create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.expect("sender id"),
+                    "reply",
+                    "body",
+                    Some(&numeric_thread_id),
+                    "normal",
+                    false,
+                    "[]",
+                    &[(recipient.id.expect("recipient id"), "to")],
+                )
+                .await
+                {
+                    Outcome::Ok(_) => {}
+                    other => panic!("create_message_with_recipients reply failed: {other:?}"),
+                }
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                validate_explicit_thread_id_for_send(&ctx, &pool, project_id, &numeric_thread_id)
+                    .await
+                    .expect("existing numeric thread id should be allowed");
+            },
+        );
+    }
+
+    #[test]
+    fn validate_explicit_thread_id_for_send_rejects_unknown_numeric_thread() {
+        run_thread_validation_test(
+            "messaging_numeric_thread_missing.db",
+            |cx, pool| async move {
+                let project = ensure_project_row(&cx, &pool, "/tmp/am-msg-thread-id-missing").await;
+                let project_id = project.id.expect("project id");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let err = validate_explicit_thread_id_for_send(&ctx, &pool, project_id, "424242")
+                    .await
+                    .expect_err("unknown numeric thread id should be rejected");
+                assert!(err.message.contains("existing reply-seeded thread"));
+            },
+        );
+    }
+
+    #[test]
+    fn validate_explicit_thread_id_for_send_rejects_root_message_without_reply_seed() {
+        run_thread_validation_test("messaging_numeric_root_only.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/tmp/am-msg-thread-id-root-only").await;
             let project_id = project.id.expect("project id");
             let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
             let recipient = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
-            let message = match queries::create_message_with_recipients(
+            let root_message = match queries::create_message_with_recipients(
                 &cx,
                 &pool,
                 project_id,
@@ -3833,26 +3907,74 @@ mod tests {
             };
 
             let ctx = McpContext::new(cx.clone(), 1);
-            validate_explicit_thread_id_for_send(
+            let err = validate_explicit_thread_id_for_send(
                 &ctx,
                 &pool,
                 project_id,
-                &message.id.expect("message id").to_string(),
+                &root_message.id.expect("message id").to_string(),
             )
             .await
-            .expect("existing numeric thread id should be allowed");
+            .expect_err("root message id without replies should be rejected");
+            assert!(err.message.contains("existing reply-seeded thread"));
         });
     }
 
     #[test]
-    fn validate_explicit_thread_id_for_send_rejects_unknown_numeric_thread() {
-        run_thread_validation_test("messaging_numeric_thread_missing.db", |cx, pool| async move {
-            let project = ensure_project_row(&cx, &pool, "/tmp/am-msg-thread-id-missing").await;
+    fn validate_explicit_thread_id_for_send_rejects_leading_zero_numeric_variant() {
+        run_thread_validation_test("messaging_numeric_leading_zero.db", |cx, pool| async move {
+            let project =
+                ensure_project_row(&cx, &pool, "/tmp/am-msg-thread-id-leading-zero").await;
             let project_id = project.id.expect("project id");
+            let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+            let recipient = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+            let root_message = match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "seed",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            };
+            let numeric_thread_id = root_message.id.expect("message id").to_string();
+            match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "reply",
+                "body",
+                Some(&numeric_thread_id),
+                "normal",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            {
+                Outcome::Ok(_) => {}
+                other => panic!("create_message_with_recipients reply failed: {other:?}"),
+            }
+
             let ctx = McpContext::new(cx.clone(), 1);
-            let err = validate_explicit_thread_id_for_send(&ctx, &pool, project_id, "424242")
-                .await
-                .expect_err("unknown numeric thread id should be rejected");
+            let leading_zero_thread_id = format!("0{numeric_thread_id}");
+            let err = validate_explicit_thread_id_for_send(
+                &ctx,
+                &pool,
+                project_id,
+                &leading_zero_thread_id,
+            )
+            .await
+            .expect_err("leading-zero numeric variant should be rejected");
             assert!(err.message.contains("existing reply-seeded thread"));
         });
     }
@@ -4061,7 +4183,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_message_deserializes_missing_bcc_as_empty() {
+    fn inbox_message_deserializes_missing_recipient_lists_as_empty() {
         let json = json!({
             "id": 1,
             "project_id": 1,
@@ -4071,15 +4193,42 @@ mod tests {
             "importance": "normal",
             "ack_required": false,
             "from": "BlueLake",
-            "to": ["RedFox"],
-            "cc": [],
             "created_ts": "2026-02-06T00:00:00Z",
             "kind": "to",
             "attachments": [],
         });
 
         let parsed: InboxMessage = serde_json::from_value(json).expect("deserialize inbox message");
+        assert!(parsed.to.is_empty());
+        assert!(parsed.cc.is_empty());
         assert!(parsed.bcc.is_empty());
+    }
+
+    #[test]
+    fn inbox_message_omits_recipient_lists_when_serialized() {
+        let r = InboxMessage {
+            id: 1,
+            project_id: 1,
+            sender_id: 1,
+            thread_id: Some("thread-1".into()),
+            subject: "test".into(),
+            importance: "normal".into(),
+            ack_required: false,
+            from: "BlueLake".into(),
+            to: vec!["RedFox".into()],
+            cc: vec!["GoldHawk".into()],
+            bcc: vec!["SilverPeak".into()],
+            created_ts: Some("2026-02-06T00:00:00Z".into()),
+            kind: "to".into(),
+            attachments: vec![],
+            body_md: None,
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(json.get("to").is_none());
+        assert!(json.get("cc").is_none());
+        assert!(json.get("bcc").is_none());
     }
 
     #[test]

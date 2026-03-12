@@ -82,13 +82,39 @@ impl AsyncCliContext {
     pub fn server_url(&self) -> String {
         format!(
             "http://{}:{}{}",
-            self.config.http_host, self.config.http_port, self.config.http_path
+            normalize_client_connect_host(&self.config.http_host),
+            self.config.http_port,
+            self.config.http_path
         )
     }
 
     /// Get the bearer token from config (if set).
     pub fn bearer(&self) -> Option<&str> {
         self.config.http_bearer_token.as_deref()
+    }
+}
+
+fn normalize_client_connect_host(host: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return std::borrow::Cow::Borrowed("127.0.0.1");
+    }
+
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed);
+
+    match unbracketed {
+        "0.0.0.0" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        "::" => std::borrow::Cow::Borrowed("[::1]"),
+        _ => {
+            if unbracketed.contains(':') && !trimmed.starts_with('[') {
+                std::borrow::Cow::Owned(format!("[{unbracketed}]"))
+            } else {
+                std::borrow::Cow::Borrowed(trimmed)
+            }
+        }
     }
 }
 
@@ -349,6 +375,17 @@ mod tests {
         assert!(result.contains("2024-02-08"), "expected date in {result}");
         // Should NOT contain seconds or timezone
         assert!(!result.contains('+'), "should not have tz offset: {result}");
+    }
+
+    #[test]
+    fn normalize_client_connect_host_maps_wildcards_and_ipv6() {
+        assert_eq!(normalize_client_connect_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(normalize_client_connect_host("::"), "[::1]");
+        assert_eq!(
+            normalize_client_connect_host("2001:db8::42"),
+            "[2001:db8::42]"
+        );
+        assert_eq!(normalize_client_connect_host("[::1]"), "[::1]");
     }
 
     // ── format_duration ─────────────────────────────────────────────────

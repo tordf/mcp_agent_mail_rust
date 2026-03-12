@@ -2347,7 +2347,8 @@ fn select_killable_agent_mail_pids(
     } else if matches!(
         status,
         mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer
-    ) {
+    ) && listener_pids.len() == 1
+    {
         listener_pids
     } else {
         Vec::new()
@@ -2513,6 +2514,14 @@ mod port_kill_tests {
         assert_eq!(
             select_killable_agent_mail_pids(&PortStatus::AgentMailServer, vec![], vec![22]),
             vec![22]
+        );
+    }
+
+    #[test]
+    fn select_killable_agent_mail_pids_rejects_ambiguous_unsigned_listener_sets() {
+        assert!(
+            select_killable_agent_mail_pids(&PortStatus::AgentMailServer, vec![], vec![22, 33])
+                .is_empty()
         );
     }
 
@@ -4010,6 +4019,32 @@ fn sqlite_conn_is_healthy(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     })
 }
 
+const SQLITE_BASE_INIT_TABLES: [&str; 5] = [
+    "projects",
+    "agents",
+    "messages",
+    "message_recipients",
+    "file_reservations",
+];
+
+fn sqlite_conn_requires_canonical_init(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+    let rows = conn
+        .query_sync(
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' \
+               AND name IN ('projects', 'agents', 'messages', 'message_recipients', 'file_reservations')",
+            &[],
+        )
+        .map_err(|e| CliError::Other(format!("sqlite_master probe failed: {e}")))?;
+    let existing: std::collections::HashSet<String> = rows
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .collect();
+    Ok(SQLITE_BASE_INIT_TABLES
+        .iter()
+        .any(|table| !existing.contains(*table)))
+}
+
 fn sqlite_conn_quick_check_ok_canonical(
     conn: &sqlmodel_sqlite::SqliteConnection,
 ) -> CliResult<bool> {
@@ -4687,42 +4722,55 @@ pub(crate) fn open_db_sync_with_database_url(
         ensure_sqlite_parent_dir(Path::new(&path))?;
     }
     let (mut conn, mut opened_path) = open_sqlite_with_fallback(&path)?;
-    if opened_path != ":memory:" && !sqlite_conn_is_healthy(&conn)? {
-        // If a malformed relative path shadows a healthy absolute DB, prefer that absolute file
-        // before mutating/quarantining the relative artifact.
-        if let Some(absolute_path) = sqlite_absolute_candidate_path(&opened_path)
-            && absolute_path != opened_path
-            && let Ok(fallback_conn) = mcp_agent_mail_db::DbConn::open_file(&absolute_path)
-            && sqlite_conn_is_healthy(&fallback_conn)?
-        {
-            conn = fallback_conn;
-            opened_path = absolute_path;
-        }
-
-        if !sqlite_conn_is_healthy(&conn)? {
-            drop(conn);
-            recover_sqlite_file(Path::new(&opened_path))?;
-            conn = mcp_agent_mail_db::DbConn::open_file(&opened_path)
-                .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
-        }
-    }
-
-    // For file-backed DBs, run base schema init via canonical sqlite first.
-    // This avoids known malformed-index issues observed on legacy fixtures when
-    // applying broad schema DDL through the Franken connection path.
+    let mut needs_canonical_init = false;
     if opened_path != ":memory:" {
-        drop(conn);
-        if let Err(init_error) = init_schema_sqlite_canonical(&opened_path) {
-            let init_error_text = init_error.to_string();
-            if is_sqlite_recovery_error_message(&init_error_text) {
+        let mut conn_healthy = sqlite_conn_is_healthy(&conn)?;
+        if !conn_healthy {
+            // If a malformed relative path shadows a healthy absolute DB, prefer that absolute file
+            // before mutating/quarantining the relative artifact.
+            if let Some(absolute_path) = sqlite_absolute_candidate_path(&opened_path)
+                && absolute_path != opened_path
+                && let Ok(fallback_conn) = mcp_agent_mail_db::DbConn::open_file(&absolute_path)
+                && sqlite_conn_is_healthy(&fallback_conn)?
+            {
+                conn = fallback_conn;
+                opened_path = absolute_path;
+                conn_healthy = true;
+            }
+
+            if !conn_healthy {
+                drop(conn);
                 recover_sqlite_file(Path::new(&opened_path))?;
-                init_schema_sqlite_canonical(&opened_path)?;
-            } else {
-                return Err(init_error);
+                conn = mcp_agent_mail_db::DbConn::open_file(&opened_path).map_err(|e| {
+                    CliError::Other(format!("cannot reopen DB at {opened_path}: {e}"))
+                })?;
+                needs_canonical_init = true;
             }
         }
-        let (reopened, _resolved_path) = open_sqlite_with_fallback(&opened_path)?;
-        return Ok(reopened);
+
+        if !needs_canonical_init && sqlite_conn_requires_canonical_init(&conn)? {
+            needs_canonical_init = true;
+        }
+
+        // For file-backed DBs, run canonical schema bootstrap only when the file is
+        // empty/partial/recovered. Re-running write-heavy init on every `am robot`
+        // command turns read-mostly status calls into avoidable lock contention.
+        if needs_canonical_init {
+            drop(conn);
+            if let Err(init_error) = init_schema_sqlite_canonical(&opened_path) {
+                let init_error_text = init_error.to_string();
+                if is_sqlite_recovery_error_message(&init_error_text) {
+                    recover_sqlite_file(Path::new(&opened_path))?;
+                    init_schema_sqlite_canonical(&opened_path)?;
+                } else {
+                    return Err(init_error);
+                }
+            }
+            let (reopened, _resolved_path) = open_sqlite_with_fallback(&opened_path)?;
+            return Ok(reopened);
+        }
+
+        return Ok(conn);
     }
 
     // In-memory DBs keep the original Franken init path.
@@ -27004,6 +27052,97 @@ startup_timeout_sec = 42
             health,
             "shared connection should remain healthy after transient lock"
         );
+    }
+
+    #[test]
+    fn sqlite_conn_requires_canonical_init_for_empty_db() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        assert!(
+            sqlite_conn_requires_canonical_init(&conn).expect("schema probe"),
+            "empty databases should still run canonical bootstrap"
+        );
+    }
+
+    #[test]
+    fn sqlite_conn_requires_canonical_init_false_for_initialized_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("initialized.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        init_schema_sqlite_canonical(&db_path_str).expect("initialize canonical schema");
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open initialized db");
+        assert!(
+            !sqlite_conn_requires_canonical_init(&conn).expect("schema probe"),
+            "fully initialized databases should skip canonical bootstrap"
+        );
+    }
+
+    #[test]
+    fn open_db_sync_with_database_url_skips_canonical_init_for_initialized_db_under_reserved_lock()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("reserved-lock.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        init_schema_sqlite_canonical(&db_path_str).expect("initialize canonical schema");
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let lock_path = db_path_str.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let lock_conn =
+                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            lock_conn
+                .execute_raw("PRAGMA busy_timeout = 1;")
+                .expect("set lock busy_timeout");
+            lock_conn
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect("hold reserved sqlite lock");
+            ready_tx.send(()).expect("signal lock ready");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("wait for release");
+            lock_conn
+                .execute_raw("ROLLBACK")
+                .expect("release sqlite lock");
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("wait for lock thread");
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let open_url = db_url.clone();
+        let open_thread = std::thread::spawn(move || {
+            let result = open_db_sync_with_database_url(&open_url).and_then(|conn| {
+                conn.query_sync("SELECT COUNT(*) AS c FROM sqlite_master", &[])
+                    .map_err(|e| CliError::Other(format!("sqlite_master count failed: {e}")))
+                    .map(|rows| {
+                        rows.first()
+                            .and_then(|row| row.get_named::<i64>("c").ok())
+                            .unwrap_or(0)
+                    })
+            });
+            result_tx.send(result).expect("send open result");
+        });
+
+        let table_count = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => result.expect("open existing healthy db under reserved lock"),
+            Err(err) => {
+                let _ = release_tx.send(());
+                open_thread.join().expect("join open thread after timeout");
+                lock_thread.join().expect("join lock thread after timeout");
+                panic!(
+                    "open should not wait for reserved lock when schema is already initialized: {err}"
+                );
+            }
+        };
+        assert!(table_count > 0, "sqlite_master should remain readable");
+
+        release_tx.send(()).expect("release lock thread");
+        open_thread.join().expect("join open thread");
+        lock_thread.join().expect("join lock thread");
     }
 
     #[test]

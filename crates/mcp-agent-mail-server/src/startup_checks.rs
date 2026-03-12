@@ -12,7 +12,7 @@ use mcp_agent_mail_db::DbPoolConfig;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -212,16 +212,19 @@ fn normalize_connect_host_for_health_check(host: &str) -> std::borrow::Cow<'_, s
 /// Sends a minimal HTTP GET request to `/health` and checks for a valid response.
 fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
     let connect_host = normalize_connect_host_for_health_check(host);
-    let addr = format!("{connect_host}:{port}");
+    let host_for_resolution = connect_host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(connect_host.as_ref());
+    let Ok(mut addr_iter) = (host_for_resolution, port).to_socket_addrs() else {
+        return false;
+    };
+    let Some(addr) = addr_iter.next() else {
+        return false;
+    };
 
     // Try to connect with a short timeout
-    let Ok(stream) = TcpStream::connect_timeout(
-        &addr.parse().unwrap_or_else(|_| {
-            // Fallback for invalid addresses
-            std::net::SocketAddr::from(([127, 0, 0, 1], port))
-        }),
-        HEALTH_CHECK_TIMEOUT,
-    ) else {
+    let Ok(stream) = TcpStream::connect_timeout(&addr, HEALTH_CHECK_TIMEOUT) else {
         return false;
     };
 
@@ -627,7 +630,10 @@ fn listener_host_matches_request(listener_host: &str, requested_host: &str) -> b
     let listener_host = normalize_socket_host(listener_host);
     let requested_host = normalize_socket_host(requested_host);
 
-    if is_wildcard_host(&requested_host) || is_wildcard_host(&listener_host) {
+    if is_wildcard_host(&requested_host) {
+        return is_wildcard_host(&listener_host);
+    }
+    if is_wildcard_host(&listener_host) {
         return true;
     }
     if requested_host.eq_ignore_ascii_case("localhost") {
@@ -1950,6 +1956,8 @@ mod tests {
         ));
         assert!(listener_host_matches_request("127.0.0.1", "localhost"));
         assert!(!listener_host_matches_request("127.0.0.2", "127.0.0.1"));
+        assert!(!listener_host_matches_request("127.0.0.1", "0.0.0.0"));
+        assert!(!listener_host_matches_request("::1", "::"));
     }
 
     #[test]

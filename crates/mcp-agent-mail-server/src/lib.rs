@@ -1004,7 +1004,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
-    
+
     let heal_config = config.clone();
     let _ = std::thread::Builder::new()
         .name("startup-heal".into())
@@ -1399,6 +1399,10 @@ fn format_http_authority_host(host: &str) -> String {
     }
 }
 
+pub(crate) fn connect_authority_host(http_host: &str) -> String {
+    format_http_authority_host(normalized_probe_host(http_host))
+}
+
 async fn probe_http_healthz(
     cx: &Cx,
     config: &mcp_agent_mail_core::Config,
@@ -1408,8 +1412,7 @@ async fn probe_http_healthz(
         .max_total_connections(1)
         .idle_timeout(Duration::ZERO)
         .build();
-    let probe_host = normalized_probe_host(&config.http_host);
-    let authority_host = format_http_authority_host(probe_host);
+    let authority_host = connect_authority_host(&config.http_host);
     let url = format!("http://{authority_host}:{}{}", config.http_port, "/healthz");
     let started_at = Instant::now();
     match timeout(
@@ -1525,10 +1528,24 @@ fn startup_readiness_fast_path_active() -> bool {
     }
 }
 
+pub(crate) const SERVER_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 60_000;
+pub(crate) const BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 250;
+
 pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
     let conn = DbConn::open_file(path)
         .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
-    let _ = conn.execute_raw("PRAGMA busy_timeout = 60000;");
+    let _ = conn.execute_raw(&format!(
+        "PRAGMA busy_timeout = {SERVER_SYNC_DB_BUSY_TIMEOUT_MS};"
+    ));
+    Ok(conn)
+}
+
+pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+    let conn = DbConn::open_file(path)
+        .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
+    let _ = conn.execute_raw(&format!(
+        "PRAGMA busy_timeout = {BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS};"
+    ));
     Ok(conn)
 }
 
@@ -2074,7 +2091,9 @@ mod tui_result_tests {
             Ok(()),
         );
         assert_eq!(
-            result.expect_err("non-signal interrupt should surface").to_string(),
+            result
+                .expect_err("non-signal interrupt should surface")
+                .to_string(),
             "stdin poll interrupted"
         );
     }
@@ -4869,7 +4888,7 @@ fn dashboard_open_connection(database_url: &str) -> Option<DbConn> {
     if path == ":memory:" {
         DbConn::open_memory().ok()
     } else {
-        DbConn::open_file(&path).ok()
+        open_best_effort_sync_db_connection(&path).ok()
     }
 }
 
@@ -7877,7 +7896,7 @@ pub(crate) fn detect_tailscale_ip() -> Option<String> {
 /// When `token` is `Some`, the token is percent-encoded and appended as
 /// `?token=…` so the URL works in a browser without extra auth headers.
 pub(crate) fn build_web_ui_url(host: &str, port: u16, token: Option<&str>) -> String {
-    let base = format!("http://{host}:{port}/mail");
+    let base = format!("http://{}:{port}/mail", connect_authority_host(host));
     match token {
         Some(t) => format!("{base}?token={}", percent_encode_query_component(t)),
         None => base,
@@ -8775,7 +8794,15 @@ mod tests {
     }
 
     fn safe_component(value: &str) -> String {
-        let out = value.trim().replace(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' '), "_");
+        let out = value.trim().replace(
+            |c| {
+                matches!(
+                    c,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' '
+                )
+            },
+            "_",
+        );
         if out.is_empty() || out == "." || out == ".." {
             "unknown".to_string()
         } else {
@@ -15565,6 +15592,60 @@ mod tests {
     fn dashboard_db_stats_default_has_empty_agents_list() {
         let stats = DashboardDbStats::default();
         assert!(stats.agents_list.is_empty());
+    }
+
+    #[test]
+    fn open_server_sync_db_connection_uses_server_busy_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("server-busy-timeout.db");
+        let conn = open_server_sync_db_connection(&db_path.display().to_string()).expect("open");
+
+        let configured = conn
+            .query_sync("PRAGMA busy_timeout", &[])
+            .expect("pragma query")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("timeout")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(configured, SERVER_SYNC_DB_BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn dashboard_open_connection_uses_best_effort_busy_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("dashboard-busy-timeout.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = dashboard_open_connection(&database_url).expect("open");
+
+        let configured = conn
+            .query_sync("PRAGMA busy_timeout", &[])
+            .expect("pragma query")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("timeout")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(configured, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn build_web_ui_url_normalizes_wildcard_and_ipv6_hosts() {
+        assert_eq!(
+            build_web_ui_url("0.0.0.0", 8765, None),
+            "http://127.0.0.1:8765/mail"
+        );
+        assert_eq!(build_web_ui_url("::", 8765, None), "http://[::1]:8765/mail");
+        assert_eq!(
+            build_web_ui_url("2001:db8::42", 8765, None),
+            "http://[2001:db8::42]:8765/mail"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -1295,21 +1296,28 @@ fn urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
     let Some(expected) = parse_http_url_for_status(expected_url) else {
         return false;
     };
-    let actual_host = normalize_status_url_host(&actual.host);
-    let expected_host = normalize_status_url_host(&expected.host);
-
     actual.scheme == expected.scheme
-        && actual_host.eq_ignore_ascii_case(expected_host)
+        && status_url_hosts_match(&actual.host, &expected.host)
         && actual.port == expected.port
         && actual.path == expected.path
 }
 
-fn normalize_status_url_host(host: &str) -> &str {
-    if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
-        "127.0.0.1"
-    } else {
-        host
+fn status_url_hosts_match(actual_host: &str, expected_host: &str) -> bool {
+    if actual_host.eq_ignore_ascii_case(expected_host) {
+        return true;
     }
+    if actual_host.eq_ignore_ascii_case("localhost") {
+        return is_status_loopback_host(expected_host);
+    }
+    if expected_host.eq_ignore_ascii_case("localhost") {
+        return is_status_loopback_host(actual_host);
+    }
+    false
+}
+
+fn is_status_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2419,7 +2427,7 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
-    fn check_config_file_treats_loopback_host_aliases_as_equivalent() {
+    fn check_config_file_treats_localhost_as_loopback_equivalent() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.json");
         let content = merge_mcp_server(
@@ -2436,8 +2444,20 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(url_matches);
 
         assert!(urls_match_for_status(
+            "http://localhost:8765/mcp/",
+            "http://[::1]:8765/mcp/"
+        ));
+    }
+
+    #[test]
+    fn check_config_file_keeps_ipv4_and_ipv6_loopback_literals_distinct() {
+        assert!(!urls_match_for_status(
             "http://[::1]:8765/mcp/",
             "http://127.0.0.1:8765/mcp/"
+        ));
+        assert!(!urls_match_for_status(
+            "http://127.0.0.1:8765/mcp/",
+            "http://[::1]:8765/mcp/"
         ));
     }
 

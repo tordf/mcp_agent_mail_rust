@@ -764,7 +764,9 @@ fn open_sync_connection_with_path(database_url: &str) -> Option<(DbConn, String)
     }
     match path.as_str() {
         ":memory:" => None,
-        _ => DbConn::open_file(&path).ok().map(|conn| (conn, path)),
+        _ => crate::open_best_effort_sync_db_connection(&path)
+            .ok()
+            .map(|conn| (conn, path)),
     }
 }
 
@@ -2833,6 +2835,30 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
         assert!(open_sync_connection(&url).is_some());
+    }
+
+    #[test]
+    fn open_sync_connection_uses_best_effort_busy_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("busy_timeout.db");
+        let url = format!("sqlite:///{}", db_path.display());
+        let conn = open_sync_connection(&url).expect("open");
+
+        let configured = conn
+            .query_sync("PRAGMA busy_timeout", &[])
+            .expect("pragma query")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("timeout")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            configured,
+            crate::BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS as i64
+        );
     }
 
     #[test]

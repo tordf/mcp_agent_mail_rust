@@ -135,7 +135,9 @@ impl ConfigSnapshot {
     pub fn from_config(config: &Config) -> Self {
         let endpoint = format!(
             "http://{}:{}{}",
-            config.http_host, config.http_port, config.http_path
+            crate::connect_authority_host(&config.http_host),
+            config.http_port,
+            config.http_path
         );
         let web_ui_url = crate::build_web_ui_url(
             &config.http_host,
@@ -2662,6 +2664,29 @@ mod tests {
             matches!(mode, "api" | "mcp" | "custom"),
             "transport_mode should be api, mcp, or custom, got: {mode}"
         );
+    }
+
+    #[test]
+    fn e8_config_snapshot_normalizes_operator_urls_for_wildcard_and_ipv6_hosts() {
+        let wildcard = Config {
+            http_host: "0.0.0.0".into(),
+            http_port: 8765,
+            http_path: "/mcp/".into(),
+            ..Default::default()
+        };
+        let snap = ConfigSnapshot::from_config(&wildcard);
+        assert_eq!(snap.endpoint, "http://127.0.0.1:8765/mcp/");
+        assert_eq!(snap.web_ui_url, "http://127.0.0.1:8765/mail");
+
+        let ipv6 = Config {
+            http_host: "2001:db8::42".into(),
+            http_port: 8765,
+            http_path: "/api/".into(),
+            ..Default::default()
+        };
+        let snap = ConfigSnapshot::from_config(&ipv6);
+        assert_eq!(snap.endpoint, "http://[2001:db8::42]:8765/api/");
+        assert_eq!(snap.web_ui_url, "http://[2001:db8::42]:8765/mail");
     }
 
     // ── E8: assert_screen_truth invariants ───────────────────────────
