@@ -936,7 +936,7 @@ mod tests {
     /// Strip non-alphabetic characters, returning `None` if nothing remains.
     /// Truncates to 128 chars.
     fn sanitize_agent_name(name: &str) -> Option<String> {
-        let cleaned: String = name.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        let cleaned: String = name.chars().filter(char::is_ascii_alphabetic).collect();
         if cleaned.is_empty() {
             return None;
         }
