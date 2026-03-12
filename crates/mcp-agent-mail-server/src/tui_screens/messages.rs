@@ -35,6 +35,7 @@ use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
+use serde::Deserialize;
 
 use crate::tui_action_menu::{ActionEntry, ActionKind, messages_actions, messages_batch_actions};
 use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedState};
@@ -228,6 +229,30 @@ struct MessageEntry {
     ack_required: bool,
     /// Whether to display the project column (true in Global mode).
     show_project: bool,
+}
+
+#[derive(Debug)]
+struct RawMessageRow {
+    id: i64,
+    subject: String,
+    body_md: String,
+    thread_id: String,
+    importance: String,
+    ack_required: bool,
+    created_ts: i64,
+    sender_id: i64,
+    project_id: i64,
+    recipients_json: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StoredRecipients {
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
 }
 
 impl RenderItem for MessageEntry {
@@ -1270,22 +1295,17 @@ impl MessageBrowserScreen {
             return Err("Database connection unavailable".to_string());
         };
         let show_project = self.inbox_mode.is_global();
-        let sql = format!(
-            "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
-             m.created_ts, \
-             a_sender.name AS sender_name, \
-             p.slug AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
-             FROM messages m \
-             JOIN agents a_sender ON a_sender.id = m.sender_id \
-             JOIN projects p ON p.id = m.project_id \
-             LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-             LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-             WHERE m.id = {message_id} \
-             GROUP BY m.id \
-             LIMIT 1"
+        let params = [Value::BigInt(message_id)];
+        let rows = query_raw_message_rows(
+            conn,
+            "SELECT id, subject, body_md, thread_id, importance, ack_required, \
+             created_ts, sender_id, project_id, recipients_json \
+             FROM messages \
+             WHERE id = ? \
+             LIMIT 1",
+            &params,
         );
-        query_messages(conn, &sql, &[], show_project)
+        message_entries_from_rows(conn, rows, show_project)
             .into_iter()
             .next()
             .ok_or_else(|| format!("Message #{message_id} not found"))
@@ -3565,35 +3585,39 @@ fn fetch_recent_messages(
     project_filter: Option<&str>,
     show_project: bool,
 ) -> (Vec<MessageEntry>, usize) {
-    let (where_clause, params) = project_filter.map_or_else(
-        || (String::new(), Vec::new()),
-        |slug| {
+    let (sql, params, total) = match project_filter {
+        Some(slug) => {
+            let Some(project_id) = project_id_for_slug(conn, slug) else {
+                return (Vec::new(), 0);
+            };
             (
-                "WHERE p.slug = ?".to_string(),
-                vec![Value::Text(slug.to_string())],
+                format!(
+                    "SELECT id, subject, body_md, thread_id, importance, ack_required, \
+                     created_ts, sender_id, project_id, recipients_json \
+                     FROM messages \
+                     WHERE project_id = ? \
+                     ORDER BY created_ts DESC \
+                     LIMIT {limit}"
+                ),
+                vec![Value::BigInt(project_id)],
+                count_messages(conn, project_filter),
             )
-        },
-    );
+        }
+        None => (
+            format!(
+                "SELECT id, subject, body_md, thread_id, importance, ack_required, \
+                 created_ts, sender_id, project_id, recipients_json \
+                 FROM messages \
+                 ORDER BY created_ts DESC \
+                 LIMIT {limit}"
+            ),
+            Vec::new(),
+            count_messages(conn, None),
+        ),
+    };
 
-    let sql = format!(
-        "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, \
-         m.created_ts, \
-         a_sender.name AS sender_name, \
-         p.slug AS project_slug, \
-         COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
-         FROM messages m \
-         JOIN agents a_sender ON a_sender.id = m.sender_id \
-         JOIN projects p ON p.id = m.project_id \
-         LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-         LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-         {where_clause} \
-         GROUP BY m.id \
-         ORDER BY m.created_ts DESC \
-         LIMIT {limit}"
-    );
-
-    let total = count_messages(conn, project_filter);
-    let results = query_messages(conn, &sql, &params, show_project);
+    let rows = query_raw_message_rows(conn, &sql, &params);
+    let results = message_entries_from_rows(conn, rows, show_project);
     (results, total)
 }
 
@@ -3756,47 +3780,33 @@ fn recipient_names_by_message(
         .unwrap_or_default()
 }
 
-/// Execute a message query and extract rows into `MessageEntry` structs.
-fn query_messages(
-    conn: &DbConn,
-    sql: &str,
-    params: &[Value],
-    show_project: bool,
-) -> Vec<MessageEntry> {
+fn query_raw_message_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<RawMessageRow> {
     conn.query_sync(sql, params)
         .ok()
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
                     let created_ts = row.get_named::<i64>("created_ts").ok()?;
-                    Some(MessageEntry {
+                    Some(RawMessageRow {
                         id: row.get_named::<i64>("id").ok()?,
                         subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
-                        from_agent: row
-                            .get_named::<String>("sender_name")
-                            .ok()
-                            .unwrap_or_default(),
-                        to_agents: row
-                            .get_named::<String>("to_agents")
-                            .ok()
-                            .unwrap_or_default(),
-                        project_slug: row
-                            .get_named::<String>("project_slug")
-                            .ok()
-                            .unwrap_or_default(),
+                        sender_id: row.get_named::<i64>("sender_id").ok()?,
+                        project_id: row.get_named::<i64>("project_id").ok()?,
                         thread_id: row
                             .get_named::<String>("thread_id")
                             .ok()
                             .unwrap_or_default(),
-                        timestamp_iso: micros_to_iso(created_ts),
-                        timestamp_micros: created_ts,
                         body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
                         importance: row
                             .get_named::<String>("importance")
                             .ok()
                             .unwrap_or_else(|| "normal".to_string()),
                         ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
-                        show_project,
+                        created_ts,
+                        recipients_json: row
+                            .get_named::<String>("recipients_json")
+                            .ok()
+                            .unwrap_or_default(),
                     })
                 })
                 .collect()
@@ -3804,19 +3814,105 @@ fn query_messages(
         .unwrap_or_default()
 }
 
+fn message_entries_from_rows(
+    conn: &DbConn,
+    rows: Vec<RawMessageRow>,
+    show_project: bool,
+) -> Vec<MessageEntry> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let sender_ids: Vec<i64> = rows.iter().map(|row| row.sender_id).collect();
+    let project_ids: Vec<i64> = rows.iter().map(|row| row.project_id).collect();
+    let sender_name_map = agent_names_by_id(conn, &sender_ids);
+    let project_slug_map = project_slugs_by_id(conn, &project_ids);
+
+    rows.into_iter()
+        .map(|row| MessageEntry {
+            id: row.id,
+            subject: row.subject,
+            from_agent: sender_name_map
+                .get(&row.sender_id)
+                .cloned()
+                .unwrap_or_default(),
+            to_agents: recipient_names_from_json(&row.recipients_json),
+            project_slug: project_slug_map
+                .get(&row.project_id)
+                .cloned()
+                .unwrap_or_default(),
+            thread_id: row.thread_id,
+            timestamp_iso: micros_to_iso(row.created_ts),
+            timestamp_micros: row.created_ts,
+            body_md: row.body_md,
+            importance: row.importance,
+            ack_required: row.ack_required,
+            show_project,
+        })
+        .collect()
+}
+
+fn agent_names_by_id(conn: &DbConn, agent_ids: &[i64]) -> std::collections::HashMap<i64, String> {
+    if agent_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let mut dedup = std::collections::BTreeSet::new();
+    dedup.extend(agent_ids.iter().copied());
+    if dedup.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let placeholders = vec!["?"; dedup.len()].join(", ");
+    let sql = format!("SELECT id, name FROM agents WHERE id IN ({placeholders})");
+    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let id = row.get_named::<i64>("id").ok()?;
+                    let name = row.get_named::<String>("name").ok()?;
+                    Some((id, name))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn recipient_names_from_json(raw: &str) -> String {
+    let parsed = serde_json::from_str::<StoredRecipients>(raw).unwrap_or_default();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut recipients = Vec::new();
+    for group in [parsed.to, parsed.cc, parsed.bcc] {
+        for name in group {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let folded = trimmed.to_ascii_lowercase();
+            if seen.insert(folded) {
+                recipients.push(trimmed.to_string());
+            }
+        }
+    }
+    recipients.join(", ")
+}
+
 /// Count total messages, optionally filtered by project.
 fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
-    let (sql, params) = project_filter.map_or_else(
-        || ("SELECT COUNT(*) AS c FROM messages", Vec::new()),
-        |slug| {
+    let (sql, params) = match project_filter {
+        Some(slug) => {
+            let Some(project_id) = project_id_for_slug(conn, slug) else {
+                return 0;
+            };
             (
-                "SELECT COUNT(*) AS c FROM messages m \
-                 JOIN projects p ON p.id = m.project_id \
-                 WHERE p.slug = ?",
-                vec![Value::Text(slug.to_string())],
+                "SELECT COUNT(*) AS c FROM messages WHERE project_id = ?",
+                vec![Value::BigInt(project_id)],
             )
-        },
-    );
+        }
+        None => ("SELECT COUNT(*) AS c FROM messages", Vec::new()),
+    };
 
     conn.query_sync(sql, &params)
         .ok()
@@ -8006,5 +8102,21 @@ mod tests {
         let mut screen = MessageBrowserScreen::new();
         let cmd = screen.handle_action("nonexistent_action", "ctx");
         assert!(matches!(cmd, Cmd::None));
+    }
+
+    #[test]
+    fn recipient_names_from_json_combines_groups_in_stable_order() {
+        let raw = r#"{"to":["BlueLake","GreenCastle"],"cc":["RedFox"],"bcc":["AmberOx"]}"#;
+        assert_eq!(
+            recipient_names_from_json(raw),
+            "BlueLake, GreenCastle, RedFox, AmberOx"
+        );
+    }
+
+    #[test]
+    fn recipient_names_from_json_dedups_and_ignores_invalid_payloads() {
+        let raw = r#"{"to":["BlueLake","bluelake",""],"cc":["BlueLake","  "],"bcc":["AmberOx"]}"#;
+        assert_eq!(recipient_names_from_json(raw), "BlueLake, AmberOx");
+        assert!(recipient_names_from_json("{not-json").is_empty());
     }
 }

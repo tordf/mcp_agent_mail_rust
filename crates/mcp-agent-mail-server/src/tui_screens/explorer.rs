@@ -43,6 +43,8 @@ fn sanitize_diagnostic_value(value: &str) -> String {
         .join(" ")
 }
 const MAX_TEXT_FILTER_IDS: usize = 600;
+const MAX_CANDIDATE_MESSAGES_DEFAULT: usize = 256;
+const MAX_CANDIDATE_MESSAGES_FILTERED: usize = 2048;
 const DEBOUNCE_TICKS: u8 = 1;
 
 /// Default SLA threshold for overdue acks: 30 minutes in microseconds.
@@ -191,6 +193,12 @@ struct DisplayEntry {
     ack_required: bool,
     created_ts: i64,
     direction: Direction,
+    read_ts: Option<i64>,
+    ack_ts: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RecipientStatus {
     read_ts: Option<i64>,
     ack_ts: Option<i64>,
 }
@@ -530,11 +538,22 @@ impl MailExplorerScreen {
             }
         };
 
+        let candidate_ids = match self.recent_candidate_message_ids(&conn, text_match_ids.as_ref())
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.last_error = Some(e);
+                self.db_conn = Some(conn);
+                self.search_dirty = false;
+                return;
+            }
+        };
+
         // Build and execute inbound + outbound queries
         let mut all_entries = Vec::new();
 
         if self.direction != Direction::Outbound {
-            match self.fetch_inbound(&conn, text_match_ids.as_ref()) {
+            match self.fetch_inbound(&conn, candidate_ids.as_ref()) {
                 Ok(entries) => all_entries.extend(entries),
                 Err(e) => {
                     self.last_error = Some(e);
@@ -546,7 +565,7 @@ impl MailExplorerScreen {
         }
 
         if self.direction != Direction::Inbound {
-            match self.fetch_outbound(&conn, text_match_ids.as_ref()) {
+            match self.fetch_outbound(&conn, candidate_ids.as_ref()) {
                 Ok(entries) => all_entries.extend(entries),
                 Err(e) => {
                     self.last_error = Some(e);
@@ -825,18 +844,24 @@ impl MailExplorerScreen {
     fn fetch_inbound(
         &self,
         conn: &DbConn,
-        text_match_ids: Option<&std::collections::HashSet<i64>>,
+        candidate_ids: Option<&std::collections::HashSet<i64>>,
     ) -> Result<Vec<DisplayEntry>, String> {
+        let recipient_agent_ids = resolve_agent_ids_by_name(conn, &self.agent_filter)?;
         let mut conditions = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 
-        // Agent filter (filter by recipient name)
-        if !self.agent_filter.is_empty() {
-            conditions.push("a_recip.name = ? COLLATE NOCASE".to_string());
-            params.push(Value::Text(self.agent_filter.clone()));
+        if !append_message_id_filter_for_column("m.id", &mut conditions, &mut params, candidate_ids)
+        {
+            return Ok(Vec::new());
         }
 
-        if !append_message_id_filter(&mut conditions, &mut params, text_match_ids) {
+        // Agent filter (filter by recipient name)
+        if !append_agent_id_filter_for_column(
+            "r.agent_id",
+            &mut conditions,
+            &mut params,
+            recipient_agent_ids.as_ref(),
+        ) {
             return Ok(Vec::new());
         }
 
@@ -863,46 +888,63 @@ impl MailExplorerScreen {
         };
 
         let sql = format!(
-            "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts, \
-             m.thread_id, s.name AS sender_name, p.slug AS project_slug, \
-             r.read_ts, r.ack_ts, \
-             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+            "SELECT DISTINCT m.id, m.subject, m.body_md, m.importance, m.ack_required, \
+             m.created_ts, m.thread_id, s.name AS sender_name, p.slug AS project_slug \
              FROM message_recipients r \
              JOIN messages m ON m.id = r.message_id \
              JOIN agents s ON s.id = m.sender_id \
              JOIN projects p ON p.id = m.project_id \
-             LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id \
-             LEFT JOIN agents a_recip ON a_recip.id = mr2.agent_id \
              WHERE 1=1{where_clause} \
-             GROUP BY m.id \
              ORDER BY m.created_ts DESC \
              LIMIT {MAX_ENTRIES}"
         );
 
-        conn.query_sync(&sql, &params)
-            .map_err(|e| format!("Inbound query: {e}"))
-            .map(|rows| {
-                rows.into_iter()
-                    .filter_map(|row| map_entry(&row, Direction::Inbound))
-                    .collect()
+        let rows = conn
+            .query_sync(&sql, &params)
+            .map_err(|e| format!("Inbound query: {e}"))?;
+
+        let message_ids = collect_message_ids(&rows);
+        let recipient_map = recipient_names_by_message(conn, &message_ids)?;
+        let status_map =
+            self.inbound_status_by_message(conn, &message_ids, recipient_agent_ids.as_ref())?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let message_id = row.get_named::<i64>("id").ok()?;
+                let status = status_map.get(&message_id).cloned().unwrap_or_default();
+                map_entry(
+                    &row,
+                    Direction::Inbound,
+                    recipient_map.get(&message_id).cloned().unwrap_or_default(),
+                    status.read_ts,
+                    status.ack_ts,
+                )
             })
+            .collect())
     }
 
     fn fetch_outbound(
         &self,
         conn: &DbConn,
-        text_match_ids: Option<&std::collections::HashSet<i64>>,
+        candidate_ids: Option<&std::collections::HashSet<i64>>,
     ) -> Result<Vec<DisplayEntry>, String> {
+        let sender_agent_ids = resolve_agent_ids_by_name(conn, &self.agent_filter)?;
         let mut conditions = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 
-        // Agent filter (filter by sender name)
-        if !self.agent_filter.is_empty() {
-            conditions.push("s.name = ? COLLATE NOCASE".to_string());
-            params.push(Value::Text(self.agent_filter.clone()));
+        if !append_message_id_filter_for_column("m.id", &mut conditions, &mut params, candidate_ids)
+        {
+            return Ok(Vec::new());
         }
 
-        if !append_message_id_filter(&mut conditions, &mut params, text_match_ids) {
+        // Agent filter (filter by sender name)
+        if !append_agent_id_filter_for_column(
+            "m.sender_id",
+            &mut conditions,
+            &mut params,
+            sender_agent_ids.as_ref(),
+        ) {
             return Ok(Vec::new());
         }
 
@@ -914,24 +956,168 @@ impl MailExplorerScreen {
 
         let sql = format!(
             "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts, \
-             m.thread_id, s.name AS sender_name, p.slug AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+             m.thread_id, s.name AS sender_name, p.slug AS project_slug \
              FROM messages m \
              JOIN agents s ON s.id = m.sender_id \
              JOIN projects p ON p.id = m.project_id \
-             LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-             LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
              WHERE 1=1{where_clause} \
-             GROUP BY m.id \
              ORDER BY m.created_ts DESC \
              LIMIT {MAX_ENTRIES}"
         );
 
+        let rows = conn
+            .query_sync(&sql, &params)
+            .map_err(|e| format!("Outbound query: {e}"))?;
+
+        let message_ids = collect_message_ids(&rows);
+        let recipient_map = recipient_names_by_message(conn, &message_ids)?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let message_id = row.get_named::<i64>("id").ok()?;
+                map_entry(
+                    &row,
+                    Direction::Outbound,
+                    recipient_map.get(&message_id).cloned().unwrap_or_default(),
+                    None,
+                    None,
+                )
+            })
+            .collect())
+    }
+
+    fn recent_candidate_message_ids(
+        &self,
+        conn: &DbConn,
+        text_match_ids: Option<&std::collections::HashSet<i64>>,
+    ) -> Result<Option<std::collections::HashSet<i64>>, String> {
+        let mut conditions = Vec::new();
+        let mut params = Vec::new();
+        if !append_message_id_filter_for_column("id", &mut conditions, &mut params, text_match_ids)
+        {
+            return Ok(Some(std::collections::HashSet::new()));
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        let limit = self.candidate_message_limit(text_match_ids);
+        let sql = format!(
+            "SELECT id \
+             FROM messages{where_clause} \
+             ORDER BY created_ts DESC \
+             LIMIT {limit}"
+        );
         conn.query_sync(&sql, &params)
-            .map_err(|e| format!("Outbound query: {e}"))
+            .map_err(|e| format!("Candidate message ID query: {e}"))
+            .map(|rows| {
+                Some(
+                    rows.into_iter()
+                        .filter_map(|row| {
+                            row.get_named::<i64>("id")
+                                .ok()
+                                .or_else(|| row.get_as::<i64>(0).ok())
+                        })
+                        .collect(),
+                )
+            })
+    }
+
+    fn candidate_message_limit(
+        &self,
+        text_match_ids: Option<&std::collections::HashSet<i64>>,
+    ) -> usize {
+        if text_match_ids.is_none()
+            && self.agent_filter.is_empty()
+            && self.ack_filter == AckFilter::All
+            && self.direction == Direction::All
+            && self.sort_mode == SortMode::DateDesc
+        {
+            return MAX_CANDIDATE_MESSAGES_DEFAULT;
+        }
+        MAX_CANDIDATE_MESSAGES_FILTERED
+    }
+
+    fn inbound_status_by_message(
+        &self,
+        conn: &DbConn,
+        message_ids: &[i64],
+        recipient_agent_ids: Option<&std::collections::BTreeSet<i64>>,
+    ) -> Result<std::collections::HashMap<i64, RecipientStatus>, String> {
+        if message_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut conditions = Vec::new();
+        let mut params = Vec::new();
+        if !append_message_id_slice_filter_for_column(
+            "message_id",
+            &mut conditions,
+            &mut params,
+            message_ids,
+        ) {
+            return Ok(std::collections::HashMap::new());
+        }
+        if !append_agent_id_filter_for_column(
+            "agent_id",
+            &mut conditions,
+            &mut params,
+            recipient_agent_ids,
+        ) {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        match self.ack_filter {
+            AckFilter::PendingAck => {
+                conditions.push("ack_ts IS NULL".to_string());
+            }
+            AckFilter::Acknowledged => {
+                conditions.push("ack_ts IS NOT NULL".to_string());
+            }
+            AckFilter::Unread => {
+                conditions.push("read_ts IS NULL".to_string());
+            }
+            AckFilter::All => {}
+        }
+
+        let where_clause = format!(" WHERE {}", conditions.join(" AND "));
+        let sql = format!(
+            "SELECT message_id, \
+             SUM(CASE WHEN read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+             SUM(CASE WHEN ack_ts IS NULL THEN 1 ELSE 0 END) AS pending_ack_count, \
+             MAX(read_ts) AS latest_read_ts, \
+             MAX(ack_ts) AS latest_ack_ts \
+             FROM message_recipients{where_clause} \
+             GROUP BY message_id"
+        );
+
+        conn.query_sync(&sql, &params)
+            .map_err(|e| format!("Inbound recipient status query: {e}"))
             .map(|rows| {
                 rows.into_iter()
-                    .filter_map(|row| map_entry(&row, Direction::Outbound))
+                    .filter_map(|row| {
+                        let message_id = row.get_named::<i64>("message_id").ok()?;
+                        let unread_count = row.get_named::<i64>("unread_count").unwrap_or(0);
+                        let pending_ack_count =
+                            row.get_named::<i64>("pending_ack_count").unwrap_or(0);
+                        Some((
+                            message_id,
+                            RecipientStatus {
+                                read_ts: if unread_count > 0 {
+                                    None
+                                } else {
+                                    row.get_named("latest_read_ts").ok()
+                                },
+                                ack_ts: if pending_ack_count > 0 {
+                                    None
+                                } else {
+                                    row.get_named("latest_ack_ts").ok()
+                                },
+                            },
+                        ))
+                    })
                     .collect()
             })
     }
@@ -960,7 +1146,8 @@ impl MailExplorerScreen {
     }
 }
 
-fn append_message_id_filter(
+fn append_message_id_filter_for_column(
+    column: &str,
     conditions: &mut Vec<String>,
     params: &mut Vec<Value>,
     message_ids: Option<&std::collections::HashSet<i64>>,
@@ -974,10 +1161,114 @@ fn append_message_id_filter(
 
     let mut ids: Vec<i64> = message_ids.iter().copied().collect();
     ids.sort_unstable();
+    append_message_id_slice_filter_for_column(column, conditions, params, &ids)
+}
+
+fn append_message_id_slice_filter_for_column(
+    column: &str,
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Value>,
+    ids: &[i64],
+) -> bool {
+    if ids.is_empty() {
+        return false;
+    }
+
     let placeholders = vec!["?"; ids.len()].join(", ");
-    conditions.push(format!("m.id IN ({placeholders})"));
+    conditions.push(format!("{column} IN ({placeholders})"));
+    params.extend(ids.iter().copied().map(Value::BigInt));
+    true
+}
+
+fn append_agent_id_filter_for_column(
+    column: &str,
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Value>,
+    agent_ids: Option<&std::collections::BTreeSet<i64>>,
+) -> bool {
+    let Some(agent_ids) = agent_ids else {
+        return true;
+    };
+    if agent_ids.is_empty() {
+        return false;
+    }
+
+    let ids: Vec<i64> = agent_ids.iter().copied().collect();
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    conditions.push(format!("{column} IN ({placeholders})"));
     params.extend(ids.into_iter().map(Value::BigInt));
     true
+}
+
+fn resolve_agent_ids_by_name(
+    conn: &DbConn,
+    agent_name: &str,
+) -> Result<Option<std::collections::BTreeSet<i64>>, String> {
+    if agent_name.is_empty() {
+        return Ok(None);
+    }
+
+    conn.query_sync(
+        "SELECT id FROM agents WHERE name = ? COLLATE NOCASE",
+        &[Value::Text(agent_name.to_string())],
+    )
+    .map_err(|e| format!("Agent lookup query: {e}"))
+    .map(|rows| {
+        Some(
+            rows.into_iter()
+                .filter_map(|row| row.get_named::<i64>("id").ok())
+                .collect(),
+        )
+    })
+}
+
+fn collect_message_ids(rows: &[Row]) -> Vec<i64> {
+    let mut ids = std::collections::BTreeSet::new();
+    for row in rows {
+        if let Ok(message_id) = row.get_named::<i64>("id").or_else(|_| row.get_as::<i64>(0)) {
+            ids.insert(message_id);
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn recipient_names_by_message(
+    conn: &DbConn,
+    message_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, String>, String> {
+    if message_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut conditions = Vec::new();
+    let mut params = Vec::new();
+    if !append_message_id_slice_filter_for_column(
+        "mr.message_id",
+        &mut conditions,
+        &mut params,
+        message_ids,
+    ) {
+        return Ok(std::collections::HashMap::new());
+    }
+    let where_clause = format!(" WHERE {}", conditions.join(" AND "));
+    let sql = format!(
+        "SELECT mr.message_id, COALESCE(GROUP_CONCAT(DISTINCT a.name), '') AS to_agents \
+         FROM message_recipients mr \
+         JOIN agents a ON a.id = mr.agent_id{where_clause} \
+         GROUP BY mr.message_id"
+    );
+
+    conn.query_sync(&sql, &params)
+        .map_err(|e| format!("Recipient lookup query: {e}"))
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let message_id = row.get_named::<i64>("message_id").ok()?;
+                    let to_agents = row.get_named::<String>("to_agents").ok()?;
+                    Some((message_id, to_agents))
+                })
+                .collect()
+        })
 }
 
 impl Default for MailExplorerScreen {
@@ -1389,7 +1680,13 @@ impl MailScreen for MailExplorerScreen {
 // Row mapping
 // ──────────────────────────────────────────────────────────────────────
 
-fn map_entry(row: &Row, direction: Direction) -> Option<DisplayEntry> {
+fn map_entry(
+    row: &Row,
+    direction: Direction,
+    to_agents: String,
+    read_ts: Option<i64>,
+    ack_ts: Option<i64>,
+) -> Option<DisplayEntry> {
     let message_id: i64 = row.get_named("id").ok()?;
     let body: String = row.get_named("body_md").unwrap_or_default();
     let preview = {
@@ -1402,7 +1699,7 @@ fn map_entry(row: &Row, direction: Direction) -> Option<DisplayEntry> {
         message_id,
         project_slug: row.get_named("project_slug").unwrap_or_default(),
         sender_name: row.get_named("sender_name").unwrap_or_default(),
-        to_agents: row.get_named("to_agents").unwrap_or_default(),
+        to_agents,
         subject: row.get_named("subject").unwrap_or_default(),
         body_md: body,
         body_preview: preview,
@@ -1413,8 +1710,8 @@ fn map_entry(row: &Row, direction: Direction) -> Option<DisplayEntry> {
         ack_required: row.get_named::<i64>("ack_required").is_ok_and(|v| v != 0),
         created_ts: row.get_named("created_ts").ok()?,
         direction,
-        read_ts: row.get_named("read_ts").ok(),
-        ack_ts: row.get_named("ack_ts").ok(),
+        read_ts,
+        ack_ts,
     })
 }
 
@@ -2062,6 +2359,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use ftui_harness::buffer_to_text;
+    use std::collections::HashSet;
 
     #[test]
     fn screen_defaults() {
@@ -2074,6 +2372,174 @@ mod tests {
         assert!(screen.entries.is_empty());
         assert!(screen.search_dirty);
         assert!(screen.agent_filter.is_empty());
+    }
+
+    #[test]
+    fn recent_candidate_message_ids_limits_to_recent_rows() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                created_ts INTEGER NOT NULL
+            )",
+        )
+        .expect("create messages");
+        let values = (1..=MAX_CANDIDATE_MESSAGES_DEFAULT + 3)
+            .map(|id| format!("({}, {})", id, id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_raw(&format!(
+            "INSERT INTO messages (id, created_ts) VALUES {values}"
+        ))
+        .expect("seed messages");
+
+        let screen = MailExplorerScreen::new();
+        let ids = screen
+            .recent_candidate_message_ids(&conn, None)
+            .expect("candidate query")
+            .expect("ids");
+
+        assert_eq!(ids.len(), MAX_CANDIDATE_MESSAGES_DEFAULT);
+        assert!(
+            !ids.contains(&1),
+            "oldest row should fall outside candidate window"
+        );
+        assert!(ids.contains(&(MAX_CANDIDATE_MESSAGES_DEFAULT as i64 + 3)));
+    }
+
+    #[test]
+    fn recent_candidate_message_ids_respects_text_filter_subset() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                created_ts INTEGER NOT NULL
+            )",
+        )
+        .expect("create messages");
+        conn.execute_raw("INSERT INTO messages (id, created_ts) VALUES (1, 10), (2, 20), (3, 30)")
+            .expect("seed messages");
+
+        let filter_ids = HashSet::from([1_i64, 3_i64]);
+        let screen = MailExplorerScreen::new();
+        let ids = screen
+            .recent_candidate_message_ids(&conn, Some(&filter_ids))
+            .expect("candidate query")
+            .expect("ids");
+
+        assert_eq!(ids, filter_ids);
+    }
+
+    fn create_explorer_query_schema(conn: &DbConn) {
+        conn.execute_raw(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            )",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            )",
+        )
+        .expect("create agents");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                body_md TEXT NOT NULL,
+                importance TEXT NOT NULL,
+                ack_required INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                thread_id TEXT
+            )",
+        )
+        .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER
+            )",
+        )
+        .expect("create recipients");
+    }
+
+    #[test]
+    fn fetch_inbound_populates_recipients_and_pending_status_from_batched_queries() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug) VALUES (1, 'alpha');
+             INSERT INTO agents (id, name) VALUES
+                (1, 'Sender'),
+                (2, 'BlueLake'),
+                (3, 'RedFox');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
+             VALUES
+                (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
+             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
+                (1, 10, 2, 1200, 1300),
+                (2, 10, 3, NULL, NULL);",
+        )
+        .expect("seed inbound rows");
+
+        let screen = MailExplorerScreen::new();
+        let entries = screen.fetch_inbound(&conn, None).expect("fetch inbound");
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.message_id, 10);
+        assert!(entry.to_agents.contains("BlueLake"));
+        assert!(entry.to_agents.contains("RedFox"));
+        assert_eq!(
+            entry.read_ts, None,
+            "any unread recipient should keep badge pending"
+        );
+        assert_eq!(
+            entry.ack_ts, None,
+            "any unacked recipient should keep ack pending"
+        );
+    }
+
+    #[test]
+    fn fetch_outbound_populates_recipients_without_grouped_join() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug) VALUES (1, 'alpha');
+             INSERT INTO agents (id, name) VALUES
+                (1, 'Sender'),
+                (2, 'BlueLake'),
+                (3, 'RedFox');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
+             VALUES
+                (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
+             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
+                (1, 10, 2, 1200, 1300),
+                (2, 10, 3, NULL, NULL);",
+        )
+        .expect("seed outbound rows");
+
+        let mut screen = MailExplorerScreen::new();
+        screen.agent_filter = "Sender".to_string();
+        let entries = screen.fetch_outbound(&conn, None).expect("fetch outbound");
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.message_id, 10);
+        assert!(entry.to_agents.contains("BlueLake"));
+        assert!(entry.to_agents.contains("RedFox"));
+        assert_eq!(entry.read_ts, None);
+        assert_eq!(entry.ack_ts, None);
     }
 
     #[test]

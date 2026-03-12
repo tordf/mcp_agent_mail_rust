@@ -130,8 +130,11 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
 pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, MigrationError> {
     let mut saw_integer = false;
     let mut saw_text = false;
+    let mut saw_nonempty_table = false;
+    let mut saw_incompatible_timestamp_schema = false;
     let mut text_tables = BTreeSet::new();
     let mut table_exists_cache: HashMap<&'static str, bool> = HashMap::new();
+    let mut table_has_rows_cache: HashMap<&'static str, Option<bool>> = HashMap::new();
 
     for &(table, column, _nullable) in TIMESTAMP_COLUMNS {
         // Check if table exists first (the table might not exist in older schemas).
@@ -152,12 +155,24 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
         let sql =
             format!("SELECT typeof({column}) AS t FROM {table} WHERE {column} IS NOT NULL LIMIT 1");
         let Ok(rows) = conn.query_sync(&sql, &[]) else {
+            let table_has_rows = table_has_rows_cache.entry(table).or_insert_with(|| {
+                let row_probe_sql = format!("SELECT 1 AS present FROM {table} LIMIT 1");
+                conn.query_sync(&row_probe_sql, &[])
+                    .ok()
+                    .map(|rows| !rows.is_empty())
+            });
+            if let Some(has_rows) = table_has_rows.as_ref().copied() {
+                saw_nonempty_table |= has_rows;
+                saw_incompatible_timestamp_schema = true;
+            }
             continue; // Table might not exist or column renamed
         };
 
         if rows.is_empty() {
             continue; // Table is empty, skip
         }
+
+        saw_nonempty_table = true;
 
         let type_str: String = rows[0].get_named("t").unwrap_or_default();
         match type_str.as_str() {
@@ -178,6 +193,11 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
     }
 
     if !saw_integer && !saw_text {
+        if saw_nonempty_table || saw_incompatible_timestamp_schema {
+            return Ok(TimestampFormat::Unknown(
+                "existing rows use an unsupported or unreadable timestamp schema".to_string(),
+            ));
+        }
         return Ok(TimestampFormat::Empty);
     }
     if saw_text && !saw_integer {
@@ -1024,6 +1044,32 @@ mod tests {
             }
             other => panic!("expected Mixed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_nonempty_legacy_schema_as_unknown_instead_of_empty() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(
+            "CREATE TABLE projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                slug TEXT NOT NULL UNIQUE, \
+                human_key TEXT NOT NULL, \
+                created_on TEXT NOT NULL\
+            )",
+        )
+        .expect("create legacy projects table");
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_on) \
+             VALUES ('legacy', '/tmp/legacy', '2026-02-24 15:30:00.123456')",
+            &[],
+        )
+        .expect("insert legacy project");
+
+        let format = detect_timestamp_format(&conn).expect("detect format");
+        assert!(
+            matches!(format, TimestampFormat::Unknown(_)),
+            "non-empty legacy schemas should not be misreported as empty: {format:?}"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use tantivy::Order;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{AllQuery, Query, TermQuery};
 use tantivy::schema::IndexRecordOption;
-use tantivy::{Index, Term};
+use tantivy::{Index, TantivyDocument, Term};
 
 use crate::DbConn;
 use crate::search_planner::{
@@ -631,14 +631,18 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
     // mixed aggregate/non-aggregate projections in one SELECT.
     // Also avoid wrapping MAX() with COALESCE() because FrankensQLite's current
     // aggregate planner can classify that shape as mixed aggregate/non-aggregate.
-    let rows = conn
-        .query_sync(
-            "SELECT \
+    let rows = match conn.query_sync(
+        "SELECT \
              (SELECT COUNT(*) FROM messages) AS count, \
              (SELECT MAX(id) FROM messages) AS max_id",
-            &[],
-        )
-        .map_err(|e| format!("backfill stats query failed: {e}"))?;
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(e) if sqlite_error_is_missing_table(&e.to_string(), "messages") => {
+            return Ok(MessageStats::default());
+        }
+        Err(e) => return Err(format!("backfill stats query failed: {e}")),
+    };
     let Some(row) = rows.first() else {
         return Ok(MessageStats::default());
     };
@@ -653,9 +657,13 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
 }
 
 fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
-    let max_id_rows = conn
-        .query_sync("SELECT MAX(id) AS max_id FROM messages", &[])
-        .map_err(|e| format!("backfill watermark max-id query failed: {e}"))?;
+    let max_id_rows = match conn.query_sync("SELECT MAX(id) AS max_id FROM messages", &[]) {
+        Ok(rows) => rows,
+        Err(e) if sqlite_error_is_missing_table(&e.to_string(), "messages") => {
+            return Ok(MessageWatermark::default());
+        }
+        Err(e) => return Err(format!("backfill watermark max-id query failed: {e}")),
+    };
     let max_id = max_id_rows
         .first()
         .and_then(|row| row.get_named::<i64>("max_id").ok())
@@ -678,6 +686,21 @@ fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String>
         .unwrap_or(max_id);
 
     Ok(MessageWatermark { sequence, max_id })
+}
+
+fn sqlite_error_is_missing_table(message: &str, table: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let table = table.to_ascii_lowercase();
+    lower.contains(&format!("no such table: {table}"))
+        || lower.contains(&format!("no such table: main.{table}"))
+}
+
+fn backfill_table_exists(conn: &DbConn, table: &str) -> Result<bool, String> {
+    match conn.query_sync(&format!("SELECT 1 FROM {table} LIMIT 1"), &[]) {
+        Ok(_) => Ok(true),
+        Err(e) if sqlite_error_is_missing_table(&e.to_string(), table) => Ok(false),
+        Err(e) => Err(format!("backfill table probe failed for {table}: {e}")),
+    }
 }
 
 fn fetch_id_text_map(conn: &DbConn, sql: &str) -> Result<HashMap<i64, String>, String> {
@@ -792,7 +815,7 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     };
 
     let handles = bridge.handles();
-    // Reduce memory footprint to 3MB (minimum Tantivy allowed) since we are 
+    // Reduce memory footprint to 3MB (minimum Tantivy allowed) since we are
     // only indexing a single message and immediately committing.
     let mut writer = bridge
         .index()
@@ -908,6 +931,28 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
             .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?,
         "search backfill connection",
     );
+
+    if !backfill_table_exists(&conn, "messages")? {
+        let index_stats = fetch_index_message_stats(&bridge)?;
+        if index_stats.count > 0 {
+            let mut writer: tantivy::IndexWriter<TantivyDocument> = bridge
+                .index()
+                .writer(15_000_000)
+                .map_err(|e| format!("Tantivy writer error: {e}"))?;
+            writer
+                .delete_all_documents()
+                .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
+            writer
+                .commit()
+                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+            crate::search_service::invalidate_search_cache(
+                crate::search_cache::InvalidationTrigger::IndexUpdate,
+            );
+        }
+        tracing::info!("backfill: messages table missing, treating database as empty");
+        refresh_index_health_metrics(&bridge);
+        return Ok((0, 0));
+    }
 
     let message_watermark = fetch_db_message_watermark(&conn)?;
     let current_index_fingerprint = index_meta_fingerprint(&bridge);
@@ -2152,6 +2197,15 @@ mod tests {
     }
 
     #[test]
+    fn fetch_db_message_watermark_treats_missing_messages_table_as_empty() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+
+        let watermark = fetch_db_message_watermark(&conn).expect("watermark query");
+        assert_eq!(watermark.max_id, 0);
+        assert_eq!(watermark.sequence, 0);
+    }
+
+    #[test]
     fn fetch_db_message_stats_handles_empty_messages_without_coalesce() {
         let conn = DbConn::open_memory().expect("open in-memory db");
         conn.execute_sync(
@@ -2159,6 +2213,15 @@ mod tests {
             &[],
         )
         .expect("create messages");
+
+        let stats = fetch_db_message_stats(&conn).expect("stats query");
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.max_id, 0);
+    }
+
+    #[test]
+    fn fetch_db_message_stats_treats_missing_messages_table_as_empty() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
 
         let stats = fetch_db_message_stats(&conn).expect("stats query");
         assert_eq!(stats.count, 0);

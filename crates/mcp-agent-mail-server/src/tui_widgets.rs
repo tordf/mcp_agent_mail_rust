@@ -3335,6 +3335,18 @@ impl ChartTransition {
         self.started_at = Some(now);
     }
 
+    /// Whether the transition is still actively animating at `now`.
+    #[must_use]
+    pub fn is_animating(&self, now: std::time::Instant) -> bool {
+        let Some(started_at) = self.started_at else {
+            return false;
+        };
+        if self.duration.is_zero() || Self::values_equal(&self.from, &self.to) {
+            return false;
+        }
+        now.saturating_duration_since(started_at) < self.duration
+    }
+
     /// Sample interpolated values at `now`.
     ///
     /// When `disable_motion` is true, returns the target immediately.
@@ -6702,6 +6714,17 @@ mod tests {
 
         let done = transition.sample_values(start + std::time::Duration::from_millis(250), false);
         assert_eq!(done, vec![25.0]);
+    }
+
+    #[test]
+    fn chart_transition_is_animating_only_until_duration_elapses() {
+        let start = std::time::Instant::now();
+        let mut transition = ChartTransition::new(std::time::Duration::from_millis(200));
+        transition.set_target(&[5.0], start);
+        transition.set_target(&[25.0], start);
+
+        assert!(transition.is_animating(start + std::time::Duration::from_millis(50)));
+        assert!(!transition.is_animating(start + std::time::Duration::from_millis(250)));
     }
 
     #[test]

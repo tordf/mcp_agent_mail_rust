@@ -424,7 +424,12 @@ impl DbPool {
                     };
 
                     // Per-connection PRAGMAs matching legacy Python `db.py` event listeners.
-                    if let Err(first_init_err) = conn.execute_raw(&init_sql) {
+                    if let Err(first_init_err) = execute_sql_with_lock_retry(
+                        &conn,
+                        &sqlite_path,
+                        &init_sql,
+                        "pool connection init pragmas",
+                    ) {
                         if sqlite_path == ":memory:"
                             || !is_sqlite_recovery_error_message(&first_init_err.to_string())
                         {
@@ -446,7 +451,12 @@ impl DbPool {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         };
-                        if let Err(second_init_err) = conn.execute_raw(&init_sql) {
+                        if let Err(second_init_err) = execute_sql_with_lock_retry(
+                            &conn,
+                            &sqlite_path,
+                            &init_sql,
+                            "pool connection init pragmas after recovery",
+                        ) {
                             return Outcome::Err(second_init_err);
                         }
                     }
@@ -1145,7 +1155,12 @@ async fn run_sqlite_init_once(
             "sqlite init migration connection",
         );
 
-        if let Err(err) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
+        if let Err(err) = execute_sql_with_lock_retry(
+            &*mig_conn,
+            sqlite_path,
+            schema::PRAGMA_DB_INIT_BASE_SQL,
+            "sqlite init base pragmas",
+        ) {
             return Outcome::Err(SqlError::Custom(format!(
                 "sqlite init stage=base_pragmas failed: {err}"
             )));
@@ -1177,7 +1192,14 @@ async fn run_sqlite_init_once(
         "sqlite init runtime connection",
     );
 
-    if !run_migrations && let Err(err) = runtime_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
+    if !run_migrations
+        && let Err(err) = execute_sql_with_lock_retry(
+            &*runtime_conn,
+            sqlite_path,
+            schema::PRAGMA_DB_INIT_BASE_SQL,
+            "sqlite init runtime base pragmas",
+        )
+    {
         return Outcome::Err(SqlError::Custom(format!(
             "sqlite init stage=base_pragmas_runtime failed: {err}"
         )));
@@ -1199,7 +1221,12 @@ async fn run_sqlite_init_once(
     // If we leave the DB in DELETE mode, concurrent pool connections applying
     // WAL-specific PRAGMAs can corrupt a freshly created database.
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/13
-    if let Err(err) = runtime_conn.execute_raw("PRAGMA journal_mode = WAL;") {
+    if let Err(err) = execute_sql_with_lock_retry(
+        &*runtime_conn,
+        sqlite_path,
+        "PRAGMA journal_mode = WAL;",
+        "sqlite init switch journal_mode=WAL",
+    ) {
         tracing::warn!(
             path = %sqlite_path,
             error = %err,
@@ -1218,10 +1245,10 @@ fn should_retry_sqlite_init_error(error: &SqlError) -> bool {
     is_sqlite_recovery_error_message(&msg) || is_lock_error(&msg)
 }
 
-const SQLITE_OPEN_LOCK_MAX_RETRIES: usize = 3;
+const SQLITE_LOCK_MAX_RETRIES: usize = 3;
 
 #[must_use]
-fn sqlite_open_lock_retry_delay(retry_index: usize) -> Duration {
+fn sqlite_lock_retry_delay(retry_index: usize) -> Duration {
     let exponent = u32::try_from(retry_index.min(3)).unwrap_or(3);
     Duration::from_millis(25_u64.saturating_mul(1_u64 << exponent))
 }
@@ -1291,39 +1318,74 @@ fn open_sqlite_file_with_lock_retry_canonical(
 }
 
 #[allow(clippy::result_large_err)]
-fn open_sqlite_file_with_lock_retry_impl<C, F, S>(
+fn retry_sqlite_lock_impl<T, F, S>(
     sqlite_path: &str,
-    mut open_file: F,
+    operation: &str,
+    mut op: F,
     mut sleep_fn: S,
-) -> Result<C, SqlError>
+) -> Result<T, SqlError>
 where
-    F: FnMut(&str) -> Result<C, SqlError>,
+    F: FnMut() -> Result<T, SqlError>,
     S: FnMut(Duration),
 {
     let mut retries = 0usize;
     loop {
-        match open_file(sqlite_path) {
-            Ok(conn) => return Ok(conn),
+        match op() {
+            Ok(value) => return Ok(value),
             Err(err) => {
                 let message = err.to_string();
-                if !is_lock_error(&message) || retries >= SQLITE_OPEN_LOCK_MAX_RETRIES {
+                if !is_lock_error(&message) || retries >= SQLITE_LOCK_MAX_RETRIES {
                     return Err(err);
                 }
-                let delay = sqlite_open_lock_retry_delay(retries);
+                let delay = sqlite_lock_retry_delay(retries);
                 let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
                 tracing::warn!(
                     path = %sqlite_path,
+                    operation,
                     error = %err,
                     retry = retries + 1,
-                    max_retries = SQLITE_OPEN_LOCK_MAX_RETRIES,
+                    max_retries = SQLITE_LOCK_MAX_RETRIES,
                     delay_ms,
-                    "sqlite open hit lock/busy error; retrying"
+                    "sqlite operation hit lock/busy error; retrying"
                 );
                 sleep_fn(delay);
                 retries += 1;
             }
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_with_lock_retry_impl<C, F, S>(
+    sqlite_path: &str,
+    mut open_file: F,
+    sleep_fn: S,
+) -> Result<C, SqlError>
+where
+    F: FnMut(&str) -> Result<C, SqlError>,
+    S: FnMut(Duration),
+{
+    retry_sqlite_lock_impl(
+        sqlite_path,
+        "sqlite open",
+        || open_file(sqlite_path),
+        sleep_fn,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn execute_sql_with_lock_retry(
+    conn: &DbConn,
+    sqlite_path: &str,
+    sql: &str,
+    operation: &str,
+) -> Result<(), SqlError> {
+    retry_sqlite_lock_impl(
+        sqlite_path,
+        operation,
+        || conn.execute_raw(sql),
+        std::thread::sleep,
+    )
 }
 
 /// Open a file-backed sqlite connection and automatically recover from
@@ -4154,14 +4216,41 @@ mod tests {
 
     #[test]
     fn sqlite_open_lock_retry_delay_exponential_and_capped() {
-        assert_eq!(sqlite_open_lock_retry_delay(0), Duration::from_millis(25));
-        assert_eq!(sqlite_open_lock_retry_delay(1), Duration::from_millis(50));
-        assert_eq!(sqlite_open_lock_retry_delay(2), Duration::from_millis(100));
-        assert_eq!(sqlite_open_lock_retry_delay(3), Duration::from_millis(200));
+        assert_eq!(sqlite_lock_retry_delay(0), Duration::from_millis(25));
+        assert_eq!(sqlite_lock_retry_delay(1), Duration::from_millis(50));
+        assert_eq!(sqlite_lock_retry_delay(2), Duration::from_millis(100));
+        assert_eq!(sqlite_lock_retry_delay(3), Duration::from_millis(200));
         assert_eq!(
-            sqlite_open_lock_retry_delay(999),
+            sqlite_lock_retry_delay(999),
             Duration::from_millis(200),
             "backoff should cap to avoid unbounded startup delay"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn retry_sqlite_lock_impl_retries_then_succeeds() {
+        let attempts = std::cell::Cell::new(0usize);
+        let sleep_calls = std::cell::RefCell::new(Vec::new());
+        let result = retry_sqlite_lock_impl(
+            "ignored.sqlite3",
+            "test operation",
+            || {
+                let next = attempts.get() + 1;
+                attempts.set(next);
+                if next <= 2 {
+                    Err(SqlError::Custom("database is locked".to_string()))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| sleep_calls.borrow_mut().push(delay),
+        );
+        assert!(result.is_ok(), "expected success after lock retries");
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            sleep_calls.borrow().as_slice(),
+            &[sqlite_lock_retry_delay(0), sqlite_lock_retry_delay(1)]
         );
     }
 
@@ -4187,10 +4276,7 @@ mod tests {
         assert_eq!(open_calls.get(), 3);
         assert_eq!(
             sleep_calls.borrow().as_slice(),
-            &[
-                sqlite_open_lock_retry_delay(0),
-                sqlite_open_lock_retry_delay(1)
-            ]
+            &[sqlite_lock_retry_delay(0), sqlite_lock_retry_delay(1)]
         );
     }
 

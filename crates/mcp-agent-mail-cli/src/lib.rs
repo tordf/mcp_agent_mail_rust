@@ -2949,47 +2949,12 @@ struct PreflightBannerStats {
 fn query_preflight_banner_stats_batched(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> Option<PreflightBannerStats> {
-    query_preflight_banner_stats_from_sqlite_sequence(conn)
-        .or_else(|| query_preflight_banner_stats_from_max_ids(conn))
-}
-
-fn query_preflight_banner_stats_from_sqlite_sequence(
-    conn: &mcp_agent_mail_db::DbConn,
-) -> Option<PreflightBannerStats> {
     let sql = "SELECT \
-               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'projects'), 0) AS projects_count, \
-               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'agents'), 0) AS agents_count, \
-               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'messages'), 0) AS messages_count, \
-               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'file_reservations'), 0) AS reservations_count, \
-               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'agent_links'), 0) AS links_count";
-    let row = conn.query_sync(sql, &[]).ok()?.into_iter().next()?;
-    let read_count = |key: &str| {
-        row.get_named::<i64>(key)
-            .ok()
-            .and_then(|v| u64::try_from(v).ok())
-            .unwrap_or(0)
-    };
-    Some(PreflightBannerStats {
-        projects: read_count("projects_count"),
-        agents: read_count("agents_count"),
-        messages: read_count("messages_count"),
-        file_reservations: read_count("reservations_count"),
-        contact_links: read_count("links_count"),
-    })
-}
-
-fn query_preflight_banner_stats_from_max_ids(
-    conn: &mcp_agent_mail_db::DbConn,
-) -> Option<PreflightBannerStats> {
-    // Avoid wrapping MAX() with COALESCE() to stay on FrankensQLite's
-    // fast aggregate path and avoid mixed aggregate/non-aggregate planner
-    // edge-cases that can force an expensive COUNT(*) fallback.
-    let sql = "SELECT \
-               (SELECT MAX(id) FROM projects) AS projects_count, \
-               (SELECT MAX(id) FROM agents) AS agents_count, \
-               (SELECT MAX(id) FROM messages) AS messages_count, \
-               (SELECT MAX(id) FROM file_reservations) AS reservations_count, \
-               (SELECT MAX(id) FROM agent_links) AS links_count";
+               (SELECT COUNT(*) FROM projects) AS projects_count, \
+               (SELECT COUNT(*) FROM agents) AS agents_count, \
+               (SELECT COUNT(*) FROM messages) AS messages_count, \
+               (SELECT COUNT(*) FROM file_reservations) AS reservations_count, \
+               (SELECT COUNT(*) FROM agent_links) AS links_count";
     let row = conn.query_sync(sql, &[]).ok()?.into_iter().next()?;
     let read_count = |key: &str| {
         row.get_named::<i64>(key)
@@ -4019,20 +3984,56 @@ fn sqlite_conn_is_healthy(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     })
 }
 
-const SQLITE_BASE_INIT_TABLES: [&str; 5] = [
+const SQLITE_BASE_INIT_TABLES: [&str; 11] = [
     "projects",
+    "products",
+    "product_project_links",
     "agents",
     "messages",
     "message_recipients",
     "file_reservations",
+    "file_reservation_releases",
+    "agent_links",
+    "project_sibling_suggestions",
+    "inbox_stats",
 ];
+
+const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 10] = [
+    ("products", "product_uid"),
+    ("product_project_links", "created_at"),
+    ("agents", "attachments_policy"),
+    ("agents", "contact_policy"),
+    ("messages", "attachments"),
+    ("message_recipients", "kind"),
+    ("message_recipients", "ack_ts"),
+    ("file_reservations", "reason"),
+    ("file_reservation_releases", "released_ts"),
+    ("agent_links", "updated_ts"),
+];
+
+fn sqlite_conn_has_column(
+    conn: &mcp_agent_mail_db::DbConn,
+    table: &str,
+    column: &str,
+) -> CliResult<bool> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .map_err(|e| CliError::Other(format!("PRAGMA table_info({table}) failed: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .any(|name| name == column))
+}
 
 fn sqlite_conn_requires_canonical_init(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     let rows = conn
         .query_sync(
             "SELECT name FROM sqlite_master \
              WHERE type='table' \
-               AND name IN ('projects', 'agents', 'messages', 'message_recipients', 'file_reservations')",
+               AND name IN ('projects', 'products', 'product_project_links', \
+                            'agents', 'messages', 'message_recipients', \
+                            'file_reservations', 'file_reservation_releases', \
+                            'agent_links', 'project_sibling_suggestions', 'inbox_stats')",
             &[],
         )
         .map_err(|e| CliError::Other(format!("sqlite_master probe failed: {e}")))?;
@@ -4040,9 +4041,18 @@ fn sqlite_conn_requires_canonical_init(conn: &mcp_agent_mail_db::DbConn) -> CliR
         .into_iter()
         .filter_map(|row| row.get_named::<String>("name").ok())
         .collect();
-    Ok(SQLITE_BASE_INIT_TABLES
+    if SQLITE_BASE_INIT_TABLES
         .iter()
-        .any(|table| !existing.contains(*table)))
+        .any(|table| !existing.contains(*table))
+    {
+        return Ok(true);
+    }
+    for (table, column) in SQLITE_BASE_INIT_COLUMNS {
+        if !sqlite_conn_has_column(conn, table, column)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn sqlite_conn_quick_check_ok_canonical(
@@ -14974,7 +14984,9 @@ mod mail_server_cli_bridge_tests {
 
         let error = ensure_message_in_project(&message, 8, 42)
             .expect_err("cross-project message should be hidden");
-        assert!(matches!(error, CliError::InvalidArgument(message) if message == "message not found: 42"));
+        assert!(
+            matches!(error, CliError::InvalidArgument(message) if message == "message not found: 42")
+        );
     }
 }
 
@@ -26875,7 +26887,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn query_preflight_banner_stats_batched_uses_max_id_fast_path() {
+    fn query_preflight_banner_stats_batched_counts_sparse_ids_correctly() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("preflight_banner_sparse.sqlite3");
         let db_path_str = db_path.to_string_lossy().into_owned();
@@ -26897,9 +26909,50 @@ startup_timeout_sec = 42
 
         let stats =
             query_preflight_banner_stats_batched(&conn).expect("batched preflight stats query");
-        assert_eq!(stats.messages, 100);
+        assert_eq!(stats.messages, 2);
         assert_eq!(stats.projects, 0);
         assert_eq!(stats.agents, 0);
+    }
+
+    #[test]
+    fn query_preflight_banner_stats_batched_ignores_stale_sqlite_sequence_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("preflight_banner_sequence.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .expect("create projects");
+        conn.execute_raw("CREATE TABLE agents(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .expect("create messages");
+        conn.execute_raw("CREATE TABLE file_reservations(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .expect("create file_reservations");
+        conn.execute_raw("CREATE TABLE agent_links(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .expect("create agent_links");
+
+        conn.execute_raw("INSERT INTO agents DEFAULT VALUES")
+            .expect("seed first agent");
+        conn.execute_raw("INSERT INTO agents DEFAULT VALUES")
+            .expect("seed second agent");
+        conn.execute_raw("DELETE FROM agents WHERE id = 2")
+            .expect("leave sqlite_sequence ahead of row count");
+
+        conn.execute_raw("INSERT INTO agent_links DEFAULT VALUES")
+            .expect("seed first contact link");
+        conn.execute_raw("INSERT INTO agent_links DEFAULT VALUES")
+            .expect("seed second contact link");
+        conn.execute_raw("DELETE FROM sqlite_sequence WHERE name = 'agent_links'")
+            .expect("simulate stale sqlite_sequence entry");
+
+        let stats =
+            query_preflight_banner_stats_batched(&conn).expect("batched preflight stats query");
+        assert_eq!(stats.agents, 1, "deleted rows must not inflate banner counts");
+        assert_eq!(
+            stats.contact_links, 2,
+            "missing or stale sqlite_sequence rows must not undercount banner totals"
+        );
     }
 
     #[test]
@@ -27112,6 +27165,52 @@ startup_timeout_sec = 42
         assert!(
             !sqlite_conn_requires_canonical_init(&conn).expect("schema probe"),
             "fully initialized databases should skip canonical bootstrap"
+        );
+    }
+
+    #[test]
+    fn sqlite_conn_requires_canonical_init_for_partial_schema() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        for sql in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, product_uid TEXT, name TEXT, created_at INTEGER)",
+            "CREATE TABLE product_project_links (id INTEGER PRIMARY KEY, product_id INTEGER, project_id INTEGER, created_at INTEGER)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, model TEXT, task_description TEXT DEFAULT '', inception_ts INTEGER, last_active_ts INTEGER, attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT, subject TEXT, body_md TEXT, importance TEXT, ack_required INTEGER, created_ts INTEGER, attachments TEXT DEFAULT '[]')",
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT DEFAULT 'to', read_ts INTEGER, ack_ts INTEGER)",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, path_pattern TEXT, exclusive INTEGER, reason TEXT DEFAULT '', created_ts INTEGER, expires_ts INTEGER, released_ts INTEGER)",
+        ] {
+            conn.execute_raw(sql).expect("create partial schema table");
+        }
+
+        assert!(
+            sqlite_conn_requires_canonical_init(&conn).expect("schema probe"),
+            "missing canonical tables should force bootstrap"
+        );
+    }
+
+    #[test]
+    fn sqlite_conn_requires_canonical_init_for_legacy_columns() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        for sql in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, product_uid TEXT, name TEXT, created_at INTEGER)",
+            "CREATE TABLE product_project_links (id INTEGER PRIMARY KEY, product_id INTEGER, project_id INTEGER, created_at INTEGER)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, model TEXT, task_description TEXT DEFAULT '', inception_ts INTEGER, last_active_ts INTEGER, attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT, subject TEXT, body_md TEXT, importance TEXT, ack_required INTEGER, created_ts INTEGER)",
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER)",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, path_pattern TEXT, exclusive INTEGER, reason TEXT DEFAULT '', created_ts INTEGER, expires_ts INTEGER, released_ts INTEGER)",
+            "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER)",
+            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER, a_agent_id INTEGER, b_project_id INTEGER, b_agent_id INTEGER, status TEXT DEFAULT 'pending', reason TEXT DEFAULT '', created_ts INTEGER, updated_ts INTEGER, expires_ts INTEGER)",
+            "CREATE TABLE project_sibling_suggestions (id INTEGER PRIMARY KEY, project_a_id INTEGER, project_b_id INTEGER, score REAL, status TEXT DEFAULT 'suggested', rationale TEXT DEFAULT '', created_ts INTEGER, evaluated_ts INTEGER, confirmed_ts INTEGER, dismissed_ts INTEGER)",
+            "CREATE TABLE inbox_stats (agent_id INTEGER PRIMARY KEY, total_count INTEGER, unread_count INTEGER, ack_pending_count INTEGER, last_message_ts INTEGER)",
+        ] {
+            conn.execute_raw(sql).expect("create legacy-shape table");
+        }
+
+        assert!(
+            sqlite_conn_requires_canonical_init(&conn).expect("schema probe"),
+            "legacy columns should force canonical bootstrap"
         );
     }
 

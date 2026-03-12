@@ -177,6 +177,11 @@ impl<'a> DbStatQueryBatcher<'a> {
             timestamp_micros: now,
         };
         restore_missing_detail_lists_from_previous(previous, &mut snapshot, self.sqlite_path);
+        refill_missing_detail_lists_from_sqlite(
+            &mut snapshot,
+            self.sqlite_path,
+            &reservation_bundle.active_counts_by_project,
+        );
         snapshot
     }
 
@@ -829,6 +834,33 @@ fn restore_missing_detail_lists_from_previous(
         &previous.contacts_list,
         sqlite_path,
     );
+}
+
+fn refill_missing_detail_lists_from_sqlite(
+    snapshot: &mut DbStatSnapshot,
+    sqlite_path: Option<&str>,
+    reservation_counts: &HashMap<i64, u64>,
+) {
+    if !snapshot_has_missing_detail_lists(snapshot) {
+        return;
+    }
+    let Some(sqlite_path) = sqlite_path else {
+        return;
+    };
+    let Ok(conn) = crate::open_server_sync_db_connection(sqlite_path) else {
+        return;
+    };
+
+    if snapshot.agents > 0 && snapshot.agents_list.is_empty() {
+        snapshot.agents_list = fetch_agents_list(&conn);
+    }
+    if snapshot.projects > 0 && snapshot.projects_list.is_empty() {
+        snapshot.projects_list =
+            fetch_projects_list_with_reservation_counts(&conn, Some(reservation_counts));
+    }
+    if snapshot.contact_links > 0 && snapshot.contacts_list.is_empty() {
+        snapshot.contacts_list = fetch_contacts_list(&conn);
+    }
 }
 
 fn maybe_reuse_previous_detail_list<T: Clone>(
@@ -3531,6 +3563,73 @@ mod tests {
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         let projects = fetch_projects_list(&conn);
         assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn refill_missing_detail_lists_from_sqlite_repairs_empty_agents_and_projects_lists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_refill_missing_detail_lists.db");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = DbConn::open_file(&db_path_str).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'proj-a', '/tmp/proj-a', 1000)",
+            &[],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, last_active_ts)
+             VALUES (1, 1, 'BlueLake', 'codex-cli', 2000)",
+            &[],
+        )
+        .expect("insert agent");
+        conn.execute_sync("INSERT INTO messages (id, project_id) VALUES (1, 1)", &[])
+            .expect("insert message");
+
+        let mut snapshot = DbStatSnapshot {
+            projects: 1,
+            agents: 1,
+            messages: 1,
+            ..DbStatSnapshot::default()
+        };
+        refill_missing_detail_lists_from_sqlite(&mut snapshot, Some(&db_path_str), &HashMap::new());
+
+        assert_eq!(snapshot.agents_list.len(), 1);
+        assert_eq!(snapshot.agents_list[0].name, "BlueLake");
+        assert_eq!(snapshot.projects_list.len(), 1);
+        assert_eq!(snapshot.projects_list[0].slug, "proj-a");
+        assert_eq!(snapshot.projects_list[0].agent_count, 1);
+        assert_eq!(snapshot.projects_list[0].message_count, 1);
     }
 
     #[test]

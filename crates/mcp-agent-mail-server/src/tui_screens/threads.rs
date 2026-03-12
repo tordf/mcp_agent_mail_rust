@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,7 @@ use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
+use serde::Deserialize;
 
 use crate::tui_bridge::{
     KeyboardMoveSnapshot, MessageDragSnapshot, ScreenDiagnosticSnapshot, TuiSharedState,
@@ -280,6 +281,33 @@ struct ThreadSummary {
     first_timestamp_iso: String,
     /// Number of unread messages in this thread (if tracking is available).
     unread_count: usize,
+}
+
+#[derive(Debug)]
+struct RawThreadSummaryRow {
+    thread_id: String,
+    message_count: usize,
+    sender_ids: Vec<i64>,
+    last_timestamp_micros: i64,
+    first_timestamp_micros: i64,
+    has_escalation: bool,
+}
+
+#[derive(Debug, Default)]
+struct LatestThreadMeta {
+    subject: String,
+    sender_id: i64,
+    project_id: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StoredRecipients {
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2226,11 +2254,14 @@ fn fetch_threads(
             .replace('%', "\\%")
             .replace('_', "\\_");
         let like_term = format!("%{escaped}%");
-        predicates.push(
-            "(m.thread_id LIKE ? ESCAPE '\\' OR a_sender.name LIKE ? ESCAPE '\\')".to_string(),
-        );
+        predicates.push("thread_id LIKE ? ESCAPE '\\'".to_string());
         params.push(Value::Text(like_term.clone()));
-        params.push(Value::Text(like_term));
+        let sender_ids = sender_ids_by_name(conn, &like_term);
+        if !sender_ids.is_empty() {
+            let placeholders = vec!["?"; sender_ids.len()].join(", ");
+            predicates.push(format!("sender_id IN ({placeholders})"));
+            params.extend(sender_ids.into_iter().map(Value::BigInt));
+        }
     }
 
     if let Some(thread_ids) = text_match_thread_ids
@@ -2239,39 +2270,38 @@ fn fetch_threads(
         let mut ids: Vec<String> = thread_ids.iter().cloned().collect();
         ids.sort_unstable();
         let placeholders = vec!["?"; ids.len()].join(", ");
-        predicates.push(format!("m.thread_id IN ({placeholders})"));
+        predicates.push(format!("thread_id IN ({placeholders})"));
         params.extend(ids.into_iter().map(Value::Text));
     }
 
     let filter_clause = if predicates.is_empty() {
-        String::new()
+        "WHERE thread_id IS NOT NULL AND thread_id != ''".to_string()
     } else {
-        format!("WHERE {}", predicates.join(" OR "))
+        format!(
+            "WHERE thread_id IS NOT NULL AND thread_id != '' AND ({})",
+            predicates.join(" OR ")
+        )
     };
 
     let sql = format!(
         "SELECT \
-           m.thread_id, \
-           COUNT(DISTINCT m.id) AS msg_count, \
-           COUNT(DISTINCT a_sender.name) AS participant_count, \
-           GROUP_CONCAT(DISTINCT a_sender.name) AS participant_names, \
-           MAX(m.created_ts) AS last_ts, \
-           MIN(m.created_ts) AS first_ts, \
-           p.slug AS project_slug, \
-           MAX(CASE WHEN m.importance IN ('high','urgent') THEN 1 ELSE 0 END) AS has_escalation \
-         FROM messages m \
-         JOIN agents a_sender ON a_sender.id = m.sender_id \
-         JOIN projects p ON p.id = m.project_id \
+           thread_id, \
+           COUNT(*) AS msg_count, \
+           GROUP_CONCAT(DISTINCT sender_id) AS sender_ids, \
+           MAX(created_ts) AS last_ts, \
+           MIN(created_ts) AS first_ts, \
+           MAX(CASE WHEN importance IN ('high','urgent') THEN 1 ELSE 0 END) AS has_escalation \
+         FROM messages \
          {filter_clause} \
-         GROUP BY m.thread_id \
-         HAVING m.thread_id != '' AND m.thread_id IS NOT NULL \
+         GROUP BY thread_id \
          ORDER BY last_ts DESC \
          LIMIT {limit}"
     );
 
-    let rows = conn.query_sync(&sql, &params).ok().unwrap_or_default();
-
-    let mut threads: Vec<ThreadSummary> = rows
+    let rows: Vec<RawThreadSummaryRow> = conn
+        .query_sync(&sql, &params)
+        .ok()
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|row| {
             let thread_id = row.get_named::<String>("thread_id").ok()?;
@@ -2282,94 +2312,300 @@ fn fetch_threads(
                 .ok()
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(0);
+            let sender_ids = row
+                .get_named::<String>("sender_ids")
+                .ok()
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.trim().parse::<i64>().ok())
+                .collect::<Vec<_>>();
 
-            // Compute velocity: msgs/hour over thread lifetime.
-            // Precision loss acceptable: microsecond timestamps and message counts
-            // don't need f64's full mantissa for display purposes.
-            #[allow(clippy::cast_precision_loss)]
-            let duration_hours = last_ts.saturating_sub(first_ts).max(1) as f64 / (3_600_000_000.0);
-            #[allow(clippy::cast_precision_loss)]
-            let velocity = if duration_hours > 0.001 {
-                msg_count as f64 / duration_hours
-            } else {
-                msg_count as f64 // single-burst thread
-            };
-
-            Some(ThreadSummary {
+            Some(RawThreadSummaryRow {
                 thread_id,
                 message_count: msg_count,
-                participant_count: row
-                    .get_named::<i64>("participant_count")
-                    .ok()
-                    .and_then(|v| usize::try_from(v).ok())
-                    .unwrap_or(0),
-                last_subject: String::new(),
-                last_sender: String::new(),
+                sender_ids,
                 last_timestamp_micros: last_ts,
-                last_timestamp_iso: micros_to_iso(last_ts),
-                project_slug: row
-                    .get_named::<String>("project_slug")
-                    .ok()
-                    .unwrap_or_default(),
+                first_timestamp_micros: first_ts,
                 has_escalation: row.get_named::<i64>("has_escalation").ok().unwrap_or(0) != 0,
-                velocity_msg_per_hr: velocity,
-                participant_names: row
-                    .get_named::<String>("participant_names")
-                    .ok()
-                    .unwrap_or_default(),
-                first_timestamp_iso: micros_to_iso(first_ts),
-                unread_count: 0, // Will be updated if read tracking is available
             })
         })
         .collect();
 
-    // Second pass: fetch latest subject/sender and enrich participant list
-    // with recipients (the main query only counts senders).
-    for thread in &mut threads {
-        let detail_sql = "SELECT m.subject, a_sender.name AS sender_name, m.created_ts \
-             FROM messages m \
-             JOIN agents a_sender ON a_sender.id = m.sender_id \
-             WHERE m.thread_id = ? \
-             ORDER BY m.created_ts DESC \
-             LIMIT 1";
-        if let Some(row) = conn
-            .query_sync(detail_sql, &[Value::Text(thread.thread_id.clone())])
-            .ok()
-            .and_then(|mut rows| rows.pop())
-        {
-            thread.last_subject = row.get_named::<String>("subject").ok().unwrap_or_default();
-            thread.last_sender = row
-                .get_named::<String>("sender_name")
-                .ok()
-                .unwrap_or_default();
-        }
+    build_thread_summaries(conn, rows)
+}
 
-        // Enrich participant list with recipients from message_recipients.
-        let recip_sql = "SELECT DISTINCT a.name \
-             FROM message_recipients mr \
-             JOIN agents a ON a.id = mr.agent_id \
-             JOIN messages m ON m.id = mr.message_id \
-             WHERE m.thread_id = ?";
-        if let Ok(rows) = conn.query_sync(recip_sql, &[Value::Text(thread.thread_id.clone())]) {
-            let mut names: HashSet<String> = thread
-                .participant_names
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            for row in rows {
-                if let Ok(name) = row.get_named::<String>("name") {
-                    names.insert(name);
-                }
-            }
-            let mut sorted_names: Vec<String> = names.into_iter().collect();
-            sorted_names.sort_unstable();
-            thread.participant_count = sorted_names.len();
-            thread.participant_names = sorted_names.join(", ");
-        }
+fn sender_ids_by_name(conn: &DbConn, like_term: &str) -> Vec<i64> {
+    conn.query_sync(
+        "SELECT id FROM agents WHERE name LIKE ? ESCAPE '\\'",
+        &[Value::Text(like_term.to_string())],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| row.get_named::<i64>("id").ok())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<ThreadSummary> {
+    if rows.is_empty() {
+        return Vec::new();
     }
 
-    threads
+    let thread_ids: Vec<String> = rows.iter().map(|row| row.thread_id.clone()).collect();
+    let mut agent_ids = Vec::new();
+    for row in &rows {
+        agent_ids.extend(row.sender_ids.iter().copied());
+    }
+
+    let latest_meta = latest_thread_meta_by_thread(conn, &thread_ids);
+    let mut project_ids = Vec::new();
+    for meta in latest_meta.values() {
+        agent_ids.push(meta.sender_id);
+        project_ids.push(meta.project_id);
+    }
+
+    let sender_name_map = agent_names_by_id(conn, &agent_ids);
+    let project_slug_map = project_slugs_by_id(conn, &project_ids);
+    let participant_names_map = participant_names_by_thread(conn, &thread_ids, &sender_name_map);
+
+    rows.into_iter()
+        .map(|row| {
+            let last_meta = latest_meta.get(&row.thread_id);
+            let participant_names = participant_names_map
+                .get(&row.thread_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    participant_names_for_sender_ids(&row.sender_ids, &sender_name_map)
+                });
+            let participant_count = participant_names
+                .split(", ")
+                .filter(|name| !name.is_empty())
+                .count();
+
+            #[allow(clippy::cast_precision_loss)]
+            let duration_hours = row
+                .last_timestamp_micros
+                .saturating_sub(row.first_timestamp_micros)
+                .max(1) as f64
+                / 3_600_000_000.0;
+            #[allow(clippy::cast_precision_loss)]
+            let velocity = if duration_hours > 0.001 {
+                row.message_count as f64 / duration_hours
+            } else {
+                row.message_count as f64
+            };
+
+            ThreadSummary {
+                thread_id: row.thread_id.clone(),
+                message_count: row.message_count,
+                participant_count,
+                last_subject: last_meta
+                    .map(|meta| meta.subject.clone())
+                    .unwrap_or_default(),
+                last_sender: last_meta
+                    .and_then(|meta| sender_name_map.get(&meta.sender_id))
+                    .cloned()
+                    .unwrap_or_default(),
+                last_timestamp_micros: row.last_timestamp_micros,
+                last_timestamp_iso: micros_to_iso(row.last_timestamp_micros),
+                project_slug: last_meta
+                    .and_then(|meta| project_slug_map.get(&meta.project_id))
+                    .cloned()
+                    .unwrap_or_default(),
+                has_escalation: row.has_escalation,
+                velocity_msg_per_hr: velocity,
+                participant_names,
+                first_timestamp_iso: micros_to_iso(row.first_timestamp_micros),
+                unread_count: 0,
+            }
+        })
+        .collect()
+}
+
+fn latest_thread_meta_by_thread(
+    conn: &DbConn,
+    thread_ids: &[String],
+) -> HashMap<String, LatestThreadMeta> {
+    if thread_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = vec!["?"; thread_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT m.thread_id, m.subject, m.sender_id, m.project_id, m.id \
+         FROM messages m \
+         JOIN ( \
+             SELECT thread_id, MAX(created_ts) AS last_ts \
+             FROM messages \
+             WHERE thread_id IN ({placeholders}) \
+             GROUP BY thread_id \
+         ) latest \
+           ON latest.thread_id = m.thread_id AND latest.last_ts = m.created_ts \
+         ORDER BY m.thread_id ASC, m.id DESC"
+    );
+    let params: Vec<Value> = thread_ids.iter().cloned().map(Value::Text).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            let mut latest = HashMap::new();
+            for row in rows {
+                let Some(thread_id) = row.get_named::<String>("thread_id").ok() else {
+                    continue;
+                };
+                latest.entry(thread_id).or_insert_with(|| LatestThreadMeta {
+                    subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                    sender_id: row.get_named::<i64>("sender_id").ok().unwrap_or_default(),
+                    project_id: row.get_named::<i64>("project_id").ok().unwrap_or_default(),
+                });
+            }
+            latest
+        })
+        .unwrap_or_default()
+}
+
+fn participant_names_by_thread(
+    conn: &DbConn,
+    thread_ids: &[String],
+    sender_name_map: &HashMap<i64, String>,
+) -> HashMap<String, String> {
+    if thread_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = vec!["?"; thread_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT thread_id, sender_id, recipients_json \
+         FROM messages \
+         WHERE thread_id IN ({placeholders})"
+    );
+    let params: Vec<Value> = thread_ids.iter().cloned().map(Value::Text).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            let mut participants: HashMap<String, BTreeSet<String>> = HashMap::new();
+            for row in rows {
+                let Some(thread_id) = row.get_named::<String>("thread_id").ok() else {
+                    continue;
+                };
+                let names = participants.entry(thread_id).or_default();
+                if let Some(sender_name) = row
+                    .get_named::<i64>("sender_id")
+                    .ok()
+                    .and_then(|sender_id| sender_name_map.get(&sender_id).cloned())
+                    && !sender_name.is_empty()
+                {
+                    names.insert(sender_name);
+                }
+                let recipients_json = row
+                    .get_named::<String>("recipients_json")
+                    .ok()
+                    .unwrap_or_default();
+                names.extend(recipient_names_from_json(&recipients_json));
+            }
+            participants
+                .into_iter()
+                .map(|(thread_id, names)| {
+                    let joined = names.into_iter().collect::<Vec<_>>().join(", ");
+                    (thread_id, joined)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn participant_names_for_sender_ids(
+    sender_ids: &[i64],
+    sender_name_map: &HashMap<i64, String>,
+) -> String {
+    let mut names = BTreeSet::new();
+    for sender_id in sender_ids {
+        if let Some(name) = sender_name_map.get(sender_id)
+            && !name.is_empty()
+        {
+            names.insert(name.clone());
+        }
+    }
+    names.into_iter().collect::<Vec<_>>().join(", ")
+}
+
+fn agent_names_by_id(conn: &DbConn, agent_ids: &[i64]) -> HashMap<i64, String> {
+    if agent_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let dedup = agent_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if dedup.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = vec!["?"; dedup.len()].join(", ");
+    let sql = format!("SELECT id, name FROM agents WHERE id IN ({placeholders})");
+    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let id = row.get_named::<i64>("id").ok()?;
+                    let name = row.get_named::<String>("name").ok()?;
+                    Some((id, name))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn project_slugs_by_id(conn: &DbConn, project_ids: &[i64]) -> HashMap<i64, String> {
+    if project_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let dedup = project_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if dedup.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = vec!["?"; dedup.len()].join(", ");
+    let sql = format!("SELECT id, slug FROM projects WHERE id IN ({placeholders})");
+    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let id = row.get_named::<i64>("id").ok()?;
+                    let slug = row.get_named::<String>("slug").ok()?;
+                    Some((id, slug))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn recipient_names_from_json(raw: &str) -> BTreeSet<String> {
+    let parsed = serde_json::from_str::<StoredRecipients>(raw).unwrap_or_default();
+    let mut recipients = BTreeSet::new();
+    for group in [parsed.to, parsed.cc, parsed.bcc] {
+        for name in group {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                recipients.insert(trimmed.to_string());
+            }
+        }
+    }
+    recipients
 }
 
 /// Truth assertion: when the DB reports non-zero threads but the rendered
@@ -5225,6 +5461,8 @@ mod tests {
         let conn = DbConn::open_memory().expect("open memory sqlite");
         conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             .expect("create agents table");
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL)")
+            .expect("create projects table");
         conn.execute_raw(
             "CREATE TABLE messages (\
                id INTEGER PRIMARY KEY, \
@@ -5233,7 +5471,9 @@ mod tests {
                importance TEXT NOT NULL, \
                created_ts INTEGER NOT NULL, \
                sender_id INTEGER NOT NULL, \
-               thread_id TEXT NOT NULL\
+               project_id INTEGER NOT NULL, \
+               thread_id TEXT NOT NULL, \
+               recipients_json TEXT NOT NULL DEFAULT '{}'\
              )",
         )
         .expect("create messages table");
@@ -5246,13 +5486,15 @@ mod tests {
         .expect("create recipients table");
         conn.execute_raw("INSERT INTO agents (id, name) VALUES (1, 'Sender'), (2, 'Receiver')")
             .expect("seed agents");
+        conn.execute_raw("INSERT INTO projects (id, slug) VALUES (1, 'test-proj')")
+            .expect("seed projects");
 
         for idx in 1..=count {
             let id = i64::try_from(idx).expect("idx fits i64");
             let created_ts = 1_700_000_000_000_000_i64 + (id * 1_000_000_i64);
             let insert_message = format!(
-                "INSERT INTO messages (id, subject, body_md, importance, created_ts, sender_id, thread_id) \
-                 VALUES ({id}, 'Subject {id}', 'Body {id}', 'normal', {created_ts}, 1, '{}')",
+                "INSERT INTO messages (id, subject, body_md, importance, created_ts, sender_id, project_id, thread_id, recipients_json) \
+                 VALUES ({id}, 'Subject {id}', 'Body {id}', 'normal', {created_ts}, 1, 1, '{}', '{{\"to\":[\"Receiver\"],\"cc\":[],\"bcc\":[]}}')",
                 thread_id.replace('\'', "''")
             );
             conn.execute_raw(&insert_message)
@@ -5264,6 +5506,32 @@ mod tests {
         }
 
         conn
+    }
+
+    #[test]
+    fn fetch_threads_enriches_latest_subject_project_and_participants_without_join_tables() {
+        let conn = make_thread_messages_db("thread-summary", 3);
+
+        let threads = fetch_threads(&conn, "", None, 10);
+        assert_eq!(threads.len(), 1);
+
+        let thread = &threads[0];
+        assert_eq!(thread.thread_id, "thread-summary");
+        assert_eq!(thread.message_count, 3);
+        assert_eq!(thread.last_subject, "Subject 3");
+        assert_eq!(thread.last_sender, "Sender");
+        assert_eq!(thread.project_slug, "test-proj");
+        assert_eq!(thread.participant_names, "Receiver, Sender");
+        assert_eq!(thread.participant_count, 2);
+    }
+
+    #[test]
+    fn fetch_threads_filter_matches_sender_name_via_agent_lookup() {
+        let conn = make_thread_messages_db("thread-by-sender", 2);
+
+        let threads = fetch_threads(&conn, "Send", None, 10);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, "thread-by-sender");
     }
 
     fn make_thread(id: &str, msg_count: usize, participant_count: usize) -> ThreadSummary {

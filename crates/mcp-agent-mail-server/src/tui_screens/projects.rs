@@ -13,6 +13,8 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
+use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::pool::DbPoolConfig;
 
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{MailEvent, ProjectSummary};
@@ -30,6 +32,7 @@ const COL_CREATED: usize = 5;
 
 const SORT_LABELS: &[&str] = &["Slug", "Path", "Agents", "Msgs", "Reserv", "Created"];
 const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
+const PROJECT_RECOVERY_LIMIT: usize = 500;
 
 /// Activity recency thresholds (microseconds).
 const ACTIVE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
@@ -61,6 +64,102 @@ fn assert_projects_list_cardinality(total_db_projects: u64, rendered_count: usiz
              but rendered list is empty with no active filter — data pipeline dropped all rows"
         );
     }
+}
+
+fn recover_projects_list_from_sqlite(database_url: &str) -> Option<Vec<ProjectSummary>> {
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg.sqlite_path().ok()?;
+    let conn = crate::open_best_effort_sync_db_connection(&path).ok()?;
+    let mut projects = fetch_recent_projects_minimal(&conn);
+    if projects.is_empty() {
+        return Some(projects);
+    }
+
+    let project_ids: Vec<i64> = projects.iter().map(|project| project.id).collect();
+    let agent_counts = fetch_project_count_map(&conn, "agents", &project_ids);
+    let message_counts = fetch_project_count_map(&conn, "messages", &project_ids);
+    for project in &mut projects {
+        project.agent_count = agent_counts.get(&project.id).copied().unwrap_or(0);
+        project.message_count = message_counts.get(&project.id).copied().unwrap_or(0);
+    }
+    Some(projects)
+}
+
+fn fetch_recent_projects_minimal(conn: &DbConn) -> Vec<ProjectSummary> {
+    let sql = format!(
+        "SELECT id, slug, human_key, created_at \
+         FROM projects \
+         ORDER BY created_at DESC, id DESC \
+         LIMIT {PROJECT_RECOVERY_LIMIT}"
+    );
+    conn.query_sync(&sql, &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    Some(ProjectSummary {
+                        id: row
+                            .get_named::<i64>("id")
+                            .ok()
+                            .or_else(|| row.get_as::<i64>(0).ok())?,
+                        slug: row
+                            .get_named::<String>("slug")
+                            .ok()
+                            .or_else(|| row.get_as::<String>(1).ok())?,
+                        human_key: row
+                            .get_named::<String>("human_key")
+                            .ok()
+                            .or_else(|| row.get_as::<String>(2).ok())?,
+                        created_at: row
+                            .get_named::<i64>("created_at")
+                            .ok()
+                            .or_else(|| row.get_as::<i64>(3).ok())
+                            .unwrap_or(0),
+                        ..ProjectSummary::default()
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn fetch_project_count_map(conn: &DbConn, table: &str, project_ids: &[i64]) -> HashMap<i64, u64> {
+    if project_ids.is_empty() {
+        return HashMap::new();
+    }
+    let ids = project_ids
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT project_id, COUNT(*) AS cnt \
+         FROM {table} \
+         WHERE project_id IN ({ids}) \
+         GROUP BY project_id"
+    );
+    conn.query_sync(&sql, &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    Some((
+                        row.get_named::<i64>("project_id")
+                            .ok()
+                            .or_else(|| row.get_as::<i64>(0).ok())?,
+                        row.get_named::<i64>("cnt")
+                            .ok()
+                            .or_else(|| row.get_as::<i64>(1).ok())
+                            .and_then(|count| u64::try_from(count.max(0)).ok())
+                            .unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -118,9 +217,19 @@ impl ProjectsScreen {
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
         let db = state.db_stats_snapshot().unwrap_or_default();
+        let cfg = state.config_snapshot();
         let total_rows = db.projects;
         let raw_count = u64::try_from(db.projects_list.len()).unwrap_or(u64::MAX);
         let mut rows: Vec<ProjectSummary> = db.projects_list;
+        let mut detail_recovered = false;
+        if total_rows > 0 && rows.is_empty() {
+            if let Some(recovered) = recover_projects_list_from_sqlite(&cfg.raw_database_url)
+                && !recovered.is_empty()
+            {
+                rows = recovered;
+                detail_recovered = true;
+            }
+        }
 
         // Apply filter
         let filter_text = self.filter.trim().to_ascii_lowercase();
@@ -171,13 +280,12 @@ impl ProjectsScreen {
         // Detect when list was capped by poller LIMIT (total_rows > list length).
         let list_capped = total_rows > raw_count;
 
-        let cfg = state.config_snapshot();
         let transport_mode = cfg.transport_mode().to_string();
         state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
             screen: "projects".to_string(),
             scope: "db_stats.projects_list".to_string(),
             query_params: format!(
-                "filter={filter};sort_col={sort_label};sort_asc={};list_rows={raw_count};total_rows={total_rows};capped={list_capped}",
+                "filter={filter};sort_col={sort_label};sort_asc={};list_rows={raw_count};total_rows={total_rows};capped={list_capped};recovered={detail_recovered}",
                 self.sort_asc,
             ),
             raw_count: raw_from_db,
@@ -993,9 +1101,17 @@ fn truncate_path_front(path: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use mcp_agent_mail_core::Config;
+    use tempfile::tempdir;
 
     fn test_state() -> std::sync::Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
+    }
+
+    fn set_database_url(state: &std::sync::Arc<TuiSharedState>, database_url: String) {
+        let mut snapshot = state.config_snapshot();
+        snapshot.database_url = database_url.clone();
+        snapshot.raw_database_url = database_url;
+        state.update_config_snapshot(snapshot);
     }
 
     #[test]
@@ -1578,6 +1694,94 @@ mod tests {
         assert_eq!(diag.rendered_count, 2);
         assert_eq!(diag.dropped_count, 1);
         assert!(diag.query_params.contains("capped=false"));
+    }
+
+    #[test]
+    fn rebuild_recovers_projects_from_sqlite_when_snapshot_list_is_empty() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("projects-recovery.sqlite3");
+        let db_path_str = db_path.display().to_string();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open sqlite");
+        conn.execute_raw(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+        )
+        .expect("create agents");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                recipients_json TEXT NOT NULL,
+                created_ts INTEGER NOT NULL
+            )",
+        )
+        .expect("create messages");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+                (1, 'alpha', '/tmp/alpha', 100),
+                (2, 'beta', '/tmp/beta', 200)",
+        )
+        .expect("seed projects");
+        conn.execute_raw(
+            "INSERT INTO agents (id, project_id, name, program, last_active_ts) VALUES
+                (10, 1, 'BlueLake', 'codex', 111),
+                (11, 1, 'RedStone', 'codex', 112),
+                (12, 2, 'GreenField', 'claude', 113)",
+        )
+        .expect("seed agents");
+        conn.execute_raw(
+            "INSERT INTO messages (id, project_id, sender_id, subject, recipients_json, created_ts) VALUES
+                (100, 1, 10, 'hello', '[]', 201),
+                (101, 1, 11, 'world', '[]', 202),
+                (102, 2, 12, 'beta', '[]', 203)",
+        )
+        .expect("seed messages");
+
+        let state = test_state();
+        set_database_url(&state, format!("sqlite:///{}", db_path.display()));
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 2,
+            projects_list: Vec::new(),
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(
+            screen.projects.len(),
+            2,
+            "screen should repopulate from sqlite"
+        );
+        assert_eq!(screen.projects[0].slug, "beta", "newest project first");
+        assert_eq!(screen.projects[0].agent_count, 1);
+        assert_eq!(screen.projects[0].message_count, 1);
+        assert_eq!(screen.projects[1].slug, "alpha");
+        assert_eq!(screen.projects[1].agent_count, 2);
+        assert_eq!(screen.projects[1].message_count, 2);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("diagnostic expected");
+        assert!(
+            diag.query_params.contains("recovered=true"),
+            "diagnostic should record direct sqlite recovery"
+        );
     }
 
     // ── B8: DB context binding guardrail regression tests ─────────────

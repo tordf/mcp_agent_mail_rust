@@ -1328,6 +1328,7 @@ impl MailScreen for DashboardScreen {
         // IMPORTANT: do not require "dirty" on this exact tick. Data generation
         // changes are edge-triggered; cadence ticks are phase-based. If those
         // phases do not align, gating on both can miss refresh forever.
+        let mut throughput_changed = false;
         if tick_count.is_multiple_of(STAT_REFRESH_TICKS) {
             if self.current_db_stats.timestamp_micros == 0 {
                 if let Some(stats) = state.db_stats_snapshot() {
@@ -1369,12 +1370,14 @@ impl MailScreen for DashboardScreen {
                     .drain(..self.throughput_history.len() - THROUGHPUT_HISTORY_CAP);
             }
             self.prev_req_total = counters.total;
+            throughput_changed = true;
         }
 
-        // Advance chart transition (always — animation, no data dependency).
         let now = Instant::now();
-        self.throughput_transition
-            .set_target(&self.throughput_history, now);
+        if throughput_changed {
+            self.throughput_transition
+                .set_target(&self.throughput_history, now);
+        }
         self.animated_throughput_history = self
             .throughput_transition
             .sample_values(now, self.reduced_motion || !self.chart_animations_enabled);
@@ -1385,7 +1388,8 @@ impl MailScreen for DashboardScreen {
     fn prefers_fast_tick(&self, _state: &TuiSharedState) -> bool {
         self.chart_animations_enabled
             && !self.reduced_motion
-            && self.animated_throughput_history != self.throughput_history
+            && self.should_render_trend_panel()
+            && self.throughput_transition.is_animating(Instant::now())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6241,11 +6245,42 @@ mod tests {
         screen.chart_animations_enabled = true;
         screen.reduced_motion = false;
         screen.throughput_history = vec![1.0, 3.0, 5.0];
+        screen.show_trend_panel = true;
+        let started = Instant::now();
+        screen.throughput_transition = ChartTransition::new(std::time::Duration::from_millis(200));
+        screen
+            .throughput_transition
+            .set_target(&[1.0, 2.0, 4.0], started);
+        screen
+            .throughput_transition
+            .set_target(&screen.throughput_history, started);
         screen.animated_throughput_history = vec![1.0, 2.0, 4.0];
 
         assert!(screen.prefers_fast_tick(&state));
 
         screen.animated_throughput_history = screen.throughput_history.clone();
+        screen.throughput_transition = ChartTransition::new(std::time::Duration::from_millis(200));
+        assert!(!screen.prefers_fast_tick(&state));
+    }
+
+    #[test]
+    fn dashboard_does_not_prefer_fast_tick_when_trend_panel_is_hidden() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut screen = DashboardScreen::new();
+        screen.chart_animations_enabled = true;
+        screen.reduced_motion = false;
+        screen.show_trend_panel = false;
+        screen.throughput_history = vec![1.0, 3.0, 5.0];
+        screen.animated_throughput_history = vec![1.0, 2.0, 4.0];
+        let started = Instant::now();
+        screen.throughput_transition = ChartTransition::new(std::time::Duration::from_millis(200));
+        screen
+            .throughput_transition
+            .set_target(&[1.0, 2.0, 4.0], started);
+        screen
+            .throughput_transition
+            .set_target(&screen.throughput_history, started);
+
         assert!(!screen.prefers_fast_tick(&state));
     }
 
