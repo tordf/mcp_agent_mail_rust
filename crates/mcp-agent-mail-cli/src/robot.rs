@@ -5202,7 +5202,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Attachments => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
 
             let rows = conn
@@ -8784,6 +8784,120 @@ mod tests {
             find_project_for_cwd(&conn).expect("resolve project from ancestor");
         assert_eq!(project_id, 1);
         assert_eq!(slug, "workspace");
+    }
+
+    #[test]
+    fn handle_robot_attachments_falls_back_to_best_effort_open_under_reserved_lock() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_attachments_lock.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let seed_conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open seed db");
+        let attachments = serde_json::json!([
+            {
+                "name": "report.txt",
+                "size_bytes": 128,
+                "media_type": "text/plain"
+            }
+        ])
+        .to_string();
+        for stmt in [
+            "PRAGMA foreign_keys = OFF",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto')",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'robot-lock', '/tmp/robot-lock', '2026-03-12 11:00:00')",
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (1, 1, 'Sender', 'codex-cli', 'test', 'robot', '2026-03-12 11:00:01', '2026-03-12 11:00:02', 'auto', 'auto')",
+        ] {
+            seed_conn.execute_raw(stmt).expect("seed statement");
+        }
+        seed_conn
+            .query_sync(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text("br-lock".to_string()),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                        "Attachment message".to_string(),
+                    ),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1_741_779_600_000_000),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(attachments),
+                ],
+            )
+            .expect("insert message");
+        drop(seed_conn);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let lock_path = db_path_str.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let lock_conn =
+                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            lock_conn
+                .execute_raw("PRAGMA busy_timeout = 1;")
+                .expect("set lock busy_timeout");
+            lock_conn
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect("hold reserved sqlite lock");
+            ready_tx.send(()).expect("signal lock ready");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("wait for release");
+            lock_conn
+                .execute_raw("ROLLBACK")
+                .expect("release sqlite lock");
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("wait for lock thread");
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let robot_result = with_navigate_resource_env(
+            &db_url,
+            temp_dir.path().to_string_lossy().as_ref(),
+            || -> Result<(), String> {
+                let handle_thread = std::thread::spawn(move || {
+                    let args = RobotArgs {
+                        format: Some(OutputFormat::Json),
+                        project: Some("robot-lock".to_string()),
+                        agent: None,
+                        command: RobotSubcommand::Attachments,
+                    };
+                    let result = handle_robot(args);
+                    result_tx.send(result).expect("send robot result");
+                });
+
+                let result = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return Err(format!(
+                            "robot attachments should not block on canonical init under reserved lock: {err}"
+                        ));
+                    }
+                };
+                handle_thread
+                    .join()
+                    .map_err(|_| "join robot thread".to_string())?;
+
+                result.map_err(|err| {
+                    format!("robot attachments should succeed via best-effort fallback: {err}")
+                })
+            },
+        );
+
+        release_tx.send(()).expect("release lock thread");
+        lock_thread.join().expect("join lock thread");
+        assert!(robot_result.is_ok(), "{robot_result:?}");
     }
 
     #[test]

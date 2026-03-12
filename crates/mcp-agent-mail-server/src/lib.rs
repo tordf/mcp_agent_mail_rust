@@ -992,7 +992,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     mcp_agent_mail_core::pre_intern_policies();
 
     // Check for resource collisions (e.g. another am process holding locks)
-    let probe_report = startup_checks::run_startup_probes(config);
+    let probe_report = startup_checks::run_stdio_startup_probes(config);
     if !probe_report.is_ok() {
         ftui_runtime::ftui_eprintln!(
             "warning: startup probes detected potential issues: {}",

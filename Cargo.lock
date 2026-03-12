@@ -4690,6 +4690,7 @@ dependencies = [
  "sqlmodel-sqlite",
  "tempfile",
  "thiserror",
+ "tracing",
  "tracing-subscriber",
  "tru",
  "walkdir",
