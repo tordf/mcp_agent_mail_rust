@@ -1463,7 +1463,7 @@ impl Config {
                 config.tui_tree_style = lower;
             }
         }
-        if let Some(v) = console_value("AM_TUI_THEME") {
+        if let Some(v) = console_value("AM_TUI_THEME").or_else(|| console_value("TUI_THEME")) {
             let lower = v.trim().to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
@@ -2462,6 +2462,19 @@ mod tests {
         assert!(!config.tui_key_hints);
         assert!(config.tui_reduced_motion);
         assert!(config.tui_screen_reader);
+    }
+
+    #[test]
+    fn test_tui_theme_reads_user_envfile_when_env_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(&env_path, "TUI_THEME=solarized\n").expect("write envfile");
+        let env_path_str = env_path.to_string_lossy().to_string();
+        let vars = vec![("CONSOLE_PERSIST_PATH", env_path_str.as_str())];
+        let _env = TestEnvOverrideGuard::set(&vars);
+
+        let config = Config::from_env();
+        assert_eq!(config.tui_theme, "solarized");
     }
 
     #[test]
