@@ -4086,10 +4086,17 @@ fn sqlite_conn_requires_canonical_init(conn: &mcp_agent_mail_db::DbConn) -> CliR
     Ok(false)
 }
 
-const SQLITE_ROBOT_READ_TABLES: [&str; 4] =
-    ["projects", "agents", "messages", "message_recipients"];
+const SQLITE_ROBOT_READ_TABLES: [&str; 6] = [
+    "projects",
+    "agents",
+    "messages",
+    "message_recipients",
+    "file_reservations",
+    "agent_links",
+];
 
-const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 22] = [
+const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 40] = [
+    ("projects", "id"),
     ("projects", "slug"),
     ("projects", "human_key"),
     ("projects", "created_at"),
@@ -4097,7 +4104,10 @@ const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 22] = [
     ("agents", "project_id"),
     ("agents", "name"),
     ("agents", "program"),
+    ("agents", "model"),
+    ("agents", "inception_ts"),
     ("agents", "last_active_ts"),
+    ("agents", "contact_policy"),
     ("messages", "id"),
     ("messages", "project_id"),
     ("messages", "sender_id"),
@@ -4107,11 +4117,25 @@ const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 22] = [
     ("messages", "importance"),
     ("messages", "ack_required"),
     ("messages", "created_ts"),
+    ("messages", "attachments"),
     ("message_recipients", "message_id"),
     ("message_recipients", "agent_id"),
     ("message_recipients", "kind"),
     ("message_recipients", "read_ts"),
     ("message_recipients", "ack_ts"),
+    ("file_reservations", "id"),
+    ("file_reservations", "project_id"),
+    ("file_reservations", "agent_id"),
+    ("file_reservations", "path_pattern"),
+    ("file_reservations", "exclusive"),
+    ("file_reservations", "created_ts"),
+    ("file_reservations", "expires_ts"),
+    ("agent_links", "a_project_id"),
+    ("agent_links", "a_agent_id"),
+    ("agent_links", "b_agent_id"),
+    ("agent_links", "status"),
+    ("agent_links", "reason"),
+    ("agent_links", "updated_ts"),
 ];
 
 fn sqlite_conn_supports_robot_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
@@ -4119,7 +4143,8 @@ fn sqlite_conn_supports_robot_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResu
         .query_sync(
             "SELECT name FROM sqlite_master \
              WHERE type='table' \
-               AND name IN ('projects', 'agents', 'messages', 'message_recipients')",
+               AND name IN ('projects', 'agents', 'messages', 'message_recipients', \
+                            'file_reservations', 'agent_links')",
             &[],
         )
         .map_err(|e| CliError::Other(format!("sqlite_master robot probe failed: {e}")))?;
@@ -4900,7 +4925,7 @@ fn open_db_sync_robot_best_effort_with_database_url(
         return Ok(conn);
     }
     Err(CliError::Other(
-        "robot read fallback requires core messaging schema".to_string(),
+        "robot read fallback requires the full robot command schema".to_string(),
     ))
 }
 
@@ -27456,20 +27481,43 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn sqlite_conn_supports_robot_reads_accepts_legacy_core_schema() {
+    fn sqlite_conn_supports_robot_reads_accepts_robot_command_schema() {
         let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
         for sql in [
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto')",
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
             "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT, created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
+            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER NOT NULL, a_agent_id INTEGER NOT NULL, b_project_id INTEGER NOT NULL, b_agent_id INTEGER NOT NULL, status TEXT NOT NULL, reason TEXT DEFAULT '', created_ts DATETIME NOT NULL, updated_ts DATETIME NOT NULL, expires_ts DATETIME)",
         ] {
             conn.execute_raw(sql).expect("create robot-readable table");
         }
 
         assert!(
             sqlite_conn_supports_robot_reads(&conn).expect("robot schema probe"),
-            "legacy core messaging schema should be sufficient for best-effort robot reads"
+            "full robot query schema should be sufficient for best-effort robot reads"
+        );
+    }
+
+    #[test]
+    fn sqlite_conn_supports_robot_reads_rejects_partial_robot_schema() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        for sql in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto')",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL)",
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT, created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL)",
+            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER NOT NULL, a_agent_id INTEGER NOT NULL, b_project_id INTEGER NOT NULL, b_agent_id INTEGER NOT NULL, updated_ts DATETIME NOT NULL)",
+        ] {
+            conn.execute_raw(sql)
+                .expect("create partial robot schema table");
+        }
+
+        assert!(
+            !sqlite_conn_supports_robot_reads(&conn).expect("robot schema probe"),
+            "partial schemas that break robot subcommands must not be blessed for best-effort fallback"
         );
     }
 

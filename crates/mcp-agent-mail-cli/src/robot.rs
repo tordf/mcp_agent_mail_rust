@@ -3722,6 +3722,24 @@ fn navigate_should_use_canonical_resource(uri: &str) -> bool {
     )
 }
 
+fn build_navigate_without_db(
+    uri: &str,
+) -> Result<Option<(NavigateResult, Option<String>)>, CliError> {
+    let (path, query) = split_resource_path_and_query(uri)?;
+    let parts: Vec<String> = path
+        .split('/')
+        .map(percent_decode_resource_path_component)
+        .collect();
+    let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
+
+    match parts_ref.as_slice() {
+        ["config", "environment"] => Ok(Some(build_navigate_config_environment())),
+        ["identity", project_ref] => Ok(Some(build_navigate_identity(project_ref)?)),
+        ["tooling", ..] => Ok(Some(build_navigate_tooling(&parts_ref, &query)?)),
+        _ => Ok(None),
+    }
+}
+
 fn build_navigate_from_canonical_resource(
     uri: &str,
     default_project: Option<&str>,
@@ -4736,7 +4754,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             importance,
             since,
         } => {
-            let conn = crate::open_db_sync_robot()?;
+            // Search executes via the async search service and its full DB pool, so it
+            // cannot safely rely on the reduced best-effort robot fallback path.
+            let conn = crate::open_db_sync()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let data = build_search(
                 &conn,
@@ -4893,9 +4913,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
-            let db_ok = match crate::open_db_sync_robot() {
+            let db_ok = match crate::open_db_sync() {
                 Ok(conn) => {
-                    // Verify with a lightweight query
+                    // Verify canonical DB reachability with a lightweight query.
                     conn.query_sync("SELECT 1", &[]).is_ok()
                 }
                 Err(_) => false,
@@ -5251,6 +5271,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         RobotSubcommand::Navigate { uri } => {
             let (result, resolved_project) = if navigate_should_use_canonical_resource(&uri) {
                 build_navigate_from_canonical_resource(&uri, args.project.as_deref())?
+            } else if let Some(result) = build_navigate_without_db(&uri)? {
+                result
             } else {
                 let conn = crate::open_db_sync_robot()?;
                 let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
@@ -8280,6 +8302,36 @@ mod tests {
             other => panic!("unexpected tooling metrics result: {other:?}"),
         }
         assert!(scope.is_none());
+    }
+
+    #[test]
+    fn test_build_navigate_without_db_supports_tooling_metrics_resource() {
+        let (result, scope) = build_navigate_without_db("resource://tooling/metrics")
+            .expect("navigate tooling without db")
+            .expect("tooling metrics should bypass db");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "tooling/metrics");
+                assert!(data["health_level"].is_string());
+                assert!(data["tools"].is_array());
+            }
+            other => panic!("unexpected tooling metrics result: {other:?}"),
+        }
+        assert!(scope.is_none());
+    }
+
+    #[test]
+    fn test_build_navigate_without_db_returns_none_for_db_backed_resource() {
+        let result =
+            build_navigate_without_db("resource://thread/demo-thread").expect("navigate helper");
+        assert!(
+            result.is_none(),
+            "thread resources still require DB-backed navigate"
+        );
     }
 
     #[test]
