@@ -81,18 +81,24 @@ fn recover_projects_list_from_sqlite(database_url: &str) -> Option<Vec<ProjectSu
     let project_ids: Vec<i64> = projects.iter().map(|project| project.id).collect();
     let agent_counts = fetch_project_count_map(&conn, "agents", &project_ids);
     let message_counts = fetch_project_count_map(&conn, "messages", &project_ids);
+    let reservation_counts = crate::tui_poller::fetch_active_reservation_counts_by_project(
+        &conn,
+        chrono::Utc::now().timestamp_micros(),
+    );
     for project in &mut projects {
         project.agent_count = agent_counts.get(&project.id).copied().unwrap_or(0);
         project.message_count = message_counts.get(&project.id).copied().unwrap_or(0);
+        project.reservation_count = reservation_counts.get(&project.id).copied().unwrap_or(0);
     }
     Some(projects)
 }
 
 fn fetch_recent_projects_minimal(conn: &DbConn) -> Vec<ProjectSummary> {
+    let created_at_sort = crate::tui_poller::timestamp_sort_expr("created_at");
     let sql = format!(
-        "SELECT id, slug, human_key, created_at \
+        "SELECT id, slug, human_key, {created_at_sort} AS created_at_micros \
          FROM projects \
-         ORDER BY created_at DESC, id DESC \
+         ORDER BY {created_at_sort} DESC, id DESC \
          LIMIT {PROJECT_RECOVERY_LIMIT}"
     );
     conn.query_sync(&sql, &[])
@@ -113,17 +119,46 @@ fn fetch_recent_projects_minimal(conn: &DbConn) -> Vec<ProjectSummary> {
                             .get_named::<String>("human_key")
                             .ok()
                             .or_else(|| row.get_as::<String>(2).ok())?,
-                        created_at: row
-                            .get_named::<i64>("created_at")
-                            .ok()
-                            .or_else(|| row.get_as::<i64>(3).ok())
-                            .unwrap_or(0),
+                        created_at: parse_recovered_created_at(&row),
                         ..ProjectSummary::default()
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_recovered_created_at(row: &mcp_agent_mail_db::sqlmodel::Row) -> i64 {
+    let by_name = crate::tui_poller::parse_raw_ts(row, "created_at_micros");
+    if by_name != 0 {
+        return by_name;
+    }
+
+    row.get_as::<i64>(3)
+        .ok()
+        .or_else(|| {
+            row.get_as::<String>(3)
+                .ok()
+                .map(|value| parse_recovered_created_at_text(&value))
+        })
+        .unwrap_or(0)
+}
+
+fn parse_recovered_created_at_text(value: &str) -> i64 {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    if let Ok(parsed) = trimmed.parse::<i64>() {
+        return parsed;
+    }
+    if let Ok(parsed) = trimmed.parse::<f64>() {
+        return format!("{:.0}", parsed.trunc()).parse::<i64>().unwrap_or(0);
+    }
+    mcp_agent_mail_db::migrate::text_to_micros(trimmed, "projects_screen", "created_at", 0)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
 }
 
 fn fetch_project_count_map(conn: &DbConn, table: &str, project_ids: &[i64]) -> HashMap<i64, u64> {
@@ -221,15 +256,16 @@ impl ProjectsScreen {
         let total_rows = db.projects;
         let raw_count = u64::try_from(db.projects_list.len()).unwrap_or(u64::MAX);
         let mut rows: Vec<ProjectSummary> = db.projects_list;
-        let mut detail_recovered = false;
-        if total_rows > 0 && rows.is_empty() {
-            if let Some(recovered) = recover_projects_list_from_sqlite(&cfg.raw_database_url)
-                && !recovered.is_empty()
-            {
-                rows = recovered;
-                detail_recovered = true;
-            }
-        }
+        let detail_recovered = if total_rows > 0
+            && rows.is_empty()
+            && let Some(recovered) = recover_projects_list_from_sqlite(&cfg.raw_database_url)
+            && !recovered.is_empty()
+        {
+            rows = recovered;
+            true
+        } else {
+            false
+        };
 
         // Apply filter
         let filter_text = self.filter.trim().to_ascii_lowercase();
@@ -1697,6 +1733,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn rebuild_recovers_projects_from_sqlite_when_snapshot_list_is_empty() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("projects-recovery.sqlite3");
@@ -1707,7 +1744,7 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
                 human_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at TEXT NOT NULL
             )",
         )
         .expect("create projects");
@@ -1733,9 +1770,18 @@ mod tests {
         )
         .expect("create messages");
         conn.execute_raw(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                released_ts INTEGER,
+                expires_ts INTEGER NOT NULL
+            )",
+        )
+        .expect("create file_reservations");
+        conn.execute_raw(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES
-                (1, 'alpha', '/tmp/alpha', 100),
-                (2, 'beta', '/tmp/beta', 200)",
+                (1, 'alpha', '/tmp/alpha', '2026-03-11T00:00:00Z'),
+                (2, 'beta', '/tmp/beta', '2026-03-12T00:00:00Z')",
         )
         .expect("seed projects");
         conn.execute_raw(
@@ -1752,6 +1798,15 @@ mod tests {
                 (102, 2, 12, 'beta', '[]', 203)",
         )
         .expect("seed messages");
+        conn.execute_raw(&format!(
+            "INSERT INTO file_reservations (id, project_id, released_ts, expires_ts) VALUES
+                (1, 1, NULL, 1),
+                (2, 2, NULL, {}),
+                (3, 2, 5, {})",
+            chrono::Utc::now().timestamp_micros() + 60_000_000,
+            chrono::Utc::now().timestamp_micros() + 60_000_000,
+        ))
+        .expect("seed reservations");
 
         let state = test_state();
         set_database_url(&state, format!("sqlite:///{}", db_path.display()));
@@ -1772,9 +1827,12 @@ mod tests {
         assert_eq!(screen.projects[0].slug, "beta", "newest project first");
         assert_eq!(screen.projects[0].agent_count, 1);
         assert_eq!(screen.projects[0].message_count, 1);
+        assert_eq!(screen.projects[0].reservation_count, 1);
+        assert!(screen.projects[0].created_at > 0);
         assert_eq!(screen.projects[1].slug, "alpha");
         assert_eq!(screen.projects[1].agent_count, 2);
         assert_eq!(screen.projects[1].message_count, 2);
+        assert_eq!(screen.projects[1].reservation_count, 0);
 
         let diagnostics = state.screen_diagnostics_since(0);
         let (_, diag) = diagnostics.last().expect("diagnostic expected");

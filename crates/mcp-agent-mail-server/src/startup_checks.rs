@@ -215,7 +215,7 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
     let host_for_resolution = connect_host
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(connect_host.as_ref());
+        .unwrap_or_else(|| connect_host.as_ref());
     let Ok(addrs) = (host_for_resolution, port).to_socket_addrs() else {
         return false;
     };
@@ -292,9 +292,8 @@ fn probe_agent_mail_health_addr(connect_host: &str, port: u16, addr: std::net::S
         let mut header_bytes = 0_usize;
         loop {
             let mut line = String::new();
-            let bytes = match reader.read_line(&mut line) {
-                Ok(bytes) => bytes,
-                Err(_) => return false,
+            let Ok(bytes) = reader.read_line(&mut line) else {
+                return false;
             };
             if bytes == 0 {
                 return false;
@@ -1395,6 +1394,7 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
 
     fn default_config() -> Config {
         Config::default()
@@ -1791,11 +1791,17 @@ mod tests {
     #[test]
     fn health_check_tries_all_resolved_addresses() {
         let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind dead listener");
-        let dead_port = dead_listener.local_addr().expect("dead listener addr").port();
+        let dead_port = dead_listener
+            .local_addr()
+            .expect("dead listener addr")
+            .port();
         drop(dead_listener);
 
         let live_listener = TcpListener::bind("127.0.0.1:0").expect("bind live listener");
-        let live_port = live_listener.local_addr().expect("live listener addr").port();
+        let live_port = live_listener
+            .local_addr()
+            .expect("live listener addr")
+            .port();
         let live_addr = std::net::SocketAddr::from(([127, 0, 0, 1], live_port));
         let dead_addr = std::net::SocketAddr::from(([127, 0, 0, 1], dead_port));
 
@@ -2240,10 +2246,9 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&db_path)
             .unwrap();
-
-        use fs2::FileExt;
         file.lock_exclusive().unwrap();
 
         let mut config = default_config();

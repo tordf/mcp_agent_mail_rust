@@ -2575,10 +2575,7 @@ impl MailAppModel {
     }
 
     fn has_animating_toasts(&self) -> bool {
-        self.notifications
-            .visible()
-            .iter()
-            .any(|toast| toast.is_animating())
+        self.notifications.visible().iter().any(Toast::is_animating)
     }
 
     fn active_screen_prefers_fast_tick(&self) -> bool {

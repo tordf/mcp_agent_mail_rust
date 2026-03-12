@@ -1132,7 +1132,7 @@ impl EventRingBuffer {
     /// or the event was dropped by the sampling policy.  This is the
     /// preferred path for the server thread where blocking on the TUI
     /// reader is unacceptable.
-    #[must_use]
+    #[allow(clippy::result_large_err)]
     pub fn try_push(&self, event: MailEvent) -> Result<u64, MailEvent> {
         let Ok(mut inner) = self.inner.try_lock() else {
             self.contention_drops.fetch_add(1, Ordering::Relaxed);
@@ -2391,7 +2391,10 @@ mod tests {
     #[test]
     fn try_push_returns_none_when_locked() {
         let ring = EventRingBuffer::with_capacity(8);
-        let _guard = ring.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ring
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ring2 = ring.clone();
         assert!(ring2.try_push(sample_http("/blocked", 500)).is_err());
     }
@@ -2400,7 +2403,10 @@ mod tests {
     fn try_iter_recent_returns_none_when_locked() {
         let ring = EventRingBuffer::with_capacity(8);
         let _ = ring.push(sample_http("/ok", 200));
-        let _guard = ring.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ring
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ring2 = ring.clone();
         assert!(ring2.try_iter_recent(1).is_none());
     }
@@ -2409,7 +2415,10 @@ mod tests {
     fn try_events_since_seq_returns_none_when_locked() {
         let ring = EventRingBuffer::with_capacity(8);
         let _ = ring.push(sample_http("/ok", 200));
-        let _guard = ring.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ring
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ring2 = ring.clone();
         assert!(ring2.try_events_since_seq(0).is_none());
     }

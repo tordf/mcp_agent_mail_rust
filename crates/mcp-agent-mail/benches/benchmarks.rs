@@ -1773,7 +1773,7 @@ fn run_share_export_once(
     let finalize_us = t3.elapsed().as_micros() as u64;
 
     let context = mcp_agent_mail_share::SnapshotContext {
-        snapshot_path: snapshot_path.clone(),
+        snapshot_path,
         scope,
         scrub_summary,
         fts_enabled: finalize.fts_enabled,

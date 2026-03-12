@@ -446,29 +446,29 @@ fn unresolved_result_matches_agent_filter(query: &SearchQuery, result: &SearchRe
     };
 
     // If the result has sender info, check it.
-    let sender_matches = if let Some(from_agent) = result.from_agent.as_deref() {
-        from_agent.eq_ignore_ascii_case(agent_name)
-    } else {
-        // If sender is missing, we can't definitively exclude it for Outbox,
-        // but for Outbox it's likely a mismatch. However, for candidate
-        // generation, we prefer false positives over false negatives.
-        // If both sender and recipients are missing (raw index hit), return true.
-        result.to.is_none()
-    };
+    let sender_matches = result.from_agent.as_deref().map_or_else(
+        || {
+            // If sender is missing, we can't definitively exclude it for Outbox,
+            // but for Outbox it's likely a mismatch. However, for candidate
+            // generation, we prefer false positives over false negatives.
+            // If both sender and recipients are missing (raw index hit), return true.
+            result.to.is_none()
+        },
+        |from_agent| from_agent.eq_ignore_ascii_case(agent_name),
+    );
 
     // If the result has recipient info, check it.
-    let recipient_matches = if let Some(to) = &result.to {
+    let recipient_matches = result.to.as_ref().is_none_or(|to| {
         to.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
-            || result.cc.as_ref().map_or(false, |cc| {
-                cc.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
-            })
-            || result.bcc.as_ref().map_or(false, |bcc| {
-                bcc.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
-            })
-    } else {
-        // If recipient data is missing (raw index hit), assume it might match.
-        true
-    };
+            || result
+                .cc
+                .as_ref()
+                .is_some_and(|cc| cc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
+            || result
+                .bcc
+                .as_ref()
+                .is_some_and(|bcc| bcc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
+    });
 
     match query.direction {
         Some(Direction::Outbox) => sender_matches,
@@ -591,6 +591,7 @@ fn raw_result_matches_query_filters(
     true
 }
 
+#[allow(clippy::items_after_statements, clippy::too_many_lines)]
 async fn canonicalize_message_results(
     cx: &Cx,
     pool: &DbPool,
@@ -3096,7 +3097,7 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
     hasher.finish()
 }
 
-fn default_scope_context() -> ScopeContext {
+const fn default_scope_context() -> ScopeContext {
     ScopeContext {
         viewer: None,
         approved_contacts: Vec::new(),
@@ -3112,6 +3113,7 @@ fn default_scope_context() -> ScopeContext {
 /// key must include the effective authorization context and redaction policy that
 /// produced the response. Otherwise operator/scoped or differently redacted
 /// responses can collide and be replayed incorrectly.
+#[allow(clippy::collection_is_never_read)]
 fn cache_authorization_discriminator(options: &SearchOptions) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

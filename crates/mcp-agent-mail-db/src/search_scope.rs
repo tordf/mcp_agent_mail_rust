@@ -359,10 +359,11 @@ pub fn evaluate_scope(result: &SearchResult, ctx: &ScopeContext) -> ScopeDecisio
 
 /// Check if the viewer is the sender of this message.
 fn is_sender(result: &SearchResult, viewer: ViewerIdentity, _ctx: &ScopeContext) -> bool {
-    if let Some(sender_id) = result.from_agent_id {
-        if sender_id == viewer.agent_id && result.project_id == Some(viewer.project_id) {
-            return true;
-        }
+    if let Some(sender_id) = result.from_agent_id
+        && sender_id == viewer.agent_id
+        && result.project_id == Some(viewer.project_id)
+    {
+        return true;
     }
     false
 }

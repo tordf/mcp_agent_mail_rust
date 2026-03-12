@@ -341,17 +341,16 @@ pub fn fuse_rrf(
                 let semantic_contrib = rrf_contribution(config.k, semantic_rank);
 
                 // Optimization: find first_source from candidates (small set, linear scan is fine).
-                let first_source = candidates
-                    .iter()
-                    .find(|c| c.doc_id == doc_id)
-                    .map(|c| c.first_source)
-                    .unwrap_or_else(|| {
+                let first_source = candidates.iter().find(|c| c.doc_id == doc_id).map_or_else(
+                    || {
                         if lexical_rank.is_some() {
                             CandidateSource::Lexical
                         } else {
                             CandidateSource::Semantic
                         }
-                    });
+                    },
+                    |c| c.first_source,
+                );
 
                 let source_contributions = vec![
                     SourceContribution {

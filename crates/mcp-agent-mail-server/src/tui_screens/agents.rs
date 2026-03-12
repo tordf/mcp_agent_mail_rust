@@ -1141,8 +1141,8 @@ impl AgentsScreen {
                 } else if wide {
                     Row::new(vec![
                         name_display,
-                        agent.program.to_string(),
-                        agent.model.to_string(),
+                        agent.program.clone(),
+                        agent.model.clone(),
                         active_str,
                         msg_str,
                     ])
@@ -1150,7 +1150,7 @@ impl AgentsScreen {
                 } else {
                     Row::new(vec![
                         name_display,
-                        agent.program.to_string(),
+                        agent.program.clone(),
                         active_str,
                         msg_str,
                     ])

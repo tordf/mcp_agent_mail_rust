@@ -279,7 +279,7 @@ fn normalize_repo_path(input: &str) -> McpResult<PathBuf> {
     if !path.is_absolute() {
         return Err(McpError::new(
             McpErrorCode::InvalidParams,
-            format!("Repository path must be absolute (or use ~/...): {}", input),
+            format!("Repository path must be absolute (or use ~/...): {input}"),
         ));
     }
     Ok(path)
@@ -510,8 +510,8 @@ pub async fn file_reservation_paths(
         } else {
             // Deterministic ordering keeps API output stable across runs
             // even when the index scans hash buckets in different orders.
-            let mut holders: Vec<PendingConflictHolder> = conflict_refs
-                .drain(..)
+            let mut holders: Vec<PendingConflictHolder> = std::mem::take(&mut conflict_refs)
+                .into_iter()
                 .map(|rref| PendingConflictHolder {
                     agent_id: rref.agent_id,
                     path_pattern: rref.path_pattern.clone(),
@@ -659,6 +659,7 @@ pub async fn file_reservation_paths(
 /// - `agent_name`: Agent releasing reservations
 /// - `paths`: Restrict release to matching path patterns
 /// - `file_reservation_ids`: Restrict release to matching IDs
+#[allow(clippy::too_many_lines)]
 #[tool(
     description = "Release active file reservations held by an agent.\n\nBehavior\n--------\n- If both `paths` and `file_reservation_ids` are omitted, all active reservations for the agent are released\n- Otherwise, restricts release to matching ids and/or path patterns\n- JSON artifacts stay in Git for audit; DB records get `released_ts`\n\nReturns\n-------\ndict\n    { released: int, released_at: iso8601 }\n\nIdempotency\n-----------\n- Safe to call repeatedly. Releasing an already-released (or non-existent) reservation is a no-op.\n\nExamples\n--------\nRelease all active reservations for agent:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"13\",\"method\":\"tools/call\",\"params\":{\"name\":\"release_file_reservations\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"GreenCastle\"\n}}}\n```\n\nRelease by ids:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"14\",\"method\":\"tools/call\",\"params\":{\"name\":\"release_file_reservations\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"GreenCastle\",\"file_reservation_ids\":[101,102]\n}}}\n```"
 )]
@@ -704,10 +705,9 @@ pub async fn release_file_reservations(
                 agent_id,
                 normalized_paths.as_deref(),
                 file_reservation_ids.as_deref(),
-            ) {
-                if let Some(rid) = res.id {
-                    ids.push(rid);
-                }
+            ) && let Some(rid) = res.id
+            {
+                ids.push(rid);
             }
         }
         Some(ids)

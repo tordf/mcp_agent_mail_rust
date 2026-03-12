@@ -124,7 +124,7 @@ fn recipient_names(recipients: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn redacted_bcc_recipients() -> Vec<String> {
+const fn redacted_bcc_recipients() -> Vec<String> {
     // These resources are project-scoped rather than caller-scoped, so they
     // cannot safely determine when BCC visibility is allowed.
     Vec::new()
@@ -4466,7 +4466,7 @@ mod resource_shape_tests {
                 assert!(
                     message_value["bcc"]
                         .as_array()
-                        .is_some_and(|bcc| bcc.is_empty()),
+                        .is_some_and(std::vec::Vec::is_empty),
                     "message resource should never expose hidden recipients"
                 );
                 assert!(
@@ -4489,7 +4489,7 @@ mod resource_shape_tests {
                 assert!(
                     thread_messages[0]["bcc"]
                         .as_array()
-                        .is_some_and(|bcc| bcc.is_empty()),
+                        .is_some_and(std::vec::Vec::is_empty),
                     "thread resource should never expose hidden recipients"
                 );
                 assert!(

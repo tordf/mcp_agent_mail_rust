@@ -602,7 +602,7 @@ impl ReadCache {
         let mut has_remaining = false;
         for shard in &self.deferred_touch_shards {
             let mut s = shard.lock();
-            
+
             // Efficiently remove and collect only the keys for the requested scope.
             // Using retain() or drain_filter() (if it were stable) would be ideal,
             // but we'll manually iterate and remove to stay on stable/robust path.

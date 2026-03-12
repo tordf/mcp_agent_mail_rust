@@ -616,7 +616,9 @@ impl ToolMetricsScreen {
 
     fn rebuild_sorted(&mut self) {
         let previous_selection = self.table_state.selected;
-        let previous_selected_name = self.selected_tool_name().map(|name| name.to_owned());
+        let previous_selected_name = self
+            .selected_tool_name()
+            .map(std::borrow::ToOwned::to_owned);
         let mut tools: Vec<&ToolStats> = self.tool_map.values().collect();
         tools.sort_by(|a, b| {
             let primary = match self.sort_col {
@@ -1893,9 +1895,9 @@ mod tests {
 
         screen.ingest_events(&state);
 
-        let stats = &screen.tool_map["send_message"];
-        assert_eq!(stats.calls, 1);
-        assert_eq!(stats.errors, 0);
+        let tool_stats = &screen.tool_map["send_message"];
+        assert_eq!(tool_stats.calls, 1);
+        assert_eq!(tool_stats.errors, 0);
     }
 
     #[test]
@@ -2060,7 +2062,7 @@ mod tests {
         assert_eq!(screen.detail_scroll, 0);
         match screen.focused_event() {
             Some(MailEvent::ToolCallEnd { tool_name, .. }) => {
-                assert_eq!(tool_name, "fetch_inbox")
+                assert_eq!(tool_name, "fetch_inbox");
             }
             other => panic!("expected focused fetch_inbox tool event, got {other:?}"),
         }
@@ -2293,9 +2295,9 @@ mod tests {
 
         screen.tick(1, &state);
 
-        let stats = &screen.tool_map["resolve_pane_identity"];
-        assert_eq!(stats.calls, 1);
-        assert_eq!(stats.errors, 1);
+        let tool_stats = &screen.tool_map["resolve_pane_identity"];
+        assert_eq!(tool_stats.calls, 1);
+        assert_eq!(tool_stats.errors, 1);
     }
 
     #[test]

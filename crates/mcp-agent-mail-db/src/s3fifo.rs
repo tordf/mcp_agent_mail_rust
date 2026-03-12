@@ -182,13 +182,13 @@ where
 
     /// Number of live entries (Small + Main, excludes Ghost).
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.small_live_count + self.main_live_count
     }
 
     /// Whether the cache has no live entries.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -243,7 +243,7 @@ where
             self.small_live_count -= 1;
 
             let Node::Small { value, freq } = node else {
-                // This should be unreachable due to matches! check above, but 
+                // This should be unreachable due to matches! check above, but
                 // we handle it gracefully just in case.
                 continue;
             };
@@ -286,10 +286,10 @@ where
     fn evict_main_if_full(&mut self) {
         if self.main_capacity == 0 {
             while let Some(key) = self.main.pop_front() {
-                if matches!(self.index.get(&key), Some(Node::Main { .. })) {
-                    if let Some(Node::Main { .. }) = self.index.remove(&key) {
-                        self.main_live_count -= 1;
-                    }
+                if matches!(self.index.get(&key), Some(Node::Main { .. }))
+                    && let Some(Node::Main { .. }) = self.index.remove(&key)
+                {
+                    self.main_live_count -= 1;
                 }
             }
             return;

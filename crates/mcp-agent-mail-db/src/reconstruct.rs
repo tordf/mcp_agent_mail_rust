@@ -1201,6 +1201,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn reconstruct_with_message() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("test.db");

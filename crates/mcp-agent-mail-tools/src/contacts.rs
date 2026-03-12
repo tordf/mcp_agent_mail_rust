@@ -10,6 +10,7 @@ use fastmcp::prelude::*;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::collections::HashMap;
 
 use crate::messaging::{
     enqueue_agent_semantic_index, enqueue_message_semantic_index, try_write_message_archive,
@@ -398,10 +399,9 @@ pub async fn respond_contact(
     ttl_seconds: Option<i64>,
 ) -> McpResult<String> {
     // Normalize names
-    let to_agent = mcp_agent_mail_core::models::normalize_agent_name(&to_agent)
-        .unwrap_or(to_agent);
-    let from_agent = mcp_agent_mail_core::models::normalize_agent_name(&from_agent)
-        .unwrap_or(from_agent);
+    let to_agent = mcp_agent_mail_core::models::normalize_agent_name(&to_agent).unwrap_or(to_agent);
+    let from_agent =
+        mcp_agent_mail_core::models::normalize_agent_name(&from_agent).unwrap_or(from_agent);
 
     let pool = get_db_pool()?;
 
@@ -486,10 +486,8 @@ pub async fn list_contacts(
     agent_name: String,
 ) -> McpResult<String> {
     // Normalize agent name
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
-
-    use std::collections::HashMap;
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -584,8 +582,8 @@ pub async fn set_contact_policy(
 ) -> McpResult<String> {
     let policy_norm = parse_contact_policy(&policy);
     // Normalize agent name
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;

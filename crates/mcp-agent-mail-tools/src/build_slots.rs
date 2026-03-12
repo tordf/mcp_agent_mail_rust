@@ -49,7 +49,9 @@ pub struct ReleaseBuildSlotResponse {
 }
 
 fn safe_component(value: &str) -> String {
-    let safe = value.trim().replace(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' '), "_");
+    let safe = value
+        .trim()
+        .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '], "_");
     // Prevent path traversal via special components.
     if safe.is_empty() || safe == "." || safe == ".." {
         "unknown".to_string()

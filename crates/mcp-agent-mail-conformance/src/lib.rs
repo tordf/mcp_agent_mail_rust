@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
+use chrono::DateTime;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use chrono::DateTime;
 
 pub const FIXTURE_PATH: &str = "tests/conformance/fixtures/python_reference.json";
 
@@ -45,12 +45,13 @@ impl Fixtures {
                 "fixtures.generated_at must be non-empty".to_string(),
             ));
         }
-        
+
         // Ensure generated_at is a valid ISO 8601 timestamp
         if DateTime::parse_from_rfc3339(&self.generated_at).is_err() {
-            return Err(FixtureLoadError::Validation(
-                format!("fixtures.generated_at must be valid RFC3339 (ISO 8601), got: '{}'", self.generated_at)
-            ));
+            return Err(FixtureLoadError::Validation(format!(
+                "fixtures.generated_at must be valid RFC3339 (ISO 8601), got: '{}'",
+                self.generated_at
+            )));
         }
 
         for (tool, fixture) in &self.tools {

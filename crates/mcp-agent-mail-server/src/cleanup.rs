@@ -515,13 +515,12 @@ fn path_modified_within_grace(path: &Path, now_us: i64, grace_us: i64) -> bool {
     path.metadata()
         .ok()
         .and_then(|metadata| metadata.modified().ok())
-        .map(|modified| {
+        .is_some_and(|modified| {
             let mtime_us = modified
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));
             now_us.saturating_sub(mtime_us) <= grace_us
         })
-        .unwrap_or(false)
 }
 
 fn check_git_listed_activity(
@@ -589,12 +588,12 @@ fn check_git_listed_activity(
 }
 
 fn check_directory_activity_fallback(dir: &Path, now_us: i64, grace_us: i64) -> Option<bool> {
-    let mut scanned = 0usize;
-    for entry in walkdir::WalkDir::new(dir)
+    for (scanned, entry) in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
+        .enumerate()
     {
         if scanned >= ACTIVITY_PROBE_PATH_LIMIT {
             return None;
@@ -602,7 +601,6 @@ fn check_directory_activity_fallback(dir: &Path, now_us: i64, grace_us: i64) -> 
         if path_modified_within_grace(entry.path(), now_us, grace_us) {
             return Some(true);
         }
-        scanned += 1;
     }
     Some(false)
 }
@@ -627,15 +625,13 @@ fn check_glob_activity_fallback(
         return Some(false);
     };
 
-    let mut scanned = 0usize;
-    for entry in paths.flatten() {
+    for (scanned, entry) in paths.flatten().enumerate() {
         if scanned >= ACTIVITY_PROBE_PATH_LIMIT {
             return None;
         }
         if path_modified_within_grace(&entry, now_us, grace_us) {
             return Some(true);
         }
-        scanned += 1;
     }
     Some(false)
 }
@@ -672,17 +668,17 @@ fn check_filesystem_activity(
         // Fallback: glob traversal for non-git workspaces or truncated git scans.
         // If the fallback also truncates, fail closed and keep the reservation.
         return check_glob_activity_fallback(workspace, &pattern, now_us, grace_us).unwrap_or(true);
-    } else {
-        let candidate = workspace.join(&pattern);
-        if candidate.is_dir() {
-            if let Some(recent) = check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
-                return recent;
-            }
-            return check_directory_activity_fallback(&candidate, now_us, grace_us).unwrap_or(true);
+    }
+
+    let candidate = workspace.join(&pattern);
+    if candidate.is_dir() {
+        if let Some(recent) = check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
+            return recent;
         }
-        if candidate.exists() && path_modified_within_grace(&candidate, now_us, grace_us) {
-            return true;
-        }
+        return check_directory_activity_fallback(&candidate, now_us, grace_us).unwrap_or(true);
+    }
+    if candidate.exists() && path_modified_within_grace(&candidate, now_us, grace_us) {
+        return true;
     }
 
     false

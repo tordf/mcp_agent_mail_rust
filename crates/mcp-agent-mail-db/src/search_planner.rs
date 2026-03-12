@@ -282,7 +282,7 @@ pub struct SearchQuery {
     #[serde(default)]
     pub ranking: RankingMode,
 
-    /// Maximum results to return (clamped to 1..=100_000).
+    /// Maximum results to return (clamped to `1..=100_000`).
     pub limit: Option<usize>,
 
     /// Cursor for stable pagination (opaque token from previous result).
@@ -346,8 +346,8 @@ impl SearchQuery {
         }
     }
 
-    /// Effective limit, clamped to 1..=5,000 to support deep pagination offsets
-    /// without risking DoS via massive result sets.
+    /// Effective limit, clamped to `1..=5,000` to support deep pagination offsets
+    /// without risking `DoS` via massive result sets.
     #[must_use]
     pub fn effective_limit(&self) -> usize {
         self.limit.unwrap_or(50).clamp(1, 5000)
@@ -1391,7 +1391,7 @@ mod tests {
         assert_eq!(q.effective_limit(), 50); // default
         q.limit = Some(0);
         assert_eq!(q.effective_limit(), 1); // clamp low
-        q.limit = Some(999999);
+        q.limit = Some(999_999);
         assert_eq!(q.effective_limit(), 100_000); // clamp high
         q.limit = Some(25);
         assert_eq!(q.effective_limit(), 25);

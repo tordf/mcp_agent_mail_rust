@@ -1081,15 +1081,18 @@ fn normalize_sqlite_identity_path(path: &str) -> String {
         return cached;
     }
     let as_path = Path::new(path);
-    let normalized = if let Ok(canonical) = std::fs::canonicalize(as_path) {
-        canonical.to_string_lossy().into_owned()
-    } else if as_path.is_absolute() {
-        as_path.to_string_lossy().into_owned()
-    } else if let Ok(cwd) = std::env::current_dir() {
-        cwd.join(as_path).to_string_lossy().into_owned()
-    } else {
-        path.to_string()
-    };
+    let normalized = std::fs::canonicalize(as_path).map_or_else(
+        |_| {
+            if as_path.is_absolute() {
+                as_path.to_string_lossy().into_owned()
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(as_path).to_string_lossy().into_owned()
+            } else {
+                path.to_string()
+            }
+        },
+        |canonical| canonical.to_string_lossy().into_owned(),
+    );
     sqlite_identity_path_cache_insert(path, &normalized);
     normalized
 }
@@ -1156,7 +1159,7 @@ async fn run_sqlite_init_once(
         );
 
         if let Err(err) = execute_sql_with_lock_retry(
-            &*mig_conn,
+            &mig_conn,
             sqlite_path,
             schema::PRAGMA_DB_INIT_BASE_SQL,
             "sqlite init base pragmas",
@@ -1194,7 +1197,7 @@ async fn run_sqlite_init_once(
 
     if !run_migrations
         && let Err(err) = execute_sql_with_lock_retry(
-            &*runtime_conn,
+            &runtime_conn,
             sqlite_path,
             schema::PRAGMA_DB_INIT_BASE_SQL,
             "sqlite init runtime base pragmas",
@@ -1222,7 +1225,7 @@ async fn run_sqlite_init_once(
     // WAL-specific PRAGMAs can corrupt a freshly created database.
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/13
     if let Err(err) = execute_sql_with_lock_retry(
-        &*runtime_conn,
+        &runtime_conn,
         sqlite_path,
         "PRAGMA journal_mode = WAL;",
         "sqlite init switch journal_mode=WAL",
@@ -1937,7 +1940,8 @@ fn has_quarantined_primary_artifact(primary_path: &Path) -> bool {
     std::fs::read_dir(scan_dir)
         .ok()
         .into_iter()
-        .flat_map(|entries| entries.flatten())
+        .flatten()
+        .flatten()
         .filter_map(|entry| entry.file_name().into_string().ok())
         .any(|name| name.starts_with(&corrupt_prefix))
 }

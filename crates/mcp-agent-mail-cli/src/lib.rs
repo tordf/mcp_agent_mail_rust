@@ -3998,7 +3998,7 @@ const SQLITE_BASE_INIT_TABLES: [&str; 11] = [
     "inbox_stats",
 ];
 
-const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 10] = [
+const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 12] = [
     ("products", "product_uid"),
     ("product_project_links", "created_at"),
     ("agents", "attachments_policy"),
@@ -4009,6 +4009,8 @@ const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 10] = [
     ("file_reservations", "reason"),
     ("file_reservation_releases", "released_ts"),
     ("agent_links", "updated_ts"),
+    ("project_sibling_suggestions", "evaluated_ts"),
+    ("inbox_stats", "ack_pending_count"),
 ];
 
 fn sqlite_conn_has_column(
@@ -26948,7 +26950,10 @@ startup_timeout_sec = 42
 
         let stats =
             query_preflight_banner_stats_batched(&conn).expect("batched preflight stats query");
-        assert_eq!(stats.agents, 1, "deleted rows must not inflate banner counts");
+        assert_eq!(
+            stats.agents, 1,
+            "deleted rows must not inflate banner counts"
+        );
         assert_eq!(
             stats.contact_links, 2,
             "missing or stale sqlite_sequence rows must not undercount banner totals"

@@ -138,13 +138,14 @@ pub struct DbConnGuard {
 
 impl DbConnGuard {
     #[must_use]
-    pub fn new(conn: DbConn, context: &'static str) -> Self {
+    pub const fn new(conn: DbConn, context: &'static str) -> Self {
         Self {
             conn: Some(conn),
             context,
         }
     }
 
+    #[must_use]
     pub fn into_inner(mut self) -> DbConn {
         self.conn.take().expect("DbConnGuard already released")
     }
@@ -173,6 +174,6 @@ impl Drop for DbConnGuard {
 }
 
 #[must_use]
-pub fn guard_db_conn(conn: DbConn, context: &'static str) -> DbConnGuard {
+pub const fn guard_db_conn(conn: DbConn, context: &'static str) -> DbConnGuard {
     DbConnGuard::new(conn, context)
 }

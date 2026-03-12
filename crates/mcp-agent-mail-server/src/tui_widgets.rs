@@ -367,12 +367,15 @@ impl Widget for HeatmapGrid<'_> {
                     if labels.is_empty() {
                         0
                     } else {
-                        labels
-                            .iter()
-                            .map(|l| display_width(l))
-                            .max()
-                            .unwrap_or(0)
-                            .saturating_add(1) as u16
+                        u16::try_from(
+                            labels
+                                .iter()
+                                .map(|l| display_width(l))
+                                .max()
+                                .unwrap_or(0)
+                                .saturating_add(1),
+                        )
+                        .unwrap_or(u16::MAX)
                     }
                 });
                 let effective_label_width = if label_width > 0 && label_width * 10 > inner.width * 4

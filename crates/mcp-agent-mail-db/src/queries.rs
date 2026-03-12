@@ -1175,6 +1175,53 @@ fn is_mvcc_error(e: &DbError) -> bool {
     )
 }
 
+/// Run a whole transaction body with restart-on-`BusySnapshot` semantics.
+///
+/// `BEGIN CONCURRENT` conflicts cannot be retried in-place at the failed
+/// statement or `COMMIT`; the entire transaction body must restart from the
+/// beginning so reads are re-bound against the latest snapshot.
+async fn run_with_mvcc_retry<T, F, Fut>(
+    cx: &Cx,
+    operation: &'static str,
+    mut op: F,
+) -> Outcome<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Outcome<T, DbError>>,
+{
+    let max = *MVCC_MAX_RETRIES;
+    for attempt in 0..=max {
+        match op().await {
+            Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
+                MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    attempt,
+                    max_retries = max,
+                    error = %e,
+                    operation,
+                    "MVCC write conflict, retrying whole transaction"
+                );
+                mvcc_backoff(cx, attempt).await;
+            }
+            Outcome::Err(e) if is_mvcc_error(&e) => {
+                MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    attempts = max + 1,
+                    error = %e,
+                    operation,
+                    "MVCC retries exhausted"
+                );
+                return Outcome::Err(e);
+            }
+            other => return other,
+        }
+    }
+
+    Outcome::Err(DbError::Internal(format!(
+        "MVCC retry loop fell through in {operation}"
+    )))
+}
+
 /// Sleep with exponential backoff for MVCC retry.
 ///
 /// Base: 10 ms, max: 200 ms, ±25 % jitter (via existing LCG in `retry` module).
@@ -1186,7 +1233,7 @@ async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
         use_circuit_breaker: false,
         ..Default::default()
     };
-    let _ = sleep(wall_now(), config.delay_for_attempt(attempt)).await;
+    let () = sleep(wall_now(), config.delay_for_attempt(attempt)).await;
 }
 
 /// Snapshot of MVCC retry metrics for health/diagnostics.
@@ -1266,42 +1313,52 @@ pub async fn ensure_project(
 
     // Use an explicit write transaction and conflict-safe insert so project creation
     // participates in concurrent writer mode.
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    let fresh = match run_with_mvcc_retry(cx, "ensure_project", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    let row = ProjectRow::new(slug.clone(), human_key.to_string());
-    let insert_sql = "INSERT INTO projects (slug, human_key, created_at) \
-                      VALUES (?, ?, ?) ON CONFLICT(slug) DO NOTHING";
-    let insert_params = [
-        Value::Text(row.slug.clone()),
-        Value::Text(row.human_key.clone()),
-        Value::BigInt(row.created_at),
-    ];
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-    );
+        let row = ProjectRow::new(slug.clone(), human_key.to_string());
+        let insert_sql = "INSERT INTO projects (slug, human_key, created_at) \
+                          VALUES (?, ?, ?) ON CONFLICT(slug) DO NOTHING";
+        let insert_params = [
+            Value::Text(row.slug.clone()),
+            Value::Text(row.human_key.clone()),
+            Value::BigInt(row.created_at),
+        ];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+        );
 
-    let rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await)
-    );
-    let Some(found) = rows.first() else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::Internal(format!(
-            "project insert/upsert succeeded but re-select failed for slug={slug}"
-        )));
-    };
-    let fresh = match decode_project_row(found) {
-        Ok(row) => row,
-        Err(e) => {
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await)
+        );
+        let Some(found) = rows.first() else {
             rollback_tx(cx, &tracked).await;
-            return Outcome::Err(e);
-        }
-    };
+            return Outcome::Err(DbError::Internal(format!(
+                "project insert/upsert succeeded but re-select failed for slug={slug}"
+            )));
+        };
+        let fresh = match decode_project_row(found) {
+            Ok(row) => row,
+            Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+        };
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(fresh)
+    })
+    .await
+    {
+        Outcome::Ok(fresh) => fresh,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
     crate::cache::read_cache().put_project_scoped(&cache_scope, &fresh);
     Outcome::Ok(fresh)
 }
@@ -1481,139 +1538,149 @@ pub async fn register_agent(
 
         let (provisional, inserted_new) = {
             let tracked = tracked(&*conn);
-            let is_agent_unique_violation = |err: &DbError| match err {
-                DbError::Sqlite(msg) => {
-                    let msg = msg.to_ascii_lowercase();
-                    msg.contains("unique constraint failed")
-                        && (msg.contains("project_id") || msg.contains("name"))
-                }
-                _ => false,
-            };
+            match run_with_mvcc_retry(cx, "register_agent", || async {
+                let is_agent_unique_violation = |err: &DbError| match err {
+                    DbError::Sqlite(msg) => {
+                        let msg = msg.to_ascii_lowercase();
+                        msg.contains("unique constraint failed")
+                            && (msg.contains("project_id") || msg.contains("name"))
+                    }
+                    _ => false,
+                };
 
-            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+                try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-            // Update-first strategy keeps id stable even if backend UPSERT conflict handling
-            // changes, and avoids duplicate row creation under mixed SQLite variants.
-            let mut normalize_sets = vec!["program = ?", "model = ?", "last_active_ts = ?"];
-            let program_s = program.to_string();
-            let model_s = model.to_string();
-            let name_s = name.to_string();
-            let mut normalize_base_params = vec![
-                Value::Text(program_s.clone()),
-                Value::Text(model_s.clone()),
-                Value::BigInt(now),
-            ];
-
-            // Keep behavior consistent with insert path: omitted task_description clears
-            // to empty string instead of preserving stale content.
-            normalize_sets.push("task_description = ?");
-            let insert_task_desc = task_description.unwrap_or_default().to_string();
-            normalize_base_params.push(Value::Text(insert_task_desc.clone()));
-            if let Some(ap) = attachments_policy {
-                normalize_sets.push("attachments_policy = ?");
-                normalize_base_params.push(Value::Text(ap.to_string()));
-            }
-
-            let normalize_sql = format!(
-                "UPDATE agents SET {} WHERE project_id = ? AND name = ? COLLATE NOCASE",
-                normalize_sets.join(", ")
-            );
-            let mut normalize_params = normalize_base_params.clone();
-            normalize_params.push(Value::BigInt(project_id));
-            normalize_params.push(Value::Text(name_s.clone()));
-            let _updated_rows = try_in_tx!(
-                cx,
-                &tracked,
-                map_sql_outcome(
-                    traw_execute(cx, &tracked, &normalize_sql, &normalize_params).await
-                )
-            );
-
-            // FrankenSQLite's `changes()` always returns 0, so we cannot rely
-            // on the UPDATE return value to decide whether the row exists.
-            // Use an explicit SELECT existence check instead.
-            let exists_sql = "SELECT 1 FROM agents \
-                              WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                              LIMIT 1";
-            let exists_params = [Value::BigInt(project_id), Value::Text(name_s.clone())];
-            let exists_rows = try_in_tx!(
-                cx,
-                &tracked,
-                map_sql_outcome(traw_query(cx, &tracked, exists_sql, &exists_params).await)
-            );
-
-            let mut inserted_new = false;
-            if exists_rows.is_empty() {
-                let insert_sql = "INSERT INTO agents \
-                    (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                let attach_pol =
-                    attachments_policy.map_or_else(|| "auto".to_string(), |ap| ap.to_string());
-                let insert_params = [
-                    Value::BigInt(project_id),
-                    Value::Text(name_s),
-                    Value::Text(program_s),
-                    Value::Text(model_s),
-                    Value::Text(insert_task_desc),
+                // Update-first strategy keeps id stable even if backend UPSERT conflict handling
+                // changes, and avoids duplicate row creation under mixed SQLite variants.
+                let mut normalize_sets = vec!["program = ?", "model = ?", "last_active_ts = ?"];
+                let program_s = program.to_string();
+                let model_s = model.to_string();
+                let name_s = name.to_string();
+                let mut normalize_base_params = vec![
+                    Value::Text(program_s.clone()),
+                    Value::Text(model_s.clone()),
                     Value::BigInt(now),
-                    Value::BigInt(now),
-                    Value::Text(attach_pol),
-                    Value::Text("auto".to_string()),
                 ];
-                match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-                {
-                    Outcome::Ok(_) => {
-                        inserted_new = true;
-                    }
-                    Outcome::Err(e) if is_agent_unique_violation(&e) => {
-                        // Concurrent insert race: row now exists, so apply normalize update.
-                        let mut retry_params = normalize_base_params;
-                        retry_params.push(Value::BigInt(project_id));
-                        retry_params.push(Value::Text(name.to_string()));
-                        let _retried_rows = try_in_tx!(
-                            cx,
-                            &tracked,
-                            map_sql_outcome(
-                                traw_execute(cx, &tracked, &normalize_sql, &retry_params).await
-                            )
-                        );
-                    }
-                    Outcome::Err(e) => {
-                        rollback_tx(cx, &tracked).await;
-                        return Outcome::Err(e);
-                    }
-                    Outcome::Cancelled(r) => {
-                        rollback_tx(cx, &tracked).await;
-                        return Outcome::Cancelled(r);
-                    }
-                    Outcome::Panicked(p) => {
-                        rollback_tx(cx, &tracked).await;
-                        return Outcome::Panicked(p);
+
+                // Keep behavior consistent with insert path: omitted task_description clears
+                // to empty string instead of preserving stale content.
+                normalize_sets.push("task_description = ?");
+                let insert_task_desc = task_description.unwrap_or_default().to_string();
+                normalize_base_params.push(Value::Text(insert_task_desc.clone()));
+                if let Some(ap) = attachments_policy {
+                    normalize_sets.push("attachments_policy = ?");
+                    normalize_base_params.push(Value::Text(ap.to_string()));
+                }
+
+                let normalize_sql = format!(
+                    "UPDATE agents SET {} WHERE project_id = ? AND name = ? COLLATE NOCASE",
+                    normalize_sets.join(", ")
+                );
+                let mut normalize_params = normalize_base_params.clone();
+                normalize_params.push(Value::BigInt(project_id));
+                normalize_params.push(Value::Text(name_s.clone()));
+                let _updated_rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(
+                        traw_execute(cx, &tracked, &normalize_sql, &normalize_params).await
+                    )
+                );
+
+                // FrankenSQLite's `changes()` always returns 0, so we cannot rely
+                // on the UPDATE return value to decide whether the row exists.
+                // Use an explicit SELECT existence check instead.
+                let exists_sql = "SELECT 1 FROM agents \
+                                  WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                                  LIMIT 1";
+                let exists_params = [Value::BigInt(project_id), Value::Text(name_s.clone())];
+                let exists_rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_query(cx, &tracked, exists_sql, &exists_params).await)
+                );
+
+                let mut inserted_new = false;
+                if exists_rows.is_empty() {
+                    let insert_sql = "INSERT INTO agents \
+                        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    let attach_pol = attachments_policy
+                        .map_or_else(|| "auto".to_string(), std::string::ToString::to_string);
+                    let insert_params = [
+                        Value::BigInt(project_id),
+                        Value::Text(name_s),
+                        Value::Text(program_s),
+                        Value::Text(model_s),
+                        Value::Text(insert_task_desc),
+                        Value::BigInt(now),
+                        Value::BigInt(now),
+                        Value::Text(attach_pol),
+                        Value::Text("auto".to_string()),
+                    ];
+                    match map_sql_outcome(
+                        traw_execute(cx, &tracked, insert_sql, &insert_params).await,
+                    ) {
+                        Outcome::Ok(_) => {
+                            inserted_new = true;
+                        }
+                        Outcome::Err(e) if is_agent_unique_violation(&e) => {
+                            // Concurrent insert race: row now exists, so apply normalize update.
+                            let mut retry_params = normalize_base_params;
+                            retry_params.push(Value::BigInt(project_id));
+                            retry_params.push(Value::Text(name.to_string()));
+                            let _retried_rows = try_in_tx!(
+                                cx,
+                                &tracked,
+                                map_sql_outcome(
+                                    traw_execute(cx, &tracked, &normalize_sql, &retry_params).await
+                                )
+                            );
+                        }
+                        Outcome::Err(e) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(e);
+                        }
+                        Outcome::Cancelled(r) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Cancelled(r);
+                        }
+                        Outcome::Panicked(p) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Panicked(p);
+                        }
                     }
                 }
+
+                let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                                 inception_ts, last_active_ts, attachments_policy, contact_policy \
+                                 FROM agents \
+                                 WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                                 ORDER BY id ASC \
+                                 LIMIT 1";
+                let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+                let rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+                );
+                let Some(fresh) = rows.first().map(decode_agent_row_indexed) else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "agent upsert succeeded but re-select failed for {project_id}:{name}"
+                    )));
+                };
+
+                try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+                Outcome::Ok((fresh, inserted_new))
+            })
+            .await
+            {
+                Outcome::Ok(result) => result,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
-
-            let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                             inception_ts, last_active_ts, attachments_policy, contact_policy \
-                             FROM agents \
-                             WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                             ORDER BY id ASC \
-                             LIMIT 1";
-            let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-            let rows = try_in_tx!(
-                cx,
-                &tracked,
-                map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
-            );
-            let Some(fresh) = rows.first().map(decode_agent_row_indexed) else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(format!(
-                    "agent upsert succeeded but re-select failed for {project_id}:{name}"
-                )));
-            };
-
-            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-            (fresh, inserted_new)
         };
         drop(conn);
         let durable = match finalize_register_agent_post_commit_probe(
@@ -2075,76 +2142,77 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
 
     let tracked = tracked(&*conn);
 
-    // Batch all updates in a single transaction.
-    match begin_concurrent_tx(cx, &tracked).await {
-        Outcome::Ok(()) => {}
-        other => {
-            re_enqueue_touches(&cache_scope, &pending);
-            return match other {
-                Outcome::Err(e) => Outcome::Err(e),
-                Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                Outcome::Panicked(p) => Outcome::Panicked(p),
-                Outcome::Ok(()) => unreachable!(),
-            };
+    let flush_outcome = run_with_mvcc_retry(cx, "flush_deferred_touches", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Batch UPDATE using VALUES CTE without UPDATE ... FROM so it remains
+        // compatible with FrankenSQLite's VDBE codegen path.
+        // SQLite parameter limit is 999; 2 params per row → max 499 per chunk.
+        let entries: Vec<_> = pending.iter().collect();
+
+        for chunk in entries.chunks(400) {
+            let placeholders = std::iter::repeat_n("(?,?)", chunk.len()).collect::<Vec<_>>();
+            let sql = format!(
+                "WITH batch(agent_id, new_ts) AS (VALUES {}) \
+                 UPDATE agents \
+                 SET last_active_ts = MAX(last_active_ts, ( \
+                     SELECT b.new_ts FROM batch b WHERE b.agent_id = agents.id \
+                 )) \
+                 WHERE id IN (SELECT agent_id FROM batch)",
+                placeholders.join(",")
+            );
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            for &(&agent_id, &ts) in chunk {
+                params.push(Value::BigInt(agent_id));
+                params.push(Value::BigInt(ts));
+            }
+
+            match map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await) {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                    return Outcome::Panicked(p);
+                }
+            }
         }
-    }
 
-    // Batch UPDATE using VALUES CTE without UPDATE ... FROM so it remains
-    // compatible with FrankenSQLite's VDBE codegen path.
-    // SQLite parameter limit is 999; 2 params per row → max 499 per chunk.
-    let entries: Vec<_> = pending.iter().collect();
-
-    for chunk in entries.chunks(400) {
-        let placeholders = std::iter::repeat_n("(?,?)", chunk.len()).collect::<Vec<_>>();
-        let sql = format!(
-            "WITH batch(agent_id, new_ts) AS (VALUES {}) \
-             UPDATE agents \
-             SET last_active_ts = MAX(last_active_ts, ( \
-                 SELECT b.new_ts FROM batch b WHERE b.agent_id = agents.id \
-             )) \
-             WHERE id IN (SELECT agent_id FROM batch)",
-            placeholders.join(",")
-        );
-        let mut params = Vec::with_capacity(chunk.len() * 2);
-        for &(&agent_id, &ts) in chunk {
-            params.push(Value::BigInt(agent_id));
-            params.push(Value::BigInt(ts));
-        }
-
-        match map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await) {
-            Outcome::Ok(_) => {}
+        match map_sql_outcome(traw_execute(cx, &tracked, "COMMIT", &[]).await) {
+            Outcome::Ok(_) => Outcome::Ok(()),
             Outcome::Err(e) => {
                 let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-                re_enqueue_touches(&cache_scope, &pending);
-                return Outcome::Err(e);
+                Outcome::Err(e)
             }
             Outcome::Cancelled(r) => {
                 let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-                re_enqueue_touches(&cache_scope, &pending);
-                return Outcome::Cancelled(r);
+                Outcome::Cancelled(r)
             }
             Outcome::Panicked(p) => {
                 let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-                re_enqueue_touches(&cache_scope, &pending);
-                return Outcome::Panicked(p);
+                Outcome::Panicked(p)
             }
         }
-    }
+    })
+    .await;
 
-    match map_sql_outcome(traw_execute(cx, &tracked, "COMMIT", &[]).await) {
-        Outcome::Ok(_) => Outcome::Ok(()),
+    match flush_outcome {
+        Outcome::Ok(()) => Outcome::Ok(()),
         Outcome::Err(e) => {
-            let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
             re_enqueue_touches(&cache_scope, &pending);
             Outcome::Err(e)
         }
         Outcome::Cancelled(r) => {
-            let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
             re_enqueue_touches(&cache_scope, &pending);
             Outcome::Cancelled(r)
         }
         Outcome::Panicked(p) => {
-            let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
             re_enqueue_touches(&cache_scope, &pending);
             Outcome::Panicked(p)
         }
@@ -2174,38 +2242,48 @@ pub async fn set_agent_contact_policy(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    let now = now_micros();
-    let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
-    let params = [
-        Value::Text(policy.to_string()),
-        Value::BigInt(now),
-        Value::BigInt(agent_id),
-    ];
+        let now = now_micros();
+        let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
+        let params = [
+            Value::Text(policy.to_string()),
+            Value::BigInt(now),
+            Value::BigInt(agent_id),
+        ];
 
-    let _rows_affected = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-    );
+        let _rows_affected = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
 
-    // Fetch updated agent using raw SQL with explicit column order.
-    let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                     inception_ts, last_active_ts, attachments_policy, contact_policy \
-                     FROM agents WHERE id = ? LIMIT 1";
-    let fetch_params = [Value::BigInt(agent_id)];
-    let rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
-    );
-    let Some(row) = rows.first() else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        // Fetch updated agent using raw SQL with explicit column order.
+        let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy \
+                         FROM agents WHERE id = ? LIMIT 1";
+        let fetch_params = [Value::BigInt(agent_id)];
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agent)
+    })
+    .await
+    {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    let agent = decode_agent_row_indexed(row);
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
     Outcome::Ok(agent)
 }
@@ -2234,66 +2312,76 @@ pub async fn set_agent_contact_policy_by_name(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-    let now = now_micros();
+    let agent = match run_with_mvcc_retry(cx, "set_agent_contact_policy_by_name", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let now = now_micros();
 
-    // Resolve row first so we can preserve attachments_policy explicitly.
-    let current_sql = "SELECT id, project_id, name, program, model, task_description, \
-                       inception_ts, last_active_ts, attachments_policy, contact_policy \
-                       FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                       ORDER BY last_active_ts DESC, id DESC LIMIT 1";
-    let current_params = [
-        Value::BigInt(project_id),
-        Value::Text(normalized_name.to_string()),
-    ];
-    let current_rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, current_sql, &current_params).await)
-    );
-    let Some(current_agent) = current_rows.first().map(decode_agent_row_indexed) else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::not_found(
-            "Agent",
-            format!("{project_id}:{normalized_name}"),
-        ));
+        // Resolve row first so we can preserve attachments_policy explicitly.
+        let current_sql = "SELECT id, project_id, name, program, model, task_description, \
+                           inception_ts, last_active_ts, attachments_policy, contact_policy \
+                           FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                           ORDER BY last_active_ts DESC, id DESC LIMIT 1";
+        let current_params = [
+            Value::BigInt(project_id),
+            Value::Text(normalized_name.to_string()),
+        ];
+        let current_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, current_sql, &current_params).await)
+        );
+        let Some(current_agent) = current_rows.first().map(decode_agent_row_indexed) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "Agent",
+                format!("{project_id}:{normalized_name}"),
+            ));
+        };
+        let Some(current_id) = current_agent.id else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "policy update lookup returned agent without id for {project_id}:{normalized_name}"
+            )));
+        };
+
+        let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
+        let params = [
+            Value::Text(policy.to_string()),
+            Value::BigInt(now),
+            Value::BigInt(current_id),
+        ];
+
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
+
+        let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy \
+                         FROM agents WHERE id = ? LIMIT 1";
+        let fetch_params = [Value::BigInt(current_id)];
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+        );
+        let Some(agent) = rows.first().map(decode_agent_row_indexed) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "policy update succeeded but re-select failed for {project_id}:{normalized_name}"
+            )));
+        };
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(agent)
+    })
+    .await
+    {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    let Some(current_id) = current_agent.id else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::Internal(format!(
-            "policy update lookup returned agent without id for {project_id}:{normalized_name}"
-        )));
-    };
-
-    let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
-    let params = [
-        Value::Text(policy.to_string()),
-        Value::BigInt(now),
-        Value::BigInt(current_id),
-    ];
-
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-    );
-
-    let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                     inception_ts, last_active_ts, attachments_policy, contact_policy \
-                     FROM agents WHERE id = ? LIMIT 1";
-    let fetch_params = [Value::BigInt(current_id)];
-    let rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
-    );
-    let Some(agent) = rows.first().map(decode_agent_row_indexed) else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::Internal(format!(
-            "policy update succeeded but re-select failed for {project_id}:{normalized_name}"
-        )));
-    };
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
     Outcome::Ok(agent)
 }
@@ -2598,11 +2686,8 @@ pub async fn create_message_with_recipients(
 
         let row = {
             let tracked = tracked(&*conn);
-            let max = *MVCC_MAX_RETRIES;
-            let mut committed: Option<MessageRow> = None;
-
-            for attempt in 0..=max {
-                match create_message_with_recipients_tx(
+            match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
+                create_message_with_recipients_tx(
                     cx,
                     &tracked,
                     project_id,
@@ -2616,37 +2701,10 @@ pub async fn create_message_with_recipients(
                     recipients,
                     now,
                 )
-                .await
-                {
-                    Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
-                        MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(
-                            attempt,
-                            max_retries = max,
-                            error = %e,
-                            "MVCC write conflict in create_message, retrying"
-                        );
-                        mvcc_backoff(cx, attempt).await;
-                    }
-                    Outcome::Err(e) if is_mvcc_error(&e) => {
-                        MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::error!(
-                            attempts = max + 1,
-                            error = %e,
-                            "MVCC retries exhausted in create_message"
-                        );
-                        return Outcome::Err(e);
-                    }
-                    Outcome::Ok(created) => {
-                        committed = Some(created);
-                        break;
-                    }
-                    other => return other,
-                }
-            }
-
-            match committed {
-                Some(created) => {
+            })
+            .await
+            {
+                Outcome::Ok(created) => {
                     let Some(_message_id) = created.id else {
                         return Outcome::Err(DbError::Internal(
                             "message commit succeeded but returned row has no id".to_string(),
@@ -2654,11 +2712,9 @@ pub async fn create_message_with_recipients(
                     };
                     created
                 }
-                None => {
-                    return Outcome::Err(DbError::Internal(
-                        "MVCC retry loop fell through without committed row".into(),
-                    ));
-                }
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         };
         drop(conn);
@@ -2719,7 +2775,7 @@ pub async fn create_message_with_recipients(
 ///
 /// Runs BEGIN CONCURRENT → INSERT message → INSERT recipients → COMMIT.
 /// On any failure the `try_in_tx!` macro rolls back before returning.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn create_message_with_recipients_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
@@ -2764,7 +2820,6 @@ async fn create_message_with_recipients_tx(
         for (id, kind) in recipients {
             if let Some(name) = name_map.get(id) {
                 match *kind {
-                    "to" => to_names.push(name.clone()),
                     "cc" => cc_names.push(name.clone()),
                     "bcc" => bcc_names.push(name.clone()),
                     _ => to_names.push(name.clone()),
@@ -3216,6 +3271,7 @@ pub async fn list_numeric_thread_roots_with_replies(
 }
 
 /// List unique recipient agent names for a set of message ids.
+#[allow(clippy::items_after_statements)]
 pub async fn list_message_recipient_names_for_messages(
     cx: &Cx,
     pool: &DbPool,
@@ -4569,25 +4625,28 @@ pub async fn add_recipients(
     let tracked = tracked(&*conn);
 
     // Batch all recipient inserts in a single transaction (1 fsync instead of N).
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    run_with_mvcc_retry(cx, "add_recipients", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    for (agent_id, kind) in recipients {
-        let row = MessageRecipientRow {
-            message_id,
-            agent_id: *agent_id,
-            kind: (*kind).to_string(),
-            read_ts: None,
-            ack_ts: None,
-        };
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
-        );
-    }
+        for (agent_id, kind) in recipients {
+            let row = MessageRecipientRow {
+                message_id,
+                agent_id: *agent_id,
+                kind: (*kind).to_string(),
+                read_ts: None,
+                ack_ts: None,
+            };
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
+            );
+        }
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(())
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(())
+    })
+    .await
 }
 
 /// Mark message as read
@@ -4607,66 +4666,71 @@ pub async fn mark_message_read(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    run_with_mvcc_retry(cx, "mark_message_read", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Idempotent: only set read_ts if currently NULL.
-    let sql = "UPDATE message_recipients SET read_ts = COALESCE(read_ts, ?) WHERE agent_id = ? AND message_id = ?";
-    let params = [
-        Value::BigInt(now),
-        Value::BigInt(agent_id),
-        Value::BigInt(message_id),
-    ];
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-    );
+        // Idempotent: only set read_ts if currently NULL.
+        let sql = "UPDATE message_recipients SET read_ts = COALESCE(read_ts, ?) WHERE agent_id = ? AND message_id = ?";
+        let params = [
+            Value::BigInt(now),
+            Value::BigInt(agent_id),
+            Value::BigInt(message_id),
+        ];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
 
-    // Invalidate cached inbox stats (unread_count may have changed).
-    crate::cache::read_cache().invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+        // Invalidate cached inbox stats (unread_count may have changed).
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
-    // Read back the actual stored timestamp (may differ from `now` on
-    // idempotent calls where COALESCE preserved the original value).
-    //
-    // We intentionally do not trust `rows_affected` from the UPDATE above:
-    // under some backend/runtime combinations, updates that clearly match
-    // a row can report 0. Existence is determined by this read-back query.
-    let read_sql = "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
-    let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
-    let ts = match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-        Outcome::Ok(rows) => {
-            if rows.is_empty() {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::not_found(
-                    "MessageRecipient",
-                    format!("{agent_id}:{message_id}"),
-                ));
+        // Read back the actual stored timestamp (may differ from `now` on
+        // idempotent calls where COALESCE preserved the original value).
+        //
+        // We intentionally do not trust `rows_affected` from the UPDATE above:
+        // under some backend/runtime combinations, updates that clearly match
+        // a row can report 0. Existence is determined by this read-back query.
+        let read_sql =
+            "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
+        let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
+        let ts = match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
+            Outcome::Ok(rows) => {
+                if rows.is_empty() {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::not_found(
+                        "MessageRecipient",
+                        format!("{agent_id}:{message_id}"),
+                    ));
+                }
+                rows.first()
+                    .and_then(|r| r.get(0))
+                    .and_then(|v| match v {
+                        Value::BigInt(n) => Some(*n),
+                        Value::Int(n) => Some(i64::from(*n)),
+                        _ => None,
+                    })
+                    .unwrap_or(now)
             }
-            rows.first()
-                .and_then(|r| r.get(0))
-                .and_then(|v| match v {
-                    Value::BigInt(n) => Some(*n),
-                    Value::Int(n) => Some(i64::from(*n)),
-                    _ => None,
-                })
-                .unwrap_or(now)
-        }
-        Outcome::Err(e) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Cancelled(r);
-        }
-        Outcome::Panicked(p) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Panicked(p);
-        }
-    };
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        };
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(ts)
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(ts)
+    })
+    .await
 }
 
 /// Mark every unread message in a project inbox as read for a specific agent.
@@ -4686,49 +4750,53 @@ pub async fn mark_all_messages_read_in_project(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    run_with_mvcc_retry(cx, "mark_all_messages_read_in_project", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Identify which messages are actually unread for this agent in this project.
-    // We do this explicitly to avoid trusting unreliable rows_affected from UPDATE.
-    let find_sql = "SELECT m.id FROM message_recipients r \
-                    JOIN messages m ON m.id = r.message_id \
-                    WHERE r.agent_id = ? AND r.read_ts IS NULL \
-                    AND m.project_id = ?";
-    let find_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-    let rows = match map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await) {
-        Outcome::Ok(r) => r,
-        Outcome::Err(e) => {
-            let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-            return Outcome::Err(e);
+        // Identify which messages are actually unread for this agent in this project.
+        // We do this explicitly to avoid trusting unreliable rows_affected from UPDATE.
+        let find_sql = "SELECT m.id FROM message_recipients r \
+                        JOIN messages m ON m.id = r.message_id \
+                        WHERE r.agent_id = ? AND r.read_ts IS NULL \
+                        AND m.project_id = ?";
+        let find_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
+        let rows = match map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await) {
+            Outcome::Ok(r) => r,
+            Outcome::Err(e) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let count = rows.len();
+        if count > 0 {
+            let sql = "UPDATE message_recipients \
+                       SET read_ts = ? \
+                       WHERE agent_id = ? AND read_ts IS NULL \
+                       AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
+            let params = [
+                Value::BigInt(now),
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+            ];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+            );
         }
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
 
-    let count = rows.len();
-    if count > 0 {
-        let sql = "UPDATE message_recipients \
-                   SET read_ts = ? \
-                   WHERE agent_id = ? AND read_ts IS NULL \
-                   AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
-        let params = [
-            Value::BigInt(now),
-            Value::BigInt(agent_id),
-            Value::BigInt(project_id),
-        ];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-        );
-    }
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
-    crate::cache::read_cache().invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-
-    let count_i64 = count as i64;
-    Outcome::Ok(count_i64)
+        let count_i64 = i64::try_from(count).expect("message recipient count fits in i64");
+        Outcome::Ok(count_i64)
+    })
+    .await
 }
 
 /// Acknowledge message
@@ -4748,81 +4816,85 @@ pub async fn acknowledge_message(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    run_with_mvcc_retry(cx, "acknowledge_message", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Idempotent: set read_ts if NULL; set ack_ts if NULL.
-    let sql = "UPDATE message_recipients \
-               SET read_ts = COALESCE(read_ts, ?), ack_ts = COALESCE(ack_ts, ?) \
-               WHERE agent_id = ? AND message_id = ?";
-    let params = [
-        Value::BigInt(now),
-        Value::BigInt(now),
-        Value::BigInt(agent_id),
-        Value::BigInt(message_id),
-    ];
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-    );
+        // Idempotent: set read_ts if NULL; set ack_ts if NULL.
+        let sql = "UPDATE message_recipients \
+                   SET read_ts = COALESCE(read_ts, ?), ack_ts = COALESCE(ack_ts, ?) \
+                   WHERE agent_id = ? AND message_id = ?";
+        let params = [
+            Value::BigInt(now),
+            Value::BigInt(now),
+            Value::BigInt(agent_id),
+            Value::BigInt(message_id),
+        ];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
 
-    // Invalidate cached inbox stats (ack_pending_count may have changed).
-    crate::cache::read_cache().invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+        // Invalidate cached inbox stats (ack_pending_count may have changed).
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
-    // Read back the actual stored timestamps (may differ from `now` on
-    // idempotent calls where COALESCE preserved the original values).
-    //
-    // We intentionally do not trust `rows_affected` from the UPDATE above:
-    // under some backend/runtime combinations, updates that clearly match
-    // a row can report 0. Existence is determined by this read-back query.
-    let read_sql =
-        "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
-    let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
-    let (read_ts, ack_ts) =
-        match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-            Outcome::Ok(rows) => {
-                if rows.is_empty() {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(DbError::not_found(
-                        "MessageRecipient",
-                        format!("{agent_id}:{message_id}"),
-                    ));
+        // Read back the actual stored timestamps (may differ from `now` on
+        // idempotent calls where COALESCE preserved the original values).
+        //
+        // We intentionally do not trust `rows_affected` from the UPDATE above:
+        // under some backend/runtime combinations, updates that clearly match
+        // a row can report 0. Existence is determined by this read-back query.
+        let read_sql =
+            "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
+        let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
+        let (read_ts, ack_ts) =
+            match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
+                Outcome::Ok(rows) => {
+                    if rows.is_empty() {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(DbError::not_found(
+                            "MessageRecipient",
+                            format!("{agent_id}:{message_id}"),
+                        ));
+                    }
+                    let row = rows.first();
+                    let read_ts = row
+                        .and_then(|r| r.get(0))
+                        .and_then(|v| match v {
+                            Value::BigInt(n) => Some(*n),
+                            Value::Int(n) => Some(i64::from(*n)),
+                            _ => None,
+                        })
+                        .unwrap_or(now);
+                    let ack_ts = row
+                        .and_then(|r| r.get(1))
+                        .and_then(|v| match v {
+                            Value::BigInt(n) => Some(*n),
+                            Value::Int(n) => Some(i64::from(*n)),
+                            _ => None,
+                        })
+                        .unwrap_or(now);
+                    (read_ts, ack_ts)
                 }
-                let row = rows.first();
-                let read_ts = row
-                    .and_then(|r| r.get(0))
-                    .and_then(|v| match v {
-                        Value::BigInt(n) => Some(*n),
-                        Value::Int(n) => Some(i64::from(*n)),
-                        _ => None,
-                    })
-                    .unwrap_or(now);
-                let ack_ts = row
-                    .and_then(|r| r.get(1))
-                    .and_then(|v| match v {
-                        Value::BigInt(n) => Some(*n),
-                        Value::Int(n) => Some(i64::from(*n)),
-                        _ => None,
-                    })
-                    .unwrap_or(now);
-                (read_ts, ack_ts)
-            }
-            Outcome::Err(e) => {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(e);
-            }
-            Outcome::Cancelled(r) => {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Cancelled(r);
-            }
-            Outcome::Panicked(p) => {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Panicked(p);
-            }
-        };
+                Outcome::Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(p);
+                }
+            };
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok((read_ts, ack_ts))
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok((read_ts, ack_ts))
+    })
+    .await
 }
 
 // =============================================================================
@@ -5420,6 +5492,7 @@ async fn release_reservations_by_ids_matching_expiry(
 }
 
 /// Renew file reservations
+#[allow(clippy::too_many_lines)]
 pub async fn renew_reservations(
     cx: &Cx,
     pool: &DbPool,
@@ -5443,105 +5516,109 @@ pub async fn renew_reservations(
 
     // Wrap entire read-modify-write in a transaction so partial renewals
     // cannot occur if the process crashes or is cancelled mid-loop.
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    run_with_mvcc_retry(cx, "renew_reservations", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Fetch candidate reservations first (so tools can report old/new expiry).
-    let mut sql = format!(
-        "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
-         FROM file_reservations \
-         WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
-    );
-    let mut params: Vec<Value> = vec![
-        Value::BigInt(project_id),
-        Value::BigInt(agent_id),
-        Value::BigInt(now),
-    ];
+        // Fetch candidate reservations first (so tools can report old/new expiry).
+        let mut sql = format!(
+            "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
+             FROM file_reservations \
+             WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
+        );
+        let mut params: Vec<Value> = vec![
+            Value::BigInt(project_id),
+            Value::BigInt(agent_id),
+            Value::BigInt(now),
+        ];
 
-    if let Some(ids) = reservation_ids {
-        if ids.is_empty() {
-            sql.push_str(" AND 0");
-        } else {
-            sql.push_str(" AND id IN (");
-            for (i, id) in ids.iter().enumerate() {
-                if i > 0 {
-                    sql.push(',');
+        if let Some(ids) = reservation_ids {
+            if ids.is_empty() {
+                sql.push_str(" AND 0");
+            } else {
+                sql.push_str(" AND id IN (");
+                for (i, id) in ids.iter().enumerate() {
+                    if i > 0 {
+                        sql.push(',');
+                    }
+                    sql.push('?');
+                    params.push(Value::BigInt(*id));
                 }
-                sql.push('?');
-                params.push(Value::BigInt(*id));
+                sql.push(')');
             }
-            sql.push(')');
         }
-    }
 
-    if let Some(pats) = paths {
-        if pats.is_empty() {
-            sql.push_str(" AND 0");
-        } else {
-            sql.push_str(" AND (");
-            for (i, pat) in pats.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" OR ");
+        if let Some(pats) = paths {
+            if pats.is_empty() {
+                sql.push_str(" AND 0");
+            } else {
+                sql.push_str(" AND (");
+                for (i, pat) in pats.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(" OR ");
+                    }
+                    sql.push_str("path_pattern = ?");
+                    params.push(Value::Text((*pat).to_string()));
                 }
-                sql.push_str("path_pattern = ?");
-                params.push(Value::Text((*pat).to_string()));
+                sql.push(')');
             }
-            sql.push(')');
         }
-    }
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    let mut reservations: Vec<FileReservationRow> = match rows_out {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                match FileReservationRow::from_row(&r) {
-                    Ok(row) => out.push(row),
-                    Err(e) => {
-                        rollback_tx(cx, &tracked).await;
-                        return Outcome::Err(map_sql_error(&e));
+        let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+        let mut reservations: Vec<FileReservationRow> = match rows_out {
+            Outcome::Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for r in rows {
+                    match FileReservationRow::from_row(&r) {
+                        Ok(row) => out.push(row),
+                        Err(e) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(map_sql_error(&e));
+                        }
                     }
                 }
+                out
             }
-            out
-        }
-        Outcome::Err(e) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Cancelled(r);
-        }
-        Outcome::Panicked(p) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Panicked(p);
-        }
-    };
-
-    for row in &mut reservations {
-        let base = row.expires_ts.max(now);
-        row.expires_ts = base.saturating_add(extend);
-        let Some(id) = row.id else {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(
-                "renew_reservations: expected id to be populated".to_string(),
-            ));
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
         };
 
-        let sql = "UPDATE file_reservations SET expires_ts = ? WHERE id = ?";
-        let params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-        );
-    }
+        for row in &mut reservations {
+            let base = row.expires_ts.max(now);
+            row.expires_ts = base.saturating_add(extend);
+            let Some(id) = row.id else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "renew_reservations: expected id to be populated".to_string(),
+                ));
+            };
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(reservations)
+            let sql = "UPDATE file_reservations SET expires_ts = ? WHERE id = ?";
+            let params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+            );
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(reservations)
+    })
+    .await
 }
 
 /// List file reservations for a project
+#[allow(clippy::too_many_lines)]
 pub async fn list_file_reservations(
     cx: &Cx,
     pool: &DbPool,
@@ -5911,73 +5988,76 @@ pub async fn respond_contact(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    run_with_mvcc_retry(cx, "respond_contact", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    let existing_sql = format!(
-        "{AGENT_LINK_SELECT_COLUMNS_SQL} \
-         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
-         LIMIT 1"
-    );
-    let existing_params = [
-        Value::BigInt(from_project_id),
-        Value::BigInt(from_agent_id),
-        Value::BigInt(to_project_id),
-        Value::BigInt(to_agent_id),
-    ];
+        let existing_sql = format!(
+            "{AGENT_LINK_SELECT_COLUMNS_SQL} \
+             WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
+             LIMIT 1"
+        );
+        let existing_params = [
+            Value::BigInt(from_project_id),
+            Value::BigInt(from_agent_id),
+            Value::BigInt(to_project_id),
+            Value::BigInt(to_agent_id),
+        ];
 
-    let existing_rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, &existing_sql, &existing_params).await)
-    );
-    let Some(existing_row) = existing_rows.first() else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::not_found(
-            "AgentLink",
-            format!("{from_project_id}:{from_agent_id}->{to_project_id}:{to_agent_id}"),
-        ));
-    };
-    let mut row = match decode_agent_link_row(existing_row) {
-        Ok(link) => link,
-        Err(e) => {
+        let existing_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &existing_sql, &existing_params).await)
+        );
+        let Some(existing_row) = existing_rows.first() else {
             rollback_tx(cx, &tracked).await;
-            return Outcome::Err(e);
-        }
-    };
-    row.status = status.to_string();
-    row.updated_ts = now;
-    row.expires_ts = expires;
+            return Outcome::Err(DbError::not_found(
+                "AgentLink",
+                format!("{from_project_id}:{from_agent_id}->{to_project_id}:{to_agent_id}"),
+            ));
+        };
+        let mut row = match decode_agent_link_row(existing_row) {
+            Ok(link) => link,
+            Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+        };
+        row.status = status.to_string();
+        row.updated_ts = now;
+        row.expires_ts = expires;
 
-    let Some(link_id) = row.id else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::invalid(
-            "AgentLink.id",
-            "existing agent_link row has NULL id",
-        ));
-    };
-    let update_sql =
-        "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? WHERE id = ?";
-    let update_params = [
-        Value::Text(row.status.clone()),
-        Value::BigInt(row.updated_ts),
-        row.expires_ts.map_or(Value::Null, Value::BigInt),
-        Value::BigInt(link_id),
-    ];
-    let updated = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
-    );
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    usize::try_from(updated).map_or_else(
-        |_| {
-            Outcome::Err(DbError::invalid(
-                "row_count",
-                "row count exceeds usize::MAX",
-            ))
-        },
-        |v| Outcome::Ok((v, row)),
-    )
+        let Some(link_id) = row.id else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "AgentLink.id",
+                "existing agent_link row has NULL id",
+            ));
+        };
+        let update_sql =
+            "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? WHERE id = ?";
+        let update_params = [
+            Value::Text(row.status.clone()),
+            Value::BigInt(row.updated_ts),
+            row.expires_ts.map_or(Value::Null, Value::BigInt),
+            Value::BigInt(link_id),
+        ];
+        let updated = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
+        );
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        usize::try_from(updated).map_or_else(
+            |_| {
+                Outcome::Err(DbError::invalid(
+                    "row_count",
+                    "row count exceeds usize::MAX",
+                ))
+            },
+            |v| Outcome::Ok((v, row)),
+        )
+    })
+    .await
 }
 
 /// List contacts for an agent
@@ -6087,7 +6167,7 @@ pub async fn list_approved_contact_ids(
             params.push(Value::BigInt(*id));
         }
 
-        let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+        let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
         match rows_out {
             Outcome::Ok(rows) => {
                 for row in rows {
@@ -6147,7 +6227,7 @@ pub async fn list_recent_contact_agent_ids(
             params.push(Value::BigInt(*id));
         }
 
-        let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+        let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
         match rows_out {
             Outcome::Ok(rows) => {
                 for row in rows {
@@ -6322,42 +6402,45 @@ pub async fn ensure_product(
             }
 
             // Product doesn't exist, create it.
-            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-            let insert_sql = "INSERT INTO products (product_uid, name, created_at) \
-                              VALUES (?, ?, ?) ON CONFLICT(product_uid) DO NOTHING";
-            let insert_params = [
-                Value::Text(uid.clone()),
-                Value::Text(prod_name.clone()),
-                Value::BigInt(now),
-            ];
-            try_in_tx!(
-                cx,
-                &tracked,
-                map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-            );
+            run_with_mvcc_retry(cx, "ensure_product", || async {
+                try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+                let insert_sql = "INSERT INTO products (product_uid, name, created_at) \
+                                  VALUES (?, ?, ?) ON CONFLICT(product_uid) DO NOTHING";
+                let insert_params = [
+                    Value::Text(uid.clone()),
+                    Value::Text(prod_name.clone()),
+                    Value::BigInt(now),
+                ];
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+                );
 
-            // Re-select by stable uid so callers always get the canonical row.
-            let reselect_params = [Value::Text(uid.clone())];
-            let rows = try_in_tx!(
-                cx,
-                &tracked,
-                map_sql_outcome(traw_query(cx, &tracked, select_sql, &reselect_params).await)
-            );
-            let Some(found) = rows.first() else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(format!(
-                    "product insert/upsert succeeded but re-select failed for uid={uid}"
-                )));
-            };
-            let fresh = match decode_product_row_indexed(found) {
-                Ok(row) => row,
-                Err(err) => {
+                // Re-select by stable uid so callers always get the canonical row.
+                let reselect_params = [Value::Text(uid.clone())];
+                let rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_query(cx, &tracked, select_sql, &reselect_params).await)
+                );
+                let Some(found) = rows.first() else {
                     rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(err);
-                }
-            };
-            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-            Outcome::Ok(fresh)
+                    return Outcome::Err(DbError::Internal(format!(
+                        "product insert/upsert succeeded but re-select failed for uid={uid}"
+                    )));
+                };
+                let fresh = match decode_product_row_indexed(found) {
+                    Ok(row) => row,
+                    Err(err) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(err);
+                    }
+                };
+                try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+                Outcome::Ok(fresh)
+            })
+            .await
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -6381,31 +6464,34 @@ pub async fn link_product_to_projects(
 
     let tracked = tracked(&*conn);
 
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    run_with_mvcc_retry(cx, "link_product_to_projects", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    let mut linked = 0usize;
-    let now = now_micros();
-    for &project_id in project_ids {
-        // Use INSERT OR IGNORE to handle duplicates gracefully
-        let sql = "INSERT OR IGNORE INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)";
-        let params = [
-            Value::BigInt(product_id),
-            Value::BigInt(project_id),
-            Value::BigInt(now),
-        ];
-        let n = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-        );
-        if n > 0 {
-            linked += 1;
+        let mut linked = 0usize;
+        let now = now_micros();
+        for &project_id in project_ids {
+            // Use INSERT OR IGNORE to handle duplicates gracefully
+            let sql = "INSERT OR IGNORE INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)";
+            let params = [
+                Value::BigInt(product_id),
+                Value::BigInt(project_id),
+                Value::BigInt(now),
+            ];
+            let n = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+            );
+            if n > 0 {
+                linked += 1;
+            }
         }
-    }
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
-    Outcome::Ok(linked)
+        Outcome::Ok(linked)
+    })
+    .await
 }
 
 /// Get product by UID.
@@ -7046,46 +7132,56 @@ pub async fn insert_system_agent(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    let found = match run_with_mvcc_retry(cx, "insert_system_agent", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    let insert_sql = "INSERT INTO agents \
-        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-        ON CONFLICT(project_id, name) DO NOTHING";
-    let insert_params = [
-        Value::BigInt(project_id),
-        Value::Text(name.to_string()),
-        Value::Text(program.to_string()),
-        Value::Text(model.to_string()),
-        Value::Text(task_description.to_string()),
-        Value::BigInt(now),
-        Value::BigInt(now),
-        Value::Text("auto".to_string()),
-        Value::Text("auto".to_string()),
-    ];
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-    );
+        let insert_sql = "INSERT INTO agents \
+            (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            ON CONFLICT(project_id, name) DO NOTHING";
+        let insert_params = [
+            Value::BigInt(project_id),
+            Value::Text(name.to_string()),
+            Value::Text(program.to_string()),
+            Value::Text(model.to_string()),
+            Value::Text(task_description.to_string()),
+            Value::BigInt(now),
+            Value::BigInt(now),
+            Value::Text("auto".to_string()),
+            Value::Text("auto".to_string()),
+        ];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+        );
 
-    let select_sql = "SELECT id, project_id, name, program, model, task_description, \
-                      inception_ts, last_active_ts, attachments_policy, contact_policy \
-                      FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1";
-    let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-    let rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await)
-    );
-    let Some(found) = rows.first().map(decode_agent_row_indexed) else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::Internal(format!(
-            "system agent insert/upsert succeeded but re-select failed for {project_id}:{name}"
-        )));
+        let select_sql = "SELECT id, project_id, name, program, model, task_description, \
+                          inception_ts, last_active_ts, attachments_policy, contact_policy \
+                          FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1";
+        let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await)
+        );
+        let Some(found) = rows.first().map(decode_agent_row_indexed) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "system agent insert/upsert succeeded but re-select failed for {project_id}:{name}"
+            )));
+        };
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(found)
+    })
+    .await
+    {
+        Outcome::Ok(found) => found,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &found);
     Outcome::Ok(found)
 }
@@ -7276,6 +7372,37 @@ mod tests {
             is_mvcc_error(&err),
             "BusySnapshot must trigger whole-transaction MVCC retry"
         );
+    }
+
+    #[test]
+    fn run_with_mvcc_retry_restarts_resource_busy_snapshot_until_success() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let attempts = std::cell::Cell::new(0_u32);
+
+        let result = rt.block_on(async {
+            run_with_mvcc_retry(&cx, "test_mvcc_retry", || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                async move {
+                    if attempt < 3 {
+                        Outcome::Err(DbError::ResourceBusy(
+                            "database is busy (snapshot conflict on pages: 7)".to_string(),
+                        ))
+                    } else {
+                        Outcome::Ok(attempt)
+                    }
+                }
+            })
+            .await
+        });
+
+        assert!(matches!(result, Outcome::Ok(3)));
+        assert_eq!(attempts.get(), 3, "must restart the whole transaction body");
     }
 
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {
@@ -8283,6 +8410,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn list_numeric_thread_roots_with_replies_returns_only_roots_with_children() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -8525,6 +8653,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn release_reservations_by_ids_matching_expiry_skips_rows_renewed_after_scan() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -11998,17 +12127,17 @@ mod tests {
             .into_result()
             .expect("register agent b");
 
-            let agent_a_id = agent_a.id.expect("agent a id");
-            let agent_b_id = agent_b.id.expect("agent b id");
+            let first_agent_id = agent_a.id.expect("agent a id");
+            let second_agent_id = agent_b.id.expect("agent b id");
             assert_eq!(
-                agent_a_id, agent_b_id,
+                first_agent_id, second_agent_id,
                 "fresh in-memory pools should allocate matching first agent ids"
             );
 
-            set_agent_last_active_for_test(&cx, &pool_a, agent_a_id, 0).await;
-            set_agent_last_active_for_test(&cx, &pool_b, agent_b_id, 0).await;
+            set_agent_last_active_for_test(&cx, &pool_a, first_agent_id, 0).await;
+            set_agent_last_active_for_test(&cx, &pool_b, second_agent_id, 0).await;
 
-            touch_agent(&cx, &pool_a, agent_a_id)
+            touch_agent(&cx, &pool_a, first_agent_id)
                 .await
                 .into_result()
                 .expect("queue deferred touch in pool a");
@@ -12018,7 +12147,7 @@ mod tests {
                 .into_result()
                 .expect("flush deferred touches for pool b");
             assert_eq!(
-                read_agent_last_active_for_test(&cx, &pool_b, agent_b_id).await,
+                read_agent_last_active_for_test(&cx, &pool_b, second_agent_id).await,
                 0,
                 "pool b flush must not consume deferred touches from pool a"
             );
@@ -12028,7 +12157,7 @@ mod tests {
                 .into_result()
                 .expect("flush deferred touches for pool a");
             assert!(
-                read_agent_last_active_for_test(&cx, &pool_a, agent_a_id).await > 0,
+                read_agent_last_active_for_test(&cx, &pool_a, first_agent_id).await > 0,
                 "pool a flush should still apply its own deferred touch"
             );
         });

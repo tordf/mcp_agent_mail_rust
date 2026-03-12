@@ -974,6 +974,7 @@ impl<'a> TwoTierSearchIter<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn build_refined_results(&mut self, query_vec: &[f32]) -> Vec<ScoredResult> {
         let Some(fast_results) = self.fast_results.as_ref() else {
             // If no fast candidates are available, fall back to full quality search.

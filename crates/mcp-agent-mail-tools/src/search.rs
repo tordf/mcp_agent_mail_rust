@@ -165,7 +165,7 @@ fn is_ordered_prefix(s: &str) -> bool {
     // This avoids false positives from things like "1.2.3" or larger lists.
     let num_str = &s[..i];
     if let Ok(val) = num_str.parse::<u32>() {
-        if val < 1 || val > 5 {
+        if !(1..=5).contains(&val) {
             return false;
         }
     } else {
@@ -173,10 +173,10 @@ fn is_ordered_prefix(s: &str) -> bool {
     }
 
     // Must be followed by whitespace or end of string to be a list item.
-    if let Some(&next) = bytes.get(i + 1) {
-        if !next.is_ascii_whitespace() {
-            return false;
-        }
+    if let Some(&next) = bytes.get(i + 1)
+        && !next.is_ascii_whitespace()
+    {
+        return false;
     }
 
     true
@@ -384,9 +384,12 @@ pub(crate) fn summarize_messages(
             let mut has_keyword = false;
             let mut is_open_action = false;
             let stripped_bytes = stripped.as_bytes();
-            for &k in keywords.iter() {
+            for &k in &keywords {
                 let k_bytes = k.as_bytes();
-                if stripped_bytes.windows(k_bytes.len()).any(|w| w.eq_ignore_ascii_case(k_bytes)) {
+                if stripped_bytes
+                    .windows(k_bytes.len())
+                    .any(|w| w.eq_ignore_ascii_case(k_bytes))
+                {
                     has_keyword = true;
                     if k == "FIXME" || k == "TODO" || k == "ACTION" {
                         is_open_action = true;

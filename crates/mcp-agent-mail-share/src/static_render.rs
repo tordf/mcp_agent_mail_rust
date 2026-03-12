@@ -430,7 +430,7 @@ pub fn render_static_site(
         let filename = thread_routes
             .get(key)
             .expect("thread route must exist for every indexed thread");
-        write_page(&thread_pages_dir, &filename, &thread_html)?;
+        write_page(&thread_pages_dir, filename, &thread_html)?;
         generated_files.push(format!("viewer/pages/threads/{filename}"));
         sitemap.push(SitemapEntry {
             route: format!("threads/{filename}"),

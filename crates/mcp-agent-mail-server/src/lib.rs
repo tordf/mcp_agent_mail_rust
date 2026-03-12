@@ -1480,7 +1480,7 @@ fn run_http_headless_supervisor(config: mcp_agent_mail_core::Config) -> std::io:
         "HTTP server supervisor started"
     );
     let runtime = build_http_runtime()?;
-    let result_rx = spawn_http_supervisor_task(runtime.handle().clone(), config, None, None, None)?;
+    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, None, None)?;
     let result = recv_http_supervisor_result(result_rx);
     drop(runtime);
     result
@@ -1895,7 +1895,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     tui_state.set_server_control_sender(server_ctl_tx.clone());
     let supervisor_fail_fast_active = Arc::new(AtomicBool::new(true));
     let supervisor_result_rx = match spawn_http_supervisor_task(
-        http_runtime.handle().clone(),
+        http_runtime.handle(),
         config.clone(),
         Some(Arc::clone(&tui_state)),
         Some(server_ctl_rx),
@@ -1986,10 +1986,11 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 }
 
 fn tui_signal_termination_signal(err: &std::io::Error) -> Option<i32> {
+    const SIGNAL_PREFIX: &str = "terminated by signal ";
+
     if err.kind() != std::io::ErrorKind::Interrupted {
         return None;
     }
-    const SIGNAL_PREFIX: &str = "terminated by signal ";
 
     let message = err.to_string();
     let suffix = message
@@ -1997,8 +1998,8 @@ fn tui_signal_termination_signal(err: &std::io::Error) -> Option<i32> {
         .map(|index| &message[index + SIGNAL_PREFIX.len()..])?;
     let digits: String = suffix
         .chars()
-        .skip_while(|ch| ch.is_ascii_whitespace())
-        .take_while(|ch| ch.is_ascii_digit())
+        .skip_while(char::is_ascii_whitespace)
+        .take_while(char::is_ascii_digit)
         .collect();
     (!digits.is_empty())
         .then_some(digits)
@@ -2011,17 +2012,13 @@ fn combine_tui_and_supervisor_results(
 ) -> std::io::Result<()> {
     match tui_result {
         Ok(()) => supervisor_result,
-        Err(err) => {
-            if let Some(signal) = tui_signal_termination_signal(&err) {
-                tracing::warn!(
-                    signal,
-                    "TUI runtime terminated after receiving a shutdown signal"
-                );
-                supervisor_result
-            } else {
-                Err(err)
-            }
-        }
+        Err(err) => tui_signal_termination_signal(&err).map_or(Err(err), |signal| {
+            tracing::warn!(
+                signal,
+                "TUI runtime terminated after receiving a shutdown signal"
+            );
+            supervisor_result
+        }),
     }
 }
 
@@ -2164,7 +2161,10 @@ impl HttpRequestRuntimeDiagnostics {
             last_started_path: lock_mutex(&self.last_started_path).clone(),
             last_completed_method: lock_mutex(&self.last_completed_method).clone(),
             last_completed_path: lock_mutex(&self.last_completed_path).clone(),
-            last_completed_status: self.last_completed_status.load(Ordering::Relaxed) as u16,
+            last_completed_status: u16::try_from(
+                self.last_completed_status.load(Ordering::Relaxed),
+            )
+            .unwrap_or(u16::MAX),
         }
     }
 }
@@ -2261,9 +2261,11 @@ where
 fn recv_http_supervisor_result(
     result_rx: std::sync::mpsc::Receiver<std::io::Result<()>>,
 ) -> std::io::Result<()> {
-    result_rx
-        .recv()
-        .map_err(|_| std::io::Error::other("HTTP supervisor task exited without reporting"))?
+    result_rx.into_iter().next().unwrap_or_else(|| {
+        Err(std::io::Error::other(
+            "HTTP supervisor task exited without reporting",
+        ))
+    })
 }
 
 fn record_http_server_started(
@@ -2297,10 +2299,11 @@ fn spawn_http_supervisor_task(
     fail_fast_active: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    let runtime_handle_for_task = runtime_handle.clone();
-    let supervisor_state = tui_state.clone();
-    let fail_fast_state = tui_state.clone();
-    runtime_handle
+    let spawn_handle = runtime_handle;
+    let runtime_handle_for_task = spawn_handle.clone();
+    let supervisor_state = tui_state;
+    let fail_fast_state = supervisor_state.clone();
+    spawn_handle
         .try_spawn_with_cx(move |cx| async move {
             let result = PanicAsIoFuture::new(
                 "HTTP supervisor task",
@@ -2413,27 +2416,26 @@ async fn stop_http_server_instance_with_timeouts(
     let HttpServerInstance { join, shutdown, .. } = instance;
     let mut join = Box::pin(join);
     let _ = shutdown.begin_drain(HTTP_LISTENER_DRAIN_TIMEOUT);
-    match timeout(wall_now(), join_timeout, &mut join).await {
-        Ok(result) => result,
-        Err(_) => {
-            let forced = shutdown.begin_force_close();
-            tracing::warn!(
-                forced,
-                join_timeout_ms = join_timeout.as_millis(),
-                force_close_timeout_ms = force_close_timeout.as_millis(),
-                "HTTP server task exceeded drain timeout; escalating to force-close"
-            );
-            match timeout(wall_now(), force_close_timeout, &mut join).await {
-                Ok(result) => result,
-                Err(_) => Err(std::io::Error::new(
+    if let Ok(result) = timeout(wall_now(), join_timeout, &mut join).await {
+        result
+    } else {
+        let forced = shutdown.begin_force_close();
+        tracing::warn!(
+            forced,
+            join_timeout_ms = join_timeout.as_millis(),
+            force_close_timeout_ms = force_close_timeout.as_millis(),
+            "HTTP server task exceeded drain timeout; escalating to force-close"
+        );
+        timeout(wall_now(), force_close_timeout, &mut join)
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "server task did not stop within {:?} drain + {:?} force-close window",
-                        join_timeout, force_close_timeout
+                        "server task did not stop within {join_timeout:?} drain + {force_close_timeout:?} force-close window"
                     ),
-                )),
-            }
-        }
+                ))
+            })
     }
 }
 
@@ -2633,8 +2635,10 @@ async fn run_http_server_supervisor(
                     }
                     handled_control = true;
                 }
-                Ok(Ok(tui_bridge::ServerControlMsg::Shutdown))
-                | Ok(Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled)) => {
+                Ok(
+                    Ok(tui_bridge::ServerControlMsg::Shutdown)
+                    | Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled),
+                ) => {
                     record_http_server_shutdown(tui_state.as_deref());
                     return stop_http_server_instance(instance).await;
                 }
@@ -2773,7 +2777,7 @@ async fn rollback_http_transport_switch(
         runtime_handle,
         config,
         &mut last_restart_sleep_ms,
-        || tui_state.is_some_and(|state| state.is_shutdown_requested()),
+        || tui_state.is_some_and(tui_bridge::TuiSharedState::is_shutdown_requested),
         |err, backoff_ms| {
             tracing::error!(
                 error = %err,
@@ -3317,11 +3321,11 @@ struct StartupDashboard {
     last_render_stamp: Mutex<Option<DashboardRenderStamp>>,
 }
 
-fn startup_dashboard_enabled(config: &mcp_agent_mail_core::Config) -> bool {
+const fn startup_dashboard_enabled(config: &mcp_agent_mail_core::Config) -> bool {
     config.tui_enabled && config.log_rich_enabled
 }
 
-fn dashboard_console_interactivity_enabled(config: &mcp_agent_mail_core::Config) -> bool {
+const fn dashboard_console_interactivity_enabled(config: &mcp_agent_mail_core::Config) -> bool {
     startup_dashboard_enabled(config) && config.console_interactive_enabled
 }
 
@@ -4987,18 +4991,15 @@ fn dashboard_active_file_reservations(conn: &DbConn, now_micros: i64) -> u64 {
     let legacy_sql = format!(
         "SELECT expires_ts AS raw_expires_ts FROM file_reservations WHERE ({active_predicate})"
     );
-    conn.query_sync(&legacy_sql, &[])
-        .ok()
-        .map(|rows| {
-            rows.into_iter().fold(0_u64, |count, row| {
-                if crate::tui_poller::parse_raw_ts(&row, "raw_expires_ts") > now_micros {
-                    count.saturating_add(1)
-                } else {
-                    count
-                }
-            })
+    conn.query_sync(&legacy_sql, &[]).ok().map_or(0, |rows| {
+        rows.into_iter().fold(0_u64, |count, row| {
+            if crate::tui_poller::parse_raw_ts(&row, "raw_expires_ts") > now_micros {
+                count.saturating_add(1)
+            } else {
+                count
+            }
         })
-        .unwrap_or(0)
+    })
 }
 
 fn dashboard_count(conn: &DbConn, sql: &str) -> u64 {
@@ -9301,9 +9302,11 @@ mod tests {
 
     #[test]
     fn startup_dashboard_enabled_tracks_tui_mode() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.log_rich_enabled = true;
-        config.tui_enabled = true;
+        let mut config = mcp_agent_mail_core::Config {
+            log_rich_enabled: true,
+            tui_enabled: true,
+            ..Default::default()
+        };
         assert!(startup_dashboard_enabled(&config));
 
         config.tui_enabled = false;
@@ -9312,17 +9315,21 @@ mod tests {
 
     #[test]
     fn startup_dashboard_enabled_respects_rich_logging_flag() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.tui_enabled = true;
-        config.log_rich_enabled = false;
+        let config = mcp_agent_mail_core::Config {
+            tui_enabled: true,
+            log_rich_enabled: false,
+            ..Default::default()
+        };
         assert!(!startup_dashboard_enabled(&config));
     }
 
     #[test]
     fn dashboard_console_interactivity_tracks_tui_mode() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.console_interactive_enabled = true;
-        config.tui_enabled = true;
+        let mut config = mcp_agent_mail_core::Config {
+            console_interactive_enabled: true,
+            tui_enabled: true,
+            ..Default::default()
+        };
         assert!(dashboard_console_interactivity_enabled(&config));
 
         config.tui_enabled = false;
@@ -9331,9 +9338,11 @@ mod tests {
 
     #[test]
     fn dashboard_console_interactivity_respects_console_disable_flag() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.tui_enabled = true;
-        config.console_interactive_enabled = false;
+        let config = mcp_agent_mail_core::Config {
+            tui_enabled: true,
+            console_interactive_enabled: false,
+            ..Default::default()
+        };
         assert!(!dashboard_console_interactivity_enabled(&config));
     }
 
@@ -15613,7 +15622,7 @@ mod tests {
                     .or_else(|| row.get_as(0).ok())
             })
             .unwrap_or_default();
-        assert_eq!(configured, SERVER_SYNC_DB_BUSY_TIMEOUT_MS as i64);
+        assert_eq!(configured, i64::from(SERVER_SYNC_DB_BUSY_TIMEOUT_MS));
     }
 
     #[test]
@@ -15634,7 +15643,7 @@ mod tests {
                     .or_else(|| row.get_as(0).ok())
             })
             .unwrap_or_default();
-        assert_eq!(configured, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS as i64);
+        assert_eq!(configured, i64::from(BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS));
     }
 
     #[test]
@@ -18758,14 +18767,14 @@ mod tests {
             "first localhost request should pass"
         );
 
-        let req_b1 = make_request_with_peer_addr(
+        let req_other_subject = make_request_with_peer_addr(
             Http1Method::Post,
             "/api/",
             &[("Authorization", auth_b.as_str())],
             Some(peer),
         );
         assert!(
-            block_on(state.check_rbac_and_rate_limit(&req_b1, &json_rpc)).is_none(),
+            block_on(state.check_rbac_and_rate_limit(&req_other_subject, &json_rpc)).is_none(),
             "different localhost JWT subjects must not share a rate-limit bucket"
         );
 
@@ -19245,7 +19254,6 @@ mod tests {
         let instance = test_http_server_instance(
             runtime
                 .handle()
-                .clone()
                 .try_spawn(async { Ok::<(), std::io::Error>(()) })
                 .expect("spawn joinable task"),
             asupersync::server::shutdown::ShutdownSignal::new(),
@@ -19266,7 +19274,6 @@ mod tests {
         let instance = test_http_server_instance(
             runtime
                 .handle()
-                .clone()
                 .try_spawn(async move {
                     while task_shutdown.phase()
                         != asupersync::server::shutdown::ShutdownPhase::ForceClosing
@@ -19296,7 +19303,6 @@ mod tests {
         let instance = test_http_server_instance(
             runtime
                 .handle()
-                .clone()
                 .try_spawn(async {
                     sleep(wall_now(), Duration::from_secs(30)).await;
                     Ok::<(), std::io::Error>(())
@@ -19323,7 +19329,7 @@ mod tests {
     #[test]
     fn respawn_http_server_instance_with_retry_retries_until_success() {
         let runtime = build_http_runtime().expect("build test HTTP runtime");
-        let runtime_handle = runtime.handle().clone();
+        let runtime_handle = runtime.handle();
         let mut config = mcp_agent_mail_core::Config::default();
         let mut last_restart_sleep_ms = 0_u64;
         let mut retry_backoffs = Vec::new();

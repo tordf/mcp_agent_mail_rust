@@ -163,7 +163,7 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
             });
             if let Some(has_rows) = table_has_rows.as_ref().copied() {
                 saw_nonempty_table |= has_rows;
-                saw_incompatible_timestamp_schema = true;
+                saw_incompatible_timestamp_schema |= has_rows;
             }
             continue; // Table might not exist or column renamed
         };
@@ -1069,6 +1069,27 @@ mod tests {
         assert!(
             matches!(format, TimestampFormat::Unknown(_)),
             "non-empty legacy schemas should not be misreported as empty: {format:?}"
+        );
+    }
+
+    #[test]
+    fn detect_empty_legacy_schema_as_empty() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(
+            "CREATE TABLE projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                slug TEXT NOT NULL UNIQUE, \
+                human_key TEXT NOT NULL, \
+                created_on TEXT NOT NULL\
+            )",
+        )
+        .expect("create empty legacy projects table");
+
+        let format = detect_timestamp_format(&conn).expect("detect format");
+        assert_eq!(
+            format,
+            TimestampFormat::Empty,
+            "empty legacy schemas should still report as empty"
         );
     }
 

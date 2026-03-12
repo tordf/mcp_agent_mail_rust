@@ -546,24 +546,23 @@ pub async fn register_agent(
             let n = n.trim();
             if n.is_empty() {
                 generate_agent_name()
+            } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(n) {
+                normalized
             } else {
-                match mcp_agent_mail_core::models::normalize_agent_name(n) {
-                    Some(normalized) => normalized,
-                    None => {
-                        let (err_type, msg) = detect_agent_name_mistake(n).unwrap_or_else(|| {
-                                (
-                                    "INVALID_AGENT_NAME",
-                                    format!("Invalid agent name '{n}'. MUST be an adjective+noun combination (e.g. GreenLake).")
-                                )
-                            });
-                        return Err(legacy_tool_error(
-                            err_type,
-                            msg,
-                            true,
-                            json!({ "provided": n }),
-                        ));
-                    }
-                }
+                let (err_type, msg) = detect_agent_name_mistake(n).unwrap_or_else(|| {
+                    (
+                        "INVALID_AGENT_NAME",
+                        format!(
+                            "Invalid agent name '{n}'. MUST be an adjective+noun combination (e.g. GreenLake)."
+                        ),
+                    )
+                });
+                return Err(legacy_tool_error(
+                    err_type,
+                    msg,
+                    true,
+                    json!({ "provided": n }),
+                ));
             }
         }
         None => generate_agent_name(),
@@ -717,24 +716,24 @@ pub async fn create_agent_identity(
             let hint = hint.trim();
             if hint.is_empty() {
                 generate_agent_name()
+            } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(hint)
+            {
+                normalized
             } else {
-                match mcp_agent_mail_core::models::normalize_agent_name(hint) {
-                    Some(normalized) => normalized,
-                    None => {
-                        let (err_type, msg) = detect_agent_name_mistake(hint).unwrap_or_else(|| {
-                                (
-                                    "INVALID_AGENT_NAME",
-                                    format!("Invalid agent name hint '{hint}'. MUST be an adjective+noun combination (e.g. GreenLake).")
-                                )
-                            });
-                        return Err(legacy_tool_error(
-                            err_type,
-                            msg,
-                            true,
-                            json!({ "provided": hint }),
-                        ));
-                    }
-                }
+                let (err_type, msg) = detect_agent_name_mistake(hint).unwrap_or_else(|| {
+                    (
+                        "INVALID_AGENT_NAME",
+                        format!(
+                            "Invalid agent name hint '{hint}'. MUST be an adjective+noun combination (e.g. GreenLake)."
+                        ),
+                    )
+                });
+                return Err(legacy_tool_error(
+                    err_type,
+                    msg,
+                    true,
+                    json!({ "provided": hint }),
+                ));
             }
         }
         None => generate_agent_name(),
@@ -886,7 +885,7 @@ pub async fn whois(
     let pool = get_db_pool()?;
 
     let include_commits = include_recent_commits.unwrap_or(true);
-    let limit_raw = commit_limit.unwrap_or(5).max(0);
+    let limit_raw = commit_limit.unwrap_or(5);
     let limit = usize::try_from(limit_raw).unwrap_or(0);
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -994,14 +993,12 @@ pub async fn resolve_pane_identity(
     }
 
     let mut project_keys = vec![project_key.clone()];
-    if !Path::new(&project_key).is_absolute() {
-        if let Ok(pool) = get_db_pool() {
-            if let Ok(project) = resolve_project(ctx, &pool, &project_key).await {
-                if project.human_key != project_key {
-                    project_keys.push(project.human_key);
-                }
-            }
-        }
+    if !Path::new(&project_key).is_absolute()
+        && let Ok(pool) = get_db_pool()
+        && let Ok(project) = resolve_project(ctx, &pool, &project_key).await
+        && project.human_key != project_key
+    {
+        project_keys.push(project.human_key);
     }
 
     let checked_path = mcp_agent_mail_core::canonical_identity_path(
@@ -1513,11 +1510,8 @@ mod tests {
         let written_path =
             mcp_agent_mail_core::write_identity(&human_key, pane, "BlueLake").expect("write");
 
-        let resolved = resolve_identity_from_project_keys(
-            &[raw_project_key, human_key.clone()],
-            pane,
-        )
-        .expect("resolve identity across project keys");
+        let resolved = resolve_identity_from_project_keys(&[raw_project_key, human_key], pane)
+            .expect("resolve identity across project keys");
         assert_eq!(resolved.0, "BlueLake");
         assert_eq!(resolved.1, written_path);
 

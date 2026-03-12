@@ -122,8 +122,7 @@ fn is_agent_unique_constraint_error(message: &str) -> bool {
         .map(str::trim)
         .map(|column| column.rsplit('.').next().unwrap_or(column))
         .collect::<Vec<_>>();
-    columns.iter().any(|column| *column == "project_id")
-        && columns.iter().any(|column| *column == "name")
+    columns.contains(&"project_id") && columns.contains(&"name")
 }
 
 fn contact_blocked_error() -> McpError {
@@ -834,40 +833,34 @@ fn normalize_send_message_aliases(arguments: &mut Value) {
         return;
     };
 
-    if !args.contains_key("project_key") {
-        if let Some(val) = args
-            .remove("project")
-            .or_else(|| args.remove("project_slug"))
-            .or_else(|| args.remove("human_key"))
-        {
-            args.insert("project_key".to_string(), val);
-        }
-    } else {
+    if args.contains_key("project_key") {
         let _ = args.remove("project");
         let _ = args.remove("project_slug");
         let _ = args.remove("human_key");
+    } else if let Some(val) = args
+        .remove("project")
+        .or_else(|| args.remove("project_slug"))
+        .or_else(|| args.remove("human_key"))
+    {
+        args.insert("project_key".to_string(), val);
     }
 
-    if !args.contains_key("sender_name") {
-        if let Some(val) = args
-            .remove("from")
-            .or_else(|| args.remove("from_agent"))
-            .or_else(|| args.remove("requester"))
-        {
-            args.insert("sender_name".to_string(), val);
-        }
-    } else {
+    if args.contains_key("sender_name") {
         let _ = args.remove("from");
         let _ = args.remove("from_agent");
         let _ = args.remove("requester");
+    } else if let Some(val) = args
+        .remove("from")
+        .or_else(|| args.remove("from_agent"))
+        .or_else(|| args.remove("requester"))
+    {
+        args.insert("sender_name".to_string(), val);
     }
 
-    if !args.contains_key("message_id") {
-        if let Some(val) = args.remove("id") {
-            args.insert("message_id".to_string(), val);
-        }
-    } else {
+    if args.contains_key("message_id") {
         let _ = args.remove("id");
+    } else if let Some(val) = args.remove("id") {
+        args.insert("message_id".to_string(), val);
     }
 }
 
@@ -2853,7 +2846,11 @@ effective_free_bytes={free}"
 /// - `limit`: Max messages to return (default: 20)
 /// - `include_bodies`: Include full message bodies (default: false)
 /// - `topic`: Reserved for future topic filtering; non-blank values are currently rejected
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::items_after_statements,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 #[tool(
     description = "Retrieve recent messages for an agent without mutating read/ack state.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```"
 )]

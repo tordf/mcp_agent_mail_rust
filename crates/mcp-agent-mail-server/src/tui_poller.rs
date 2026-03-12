@@ -798,7 +798,7 @@ fn query_data_version(conn: &DbConn, sqlite_path: Option<&str>) -> Option<i64> {
     }
 }
 
-fn snapshot_has_missing_detail_lists(snapshot: &DbStatSnapshot) -> bool {
+const fn snapshot_has_missing_detail_lists(snapshot: &DbStatSnapshot) -> bool {
     (snapshot.agents > 0 && snapshot.agents_list.is_empty())
         || (snapshot.projects > 0 && snapshot.projects_list.is_empty())
         || (snapshot.contact_links > 0 && snapshot.contacts_list.is_empty())
@@ -883,7 +883,7 @@ fn maybe_reuse_previous_detail_list<T: Clone>(
     *current_rows = previous_rows.to_vec();
 }
 
-fn timestamp_sort_expr(column: &str) -> String {
+pub(crate) fn timestamp_sort_expr(column: &str) -> String {
     format!(
         "CASE \
            WHEN typeof({column}) IN ('integer', 'real') THEN CAST({column} AS INTEGER) \
@@ -1050,7 +1050,10 @@ fn fetch_projects_list_minimal(
         .unwrap_or_default()
 }
 
-fn fetch_active_reservation_counts_by_project(conn: &DbConn, now: i64) -> HashMap<i64, u64> {
+pub(crate) fn fetch_active_reservation_counts_by_project(
+    conn: &DbConn,
+    now: i64,
+) -> HashMap<i64, u64> {
     let Ok(rows) = conn.query_sync(
         "SELECT project_id, expires_ts AS raw_expires_ts, released_ts AS raw_released_ts FROM file_reservations",
         &[],
@@ -1635,6 +1638,7 @@ fn fetch_reservation_snapshot_bundle(
     try_fetch_reservation_snapshot_bundle(conn, now, sqlite_path).unwrap_or_default()
 }
 
+#[allow(clippy::too_many_lines)]
 fn try_fetch_reservation_snapshot_bundle(
     conn: &DbConn,
     now: i64,
@@ -1760,6 +1764,7 @@ fn try_fetch_reservation_snapshot_bundle(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn try_fetch_reservation_snapshot_bundle_fast(
     conn: &DbConn,
     now: i64,
@@ -2915,7 +2920,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             configured,
-            crate::BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS as i64
+            i64::from(crate::BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS)
         );
     }
 

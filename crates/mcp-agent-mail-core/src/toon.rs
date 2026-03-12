@@ -596,17 +596,16 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
     })?;
 
     let json_payload_owned = json_payload.to_string();
-    let stdin_thread = std::thread::spawn(move || {
-        stdin.write_all(json_payload_owned.as_bytes())
-    });
+    let stdin_thread = std::thread::spawn(move || stdin.write_all(json_payload_owned.as_bytes()));
 
     let output = child
         .wait_with_output()
         .map_err(|e| EncoderError::OsError(format!("TOON encoder failed: {e}")))?;
 
     // Join stdin thread to catch write errors
-    if let Err(e) =
-        stdin_thread.join().unwrap_or_else(|_| Err(std::io::Error::other("stdin writer thread panicked")))
+    if let Err(e) = stdin_thread
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("stdin writer thread panicked")))
     {
         return Err(EncoderError::OsError(format!(
             "TOON encoder stdin write failed: {e}"

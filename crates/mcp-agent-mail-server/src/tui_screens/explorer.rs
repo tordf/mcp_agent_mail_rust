@@ -471,7 +471,12 @@ impl MailExplorerScreen {
             crate::tui_events::MailEvent::message_sent(
                 e.message_id,
                 &e.sender_name,
-                e.to_agents.split(", ").map(String::from).collect(),
+                e.to_agents
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(String::from)
+                    .collect(),
                 &e.subject,
                 e.thread_id.as_deref().unwrap_or(""),
                 &e.project_slug,
@@ -1225,7 +1230,10 @@ fn resolve_agent_ids_by_name(
 fn collect_message_ids(rows: &[Row]) -> Vec<i64> {
     let mut ids = std::collections::BTreeSet::new();
     for row in rows {
-        if let Ok(message_id) = row.get_named::<i64>("id").or_else(|_| row.get_as::<i64>(0)) {
+        let message_id = row
+            .get_named::<i64>("id")
+            .map_or_else(|_| row.get_as::<i64>(0).ok(), Some);
+        if let Some(message_id) = message_id {
             ids.insert(message_id);
         }
     }
@@ -2385,7 +2393,7 @@ mod tests {
         )
         .expect("create messages");
         let values = (1..=MAX_CANDIDATE_MESSAGES_DEFAULT + 3)
-            .map(|id| format!("({}, {})", id, id))
+            .map(|id| format!("({id}, {id})"))
             .collect::<Vec<_>>()
             .join(", ");
         conn.execute_raw(&format!(
@@ -2404,7 +2412,10 @@ mod tests {
             !ids.contains(&1),
             "oldest row should fall outside candidate window"
         );
-        assert!(ids.contains(&(MAX_CANDIDATE_MESSAGES_DEFAULT as i64 + 3)));
+        let newest_id = i64::try_from(MAX_CANDIDATE_MESSAGES_DEFAULT)
+            .unwrap_or(i64::MAX)
+            .saturating_add(3);
+        assert!(ids.contains(&newest_id));
     }
 
     #[test]
@@ -2507,6 +2518,37 @@ mod tests {
             entry.ack_ts, None,
             "any unacked recipient should keep ack pending"
         );
+    }
+
+    #[test]
+    fn fetch_inbound_acknowledged_filter_uses_matching_recipient_subset_for_status() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug) VALUES (1, 'alpha');
+             INSERT INTO agents (id, name) VALUES
+                (1, 'Sender'),
+                (2, 'BlueLake'),
+                (3, 'RedFox');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
+             VALUES
+                (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
+             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
+                (1, 10, 2, 1200, 1300),
+                (2, 10, 3, NULL, NULL);",
+        )
+        .expect("seed inbound rows");
+
+        let mut screen = MailExplorerScreen::new();
+        screen.ack_filter = AckFilter::Acknowledged;
+        let entries = screen.fetch_inbound(&conn, None).expect("fetch inbound");
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.message_id, 10);
+        assert_eq!(entry.ack_ts, Some(1300));
+        assert_eq!(entry.read_ts, Some(1200));
     }
 
     #[test]
@@ -3194,6 +3236,30 @@ mod tests {
                 assert_eq!(
                     body_md, "Important deployment update with details",
                     "synthetic event must carry body_md from DisplayEntry"
+                );
+            }
+            other => panic!("expected MessageSent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_focused_event_omits_blank_recipient_names() {
+        let mut screen = MailExplorerScreen::new();
+        let mut entry = test_entry(7, 1_000_000, Direction::Inbound);
+        entry.to_agents.clear();
+        screen.entries = vec![entry];
+        screen.cursor = 0;
+
+        screen.sync_focused_event();
+
+        let event = screen
+            .focused_synthetic
+            .expect("should have synthetic event");
+        match event {
+            crate::tui_events::MailEvent::MessageSent { to, .. } => {
+                assert!(
+                    to.is_empty(),
+                    "blank recipient csv should not yield an empty-name agent"
                 );
             }
             other => panic!("expected MessageSent, got {other:?}"),

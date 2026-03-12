@@ -2159,6 +2159,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn enforce_base_mode_cleanup_drops_identity_fts_objects() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("base_cleanup_identity_fts.db");

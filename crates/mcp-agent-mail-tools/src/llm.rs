@@ -367,10 +367,10 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
 
 fn strip_provider_prefix<'a>(model: &'a str, providers: &[&str]) -> &'a str {
     for provider in providers {
-        if let Some(stripped) = model.strip_prefix(provider) {
-            if let Some(stripped) = stripped.strip_prefix(['/', ':']) {
-                return stripped;
-            }
+        if let Some(stripped) = model.strip_prefix(provider)
+            && let Some(stripped) = stripped.strip_prefix(['/', ':'])
+        {
+            return stripped;
         }
     }
     model
@@ -583,12 +583,12 @@ fn extract_fenced_json(text: &str) -> Option<Value> {
 fn extract_brace_json(text: &str) -> Option<Value> {
     let mut cursor = text;
     while let Some(open) = cursor.find('{') {
-        if let Some(close) = cursor.rfind('}') {
-            if close > open {
-                let slice = &cursor[open..=close];
-                if let Ok(v) = serde_json::from_str(slice) {
-                    return Some(v);
-                }
+        if let Some(close) = cursor.rfind('}')
+            && close > open
+        {
+            let slice = &cursor[open..=close];
+            if let Ok(v) = serde_json::from_str(slice) {
+                return Some(v);
             }
         }
         // Try the next opening brace if this one didn't lead to valid JSON

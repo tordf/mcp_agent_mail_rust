@@ -288,6 +288,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
                 Role::Leader(slot)
             };
             let len = map.len();
+            drop(map);
             (role, len)
         };
 

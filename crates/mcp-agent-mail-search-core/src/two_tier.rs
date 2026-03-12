@@ -978,7 +978,7 @@ impl<'a> TwoTierSearchIter<'a> {
 
     fn build_refined_results(&mut self, query_vec: &[f32]) -> Vec<ScoredResult> {
         let fast_results = self.fast_results.as_ref();
-        
+
         // If no fast candidates are available OR they are empty, fall back to full quality search.
         // This ensures that even if lexical search misses everything, semantic search has a chance.
         if fast_results.is_none() || fast_results.is_some_and(|r| r.is_empty()) {

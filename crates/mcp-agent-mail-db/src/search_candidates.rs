@@ -300,7 +300,7 @@ impl CandidateBudget {
             semantic_limit
         };
 
-        let budget = CandidateBudget {
+        let budget = Self {
             lexical_limit: final_lexical,
             semantic_limit: final_semantic,
             combined_limit: (final_lexical.saturating_add(final_semantic))

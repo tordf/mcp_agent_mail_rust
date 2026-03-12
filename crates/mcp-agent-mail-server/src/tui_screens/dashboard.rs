@@ -279,7 +279,7 @@ pub struct DashboardScreen {
     chart_animations_enabled: bool,
     /// Whether the console log panel is visible (toggled with `l`).
     show_log_panel: bool,
-    /// Live dashboard query input (`/` to focus). Filters every panel in-place.
+    /// Live dashboard query input (`/` to focus). Filters event/query-aware panels in-place.
     quick_query_input: TextInput,
     /// True while the query input has keyboard focus.
     quick_query_active: bool,
@@ -1328,8 +1328,7 @@ impl MailScreen for DashboardScreen {
         // IMPORTANT: do not require "dirty" on this exact tick. Data generation
         // changes are edge-triggered; cadence ticks are phase-based. If those
         // phases do not align, gating on both can miss refresh forever.
-        let mut throughput_changed = false;
-        if tick_count.is_multiple_of(STAT_REFRESH_TICKS) {
+        let throughput_changed = if tick_count.is_multiple_of(STAT_REFRESH_TICKS) {
             if self.current_db_stats.timestamp_micros == 0 {
                 if let Some(stats) = state.db_stats_snapshot() {
                     self.current_db_stats = stats.clone();
@@ -1370,8 +1369,10 @@ impl MailScreen for DashboardScreen {
                     .drain(..self.throughput_history.len() - THROUGHPUT_HISTORY_CAP);
             }
             self.prev_req_total = counters.total;
-            throughput_changed = true;
-        }
+            true
+        } else {
+            false
+        };
 
         let now = Instant::now();
         if throughput_changed {
@@ -3301,6 +3302,15 @@ fn render_bottom_rail(
     render_query_matches_panel(frame, right, query_text, db_snapshot, entries);
 }
 
+const fn snapshot_panel_query_terms(_query_text: &str) -> Vec<String> {
+    // Keep operational snapshots truthful even while the operator is running a
+    // free-form dashboard query. Query-specific hits are surfaced in the
+    // dedicated query panel instead of blanking live project/agent/contact/
+    // reservation state.
+    Vec::new()
+}
+
+#[allow(clippy::too_many_lines)]
 fn render_agents_snapshot_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3311,7 +3321,7 @@ fn render_agents_snapshot_panel(
     if area.width < 18 || area.height < 3 {
         return;
     }
-    let query_terms = parse_query_terms(query_text);
+    let query_terms = snapshot_panel_query_terms(query_text);
     let mut rows: Vec<&AgentSummary> = agents
         .iter()
         .filter(|agent| fields_match_query_terms(&[&agent.name, &agent.program], &query_terms))
@@ -3350,7 +3360,12 @@ fn render_agents_snapshot_panel(
     }
 
     if rows.is_empty() {
-        Paragraph::new("No matching agents")
+        let message = if total_agents > 0 && agents.is_empty() {
+            format!("Agent details unavailable ({total_agents} total)")
+        } else {
+            "No agents registered".to_string()
+        };
+        Paragraph::new(message)
             .style(crate::tui_theme::text_meta(&tp))
             .render(inner, frame);
         return;
@@ -3421,7 +3436,7 @@ fn render_contacts_snapshot_panel(
     if area.width < 18 || area.height < 3 {
         return;
     }
-    let query_terms = parse_query_terms(query_text);
+    let query_terms = snapshot_panel_query_terms(query_text);
     let mut rows: Vec<&ContactSummary> = contacts
         .iter()
         .filter(|contact| {
@@ -3465,7 +3480,12 @@ fn render_contacts_snapshot_panel(
     }
 
     if rows.is_empty() {
-        Paragraph::new("No matching contacts")
+        let message = if total_contacts > 0 && contacts.is_empty() {
+            format!("Contact details unavailable ({total_contacts} total)")
+        } else {
+            "No contact links".to_string()
+        };
+        Paragraph::new(message)
             .style(crate::tui_theme::text_meta(&tp))
             .render(inner, frame);
         return;
@@ -3540,6 +3560,7 @@ fn render_contacts_snapshot_panel(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_projects_snapshot_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3550,7 +3571,7 @@ fn render_projects_snapshot_panel(
     if area.width < 18 || area.height < 3 {
         return;
     }
-    let query_terms = parse_query_terms(query_text);
+    let query_terms = snapshot_panel_query_terms(query_text);
     let mut rows: Vec<&ProjectSummary> = projects
         .iter()
         .filter(|project| {
@@ -3582,8 +3603,10 @@ fn render_projects_snapshot_panel(
         } else if query_active && total_projects > u64::try_from(projects.len()).unwrap_or(u64::MAX)
         {
             "No matching projects in fetched detail rows".to_string()
-        } else {
+        } else if query_active {
             "No matching projects".to_string()
+        } else {
+            "No projects".to_string()
         };
         Paragraph::new(message)
             .style(crate::tui_theme::text_meta(&tp))
@@ -3655,6 +3678,7 @@ fn render_projects_snapshot_panel(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_project_load_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3666,7 +3690,7 @@ fn render_project_load_panel(
         return;
     }
 
-    let query_terms = parse_query_terms(query_text);
+    let query_terms = snapshot_panel_query_terms(query_text);
     let mut rows: Vec<(&ProjectSummary, u64)> = projects
         .iter()
         .filter(|project| {
@@ -3701,8 +3725,10 @@ fn render_project_load_panel(
         } else if query_active && total_projects > u64::try_from(projects.len()).unwrap_or(u64::MAX)
         {
             "No matching projects in fetched detail rows".to_string()
-        } else {
+        } else if query_active {
             "No matching projects".to_string()
+        } else {
+            "No projects".to_string()
         };
         Paragraph::new(message)
             .style(crate::tui_theme::text_meta(&tp))
@@ -3784,7 +3810,7 @@ fn render_reservation_watch_panel(
         return;
     }
     let now = unix_epoch_micros_now().unwrap_or_default();
-    let query_terms = parse_query_terms(query_text);
+    let query_terms = snapshot_panel_query_terms(query_text);
     let mut rows: Vec<&ReservationSnapshot> = reservations
         .iter()
         .filter(|reservation| !reservation.is_released())
@@ -3951,7 +3977,7 @@ fn render_reservation_ttl_buckets_panel(
     }
 
     let now = unix_epoch_micros_now().unwrap_or_default();
-    let query_terms = parse_query_terms(query_text);
+    let query_terms = snapshot_panel_query_terms(query_text);
     let filtered: Vec<&ReservationSnapshot> = reservations
         .iter()
         .filter(|reservation| !reservation.is_released())
@@ -6674,6 +6700,13 @@ mod tests {
             Some(&preview),
             true
         ));
+    }
+
+    #[test]
+    fn snapshot_panel_query_terms_ignore_dashboard_quick_query() {
+        assert!(snapshot_panel_query_terms("").is_empty());
+        assert!(snapshot_panel_query_terms("project-a").is_empty());
+        assert!(snapshot_panel_query_terms("agent reservation").is_empty());
     }
 
     #[test]

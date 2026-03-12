@@ -371,7 +371,7 @@ fn probe_single_get(
     let _ = stream.set_write_timeout(Some(config.timeout));
 
     let mut response_buf = Vec::new();
-    let result = (|| -> Result<RawResponse, ProbeError> {
+    (|| -> Result<RawResponse, ProbeError> {
         if matches!(parsed.scheme, Scheme::Https) {
             return Err(ProbeError::TlsError {
                 detail: "HTTPS probing is not enabled in this build".to_string(),
@@ -397,9 +397,7 @@ fn probe_single_get(
         let _ = stream.shutdown(std::net::Shutdown::Both);
 
         parse_http_response(&response_buf, capture_body)
-    })();
-
-    result
+    })()
 }
 
 /// Parse a raw HTTP response.

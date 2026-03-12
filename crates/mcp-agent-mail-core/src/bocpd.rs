@@ -269,18 +269,21 @@ impl BocpdDetector {
                 max_cp_term = term;
             }
         }
-        
+
         let log_cp = if max_cp_term == f64::NEG_INFINITY {
             f64::NEG_INFINITY
         } else if max_cp_term == f64::INFINITY {
             f64::INFINITY
         } else {
-            let sum_exp: f64 = self.log_run_dist.iter().zip(self.log_pred.iter())
+            let sum_exp: f64 = self
+                .log_run_dist
+                .iter()
+                .zip(self.log_pred.iter())
                 .map(|(&log_r, &log_p)| ((log_r + log_p + log_hazard) - max_cp_term).exp())
                 .sum();
             max_cp_term + sum_exp.ln()
         };
-        
+
         self.next_log_run_dist.push(log_cp);
 
         // Growth: run length increases by 1.
@@ -411,11 +414,7 @@ fn log_sum_exp(log_vals: &[f64]) -> f64 {
     if max == f64::INFINITY {
         return f64::INFINITY;
     }
-    max + log_vals
-        .iter()
-        .map(|v| (v - max).exp())
-        .sum::<f64>()
-        .ln()
+    max + log_vals.iter().map(|v| (v - max).exp()).sum::<f64>().ln()
 }
 
 // ---------------------------------------------------------------------------

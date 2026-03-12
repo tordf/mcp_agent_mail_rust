@@ -896,7 +896,10 @@ mod tests {
                     .or_else(|| row.get_as(0).ok())
             })
             .unwrap_or_default();
-        assert_eq!(configured, METRICS_DB_BUSY_TIMEOUT_MS as i64);
+        assert_eq!(
+            configured,
+            i64::try_from(METRICS_DB_BUSY_TIMEOUT_MS).unwrap_or(i64::MAX)
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@
 //! Vovk, V., Gammerman, A., & Shafer, G. (2005). *Algorithmic Learning
 //! in a Random World*. Springer.
 
-use std::collections::VecDeque;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 
 /// Minimum calibration window size before predictions are emitted.
 const MIN_CALIBRATION: usize = 30;

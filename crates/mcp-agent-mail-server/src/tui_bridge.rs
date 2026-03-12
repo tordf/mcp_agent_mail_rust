@@ -464,7 +464,7 @@ impl TuiSharedState {
 
         let mut backoff = std::time::Duration::from_millis(2);
         for _ in 0..3 {
-            let _ = sleep(wall_now(), backoff).await;
+            let () = sleep(wall_now(), backoff).await;
             match self.events.try_push(event) {
                 Ok(_) => return true,
                 Err(returned_event) => event = returned_event,
