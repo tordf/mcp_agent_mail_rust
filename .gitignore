@@ -212,3 +212,39 @@ gemini.mcp.json
 .beads/*.bak-corrupt
 .rch-bin/
 .rch-target*/
+
+# Codex IDE cache
+.codex/
+
+# Agent-generated scratch Rust files at repo root
+/*.rs
+
+# Agent-generated scratch Cargo.toml fragments
+/ftui-extras-cargo.toml
+
+# Agent-generated debug/analysis Python scripts
+/debug_*.py
+/restore.py
+/find_*.py
+/parse_*.py
+/fix.py
+
+# Generic error log
+error.log
+
+# Scratch data/widget directories
+/Widget
+/data/
+
+# JSON output artifacts
+/out.json
+
+# Server log files
+server_error*.log
+server_warnings.txt
+
+# UBS scan output
+ubs-output.txt
+
+# Release build artifacts
+release-artifacts/
