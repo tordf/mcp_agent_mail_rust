@@ -197,7 +197,8 @@ END;
 /// Note: some PRAGMAs are database-wide (notably `journal_mode`). In the Rust
 /// server we apply `journal_mode=WAL` once per sqlite file during pool warmup
 /// (see `mcp-agent-mail-db/src/pool.rs`) to avoid high-concurrency races where
-/// multiple connections simultaneously attempt WAL/migrations.
+/// multiple connections simultaneously attempt WAL/migrations; per-connection
+/// settings intentionally do not repeat that journal-mode transition.
 ///
 /// - `journal_mode=WAL`: readers never block writers; writers never block readers
 /// - `synchronous=NORMAL`: fsync on commit (not per-statement); safe with WAL
@@ -251,10 +252,13 @@ PRAGMA journal_mode = 'DELETE';
 /// IMPORTANT: `foreign_keys = OFF` must come first to override the
 /// `SQLITE_DEFAULT_FOREIGN_KEYS` compile-time default before any DML.
 /// `busy_timeout` comes next so lock waits apply to subsequent PRAGMAs.
+/// `journal_mode` is intentionally omitted because it is database-wide and is
+/// applied once during sqlite-file initialization; reissuing it per connection
+/// turns ordinary pool acquires and durability probes into avoidable lock
+/// contention.
 pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
-PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;
 PRAGMA cache_size = -8192;
@@ -276,6 +280,9 @@ const TOTAL_CACHE_BUDGET_KB: usize = 512 * 1024;
 ///
 /// `max_connections` is the pool's maximum size. The per-connection cache
 /// is `TOTAL_CACHE_BUDGET_KB / max_connections`, clamped to \[2 MB, 64 MB\].
+/// `journal_mode` is intentionally excluded here because the init gate applies
+/// WAL once per database file; repeating that database-wide state change on
+/// every connection creation amplifies lock contention.
 ///
 /// Returns a SQL string suitable for `execute_raw()`.
 #[must_use]
@@ -289,7 +296,6 @@ pub fn build_conn_pragmas(max_connections: usize) -> String {
         "\
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
-PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 2000;
 PRAGMA cache_size = -{per_conn_kb};

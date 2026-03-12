@@ -4624,7 +4624,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
     let out = match args.command {
         RobotSubcommand::Status => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
 
@@ -4655,7 +4655,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             limit,
             include_bodies,
         } => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let (agent_id, agent_name_str) =
                 resolve_agent_id(&conn, project_id, args.agent.as_deref())?.ok_or_else(|| {
@@ -4705,7 +4705,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Thread { id, limit, since } => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
 
             // For thread command, bodies included in md/json, excluded in toon
@@ -4723,7 +4723,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output_md(&env, format)?
         }
         RobotSubcommand::Message { id } => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let data = build_message(&conn, project_id, id)?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
@@ -4736,7 +4736,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             importance,
             since,
         } => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let data = build_search(
                 &conn,
@@ -4757,7 +4757,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             conflicts,
             expiring,
         } => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
             let agent = resolve_optional_agent_id(&conn, project_id, agent_flag)?;
@@ -4893,7 +4893,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
-            let db_ok = match crate::open_db_sync() {
+            let db_ok = match crate::open_db_sync_robot() {
                 Ok(conn) => {
                     // Verify with a lightweight query
                     conn.query_sync("SELECT 1", &[]).is_ok()
@@ -5086,7 +5086,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             kind,
             source,
         } => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let events = build_timeline(
                 &conn,
@@ -5108,7 +5108,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Overview => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let projects = build_overview(&conn)?;
 
             #[derive(Serialize)]
@@ -5129,7 +5129,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Analytics => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
             let anomalies = build_analytics(&conn, project_id, agent)?;
@@ -5156,7 +5156,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Agents { active, sort } => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let agents = build_agents(&conn, project_id, active, sort.as_deref())?;
 
@@ -5172,7 +5172,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Contacts => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let contacts = build_contacts(&conn, project_id)?;
 
@@ -5188,7 +5188,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Projects => {
-            let conn = crate::open_db_sync()?;
+            let conn = crate::open_db_sync_robot()?;
             let projects = build_projects(&conn)?;
 
             #[derive(Serialize)]
@@ -5252,7 +5252,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let (result, resolved_project) = if navigate_should_use_canonical_resource(&uri) {
                 build_navigate_from_canonical_resource(&uri, args.project.as_deref())?
             } else {
-                let conn = crate::open_db_sync()?;
+                let conn = crate::open_db_sync_robot()?;
                 let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
                 let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
                 build_navigate(&conn, &uri, project_id, &project_slug, agent)?

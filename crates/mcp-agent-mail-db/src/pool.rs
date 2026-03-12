@@ -1219,10 +1219,10 @@ async fn run_sqlite_init_once(
 
     // Switch to WAL journal mode AFTER migrations complete.
     //
-    // Migrations run in DELETE (rollback) mode for safety, but the runtime
-    // pool connections assume WAL mode (e.g. `wal_autocheckpoint` PRAGMAs).
-    // If we leave the DB in DELETE mode, concurrent pool connections applying
-    // WAL-specific PRAGMAs can corrupt a freshly created database.
+    // Migrations run in DELETE (rollback) mode for safety. Runtime connections
+    // intentionally do not reissue `journal_mode=WAL`, because that database-
+    // wide transition amplifies lock contention on pool acquire and durability
+    // probes. Set WAL once here before pooled connections open.
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/13
     if let Err(err) = execute_sql_with_lock_retry(
         &runtime_conn,
@@ -1233,9 +1233,9 @@ async fn run_sqlite_init_once(
         tracing::warn!(
             path = %sqlite_path,
             error = %err,
-            "failed to switch journal_mode to WAL after init; pool connections may fail"
+            "failed to switch journal_mode to WAL after init; runtime will continue in rollback-journal mode until a later init succeeds"
         );
-        // Non-fatal: pool connections will attempt WAL mode themselves.
+        // Non-fatal: reads/writes can still proceed, but concurrency may degrade.
     }
 
     drop(runtime_conn);
@@ -2715,6 +2715,98 @@ mod tests {
             sql.contains("cache_size = -8192"),
             "0 conns should fallback to 8MB: {sql}"
         );
+    }
+
+    #[test]
+    fn per_connection_pragmas_omit_db_wide_journal_mode() {
+        assert!(
+            !schema::PRAGMA_CONN_SETTINGS_SQL.contains("journal_mode"),
+            "fresh probe/read connections must not try to switch journal mode"
+        );
+
+        let sql = schema::build_conn_pragmas(4);
+        assert!(
+            !sql.contains("journal_mode"),
+            "pool connection init must not reissue journal_mode=WAL: {sql}"
+        );
+    }
+
+    #[test]
+    fn second_pool_acquire_succeeds_under_reserved_lock_after_init() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("second_acquire_reserved_lock.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 0,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let first_conn = rt
+            .block_on(async { pool.acquire(&cx).await })
+            .into_result()
+            .expect("acquire first pooled connection");
+
+        let lock_conn = DbConn::open_file(db_path.display().to_string()).expect("open lock db");
+        lock_conn
+            .execute_raw("PRAGMA busy_timeout = 1")
+            .expect("set lock busy_timeout");
+        lock_conn
+            .execute_raw("BEGIN IMMEDIATE")
+            .expect("hold reserved sqlite lock");
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let pool_for_thread = pool.clone();
+        let acquire_thread = std::thread::spawn(move || {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build thread runtime");
+            let cx = Cx::for_testing();
+            let result = rt.block_on(async {
+                match pool_for_thread.acquire(&cx).await {
+                    Outcome::Ok(conn) => conn
+                        .query_sync("SELECT 1 AS one", &[])
+                        .map(|rows| rows.len())
+                        .map_err(|e| format!("query via second pooled connection failed: {e}")),
+                    Outcome::Err(err) => Err(format!("second pooled acquire failed: {err}")),
+                    Outcome::Cancelled(reason) => {
+                        Err(format!("second pooled acquire cancelled: {reason:?}"))
+                    }
+                    Outcome::Panicked(payload) => Err(format!(
+                        "second pooled acquire panicked: {}",
+                        payload.message()
+                    )),
+                }
+            });
+            result_tx.send(result).expect("send acquire result");
+        });
+
+        let row_count = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => result.expect("reserved lock should not block second pooled acquire"),
+            Err(err) => {
+                let _ = lock_conn.execute_raw("ROLLBACK");
+                acquire_thread
+                    .join()
+                    .expect("join acquire thread after timeout");
+                panic!("second pooled acquire should not stall under reserved lock: {err}");
+            }
+        };
+        assert_eq!(row_count, 1, "second pooled connection should stay usable");
+
+        lock_conn
+            .execute_raw("ROLLBACK")
+            .expect("release sqlite lock");
+        drop(first_conn);
+        acquire_thread.join().expect("join acquire thread");
     }
 
     /// Verify explicit WAL checkpoint works on a file-backed DB.

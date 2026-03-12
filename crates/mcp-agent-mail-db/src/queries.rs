@@ -1175,11 +1175,33 @@ fn is_mvcc_error(e: &DbError) -> bool {
     )
 }
 
-/// Run a whole transaction body with restart-on-`BusySnapshot` semantics.
+/// Check if a [`DbError`] is a plain SQLite write-contention failure.
+///
+/// This intentionally stays narrower than [`crate::error::is_lock_error`]:
+/// we retry lock/busy contention, but we do not loop on broader open/I/O
+/// failures that share the same high-level `ResourceBusy` classification.
+fn is_plain_write_contention_error(e: &DbError) -> bool {
+    matches!(
+        e,
+        DbError::Sqlite(msg) | DbError::ResourceBusy(msg) if {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("database is locked")
+                || lower.contains("database table is locked")
+                || lower.contains("database schema is locked")
+                || lower.contains("database is busy")
+                || lower.contains("locked by another process")
+        }
+    )
+}
+
+/// Run a whole transaction body with whole-transaction retry semantics.
 ///
 /// `BEGIN CONCURRENT` conflicts cannot be retried in-place at the failed
 /// statement or `COMMIT`; the entire transaction body must restart from the
-/// beginning so reads are re-bound against the latest snapshot.
+/// beginning so reads are re-bound against the latest snapshot. The helper also
+/// retries plain SQLite busy/locked contention for the same reason: once a
+/// write transaction has failed mid-flight, retrying a single statement is not
+/// sufficient to guarantee a coherent outcome.
 async fn run_with_mvcc_retry<T, F, Fut>(
     cx: &Cx,
     operation: &'static str,
@@ -1203,6 +1225,16 @@ where
                 );
                 mvcc_backoff(cx, attempt).await;
             }
+            Outcome::Err(e) if is_plain_write_contention_error(&e) && attempt < max => {
+                tracing::warn!(
+                    attempt,
+                    max_retries = max,
+                    error = %e,
+                    operation,
+                    "SQLite write contention, retrying whole transaction"
+                );
+                mvcc_backoff(cx, attempt).await;
+            }
             Outcome::Err(e) if is_mvcc_error(&e) => {
                 MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
@@ -1210,6 +1242,15 @@ where
                     error = %e,
                     operation,
                     "MVCC retries exhausted"
+                );
+                return Outcome::Err(e);
+            }
+            Outcome::Err(e) if is_plain_write_contention_error(&e) => {
+                tracing::error!(
+                    attempts = max + 1,
+                    error = %e,
+                    operation,
+                    "SQLite write-contention retries exhausted"
                 );
                 return Outcome::Err(e);
             }
@@ -5859,105 +5900,110 @@ pub async fn request_contact(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    run_with_mvcc_retry(cx, "request_contact", || async {
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
-    // FrankenConnection does not consistently support `ON CONFLICT ... DO UPDATE`.
-    // Keep this path portable by doing insert-then-refresh on uniqueness conflict
-    // inside one transaction.
-    let insert_sql = "INSERT INTO agent_links \
-        (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) \
-        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)";
+        // FrankenConnection does not consistently support `ON CONFLICT ... DO UPDATE`.
+        // Keep this path portable by doing insert-then-refresh on uniqueness conflict
+        // inside one transaction.
+        let insert_sql = "INSERT INTO agent_links \
+            (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) \
+            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)";
 
-    let insert_params: Vec<Value> = vec![
-        Value::BigInt(from_project_id),
-        Value::BigInt(from_agent_id),
-        Value::BigInt(to_project_id),
-        Value::BigInt(to_agent_id),
-        Value::Text(reason.to_string()),
-        Value::BigInt(now),
-        Value::BigInt(now),
-        expires.map_or(Value::Null, Value::BigInt),
-    ];
-    let is_contact_pair_unique_violation = |err: &DbError| match err {
-        DbError::Sqlite(msg) => {
-            let msg = msg.to_ascii_lowercase();
-            msg.contains("unique constraint failed")
-                && (msg.contains("agent_links.a_project_id")
-                    || msg.contains("agent_links.a_agent_id")
-                    || msg.contains("agent_links.b_project_id")
-                    || msg.contains("agent_links.b_agent_id")
-                    || msg.contains("idx_agent_links_pair_unique"))
+        let insert_params: Vec<Value> = vec![
+            Value::BigInt(from_project_id),
+            Value::BigInt(from_agent_id),
+            Value::BigInt(to_project_id),
+            Value::BigInt(to_agent_id),
+            Value::Text(reason.to_string()),
+            Value::BigInt(now),
+            Value::BigInt(now),
+            expires.map_or(Value::Null, Value::BigInt),
+        ];
+        let is_contact_pair_unique_violation = |err: &DbError| match err {
+            DbError::Sqlite(msg) => {
+                let msg = msg.to_ascii_lowercase();
+                msg.contains("unique constraint failed")
+                    && (msg.contains("agent_links.a_project_id")
+                        || msg.contains("agent_links.a_agent_id")
+                        || msg.contains("agent_links.b_project_id")
+                        || msg.contains("agent_links.b_agent_id")
+                        || msg.contains("idx_agent_links_pair_unique"))
+            }
+            _ => false,
+        };
+
+        match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(e) => {
+                if is_contact_pair_unique_violation(&e) {
+                    let refresh_sql = "UPDATE agent_links \
+                        SET status = 'pending', reason = ?, updated_ts = ?, expires_ts = ? \
+                        WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ?";
+                    let refresh_params = vec![
+                        Value::Text(reason.to_string()),
+                        Value::BigInt(now),
+                        expires.map_or(Value::Null, Value::BigInt),
+                        Value::BigInt(from_project_id),
+                        Value::BigInt(from_agent_id),
+                        Value::BigInt(to_project_id),
+                        Value::BigInt(to_agent_id),
+                    ];
+                    let _updated_rows = try_in_tx!(
+                        cx,
+                        &tracked,
+                        map_sql_outcome(
+                            traw_execute(cx, &tracked, refresh_sql, &refresh_params).await
+                        )
+                    );
+                } else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(e);
+                }
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
         }
-        _ => false,
-    };
 
-    match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await) {
-        Outcome::Ok(_) => {}
-        Outcome::Err(e) => {
-            if is_contact_pair_unique_violation(&e) {
-                let refresh_sql = "UPDATE agent_links \
-                    SET status = 'pending', reason = ?, updated_ts = ?, expires_ts = ? \
-                    WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ?";
-                let refresh_params = vec![
-                    Value::Text(reason.to_string()),
-                    Value::BigInt(now),
-                    expires.map_or(Value::Null, Value::BigInt),
-                    Value::BigInt(from_project_id),
-                    Value::BigInt(from_agent_id),
-                    Value::BigInt(to_project_id),
-                    Value::BigInt(to_agent_id),
-                ];
-                let _updated_rows = try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(traw_execute(cx, &tracked, refresh_sql, &refresh_params).await)
-                );
-            } else {
+        // Fetch the upserted row using explicit columns to avoid SELECT * decoding issues.
+        let fetch_sql = format!(
+            "{AGENT_LINK_SELECT_COLUMNS_SQL} \
+             WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
+             LIMIT 1"
+        );
+        let fetch_params = [
+            Value::BigInt(from_project_id),
+            Value::BigInt(from_agent_id),
+            Value::BigInt(to_project_id),
+            Value::BigInt(to_agent_id),
+        ];
+
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &fetch_sql, &fetch_params).await)
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("AgentLink", "inserted/refreshed row"));
+        };
+        let decoded = match decode_agent_link_row(row) {
+            Ok(link) => link,
+            Err(e) => {
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Err(e);
             }
-        }
-        Outcome::Cancelled(r) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Cancelled(r);
-        }
-        Outcome::Panicked(p) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Panicked(p);
-        }
-    }
-
-    // Fetch the upserted row using explicit columns to avoid SELECT * decoding issues.
-    let fetch_sql = format!(
-        "{AGENT_LINK_SELECT_COLUMNS_SQL} \
-         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
-         LIMIT 1"
-    );
-    let fetch_params = [
-        Value::BigInt(from_project_id),
-        Value::BigInt(from_agent_id),
-        Value::BigInt(to_project_id),
-        Value::BigInt(to_agent_id),
-    ];
-
-    let rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, &fetch_sql, &fetch_params).await)
-    );
-    let Some(row) = rows.first() else {
-        rollback_tx(cx, &tracked).await;
-        return Outcome::Err(DbError::not_found("AgentLink", "inserted/refreshed row"));
-    };
-    let decoded = match decode_agent_link_row(row) {
-        Ok(link) => link,
-        Err(e) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(e);
-        }
-    };
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(decoded)
+        };
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(decoded)
+    })
+    .await
 }
 
 /// Respond to contact request
@@ -7403,6 +7449,70 @@ mod tests {
 
         assert!(matches!(result, Outcome::Ok(3)));
         assert_eq!(attempts.get(), 3, "must restart the whole transaction body");
+    }
+
+    #[test]
+    fn run_with_mvcc_retry_restarts_plain_locked_until_success() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let attempts = std::cell::Cell::new(0_u32);
+
+        let result = rt.block_on(async {
+            run_with_mvcc_retry(&cx, "test_write_contention_retry", || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                async move {
+                    if attempt < 3 {
+                        Outcome::Err(DbError::ResourceBusy("database is locked".to_string()))
+                    } else {
+                        Outcome::Ok(attempt)
+                    }
+                }
+            })
+            .await
+        });
+
+        assert!(matches!(result, Outcome::Ok(3)));
+        assert_eq!(
+            attempts.get(),
+            3,
+            "plain SQLITE_BUSY must restart the transaction"
+        );
+    }
+
+    #[test]
+    fn run_with_mvcc_retry_does_not_retry_non_lock_resource_busy() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let attempts = std::cell::Cell::new(0_u32);
+
+        let result = rt.block_on(async {
+            run_with_mvcc_retry(&cx, "test_non_lock_resource_busy", || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                async move {
+                    Outcome::<(), DbError>::Err(DbError::ResourceBusy(
+                        "Reservation conflict: src/lib.rs overlaps".to_string(),
+                    ))
+                }
+            })
+            .await
+        });
+
+        assert!(matches!(result, Outcome::Err(DbError::ResourceBusy(_))));
+        assert_eq!(
+            attempts.get(),
+            1,
+            "non-lock ResourceBusy must not be retried"
+        );
     }
 
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {
@@ -9711,6 +9821,90 @@ mod tests {
     }
 
     #[test]
+    fn durability_probe_succeeds_under_reserved_lock_for_committed_agent() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("probe_reserved_lock_committed.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'durability-project', '/tmp/am-probe-reserved-lock', 0)",
+            )
+            .expect("seed project");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'durable', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed committed agent");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        let lock_conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open lock");
+        lock_conn
+            .execute_raw("PRAGMA busy_timeout = 1")
+            .expect("set lock busy_timeout");
+        lock_conn
+            .execute_raw("BEGIN IMMEDIATE")
+            .expect("hold reserved sqlite lock");
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let pool_for_thread = pool.clone();
+        let probe_thread = std::thread::spawn(move || {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build thread runtime");
+            let cx = asupersync::Cx::for_testing();
+            let result = rt.block_on(async {
+                verify_agent_visible_after_commit(&cx, &pool_for_thread, 1, "BlueLake")
+                    .await
+                    .into_result()
+                    .map(|agent| agent.name)
+                    .map_err(|err| format!("durability probe failed: {err}"))
+            });
+            result_tx.send(result).expect("send probe result");
+        });
+
+        let probed_name = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => result.expect("durability probe should succeed under reserved lock"),
+            Err(err) => {
+                let _ = lock_conn.execute_raw("ROLLBACK");
+                probe_thread
+                    .join()
+                    .expect("join probe thread after timeout");
+                panic!("durability probe should not stall under reserved lock: {err}");
+            }
+        };
+        assert_eq!(probed_name, "BlueLake");
+
+        lock_conn
+            .execute_raw("ROLLBACK")
+            .expect("release sqlite lock");
+        probe_thread.join().expect("join probe thread");
+    }
+
+    #[test]
     fn post_commit_probe_errors_are_never_advisory() {
         assert!(is_hard_post_commit_probe_error(&DbError::Sqlite(
             "disk I/O error".to_string(),
@@ -10304,6 +10498,109 @@ mod tests {
             );
             assert_eq!(to_incoming[0].id, Some(first_id));
             assert_eq!(to_incoming[0].reason, "refreshed");
+        });
+    }
+
+    #[test]
+    fn request_contact_retries_transient_busy_lock() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("request_contact_retries_busy.db");
+        let db_path = dir.path().join("request_contact_retries_busy.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project_a = ensure_project(&cx, &pool, &format!("/tmp/am-contact-retry-a-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project A");
+            let project_b = ensure_project(&cx, &pool, &format!("/tmp/am-contact-retry-b-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project B");
+            let project_a_id = project_a.id.expect("project A id");
+            let project_b_id = project_b.id.expect("project B id");
+
+            let from = register_agent(
+                &cx,
+                &pool,
+                project_a_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let to = register_agent(
+                &cx,
+                &pool,
+                project_b_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let pooled = match pool.acquire(&cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(err) => panic!("acquire failed: {err}"),
+                Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+            };
+            pooled
+                .execute_sync("PRAGMA busy_timeout = 1", &[])
+                .expect("set pooled busy_timeout");
+            drop(pooled);
+
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let lock_path = db_path.to_string_lossy().into_owned();
+            let lock_thread = std::thread::spawn(move || {
+                let lock_conn = crate::DbConn::open_file(&lock_path).expect("open lock db");
+                lock_conn
+                    .execute_raw("PRAGMA busy_timeout = 1;")
+                    .expect("set lock busy_timeout");
+                lock_conn
+                    .execute_raw("BEGIN EXCLUSIVE")
+                    .expect("hold exclusive sqlite lock");
+                ready_tx.send(()).expect("signal lock ready");
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                lock_conn
+                    .execute_raw("ROLLBACK")
+                    .expect("release sqlite lock");
+            });
+
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("wait for lock thread");
+
+            let result = request_contact(
+                &cx,
+                &pool,
+                project_a_id,
+                from.id.expect("sender id"),
+                project_b_id,
+                to.id.expect("recipient id"),
+                "transient busy retry",
+                300,
+            )
+            .await
+            .into_result();
+
+            lock_thread.join().expect("join lock thread");
+
+            let link = result.expect("request_contact should retry past transient busy");
+            assert_eq!(link.status, "pending");
+            assert_eq!(link.reason, "transient busy retry");
         });
     }
 
