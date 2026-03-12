@@ -348,10 +348,8 @@ fn has_agent_mail_signature(headers: &str) -> bool {
         };
         let name = name.trim();
         let value = value.trim();
-        (name.eq_ignore_ascii_case(HEALTH_SIGNATURE_HEADER_NAME)
-            && value.eq_ignore_ascii_case(HEALTH_SIGNATURE_HEADER_VALUE))
-            || (name.eq_ignore_ascii_case("server")
-                && value.to_ascii_lowercase().contains("mcp-agent-mail"))
+        name.eq_ignore_ascii_case(HEALTH_SIGNATURE_HEADER_NAME)
+            && value.eq_ignore_ascii_case(HEALTH_SIGNATURE_HEADER_VALUE)
     })
 }
 
@@ -1398,9 +1396,18 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
 /// Run the full HTTP/TUI startup probe set.
 #[must_use]
 pub fn run_startup_probes(config: &Config) -> StartupReport {
+    let mut results = run_http_startup_preflight_probes(config).results;
+    results.push(probe_port(config));
+    StartupReport { results }
+}
+
+/// Run the HTTP/TUI startup probes that do not depend on replacing the listener.
+///
+/// Call this before deciding whether it is safe to tear down an existing server.
+#[must_use]
+pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
     let mut results = vec![probe_http_path(config), probe_auth(config)];
     results.extend(shared_runtime_startup_probes(config));
-    results.push(probe_port(config));
     StartupReport { results }
 }
 
@@ -1652,6 +1659,32 @@ mod tests {
     }
 
     #[test]
+    fn run_http_startup_preflight_probes_omits_port_check() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let mut config = default_config();
+        config.http_port = port;
+
+        let report = run_http_startup_preflight_probes(&config);
+        assert!(
+            report.is_ok(),
+            "preflight report should ignore occupied port"
+        );
+        assert!(!report.results.iter().any(|result| matches!(
+            result,
+            ProbeResult::Ok { name: "port" } | ProbeResult::Fail(ProbeFailure { name: "port", .. })
+        )));
+        assert!(report.results.iter().any(|result| matches!(
+            result,
+            ProbeResult::Ok { name: "http-path" }
+                | ProbeResult::Fail(ProbeFailure {
+                    name: "http-path",
+                    ..
+                })
+        )));
+    }
+
+    #[test]
     fn jwt_without_jwks_or_secret_fails() {
         let mut config = default_config();
         config.http_jwt_enabled = true;
@@ -1782,7 +1815,7 @@ mod tests {
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: application/json\r\n\
-                 Server: mcp-agent-mail-test\r\n\
+                 X-Agent-Mail-Health: 1\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\
                  \r\n\
@@ -1942,6 +1975,12 @@ mod tests {
     fn agent_mail_health_signature_header_is_detected() {
         let headers = "Content-Type: application/json\r\nX-Agent-Mail-Health: 1\r\n";
         assert!(has_agent_mail_signature(headers));
+    }
+
+    #[test]
+    fn server_header_alone_is_not_agent_mail_signature() {
+        let headers = "Content-Type: application/json\r\nServer: mcp-agent-mail-test\r\n";
+        assert!(!has_agent_mail_signature(headers));
     }
 
     #[test]

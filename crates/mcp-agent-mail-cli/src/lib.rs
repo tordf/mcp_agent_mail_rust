@@ -2385,6 +2385,18 @@ fn select_killable_agent_mail_pids(
     }
 }
 
+fn select_remaining_kill_pids(
+    initial_pids: &[u32],
+    refreshed_pids: Vec<u32>,
+    skip_term_grace: bool,
+) -> Vec<u32> {
+    if skip_term_grace || refreshed_pids.is_empty() {
+        initial_pids.to_vec()
+    } else {
+        refreshed_pids
+    }
+}
+
 #[cfg(unix)]
 fn send_unix_signal(pid: u32, signal: nix::sys::signal::Signal) {
     if let Ok(raw_pid) = i32::try_from(pid) {
@@ -2461,11 +2473,12 @@ fn kill_port_holder_with_pids(host: &str, port: u16, pids: Vec<u32>) -> CliResul
             return Ok(());
         }
 
-        let remaining_pids = if skip_term_grace {
-            pids.clone()
+        let refreshed_pids = if skip_term_grace {
+            Vec::new()
         } else {
             agent_mail_port_holder_pids_with_hint(host, port)
         };
+        let remaining_pids = select_remaining_kill_pids(&pids, refreshed_pids, skip_term_grace);
         for pid in &remaining_pids {
             send_sigkill(*pid);
         }
@@ -2566,6 +2579,19 @@ mod port_kill_tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn select_remaining_kill_pids_reuses_initial_listener_when_requery_finds_nothing() {
+        assert_eq!(
+            select_remaining_kill_pids(&[22], Vec::new(), false),
+            vec![22]
+        );
+    }
+
+    #[test]
+    fn select_remaining_kill_pids_prefers_refreshed_pids_after_term() {
+        assert_eq!(select_remaining_kill_pids(&[22], vec![33], false), vec![33]);
     }
 }
 
@@ -3082,6 +3108,11 @@ fn handle_serve_http(
         output::warn(&format!(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
         ));
+    }
+    let preflight_report =
+        mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
+    if !preflight_report.is_ok() {
+        return Err(CliError::Other(preflight_report.format_errors()));
     }
     auto_clear_port(&config.http_host, config.http_port)?;
     if config.tui_enabled {

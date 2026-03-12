@@ -333,6 +333,12 @@ struct StartupSignalState {
 pub(crate) const RESERVATION_EXPIRY_WARN_MICROS: i64 = 5 * 60 * 1_000_000;
 
 #[derive(Debug)]
+struct DbStatsState {
+    snapshot: DbStatSnapshot,
+    generation: u64,
+}
+
+#[derive(Debug)]
 pub struct TuiSharedState {
     events: EventRingBuffer,
     requests_total: AtomicU64,
@@ -344,7 +350,7 @@ pub struct TuiSharedState {
     shutdown: AtomicBool,
     detach_headless: AtomicBool,
     config_snapshot: Mutex<ConfigSnapshot>,
-    db_stats: Mutex<DbStatSnapshot>,
+    db_stats: Mutex<DbStatsState>,
     sparkline_data: AtomicSparkline,
     remote_terminal_events: Mutex<VecDeque<RemoteTerminalEvent>>,
     remote_terminal_dropped_oldest: AtomicU64,
@@ -395,7 +401,10 @@ impl TuiSharedState {
             shutdown: AtomicBool::new(false),
             detach_headless: AtomicBool::new(false),
             config_snapshot: Mutex::new(ConfigSnapshot::from_config(config)),
-            db_stats: Mutex::new(DbStatSnapshot::default()),
+            db_stats: Mutex::new(DbStatsState {
+                snapshot: DbStatSnapshot::default(),
+                generation: 0,
+            }),
             sparkline_data: AtomicSparkline::new(),
             remote_terminal_events: Mutex::new(VecDeque::with_capacity(
                 REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY,
@@ -581,8 +590,9 @@ impl TuiSharedState {
             .db_stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let semantic_change = db_stats_semantically_changed(&current, &stats);
-        let first_snapshot_delivery = current.timestamp_micros == 0 && stats.timestamp_micros > 0;
+        let semantic_change = db_stats_semantically_changed(&current.snapshot, &stats);
+        let first_snapshot_delivery =
+            current.snapshot.timestamp_micros == 0 && stats.timestamp_micros > 0;
         if semantic_change {
             self.urgent_ack_pending
                 .store(stats.ack_pending > 0, Ordering::Relaxed);
@@ -591,10 +601,11 @@ impl TuiSharedState {
                 Ordering::Relaxed,
             );
         }
-        *current = stats;
-        drop(current);
+        current.snapshot = stats;
         if semantic_change || first_snapshot_delivery {
-            self.db_stats_gen.fetch_add(1, Ordering::Relaxed);
+            current.generation = current.generation.saturating_add(1);
+            self.db_stats_gen
+                .store(current.generation, Ordering::Relaxed);
         }
     }
 
@@ -602,6 +613,7 @@ impl TuiSharedState {
         self.db_stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
             .timestamp_micros = timestamp_micros;
     }
 
@@ -998,24 +1010,18 @@ impl TuiSharedState {
             self.db_stats
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot
                 .clone(),
         )
     }
 
     #[must_use]
     pub fn db_stats_snapshot_with_generation(&self) -> (DbStatSnapshot, u64) {
-        let snapshot = self
+        let state = self
             .db_stats
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        (
-            snapshot,
-            // Read the generation while holding the snapshot lock so the
-            // caller never observes a generation newer than the snapshot
-            // it just cloned.
-            self.db_stats_gen.load(Ordering::Relaxed),
-        )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.snapshot.clone(), state.generation)
     }
 
     #[must_use]
