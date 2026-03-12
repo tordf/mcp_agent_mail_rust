@@ -363,6 +363,8 @@ pub struct TuiSharedState {
     screen_diagnostic_seq: AtomicU64,
     /// Generation counter bumped when `update_db_stats` changes semantic DB content.
     db_stats_gen: AtomicU64,
+    /// Whether the DB poller most recently observed a usable MCP Agent Mail DB context.
+    db_context_available: AtomicBool,
     /// Fast-path latch for urgent inactive-screen cadence based on pending acks.
     urgent_ack_pending: AtomicBool,
     /// Earliest active reservation expiry timestamp used for urgent cadence checks.
@@ -409,6 +411,7 @@ impl TuiSharedState {
             screen_diagnostics: Mutex::new(VecDeque::with_capacity(SCREEN_DIAGNOSTIC_CAPACITY)),
             screen_diagnostic_seq: AtomicU64::new(0),
             db_stats_gen: AtomicU64::new(0),
+            db_context_available: AtomicBool::new(false),
             urgent_ack_pending: AtomicBool::new(false),
             next_active_reservation_expiry_micros: AtomicI64::new(0),
             request_gen: AtomicU64::new(0),
@@ -579,6 +582,7 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let semantic_change = db_stats_semantically_changed(&current, &stats);
+        let first_snapshot_delivery = current.timestamp_micros == 0 && stats.timestamp_micros > 0;
         if semantic_change {
             self.urgent_ack_pending
                 .store(stats.ack_pending > 0, Ordering::Relaxed);
@@ -589,7 +593,7 @@ impl TuiSharedState {
         }
         *current = stats;
         drop(current);
-        if semantic_change {
+        if semantic_change || first_snapshot_delivery {
             self.db_stats_gen.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -599,6 +603,19 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .timestamp_micros = timestamp_micros;
+    }
+
+    pub fn mark_db_context_available(&self) {
+        self.db_context_available.store(true, Ordering::Relaxed);
+    }
+
+    pub fn mark_db_context_unavailable(&self) {
+        self.db_context_available.store(false, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn db_context_available(&self) -> bool {
+        self.db_context_available.load(Ordering::Relaxed)
     }
 
     pub fn request_shutdown(&self) {
@@ -986,6 +1003,22 @@ impl TuiSharedState {
     }
 
     #[must_use]
+    pub fn db_stats_snapshot_with_generation(&self) -> (DbStatSnapshot, u64) {
+        let snapshot = self
+            .db_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (
+            snapshot,
+            // Read the generation while holding the snapshot lock so the
+            // caller never observes a generation newer than the snapshot
+            // it just cloned.
+            self.db_stats_gen.load(Ordering::Relaxed),
+        )
+    }
+
+    #[must_use]
     pub fn urgent_cadence_bypass_active(&self, now_micros: i64) -> bool {
         if self.urgent_ack_pending.load(Ordering::Relaxed) {
             return true;
@@ -1312,6 +1345,7 @@ mod tests {
         let state = TuiSharedState::new(&config);
         assert!(!state.first_paint_seen());
         assert!(!state.db_ready());
+        assert!(!state.db_context_available());
         assert_eq!(state.db_warmup_state(), DbWarmupState::Pending);
         assert!(!state.wait_for_first_paint(Duration::ZERO));
         assert!(!state.wait_for_db_ready(Duration::ZERO));
@@ -1361,6 +1395,19 @@ mod tests {
         assert_eq!(state.db_warmup_state(), DbWarmupState::Ready);
         assert!(state.db_ready());
         assert!(state.wait_for_db_ready(Duration::ZERO));
+    }
+
+    #[test]
+    fn db_context_availability_tracks_latest_poll_result() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        assert!(!state.db_context_available());
+
+        state.mark_db_context_available();
+        assert!(state.db_context_available());
+
+        state.mark_db_context_unavailable();
+        assert!(!state.db_context_available());
     }
 
     #[test]
@@ -2228,6 +2275,19 @@ mod tests {
     }
 
     #[test]
+    fn data_generation_db_stats_bumps_counter_on_first_zero_snapshot_delivery() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let gen_before = state.data_generation();
+        state.update_db_stats(crate::tui_bridge::DbStatSnapshot {
+            timestamp_micros: 10,
+            ..crate::tui_bridge::DbStatSnapshot::default()
+        });
+        let gen_after = state.data_generation();
+        assert!(gen_after.db_stats_gen > gen_before.db_stats_gen);
+    }
+
+    #[test]
     fn refresh_db_stats_timestamp_preserves_db_stats_generation() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
@@ -2244,6 +2304,20 @@ mod tests {
         let snapshot = state.db_stats_snapshot().expect("snapshot");
         assert_eq!(gen_after.db_stats_gen, gen_before.db_stats_gen);
         assert_eq!(snapshot.timestamp_micros, 20);
+    }
+
+    #[test]
+    fn db_stats_snapshot_with_generation_returns_matching_first_delivery_generation() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_bridge::DbStatSnapshot {
+            timestamp_micros: 10,
+            ..crate::tui_bridge::DbStatSnapshot::default()
+        });
+
+        let (snapshot, generation) = state.db_stats_snapshot_with_generation();
+        assert_eq!(snapshot.timestamp_micros, 10);
+        assert_eq!(generation, state.data_generation().db_stats_gen);
     }
 
     #[test]

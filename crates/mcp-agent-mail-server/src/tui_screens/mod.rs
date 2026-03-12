@@ -524,6 +524,44 @@ pub const fn dirty_since(prev: &DataGeneration, current: &DataGeneration) -> Dir
     }
 }
 
+pub(super) const POLLER_DB_WAITING_BANNER: &str =
+    " Database context unavailable. Waiting for poller data...";
+pub(super) const POLLER_DB_UNAVAILABLE_BANNER: &str =
+    " Database context unavailable. Check DB URL/project scope and refresh.";
+const POLLER_DB_GRACE_TICKS: u64 = 30;
+
+#[must_use]
+pub(super) fn poller_db_context_banner(
+    state: &TuiSharedState,
+    applied_db_stats_gen: u64,
+    tick_count: u64,
+) -> Option<&'static str> {
+    let warmup_state = state.db_warmup_state();
+    if applied_db_stats_gen == 0
+        && tick_count < POLLER_DB_GRACE_TICKS
+        && !state.db_context_available()
+        && warmup_state == crate::tui_bridge::DbWarmupState::Pending
+    {
+        return None;
+    }
+    if state.db_context_available() {
+        return if applied_db_stats_gen == 0 {
+            Some(POLLER_DB_WAITING_BANNER)
+        } else {
+            None
+        };
+    }
+    if applied_db_stats_gen > 0 {
+        return Some(POLLER_DB_UNAVAILABLE_BANNER);
+    }
+    match warmup_state {
+        crate::tui_bridge::DbWarmupState::Pending => Some(POLLER_DB_WAITING_BANNER),
+        crate::tui_bridge::DbWarmupState::Ready | crate::tui_bridge::DbWarmupState::Failed => {
+            Some(POLLER_DB_UNAVAILABLE_BANNER)
+        }
+    }
+}
+
 /// Messages produced by individual screens, wrapped by `MailMsg`.
 #[derive(Debug, Clone)]
 pub enum MailScreenMsg {
@@ -813,6 +851,7 @@ impl MailScreen for PlaceholderScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_agent_mail_core::Config;
     use std::collections::HashSet;
 
     #[test]
@@ -1338,6 +1377,62 @@ mod tests {
         assert_eq!(data_gen.console_log_seq, 0);
         assert_eq!(data_gen.db_stats_gen, 0);
         assert_eq!(data_gen.request_gen, 0);
+    }
+
+    #[test]
+    fn poller_db_context_banner_waits_while_warmup_is_pending() {
+        let state = TuiSharedState::new(&Config::default());
+        assert_eq!(
+            poller_db_context_banner(&state, 0, POLLER_DB_GRACE_TICKS),
+            Some(POLLER_DB_WAITING_BANNER)
+        );
+    }
+
+    #[test]
+    fn poller_db_context_banner_stays_quiet_during_pending_startup_grace() {
+        let state = TuiSharedState::new(&Config::default());
+        assert_eq!(poller_db_context_banner(&state, 0, 0), None);
+    }
+
+    #[test]
+    fn poller_db_context_banner_escalates_after_warmup_failure() {
+        let state = TuiSharedState::new(&Config::default());
+        state.mark_db_warmup_failed();
+        assert_eq!(
+            poller_db_context_banner(&state, 0, POLLER_DB_GRACE_TICKS),
+            Some(POLLER_DB_UNAVAILABLE_BANNER)
+        );
+    }
+
+    #[test]
+    fn poller_db_context_banner_waits_until_first_available_snapshot_is_applied() {
+        let state = TuiSharedState::new(&Config::default());
+        state.mark_db_context_available();
+        assert_eq!(
+            poller_db_context_banner(&state, 0, POLLER_DB_GRACE_TICKS),
+            Some(POLLER_DB_WAITING_BANNER)
+        );
+    }
+
+    #[test]
+    fn poller_db_context_banner_escalates_after_successful_warmup_without_snapshot() {
+        let state = TuiSharedState::new(&Config::default());
+        state.mark_db_ready();
+        assert_eq!(
+            poller_db_context_banner(&state, 0, POLLER_DB_GRACE_TICKS),
+            Some(POLLER_DB_UNAVAILABLE_BANNER)
+        );
+    }
+
+    #[test]
+    fn poller_db_context_banner_escalates_when_applied_data_loses_context() {
+        let state = TuiSharedState::new(&Config::default());
+        state.mark_db_context_available();
+        state.mark_db_context_unavailable();
+        assert_eq!(
+            poller_db_context_banner(&state, 1, POLLER_DB_GRACE_TICKS),
+            Some(POLLER_DB_UNAVAILABLE_BANNER)
+        );
     }
 
     // ── SelectionState comprehensive tests (br-2bbt.10) ────────────

@@ -6980,20 +6980,27 @@ fn handle_contacts_with_conn(
 // Beads integration
 // ---------------------------------------------------------------------------
 
-fn resolve_beads_db(path: Option<&Path>) -> CliResult<PathBuf> {
-    let root = match path {
+fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
+    let start = match path {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir()
             .map_err(|e| CliError::Other(format!("cannot determine cwd: {e}")))?,
     };
-    let db_path = root.join(".beads").join("beads.db");
-    if !db_path.exists() {
-        return Err(CliError::InvalidArgument(format!(
-            "no beads database found at {}",
-            db_path.display()
-        )));
+    if start
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".beads")
+        && start.is_dir()
+    {
+        return Ok(start);
     }
-    Ok(db_path)
+
+    beads_rust::config::discover_beads_dir(Some(&start)).map_err(|e| {
+        CliError::InvalidArgument(format!(
+            "no beads directory found from {}: {e}",
+            start.display()
+        ))
+    })
 }
 
 fn handle_beads(action: BeadsCommand) -> CliResult<()> {
@@ -7028,12 +7035,12 @@ fn handle_beads_ready(
     format: Option<output::CliOutputFormat>,
     json: bool,
 ) -> CliResult<()> {
-    use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+    use beads_rust::storage::{ReadyFilters, ReadySortPolicy};
 
     let fmt = output::CliOutputFormat::resolve(format, json);
-    let db_path = resolve_beads_db(path.as_deref())?;
-    let storage = SqliteStorage::open(&db_path)
-        .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
+    let beads_dir = resolve_beads_dir(path.as_deref())?;
+    let (storage, _paths) = beads_rust::config::open_storage(&beads_dir, None, None)
+        .map_err(|e| CliError::Other(format!("failed to open beads storage: {e}")))?;
 
     let filters = ReadyFilters {
         limit: Some(limit),
@@ -7086,12 +7093,12 @@ fn handle_beads_list(
     json: bool,
 ) -> CliResult<()> {
     use beads_rust::model::{Priority, Status};
-    use beads_rust::storage::{ListFilters, SqliteStorage};
+    use beads_rust::storage::ListFilters;
 
     let fmt = output::CliOutputFormat::resolve(format, json);
-    let db_path = resolve_beads_db(path.as_deref())?;
-    let storage = SqliteStorage::open(&db_path)
-        .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
+    let beads_dir = resolve_beads_dir(path.as_deref())?;
+    let (storage, _paths) = beads_rust::config::open_storage(&beads_dir, None, None)
+        .map_err(|e| CliError::Other(format!("failed to open beads storage: {e}")))?;
 
     let statuses = status.map(|s| {
         s.split(',')
@@ -7163,12 +7170,10 @@ fn handle_beads_show(
     format: Option<output::CliOutputFormat>,
     json: bool,
 ) -> CliResult<()> {
-    use beads_rust::storage::SqliteStorage;
-
     let fmt = output::CliOutputFormat::resolve(format, json);
-    let db_path = resolve_beads_db(path.as_deref())?;
-    let storage = SqliteStorage::open(&db_path)
-        .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
+    let beads_dir = resolve_beads_dir(path.as_deref())?;
+    let (storage, _paths) = beads_rust::config::open_storage(&beads_dir, None, None)
+        .map_err(|e| CliError::Other(format!("failed to open beads storage: {e}")))?;
 
     let issue = storage
         .get_issue(&id)
@@ -7205,45 +7210,51 @@ fn handle_beads_status(
     json: bool,
 ) -> CliResult<()> {
     use beads_rust::model::Status;
-    use beads_rust::storage::{ListFilters, SqliteStorage};
+    use beads_rust::storage::ListFilters;
 
     let fmt = output::CliOutputFormat::resolve(format, json);
-    let db_path = resolve_beads_db(path.as_deref())?;
-    let storage = SqliteStorage::open(&db_path)
-        .map_err(|e| CliError::Other(format!("failed to open beads db: {e}")))?;
+    let beads_dir = resolve_beads_dir(path.as_deref())?;
+    let (storage, _paths) = beads_rust::config::open_storage(&beads_dir, None, None)
+        .map_err(|e| CliError::Other(format!("failed to open beads storage: {e}")))?;
 
-    // Count all non-closed
-    let all = storage
-        .list_issues(&ListFilters::default())
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-    let closed = storage
+    let all_issues = storage
         .list_issues(&ListFilters {
-            statuses: Some(vec![Status::Closed]),
             include_closed: true,
             ..ListFilters::default()
         })
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-
-    let open = all
+    let open = all_issues
         .iter()
         .filter(|i| matches!(i.status, Status::Open))
         .count();
-    let in_progress = all
+    let in_progress = all_issues
         .iter()
         .filter(|i| matches!(i.status, Status::InProgress))
         .count();
-    let blocked = all
+    let blocked = all_issues
         .iter()
         .filter(|i| matches!(i.status, Status::Blocked))
         .count();
-    let closed_count = closed.len();
-    let total = all.len() + closed_count;
+    let deferred = all_issues
+        .iter()
+        .filter(|i| matches!(i.status, Status::Deferred))
+        .count();
+    let closed_count = all_issues
+        .iter()
+        .filter(|i| matches!(i.status, Status::Closed))
+        .count();
+    let other = all_issues
+        .len()
+        .saturating_sub(open + in_progress + blocked + deferred + closed_count);
+    let total = all_issues.len();
 
     let result = serde_json::json!({
         "open": open,
         "in_progress": in_progress,
         "blocked": blocked,
+        "deferred": deferred,
         "closed": closed_count,
+        "other": other,
         "total": total,
     });
     output::emit_output(&result, fmt, || {
@@ -7251,7 +7262,11 @@ fn handle_beads_status(
         output::kv("Open", &open.to_string());
         output::kv("In Progress", &in_progress.to_string());
         output::kv("Blocked", &blocked.to_string());
+        output::kv("Deferred", &deferred.to_string());
         output::kv("Closed", &closed_count.to_string());
+        if other > 0 {
+            output::kv("Other", &other.to_string());
+        }
         output::kv("Total", &total.to_string());
     });
     Ok(())
@@ -23252,14 +23267,14 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn resolve_beads_db_returns_error_for_missing_dir() {
+    fn resolve_beads_dir_returns_error_for_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_beads_db(Some(dir.path()));
+        let result = resolve_beads_dir(Some(dir.path()));
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("no beads database"),
-            "expected 'no beads database' in: {err_msg}"
+            err_msg.contains("no beads directory"),
+            "expected 'no beads directory' in: {err_msg}"
         );
     }
 
@@ -23286,8 +23301,85 @@ startup_timeout_sec = 42
         let parsed: serde_json::Value =
             serde_json::from_str(json_str).expect("should be valid JSON");
         assert_eq!(parsed["open"], 0);
+        assert_eq!(parsed["deferred"], 0);
         assert_eq!(parsed["closed"], 0);
+        assert_eq!(parsed["other"], 0);
         assert_eq!(parsed["total"], 0);
+    }
+
+    #[test]
+    fn handle_beads_status_finds_beads_dir_from_nested_cwd() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        let nested = dir.path().join("crates/mcp-agent-mail-cli");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+
+        let _storage =
+            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
+
+        let _cwd = CwdGuard::chdir(&nested);
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_beads_status(None, None, true);
+        let output = capture.drain_to_string();
+
+        assert!(
+            result.is_ok(),
+            "beads status failed from nested cwd: {result:?}"
+        );
+        let json_str = extract_json_block(&output).expect("expected JSON in beads status output");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("should be valid JSON");
+        assert_eq!(parsed["total"], 0);
+    }
+
+    #[test]
+    fn handle_beads_status_reports_deferred_and_other_counts() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create .beads");
+
+        let (mut storage, _paths) =
+            beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
+        storage
+            .create_issue(
+                &beads_rust::model::Issue {
+                    id: "br-deferred".to_string(),
+                    title: "Deferred issue".to_string(),
+                    status: beads_rust::model::Status::Deferred,
+                    ..Default::default()
+                },
+                "test",
+            )
+            .expect("insert deferred issue");
+        storage
+            .create_issue(
+                &beads_rust::model::Issue {
+                    id: "br-custom".to_string(),
+                    title: "Custom issue".to_string(),
+                    status: beads_rust::model::Status::Custom("triage".to_string()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .expect("insert custom issue");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_beads_status(Some(dir.path().to_path_buf()), None, true);
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "beads status failed: {result:?}");
+        let json_str = extract_json_block(&output).expect("expected JSON in beads status output");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("should be valid JSON");
+        assert_eq!(parsed["deferred"], 1);
+        assert_eq!(parsed["other"], 1);
+        assert_eq!(parsed["total"], 2);
     }
 
     #[test]

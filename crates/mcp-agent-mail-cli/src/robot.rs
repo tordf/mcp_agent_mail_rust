@@ -1136,6 +1136,28 @@ fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliEr
     )))
 }
 
+fn normalize_project_lookup_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn find_project_for_path_or_ancestors(
+    conn: &DbConn,
+    path: &Path,
+) -> Result<(i64, String), CliError> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    for candidate in canonical.ancestors() {
+        let candidate_key = normalize_project_lookup_path(candidate);
+        if let Ok(project) = resolve_project_sync(conn, &candidate_key) {
+            return Ok(project);
+        }
+    }
+
+    Err(CliError::InvalidArgument(format!(
+        "project not found for current directory or its ancestors: {}",
+        normalize_project_lookup_path(path)
+    )))
+}
+
 fn project_human_key_sync(conn: &DbConn, project_id: i64) -> Result<Option<String>, CliError> {
     let rows = conn
         .query_sync(
@@ -1153,8 +1175,7 @@ fn project_human_key_sync(conn: &DbConn, project_id: i64) -> Result<Option<Strin
 fn find_project_for_cwd(conn: &DbConn) -> Result<(i64, String), CliError> {
     let cwd =
         std::env::current_dir().map_err(|e| CliError::Other(format!("cannot get CWD: {e}")))?;
-    let cwd_str = cwd.to_string_lossy().replace('\\', "/");
-    resolve_project_sync(conn, &cwd_str)
+    find_project_for_path_or_ancestors(conn, &cwd)
 }
 
 /// Resolve project from --project flag or CWD.
@@ -1574,7 +1595,10 @@ fn build_status(
         ));
     }
     if let Some(top) = top_threads.first() {
-        actions.push(format!("am robot thread {}", top.id));
+        actions.push(format!(
+            "am robot thread --project {project_slug} {}",
+            top.id
+        ));
     }
 
     let health = if anomalies.iter().any(|a| a.severity == "error") {
@@ -1771,7 +1795,10 @@ fn build_inbox(
     if let Some(entry) = entries.first()
         && !entry.thread.is_empty()
     {
-        actions.push(format!("am robot thread {}", entry.thread));
+        actions.push(format!(
+            "am robot thread --project {project_slug} {}",
+            entry.thread
+        ));
     }
 
     Ok(InboxResult {
@@ -2666,7 +2693,7 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
 // ── Reservations command implementation ─────────────────────────────────────
 
 /// Conflict between two reservations.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ReservationConflict {
     agent_a: String,
     path_a: String,
@@ -2798,10 +2825,39 @@ fn build_reservations(
         }
     }
 
+    let scoped_agent_name = if !show_all {
+        agent.as_ref().map(|(_, name)| name.as_str())
+    } else {
+        None
+    };
+    let scoped_conflicts: Vec<_> = if let Some(agent_name) = scoped_agent_name {
+        conflicts
+            .iter()
+            .filter(|conflict| conflict.agent_a == agent_name || conflict.agent_b == agent_name)
+            .cloned()
+            .collect()
+    } else {
+        conflicts.clone()
+    };
+    let scoped_expiring_soon: Vec<_> = if let Some(agent_name) = scoped_agent_name {
+        expiring_soon
+            .iter()
+            .filter(|entry| entry.agent.as_deref() == Some(agent_name))
+            .cloned()
+            .collect()
+    } else {
+        expiring_soon.clone()
+    };
+    let scoped_all_active = if scoped_agent_name.is_some() {
+        my_reservations.clone()
+    } else {
+        all_active.clone()
+    };
+
     // Build actions
     let mut actions = Vec::new();
     if let Some((_, ref agent_name)) = agent {
-        for entry in &expiring_soon {
+        for entry in &scoped_expiring_soon {
             if entry.agent.as_deref() == Some(agent_name.as_str()) {
                 actions.push(format!(
                     "am file_reservations renew {project_slug} {agent_name} --paths {} --extend-seconds 3600",
@@ -2814,11 +2870,11 @@ fn build_reservations(
     // Apply filters
     if conflicts_only {
         // Only keep entries involved in conflicts
-        let conflict_paths: std::collections::HashSet<String> = conflicts
+        let conflict_paths: std::collections::HashSet<String> = scoped_conflicts
             .iter()
             .flat_map(|c| vec![c.path_a.clone(), c.path_b.clone()])
             .collect();
-        let filtered: Vec<_> = all_active
+        let filtered: Vec<_> = scoped_all_active
             .into_iter()
             .filter(|e| conflict_paths.contains(&e.path))
             .collect();
@@ -2826,21 +2882,21 @@ fn build_reservations(
             ReservationsData {
                 my_reservations: vec![],
                 all_active: filtered,
-                conflicts,
+                conflicts: scoped_conflicts,
                 expiring_soon: vec![],
             },
             actions,
         ));
     }
 
-    if !show_all && agent.is_some() {
+    if scoped_agent_name.is_some() {
         // When not --all, only show my reservations in all_active
         return Ok((
             ReservationsData {
                 my_reservations: my_reservations.clone(),
-                all_active: my_reservations,
-                conflicts,
-                expiring_soon,
+                all_active: scoped_all_active,
+                conflicts: scoped_conflicts,
+                expiring_soon: scoped_expiring_soon,
             },
             actions,
         ));
@@ -5232,6 +5288,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     static NAVIGATE_RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -8534,6 +8591,24 @@ mod tests {
         (temp_dir, conn)
     }
 
+    struct RobotCwdGuard {
+        original: PathBuf,
+    }
+
+    impl RobotCwdGuard {
+        fn chdir(path: &Path) -> Self {
+            let original = std::env::current_dir().expect("get cwd");
+            std::env::set_current_dir(path).expect("set cwd");
+            Self { original }
+        }
+    }
+
+    impl Drop for RobotCwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
     #[test]
     fn test_build_thread_partial_ack_not_marked_done() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
@@ -8666,7 +8741,101 @@ mod tests {
         assert_eq!(result.entries[0].thread, "120");
         assert_eq!(
             result.actions.last().map(String::as_str),
-            Some("am robot thread 120")
+            Some("am robot thread --project proj 120")
+        );
+    }
+
+    #[test]
+    fn find_project_for_cwd_walks_ancestor_directories() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("workspace");
+        let nested = root.join("crates/mcp-agent-mail-cli");
+        std::fs::create_dir_all(&nested).expect("create nested workspace path");
+
+        let db_path = temp_dir.path().join("project_lookup.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("workspace".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                    root.canonicalize()
+                        .expect("canonicalize root")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                ),
+            ],
+        )
+        .expect("insert project");
+
+        let _cwd = RobotCwdGuard::chdir(&nested);
+        let (project_id, slug) =
+            find_project_for_cwd(&conn).expect("resolve project from ancestor");
+        assert_eq!(project_id, 1);
+        assert_eq!(slug, "workspace");
+    }
+
+    #[test]
+    fn build_reservations_scopes_conflicts_and_expiring_to_selected_agent() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (?, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (?, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL),
+                (?, 1, 1, 'docs/**', 1, 'c', 0, ?, NULL),
+                (?, 1, 3, 'docs/readme.md', 1, 'd', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 300_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(4),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 300_000_000),
+            ],
+        )
+        .expect("insert reservations");
+
+        let (data, actions) = build_reservations(
+            &conn,
+            1,
+            "proj",
+            Some((2, "Bob".to_string())),
+            false,
+            false,
+            Some(10),
+        )
+        .expect("build reservations");
+
+        assert_eq!(data.all_active.len(), 1);
+        assert_eq!(data.all_active[0].agent.as_deref(), Some("Bob"));
+        assert_eq!(data.all_active[0].path, "src/auth/jwt.rs");
+        assert_eq!(data.conflicts.len(), 1);
+        assert_eq!(data.conflicts[0].agent_a, "Alice");
+        assert_eq!(data.conflicts[0].agent_b, "Bob");
+        assert_eq!(data.expiring_soon.len(), 1);
+        assert_eq!(data.expiring_soon[0].agent.as_deref(), Some("Bob"));
+        assert_eq!(
+            actions,
+            vec![
+                "am file_reservations renew proj Bob --paths src/auth/jwt.rs --extend-seconds 3600"
+                    .to_string()
+            ]
         );
     }
 

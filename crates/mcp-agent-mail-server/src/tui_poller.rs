@@ -440,7 +440,7 @@ impl DbPoller {
                     }
                     connection_state
                         .as_mut()
-                        .map(|state| fetch_db_stats_with_connection(state, &prev))
+                        .and_then(|state| fetch_db_stats_with_connection(state, &prev))
                 })) {
                     if panic_recovery_active {
                         tracing::info!(
@@ -450,6 +450,8 @@ impl DbPoller {
                     }
                     snapshot
                 } else {
+                    connection_state = None;
+                    self.state.mark_db_context_unavailable();
                     if !panic_recovery_active {
                         tracing::warn!(
                             "tui-db-poller recovered from a panic while polling DB; keeping UI alive"
@@ -462,6 +464,7 @@ impl DbPoller {
                 None
             };
             if let Some(update) = snapshot_update {
+                self.state.mark_db_context_available();
                 self.state.mark_db_ready();
                 match update {
                     DbPollSnapshotUpdate::Snapshot(snapshot) => {
@@ -489,6 +492,7 @@ impl DbPoller {
                     .checked_sub(DB_WARMUP_FAILURE_RETRY_INTERVAL)
                     .unwrap_or_else(Instant::now);
             } else if allow_poll {
+                self.state.mark_db_context_unavailable();
                 connection_state = None;
             }
 
@@ -603,7 +607,7 @@ enum DbPollSnapshotUpdate {
 fn fetch_db_stats_with_connection(
     state: &mut PollerConnectionState,
     previous: &DbStatSnapshot,
-) -> DbPollSnapshotUpdate {
+) -> Option<DbPollSnapshotUpdate> {
     let now = now_micros();
     let data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
     let must_refresh_for_expiry = reservation_expiry_requires_time_refresh(previous, now);
@@ -632,7 +636,7 @@ fn fetch_db_stats_with_connection(
                 previous,
                 now,
             );
-            return DbPollSnapshotUpdate::TimestampOnly(now);
+            return Some(DbPollSnapshotUpdate::TimestampOnly(now));
         };
         state.last_data_version = data_version;
         update_reservation_snapshot_gap_refresh_state(
@@ -641,10 +645,15 @@ fn fetch_db_stats_with_connection(
             &update,
             now,
         );
-        return DbPollSnapshotUpdate::Snapshot(update);
+        return Some(DbPollSnapshotUpdate::Snapshot(update));
     }
     let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
         .fetch_snapshot(Some(previous));
+    if snapshot_is_empty(&snapshot)
+        && required_mail_schema_state(&state.conn) != RequiredMailSchemaState::Present
+    {
+        return None;
+    }
     state.last_data_version = data_version;
     update_reservation_snapshot_gap_refresh_state(
         state,
@@ -652,7 +661,97 @@ fn fetch_db_stats_with_connection(
         &snapshot,
         now,
     );
-    DbPollSnapshotUpdate::Snapshot(snapshot)
+    Some(DbPollSnapshotUpdate::Snapshot(snapshot))
+}
+
+fn snapshot_is_empty(snapshot: &DbStatSnapshot) -> bool {
+    snapshot.projects == 0
+        && snapshot.agents == 0
+        && snapshot.messages == 0
+        && snapshot.file_reservations == 0
+        && snapshot.contact_links == 0
+        && snapshot.ack_pending == 0
+        && snapshot.agents_list.is_empty()
+        && snapshot.projects_list.is_empty()
+        && snapshot.contacts_list.is_empty()
+        && snapshot.reservation_snapshots.is_empty()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredMailSchemaState {
+    Present,
+    Missing,
+    Unknown,
+}
+
+fn required_mail_schema_state(conn: &DbConn) -> RequiredMailSchemaState {
+    // Empty snapshots are only trustworthy when the concrete columns used by
+    // the poller queries exist, not merely when table names happen to exist.
+    for (table, columns) in [
+        ("projects", &["id", "slug", "human_key", "created_at"][..]),
+        (
+            "agents",
+            &["id", "project_id", "name", "program", "last_active_ts"][..],
+        ),
+        ("messages", &["id", "project_id"][..]),
+        (
+            "file_reservations",
+            &[
+                "id",
+                "agent_id",
+                "project_id",
+                "path_pattern",
+                "exclusive",
+                "created_ts",
+                "expires_ts",
+                "released_ts",
+            ][..],
+        ),
+        (
+            "agent_links",
+            &[
+                "id",
+                "a_agent_id",
+                "b_agent_id",
+                "a_project_id",
+                "b_project_id",
+                "status",
+                "reason",
+                "updated_ts",
+                "expires_ts",
+            ][..],
+        ),
+        ("message_recipients", &["id", "message_id", "ack_ts"][..]),
+    ] {
+        match table_has_required_columns(conn, table, columns) {
+            Some(true) => {}
+            Some(false) => return RequiredMailSchemaState::Missing,
+            None => return RequiredMailSchemaState::Unknown,
+        }
+    }
+    RequiredMailSchemaState::Present
+}
+
+fn table_has_required_columns(
+    conn: &DbConn,
+    table: &str,
+    required_columns: &[&str],
+) -> Option<bool> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .ok()?;
+    if rows.is_empty() {
+        return Some(false);
+    }
+    let available_columns: std::collections::HashSet<String> = rows
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .collect();
+    Some(
+        required_columns
+            .iter()
+            .all(|column_name| available_columns.contains(*column_name)),
+    )
 }
 
 fn refresh_reservation_time_sensitive_snapshot(
@@ -2345,36 +2444,7 @@ mod tests {
 
         // Create tables
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
-            &[],
-        )
-        .expect("create projects");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
-            &[],
-        )
-        .expect("create agents");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)",
-            &[],
-        )
-        .expect("create messages");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
-            &[],
-        )
-        .expect("create file_reservations");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agent_links (id INTEGER PRIMARY KEY)",
-            &[],
-        )
-        .expect("create agent_links");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
-            &[],
-        )
-        .expect("create message_recipients");
+        create_empty_mail_schema(&conn);
 
         // Insert some data
         conn.execute_sync(
@@ -2383,11 +2453,12 @@ mod tests {
         )
         .expect("insert project");
         conn.execute_sync(
-            "INSERT INTO agents (name, program, last_active_ts) VALUES ('GoldFox', 'claude-code', 200)",
+            "INSERT INTO agents (project_id, name, program, last_active_ts)
+             VALUES (1, 'GoldFox', 'claude-code', 200)",
             &[],
         )
         .expect("insert agent");
-        conn.execute_sync("INSERT INTO messages (id) VALUES (1)", &[])
+        conn.execute_sync("INSERT INTO messages (id, project_id) VALUES (1, 1)", &[])
             .expect("insert message");
         drop(conn);
 
@@ -2397,6 +2468,7 @@ mod tests {
         let poller =
             DbPoller::new(Arc::clone(&state), db_url).with_interval(Duration::from_millis(50));
         let mut handle = poller.start();
+        state.mark_db_ready();
 
         // Wait for at least one poll cycle
         thread::sleep(Duration::from_millis(200));
@@ -2428,36 +2500,7 @@ mod tests {
         let db_url = format!("sqlite:///{}", db_path.display());
 
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
-            &[],
-        )
-        .expect("create projects");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
-            &[],
-        )
-        .expect("create agents");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)",
-            &[],
-        )
-        .expect("create messages");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
-            &[],
-        )
-        .expect("create file_reservations");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agent_links (id INTEGER PRIMARY KEY)",
-            &[],
-        )
-        .expect("create agent_links");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
-            &[],
-        )
-        .expect("create message_recipients");
+        create_empty_mail_schema(&conn);
         conn.execute_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj1', 'hk1', 100)",
             &[],
@@ -2507,36 +2550,7 @@ mod tests {
         let db_url = format!("sqlite:///{}", db_path.display());
 
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
-            &[],
-        )
-        .expect("create projects");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
-            &[],
-        )
-        .expect("create agents");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY)",
-            &[],
-        )
-        .expect("create messages");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER)",
-            &[],
-        )
-        .expect("create file_reservations");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agent_links (id INTEGER PRIMARY KEY)",
-            &[],
-        )
-        .expect("create agent_links");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
-            &[],
-        )
-        .expect("create message_recipients");
+        create_empty_mail_schema(&conn);
         conn.execute_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj1', 'hk1', 100)",
             &[],
@@ -2579,29 +2593,8 @@ mod tests {
         let db_path = dir.path().join("test_no_change.db");
         let db_url = format!("sqlite:///{}", db_path.display());
 
-        // Create minimal tables (empty DB)
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
-        conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
-            .expect("create");
-        conn.execute_sync(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
-            &[],
-        )
-        .expect("create");
-        conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
-            .expect("create");
-        conn.execute_sync(
-            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER, expires_ts INTEGER)",
-            &[],
-        )
-        .expect("create");
-        conn.execute_sync("CREATE TABLE agent_links (id INTEGER PRIMARY KEY)", &[])
-            .expect("create");
-        conn.execute_sync(
-            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
-            &[],
-        )
-        .expect("create");
+        create_empty_mail_schema(&conn);
         drop(conn);
 
         let config = Config::default();
@@ -2609,9 +2602,14 @@ mod tests {
         let poller =
             DbPoller::new(Arc::clone(&state), db_url).with_interval(Duration::from_millis(50));
         let mut handle = poller.start();
+        state.mark_db_ready();
 
         // Wait for multiple poll cycles
         thread::sleep(Duration::from_millis(300));
+        assert!(
+            state.data_generation().db_stats_gen > 0,
+            "initial zero snapshot should still count as delivered poller data"
+        );
 
         // Should only have emitted ONE HealthPulse (the initial change from default -> zeroed+timestamp)
         let events = state.recent_events(100);
@@ -2630,33 +2628,277 @@ mod tests {
     }
 
     #[test]
+    fn open_poller_connection_state_rejects_non_sqlite_startup_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("malformed_startup.db");
+        std::fs::write(&db_path, b"not-a-database").expect("write malformed db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        assert!(
+            open_poller_connection_state(&db_url).is_none(),
+            "non-sqlite startup file should not produce a poller connection state"
+        );
+    }
+
+    fn create_empty_mail_schema(conn: &DbConn) {
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT,
+                human_key TEXT,
+                created_at INTEGER
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                name TEXT,
+                program TEXT,
+                last_active_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                path_pattern TEXT,
+                \"exclusive\" INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER,
+                released_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create file_reservations");
+        conn.execute_sync(
+            "CREATE TABLE agent_links (
+                id INTEGER PRIMARY KEY,
+                a_agent_id INTEGER,
+                b_agent_id INTEGER,
+                a_project_id INTEGER,
+                b_project_id INTEGER,
+                status TEXT,
+                reason TEXT,
+                updated_ts INTEGER,
+                expires_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create agent_links");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER,
+                ack_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create message_recipients");
+    }
+
+    #[test]
+    fn fetch_db_stats_with_connection_allows_empty_healthy_startup_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("empty_startup.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        create_empty_mail_schema(&conn);
+        drop(conn);
+
+        let (conn, sqlite_path) = open_sync_connection_with_path(&db_url).expect("open conn");
+        let mut state = PollerConnectionState {
+            conn,
+            sqlite_path,
+            last_data_version: None,
+            last_reservation_snapshot_gap_refresh_micros: 0,
+        };
+
+        let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
+        assert!(
+            matches!(update, Some(DbPollSnapshotUpdate::Snapshot(_))),
+            "healthy empty sqlite should still yield a real first snapshot"
+        );
+    }
+
+    #[test]
+    fn fetch_db_stats_with_connection_rejects_empty_missing_schema_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("wrong_schema_startup.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_sync("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)", &[])
+            .expect("create unrelated");
+        drop(conn);
+
+        let (conn, sqlite_path) = open_sync_connection_with_path(&db_url).expect("open conn");
+        let mut state = PollerConnectionState {
+            conn,
+            sqlite_path,
+            last_data_version: None,
+            last_reservation_snapshot_gap_refresh_micros: 0,
+        };
+
+        let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
+        assert!(
+            update.is_none(),
+            "empty snapshot from a non-mail schema must not count as valid DB context"
+        );
+    }
+
+    #[test]
+    fn fetch_db_stats_with_connection_rejects_empty_partial_schema_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("partial_schema_startup.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
+            .expect("create projects");
+        conn.execute_sync("CREATE TABLE agents (id INTEGER PRIMARY KEY)", &[])
+            .expect("create agents");
+        conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
+            .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY)",
+            &[],
+        )
+        .expect("create file_reservations");
+        conn.execute_sync("CREATE TABLE agent_links (id INTEGER PRIMARY KEY)", &[])
+            .expect("create agent_links");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY)",
+            &[],
+        )
+        .expect("create message_recipients");
+        drop(conn);
+
+        let (conn, sqlite_path) = open_sync_connection_with_path(&db_url).expect("open conn");
+        let mut state = PollerConnectionState {
+            conn,
+            sqlite_path,
+            last_data_version: None,
+            last_reservation_snapshot_gap_refresh_micros: 0,
+        };
+
+        let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
+        assert!(
+            update.is_none(),
+            "empty snapshot from a partial mail schema must not count as valid DB context"
+        );
+    }
+
+    #[test]
+    fn fetch_db_stats_with_connection_rejects_missing_reservation_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("reservation_columns_startup.db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT,
+                human_key TEXT,
+                created_at INTEGER
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                name TEXT,
+                program TEXT,
+                last_active_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                path_pattern TEXT,
+                \"exclusive\" INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create file_reservations");
+        conn.execute_sync(
+            "CREATE TABLE agent_links (
+                id INTEGER PRIMARY KEY,
+                a_agent_id INTEGER,
+                b_agent_id INTEGER,
+                a_project_id INTEGER,
+                b_project_id INTEGER,
+                status TEXT,
+                reason TEXT,
+                updated_ts INTEGER,
+                expires_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create agent_links");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER,
+                ack_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create message_recipients");
+        drop(conn);
+
+        let (conn, sqlite_path) = open_sync_connection_with_path(&db_url).expect("open conn");
+        let mut state = PollerConnectionState {
+            conn,
+            sqlite_path,
+            last_data_version: None,
+            last_reservation_snapshot_gap_refresh_micros: 0,
+        };
+
+        let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
+        assert!(
+            update.is_none(),
+            "missing reservation columns used by the poller must not count as valid DB context"
+        );
+    }
+
+    #[test]
     fn poller_refreshes_snapshot_timestamp_without_data_change() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_snapshot_refresh.db");
         let db_url = format!("sqlite:///{}", db_path.display());
 
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
-        conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
-            .expect("create");
-        conn.execute_sync(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
-            &[],
-        )
-        .expect("create");
-        conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
-            .expect("create");
-        conn.execute_sync(
-            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, released_ts INTEGER, expires_ts INTEGER)",
-            &[],
-        )
-        .expect("create");
-        conn.execute_sync("CREATE TABLE agent_links (id INTEGER PRIMARY KEY)", &[])
-            .expect("create");
-        conn.execute_sync(
-            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, ack_ts INTEGER)",
-            &[],
-        )
-        .expect("create");
+        create_empty_mail_schema(&conn);
         drop(conn);
 
         let config = Config::default();
@@ -2664,6 +2906,7 @@ mod tests {
         let poller =
             DbPoller::new(Arc::clone(&state), db_url).with_interval(Duration::from_millis(50));
         let mut handle = poller.start();
+        state.mark_db_ready();
 
         thread::sleep(Duration::from_millis(120));
         let first = state.db_stats_snapshot().expect("first snapshot");

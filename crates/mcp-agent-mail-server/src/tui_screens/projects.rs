@@ -190,6 +190,10 @@ pub struct ProjectsScreen {
     pending_rebuild: bool,
     /// True when the DB poller has not yet delivered any data.
     db_context_unavailable: bool,
+    /// Banner copy explaining why poller-driven data is unavailable.
+    db_context_banner: &'static str,
+    /// Latest db_stats generation that this screen has actually rebuilt from.
+    applied_db_stats_gen: u64,
 }
 
 impl ProjectsScreen {
@@ -212,11 +216,13 @@ impl ProjectsScreen {
             last_data_gen: super::DataGeneration::stale(),
             pending_rebuild: false,
             db_context_unavailable: false,
+            db_context_banner: super::POLLER_DB_WAITING_BANNER,
+            applied_db_stats_gen: 0,
         }
     }
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
-        let db = state.db_stats_snapshot().unwrap_or_default();
+        let (db, db_stats_gen) = state.db_stats_snapshot_with_generation();
         let cfg = state.config_snapshot();
         let total_rows = db.projects;
         let raw_count = u64::try_from(db.projects_list.len()).unwrap_or(u64::MAX);
@@ -317,6 +323,7 @@ impl ProjectsScreen {
                 Some(self.projects.len() - 1)
             };
         }
+        self.applied_db_stats_gen = db_stats_gen;
     }
 
     fn ingest_events(&mut self, state: &TuiSharedState) {
@@ -490,11 +497,6 @@ impl MailScreen for ProjectsScreen {
         let current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
 
-        // Poller hasn't delivered data yet if db_stats_gen == 0.
-        // Only flag as unavailable after a few seconds (30 ticks) to allow
-        // startup grace period before showing the degraded banner.
-        self.db_context_unavailable = current_gen.db_stats_gen == 0 && tick_count >= 30;
-
         // Snapshot totals *before* data changes so render_summary_band can
         // compute trend arrows by comparing live compute_totals() (post-update)
         // with prev_totals (pre-update).
@@ -512,6 +514,16 @@ impl MailScreen for ProjectsScreen {
         if tick_count.is_multiple_of(10) && self.pending_rebuild {
             self.rebuild_from_state(state);
             self.pending_rebuild = false;
+        }
+
+        if let Some(banner) =
+            super::poller_db_context_banner(state, self.applied_db_stats_gen, tick_count)
+        {
+            self.db_context_unavailable = true;
+            self.db_context_banner = banner;
+        } else {
+            self.db_context_unavailable = false;
+            self.db_context_banner = super::POLLER_DB_WAITING_BANNER;
         }
 
         self.last_data_gen = current_gen;
@@ -543,9 +555,8 @@ impl MailScreen for ProjectsScreen {
             );
 
         if self.db_context_unavailable {
-            let banner =
-                Paragraph::new(" Database context unavailable. Waiting for poller data...")
-                    .style(Style::default().fg(tp.severity_error));
+            let banner = Paragraph::new(self.db_context_banner)
+                .style(Style::default().fg(tp.severity_error));
             let banner_area = Rect::new(area.x, area.y, area.width, 1);
             banner.render(banner_area, frame);
             return;
@@ -1914,6 +1925,10 @@ mod tests {
             screen.db_context_unavailable,
             "should show banner when poller never delivered data after grace period"
         );
+        assert_eq!(
+            screen.db_context_banner,
+            crate::tui_screens::POLLER_DB_WAITING_BANNER
+        );
     }
 
     #[test]
@@ -1921,6 +1936,7 @@ mod tests {
         let state = test_state();
         let mut screen = ProjectsScreen::new();
 
+        state.mark_db_context_available();
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             projects: 1,
             projects_list: vec![ProjectSummary {
@@ -1936,6 +1952,25 @@ mod tests {
         assert!(
             !screen.db_context_unavailable,
             "should not show banner when poller has delivered data"
+        );
+    }
+
+    #[test]
+    fn b8_projects_keep_waiting_banner_until_first_snapshot_is_applied() {
+        let state = test_state();
+        state.mark_db_context_available();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            timestamp_micros: 10,
+            ..crate::tui_events::DbStatSnapshot::default()
+        });
+        let mut screen = ProjectsScreen::new();
+
+        screen.tick(1, &state);
+
+        assert!(screen.db_context_unavailable);
+        assert_eq!(
+            screen.db_context_banner,
+            crate::tui_screens::POLLER_DB_WAITING_BANNER
         );
     }
 
@@ -1966,6 +2001,7 @@ mod tests {
         let state = test_state();
         let mut screen = ProjectsScreen::new();
         screen.db_context_unavailable = true;
+        screen.db_context_banner = crate::tui_screens::POLLER_DB_UNAVAILABLE_BANNER;
 
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(120, 30, &mut pool);
@@ -1987,6 +2023,25 @@ mod tests {
         assert!(
             text.contains("Database context unavailable"),
             "should render degraded banner: {text}"
+        );
+        assert!(
+            text.contains("Check DB URL/project scope and refresh"),
+            "should render explicit degraded copy: {text}"
+        );
+    }
+
+    #[test]
+    fn b8_projects_show_explicit_unavailable_after_warmup_failure() {
+        let state = test_state();
+        state.mark_db_warmup_failed();
+        let mut screen = ProjectsScreen::new();
+
+        screen.tick(30, &state);
+
+        assert!(screen.db_context_unavailable);
+        assert_eq!(
+            screen.db_context_banner,
+            crate::tui_screens::POLLER_DB_UNAVAILABLE_BANNER
         );
     }
 }

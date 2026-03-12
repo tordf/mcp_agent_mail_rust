@@ -175,6 +175,10 @@ pub struct ContactsScreen {
     last_data_gen: super::DataGeneration,
     /// True when the DB poller has not yet delivered any data.
     db_context_unavailable: bool,
+    /// Banner copy explaining why poller-driven data is unavailable.
+    db_context_banner: &'static str,
+    /// Latest db_stats generation that this screen has actually rebuilt from.
+    applied_db_stats_gen: u64,
 }
 
 impl ContactsScreen {
@@ -207,11 +211,13 @@ impl ContactsScreen {
             last_detail_max_scroll: std::cell::Cell::new(0),
             last_data_gen: super::DataGeneration::stale(),
             db_context_unavailable: false,
+            db_context_banner: super::POLLER_DB_WAITING_BANNER,
+            applied_db_stats_gen: 0,
         }
     }
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
-        let db = state.db_stats_snapshot().unwrap_or_default();
+        let (db, db_stats_gen) = state.db_stats_snapshot_with_generation();
         let total_rows = u64::try_from(db.contacts_list.len()).unwrap_or(u64::MAX);
         let mut rows: Vec<ContactSummary> = db.contacts_list;
 
@@ -298,6 +304,7 @@ impl ContactsScreen {
                 Some(self.contacts.len() - 1)
             };
         }
+        self.applied_db_stats_gen = db_stats_gen;
     }
 
     fn layout_graph(&mut self, recent_events: &[MailEvent]) {
@@ -521,11 +528,6 @@ impl MailScreen for ContactsScreen {
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         let current_gen = state.data_generation();
 
-        // Poller hasn't delivered data yet if db_stats_gen == 0.
-        // Only flag as unavailable after a few seconds (30 ticks) to allow
-        // startup grace period before showing the degraded banner.
-        self.db_context_unavailable = current_gen.db_stats_gen == 0 && tick_count >= 30;
-
         // Rebuild every second with dirty gating. This keeps graph/event-driven
         // state fresh without doing heavy recomputation every render frame.
         if tick_count.is_multiple_of(10) {
@@ -535,6 +537,16 @@ impl MailScreen for ContactsScreen {
                 self.rebuild_from_state(state);
             }
             self.last_data_gen = current_gen;
+        }
+
+        if let Some(banner) =
+            super::poller_db_context_banner(state, self.applied_db_stats_gen, tick_count)
+        {
+            self.db_context_unavailable = true;
+            self.db_context_banner = banner;
+        } else {
+            self.db_context_unavailable = false;
+            self.db_context_banner = super::POLLER_DB_WAITING_BANNER;
         }
     }
 
@@ -552,9 +564,8 @@ impl MailScreen for ContactsScreen {
 
         if self.db_context_unavailable {
             let tp = crate::tui_theme::TuiThemePalette::current();
-            let banner =
-                Paragraph::new(" Database context unavailable. Waiting for poller data...")
-                    .style(Style::default().fg(tp.severity_error));
+            let banner = Paragraph::new(self.db_context_banner)
+                .style(Style::default().fg(tp.severity_error));
             let banner_area = Rect::new(area.x, area.y, area.width, 1);
             banner.render(banner_area, frame);
             return;
@@ -2291,5 +2302,20 @@ mod tests {
         assert!(!StatusFilter::Pending.matches("Pending"));
         assert!(!StatusFilter::Approved.matches("APPROVED"));
         assert!(!StatusFilter::Blocked.matches("BLOCKED"));
+    }
+
+    #[test]
+    fn b8_contacts_show_explicit_unavailable_after_warmup_failure() {
+        let state = test_state();
+        state.mark_db_warmup_failed();
+        let mut screen = ContactsScreen::new();
+
+        screen.tick(30, &state);
+
+        assert!(screen.db_context_unavailable);
+        assert_eq!(
+            screen.db_context_banner,
+            crate::tui_screens::POLLER_DB_UNAVAILABLE_BANNER
+        );
     }
 }
