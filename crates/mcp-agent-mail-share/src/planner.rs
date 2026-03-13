@@ -1104,8 +1104,11 @@ mod tests {
     #[test]
     fn resolve_detection_root_prefers_bundle_project_over_shell_cwd() {
         let shell_cwd = tempfile::tempdir().expect("shell cwd");
-        std::fs::write(shell_cwd.path().join("netlify.toml"), "[build]\npublish = \"dist\"")
-            .expect("write netlify config");
+        std::fs::write(
+            shell_cwd.path().join("netlify.toml"),
+            "[build]\npublish = \"dist\"",
+        )
+        .expect("write netlify config");
 
         let project = tempfile::tempdir().expect("project");
         std::fs::write(project.path().join("wrangler.toml"), "name = \"demo\"")
