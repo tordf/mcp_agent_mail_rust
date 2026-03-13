@@ -253,7 +253,7 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
     let handle = std::thread::Builder::new()
         .name("wbq-drain".into())
         .spawn(move || wbq_drain_loop(rx, op_depth_worker))
-        .unwrap_or_else(|_| unreachable!());
+        .unwrap_or_else(|error| panic!("failed to spawn wbq-drain thread: {error}"));
 
     *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     *wbq.drain_handle.lock() = Some(handle);
@@ -1594,7 +1594,9 @@ impl CommitCoalescer {
                         worker_count,
                     );
                 })
-                .unwrap_or_else(|_| unreachable!());
+                .unwrap_or_else(|error| {
+                    panic!("failed to spawn commit-coalescer-{worker_idx} thread: {error}")
+                });
         }
 
         mcp_agent_mail_core::global_metrics()
