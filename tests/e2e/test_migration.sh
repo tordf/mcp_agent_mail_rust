@@ -10,6 +10,7 @@
 #   - Doctor passes and migration backup artifacts are present
 
 set -euo pipefail
+shopt -s expand_aliases
 
 E2E_SUITE="migration"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,9 +45,13 @@ PYTHON_DB="${PYTHON_CLONE}/storage.sqlite3"
 MCP_CONFIG="${RUN_DIR}/codex.mcp.json"
 PATH_BASE="/usr/bin:/bin"
 LEGACY_TOKEN="legacy-token-123"
+PREEXISTING_RUST_ROOT="${TEST_HOME}/preexisting-rust-root"
+PREEXISTING_RUST_DB="${PREEXISTING_RUST_ROOT}/storage.sqlite3"
+RUST_CONFIG_ENV="${TEST_HOME}/.config/mcp-agent-mail/config.env"
 
-mkdir -p "${RUN_DIR}" "${DEST}" "${STORAGE_ROOT}" "${PYTHON_CLONE}" "${TEST_HOME}/.codex" "${TEST_HOME}/.config/fish"
+mkdir -p "${RUN_DIR}" "${DEST}" "${STORAGE_ROOT}" "${PYTHON_CLONE}" "${TEST_HOME}/.codex" "${TEST_HOME}/.config/fish" "${PREEXISTING_RUST_ROOT}" "$(dirname "${RUST_CONFIG_ENV}")"
 mkdir -p "${PYTHON_CLONE}/src/mcp_agent_mail"
+mkdir -p "${PYTHON_CLONE}/scripts"
 cat > "${PYTHON_CLONE}/pyproject.toml" <<'EOF'
 [project]
 name = "mcp_agent_mail"
@@ -56,6 +61,12 @@ python3 -m venv "${PYTHON_CLONE}/.venv"
 cat > "${PYTHON_CLONE}/src/mcp_agent_mail/__init__.py" <<'EOF'
 __all__ = []
 EOF
+cat > "${PYTHON_CLONE}/scripts/run_server_with_token.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "LEGACY_PYTHON_HELPER_STILL_ACTIVE" >&2
+exit 17
+EOF
+chmod +x "${PYTHON_CLONE}/scripts/run_server_with_token.sh"
 
 json_query() {
     local json="$1"
@@ -110,19 +121,23 @@ resolve_bin() {
 
 run_installer() {
     local case_id="$1"
+    local run_dir="${2:-$RUN_DIR}"
+    local test_home="${3:-$TEST_HOME}"
+    local dest_dir="${4:-$DEST}"
+    local storage_root="${5:-$STORAGE_ROOT}"
     local stdout_file="${WORK}/${case_id}_stdout.txt"
     local stderr_file="${WORK}/${case_id}_stderr.txt"
     set +e
     (
-        cd "${RUN_DIR}"
+        cd "${run_dir}"
         # Mirror curl|bash style installer execution while keeping this suite offline.
-        HOME="${TEST_HOME}" \
+        HOME="${test_home}" \
         PATH="${PATH_BASE}" \
-        STORAGE_ROOT="${STORAGE_ROOT}" \
+        STORAGE_ROOT="${storage_root}" \
         bash -s -- \
             --version "v${TARGET_VERSION}" \
             --artifact-url "file://${ARTIFACT_PATH}" \
-            --dest "${DEST}" \
+            --dest "${dest_dir}" \
             --offline \
             --no-verify \
             --no-gum \
@@ -160,15 +175,31 @@ chmod +x "${ARTIFACT_STAGE}/am" "${ARTIFACT_STAGE}/mcp-agent-mail"
 tar -cJf "${ARTIFACT_PATH}" -C "${ARTIFACT_STAGE}" am mcp-agent-mail
 e2e_assert_file_exists "offline artifact created" "${ARTIFACT_PATH}"
 
-# Seed a legacy Python-like shell alias and config surface.
+# Seed a pre-existing Rust config to ensure installer takeover rewrites it
+# instead of preserving stale paths/token state.
+cat > "${RUST_CONFIG_ENV}" <<EOF
+# existing rust config
+export DATABASE_URL="sqlite:///${PREEXISTING_RUST_DB}" # stale path
+export STORAGE_ROOT='${PREEXISTING_RUST_ROOT}' # stale storage root
+export HTTP_BEARER_TOKEN="stale-rust-token" # stale rust token
+TUI_ENABLED=false
+EOF
+
+# Seed a legacy Python-like shell function and config surface.
 cat > "${TEST_HOME}/.zshrc" <<EOF
 # >>> MCP Agent Mail alias
-alias am='cd "${PYTHON_CLONE}" && "${PYTHON_CLONE}/.venv/bin/python" -m mcp_agent_mail'
+am() {
+  cd "${PYTHON_CLONE}" && scripts/run_server_with_token.sh "\$@"
+}
 # <<< MCP Agent Mail alias
 EOF
 cat > "${TEST_HOME}/.bashrc" <<'EOF'
 # baseline bashrc
 EOF
+
+am() {
+  cd "${PYTHON_CLONE}" && scripts/run_server_with_token.sh "$@"
+}
 
 cat > "${MCP_CONFIG}" <<EOF
 {
@@ -195,9 +226,9 @@ git -C "${STORAGE_ROOT}" commit -m "seed storage repo" >/dev/null 2>&1
 
 # Create a legacy-style database with TEXT timestamps.
 cat > "${PYTHON_CLONE}/.env" <<EOF
-DATABASE_URL=sqlite+aiosqlite:///${PYTHON_DB}
-HTTP_BEARER_TOKEN=${LEGACY_TOKEN}
-STORAGE_ROOT=${PYTHON_CLONE}
+DATABASE_URL="sqlite+aiosqlite:///${PYTHON_DB}" # legacy sqlite path
+HTTP_BEARER_TOKEN='${LEGACY_TOKEN}' # legacy token
+STORAGE_ROOT="${PYTHON_CLONE}" # legacy storage root
 EOF
 
 sqlite3 "${PYTHON_DB}" <<'SQL'
@@ -396,6 +427,7 @@ e2e_case_banner "install.sh migrates over existing Python setup"
 run_installer "case_01_install"
 e2e_assert_exit_code "installer exits cleanly" "0" "${INSTALL_RC}"
 e2e_assert_contains "installer output mentions install destination" "${INSTALL_STDOUT}" "${DEST}"
+e2e_assert_not_contains "supported legacy alias path no longer requires manual unalias guidance" "${INSTALL_STDOUT}" "unalias am 2>/dev/null || true"
 
 MIGRATED_ENV="${TEST_HOME}/.config/mcp-agent-mail/config.env"
 MIGRATED_DB_URL="$(grep -E '^DATABASE_URL=' "${MIGRATED_ENV}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
@@ -421,7 +453,7 @@ e2e_assert_contains "am --version resolves to Rust binary" "${VERSION_OUT}" "${T
 e2e_assert_not_contains "am --version is not Python" "${VERSION_OUT}" "python"
 
 ZSHRC_CONTENT="$(cat "${TEST_HOME}/.zshrc" 2>/dev/null || true)"
-if grep -Eq '^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\(\))' "${TEST_HOME}/.zshrc"; then
+if grep -Eq '^[[:space:]]*(alias am=|alias am |function am($|[[:space:](])|am[[:space:]]*\(\))' "${TEST_HOME}/.zshrc"; then
     e2e_fail "active python alias/function removed from .zshrc"
 else
     e2e_pass "active python alias/function removed from .zshrc"
@@ -545,7 +577,13 @@ fi
 # Token parity check: migrated env + MCP config should still reference legacy token.
 e2e_assert_file_exists "migrated env config exists" "${MIGRATED_ENV}"
 MIGRATED_TOKEN="$(grep -E '^HTTP_BEARER_TOKEN=' "${MIGRATED_ENV}" | head -1 | cut -d= -f2-)"
+MIGRATED_DB_CFG="$(grep -E '^DATABASE_URL=' "${MIGRATED_ENV}" | head -1 | cut -d= -f2-)"
+MIGRATED_STORAGE_CFG="$(grep -E '^STORAGE_ROOT=' "${MIGRATED_ENV}" | head -1 | cut -d= -f2-)"
+MIGRATED_TUI_CFG="$(grep -E '^TUI_ENABLED=' "${MIGRATED_ENV}" | head -1 | cut -d= -f2-)"
 e2e_assert_eq "bearer token preserved in migrated env config" "${LEGACY_TOKEN}" "${MIGRATED_TOKEN}"
+e2e_assert_eq "existing rust config DATABASE_URL updated to adopted db path" "sqlite:///${PREEXISTING_RUST_DB}" "${MIGRATED_DB_CFG}"
+e2e_assert_eq "existing rust config STORAGE_ROOT preserved at adopted rust root" "${PREEXISTING_RUST_ROOT}" "${MIGRATED_STORAGE_CFG}"
+e2e_assert_eq "existing non-path rust config values preserved" "false" "${MIGRATED_TUI_CFG}"
 
 if json_query "${UPDATED_CONFIG}" "entry=d['mcpServers']['mcp-agent-mail']; auth=((entry.get('headers') or {}).get('Authorization','')); env=((entry.get('env') or {}).get('HTTP_BEARER_TOKEN','')); assert ('${LEGACY_TOKEN}' in auth) or (env == '${LEGACY_TOKEN}')"; then
     e2e_pass "MCP config carries legacy bearer token"
@@ -554,7 +592,95 @@ else
 fi
 
 # ===========================================================================
-# Case 6: Doctor + backup artifacts + Git health
+# Case 6: Already-loaded legacy shell function hands off to Rust immediately
+# ===========================================================================
+e2e_case_banner "stale in-memory legacy shell function hands off to Rust without shell reload"
+STALE_ALIAS_VERSION_FILE="${WORK}/case_06_stale_alias_version.txt"
+STALE_ALIAS_PROJECTS_FILE="${WORK}/case_06_stale_alias_projects.json"
+OLD_PATH="${PATH}"
+set +e
+PATH="${DEST}:${PATH_BASE}"
+am --version >"${STALE_ALIAS_VERSION_FILE}" 2>&1
+STALE_ALIAS_VERSION_RC=$?
+PATH="${DEST}:${PATH_BASE}"
+am list-projects --json >"${STALE_ALIAS_PROJECTS_FILE}" 2>&1
+STALE_ALIAS_PROJECTS_RC=$?
+PATH="${OLD_PATH}"
+set -e
+cd "${RUN_DIR}"
+
+STALE_ALIAS_VERSION="$(cat "${STALE_ALIAS_VERSION_FILE}" 2>/dev/null || true)"
+STALE_ALIAS_PROJECTS="$(cat "${STALE_ALIAS_PROJECTS_FILE}" 2>/dev/null || true)"
+e2e_save_artifact "case_06_stale_alias_version.txt" "${STALE_ALIAS_VERSION}"
+e2e_save_artifact "case_06_stale_alias_projects.json" "${STALE_ALIAS_PROJECTS}"
+e2e_assert_exit_code "stale shell function version handoff exits cleanly" "0" "${STALE_ALIAS_VERSION_RC}"
+e2e_assert_contains "stale shell function now resolves to Rust am" "${STALE_ALIAS_VERSION}" "${TARGET_VERSION}"
+e2e_assert_not_contains "stale shell function no longer runs legacy python helper" "${STALE_ALIAS_VERSION}" "LEGACY_PYTHON_HELPER_STILL_ACTIVE"
+e2e_assert_exit_code "stale shell function project listing exits cleanly" "0" "${STALE_ALIAS_PROJECTS_RC}"
+if json_query "${STALE_ALIAS_PROJECTS}" "assert any(p.get('human_key') == '/tmp/legacy-project' for p in d)"; then
+    e2e_pass "stale shell function handoff can read migrated Rust data immediately"
+else
+    e2e_fail "stale shell function handoff can read migrated Rust data immediately"
+fi
+unset -f am
+
+# ===========================================================================
+# Case 6b: i64 legacy DB is still adopted automatically
+# ===========================================================================
+e2e_case_banner "installer adopts already-normalized legacy sqlite data automatically"
+MAIN_INSTALL_RC="${INSTALL_RC}"
+MAIN_INSTALL_STDOUT="${INSTALL_STDOUT}"
+MAIN_INSTALL_STDERR="${INSTALL_STDERR}"
+I64_HOME="${WORK}/i64_home"
+I64_RUN_DIR="${WORK}/i64_project"
+I64_DEST="${I64_HOME}/.local/bin"
+I64_STORAGE_ROOT="${I64_HOME}/.mcp_agent_mail_git_mailbox_repo"
+I64_PYTHON_CLONE="${I64_HOME}/legacy_python_clone"
+I64_PYTHON_DB="${I64_PYTHON_CLONE}/storage.sqlite3"
+I64_CONFIG_ENV="${I64_HOME}/.config/mcp-agent-mail/config.env"
+mkdir -p "${I64_RUN_DIR}" "${I64_DEST}" "${I64_STORAGE_ROOT}" "${I64_PYTHON_CLONE}/src/mcp_agent_mail" "${I64_PYTHON_CLONE}/scripts" "${I64_HOME}/.config/mcp-agent-mail"
+cp -p "${MIGRATED_DB_SNAPSHOT}" "${I64_PYTHON_DB}"
+cat > "${I64_PYTHON_CLONE}/pyproject.toml" <<'EOF'
+[project]
+name = "mcp_agent_mail"
+version = "0.0.0"
+EOF
+cat > "${I64_PYTHON_CLONE}/src/mcp_agent_mail/__init__.py" <<'EOF'
+__all__ = []
+EOF
+cat > "${I64_PYTHON_CLONE}/scripts/run_server_with_token.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "LEGACY_I64_HELPER_STILL_ACTIVE" >&2
+exit 23
+EOF
+chmod +x "${I64_PYTHON_CLONE}/scripts/run_server_with_token.sh"
+cat > "${I64_PYTHON_CLONE}/.env" <<EOF
+DATABASE_URL=sqlite+aiosqlite:///${I64_PYTHON_DB}
+HTTP_BEARER_TOKEN=${LEGACY_TOKEN}
+STORAGE_ROOT=${I64_PYTHON_CLONE}
+EOF
+cat > "${I64_HOME}/.zshrc" <<EOF
+# >>> MCP Agent Mail alias
+am() {
+  cd "${I64_PYTHON_CLONE}" && scripts/run_server_with_token.sh "\$@"
+}
+# <<< MCP Agent Mail alias
+EOF
+run_installer "case_06b_i64_install" "${I64_RUN_DIR}" "${I64_HOME}" "${I64_DEST}" "${I64_STORAGE_ROOT}"
+e2e_assert_exit_code "i64 legacy install exits cleanly" "0" "${INSTALL_RC}"
+I64_ADOPTED_DB="${I64_STORAGE_ROOT}/storage.sqlite3"
+e2e_assert_file_exists "i64 legacy db copied into rust storage root" "${I64_ADOPTED_DB}"
+I64_SUBJECT="$(sqlite3 "${I64_ADOPTED_DB}" "SELECT subject FROM messages WHERE id=1;" 2>/dev/null || true)"
+e2e_assert_eq "i64 legacy db preserves migrated message content" "Legacy migration message" "${I64_SUBJECT}"
+e2e_assert_file_exists "i64 takeover writes rust config env" "${I64_CONFIG_ENV}"
+I64_DB_CFG="$(grep -E '^DATABASE_URL=' "${I64_CONFIG_ENV}" | head -1 | cut -d= -f2-)"
+e2e_assert_eq "i64 takeover rust config points at adopted db" "sqlite:///${I64_ADOPTED_DB}" "${I64_DB_CFG}"
+INSTALL_RC="${MAIN_INSTALL_RC}"
+INSTALL_STDOUT="${MAIN_INSTALL_STDOUT}"
+INSTALL_STDERR="${MAIN_INSTALL_STDERR}"
+
+# ===========================================================================
+# Case 7: Doctor + backup artifacts + Git health
 # ===========================================================================
 e2e_case_banner "doctor health, backup artifacts, and storage git integrity"
 set +e
@@ -595,7 +721,7 @@ else
 fi
 
 # ===========================================================================
-# Case 7: Docker harness definition exists (optional build smoke)
+# Case 8: Docker harness definition exists (optional build smoke)
 # ===========================================================================
 e2e_case_banner "docker harness file is present for containerized migration runs"
 DOCKERFILE_PATH="${SCRIPT_DIR}/Dockerfile.migration"

@@ -467,6 +467,8 @@ PYTHON_DB_PROBE_OUTPUT=""
 MIGRATED_BEARER_TOKEN=""
 RUST_DB_PATH=""
 PYTHON_ALIAS_DISPLACED_COUNT=0
+PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE=1
+LEGACY_LAUNCHER_SHIM_COUNT=0
 
 # T1.1: Detect Python am alias in shell rc files
 detect_python_alias() {
@@ -543,7 +545,7 @@ detect_python_alias() {
       local marker_payload
       marker_payload=$(sed -n '/# >>> MCP Agent Mail/,/# <<< MCP Agent Mail/p' "$rc")
       local active_entry
-      active_entry=$(printf '%s\n' "$marker_payload" | grep -E "^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\\(\\))" | head -1 || true)
+      active_entry=$(printf '%s\n' "$marker_payload" | grep -E "^[[:space:]]*(alias am=|alias am |function am($|[[:space:](])|am[[:space:]]*\\(\\))" | head -1 || true)
 
       if [ -n "$active_entry" ]; then
         PYTHON_ALIAS_FOUND=1
@@ -551,7 +553,7 @@ detect_python_alias() {
         PYTHON_ALIAS_HAS_MARKERS=1
         PYTHON_ALIAS_LINE="$marker_line"
         PYTHON_ALIAS_CONTENT="$active_entry"
-        if echo "$active_entry" | grep -qE "^[[:space:]]*(function am[[:space:](]|am[[:space:]]*\\(\\))"; then
+        if echo "$active_entry" | grep -qE "^[[:space:]]*(function am($|[[:space:](])|am[[:space:]]*\\(\\))"; then
           PYTHON_ALIAS_KIND="function"
         else
           PYTHON_ALIAS_KIND="alias"
@@ -584,7 +586,7 @@ detect_python_alias() {
     # Check for function definition: "function am()" or "am()" (bash/zsh)
     # Or "function am" (fish)
     local func_line=""
-    func_line=$(grep -n -E "^[[:space:]]*(function am[[:space:](]|am[[:space:]]*\(\))" "$rc" 2>/dev/null | grep -v "^[[:space:]]*#" | head -1 || true)
+    func_line=$(grep -n -E "^[[:space:]]*(function am($|[[:space:](])|am[[:space:]]*\(\))" "$rc" 2>/dev/null | grep -v "^[[:space:]]*#" | head -1 || true)
     if [ -n "$func_line" ]; then
       local line_content
       line_content=$(echo "$func_line" | cut -d: -f2-)
@@ -601,6 +603,53 @@ detect_python_alias() {
     fi
   done
   verbose "detect_python_alias:not_found"
+}
+
+python_alias_entry_body() {
+  [ "$PYTHON_ALIAS_FOUND" -eq 1 ] || return 1
+  [ -n "${PYTHON_ALIAS_FILE:-}" ] || return 1
+  [ -f "$PYTHON_ALIAS_FILE" ] || return 1
+
+  if [ "$PYTHON_ALIAS_HAS_MARKERS" -eq 1 ]; then
+    sed -n '/# >>> MCP Agent Mail/,/# <<< MCP Agent Mail/p' "$PYTHON_ALIAS_FILE" 2>/dev/null || true
+    return 0
+  fi
+
+  if [ "${PYTHON_ALIAS_KIND:-alias}" = "function" ] && [ "${PYTHON_ALIAS_LINE:-0}" -gt 0 ]; then
+    sed -n "${PYTHON_ALIAS_LINE},$((PYTHON_ALIAS_LINE + 20))p" "$PYTHON_ALIAS_FILE" 2>/dev/null || true
+    return 0
+  fi
+
+  printf '%s\n' "${PYTHON_ALIAS_CONTENT:-}"
+}
+
+python_alias_targets_rewritable_helper() {
+  [ "$PYTHON_CLONE_FOUND" -eq 1 ] || return 1
+  [ -n "${PYTHON_CLONE_PATH:-}" ] || return 1
+
+  local alias_body=""
+  local expected_helper="${PYTHON_CLONE_PATH%/}/scripts/run_server_with_token.sh"
+  local helper_path=""
+  local clone_path=""
+
+  alias_body="$(python_alias_entry_body 2>/dev/null || true)"
+  [ -z "$alias_body" ] && alias_body="${PYTHON_ALIAS_CONTENT:-}"
+  [ -n "$alias_body" ] || return 1
+
+  helper_path=$(printf '%s\n' "$alias_body" | sed -n "s|.*['\"]\{0,1\}\([^\"'[:space:]]*/scripts/run_server_with_token\\.sh\).*|\1|p" | tail -1)
+  helper_path="${helper_path/#\~/$HOME}"
+  if [ -n "$helper_path" ] && [ "${helper_path%/}" = "${expected_helper%/}" ]; then
+    return 0
+  fi
+
+  clone_path=$(printf '%s\n' "$alias_body" | sed -n "s/.*cd [\"']*\([^\"';&|]*\)[\"']*.*/\1/p" | tail -1)
+  clone_path="${clone_path/#\~/$HOME}"
+  if [ -n "$clone_path" ] && [ "${clone_path%/}" = "${PYTHON_CLONE_PATH%/}" ]; then
+    printf '%s\n' "$alias_body" | grep -Eq '(^|[[:space:];&|])(\./)?scripts/run_server_with_token\.sh([[:space:];&|)"'"'"'$]|$)'
+    return $?
+  fi
+
+  return 1
 }
 
 # T1.2: Detect Python am binary/script in PATH
@@ -704,6 +753,72 @@ extract_migrate_check_format() {
   printf "%s\n" "$output" | sed -n 's/^Database format: //p' | head -1
 }
 
+strip_wrapping_quotes() {
+  local value="${1:-}"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  printf '%s\n' "$value"
+}
+
+trim_ascii_whitespace() {
+  local value="${1:-}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
+}
+
+parse_env_assignment_rhs() {
+  local raw
+  raw=$(trim_ascii_whitespace "${1:-}")
+
+  local out=""
+  local quote=""
+  local prev=""
+  local char=""
+  local i=0
+  local raw_len=${#raw}
+
+  while [ "$i" -lt "$raw_len" ]; do
+    char="${raw:$i:1}"
+    if [ -n "$quote" ]; then
+      out="${out}${char}"
+      if [ "$char" = "$quote" ]; then
+        quote=""
+      fi
+    else
+      if [ "$char" = '"' ] || [ "$char" = "'" ]; then
+        quote="$char"
+        out="${out}${char}"
+      elif [ "$char" = "#" ]; then
+        if [ -z "$prev" ] || [[ "$prev" =~ [[:space:]] ]]; then
+          break
+        fi
+        out="${out}${char}"
+      else
+        out="${out}${char}"
+      fi
+    fi
+    prev="$char"
+    i=$((i + 1))
+  done
+
+  out=$(trim_ascii_whitespace "$out")
+  strip_wrapping_quotes "$out"
+}
+
+read_env_assignment_value() {
+  local file="$1"
+  local key="$2"
+  local value=""
+
+  [ -f "$file" ] || return 0
+  value=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//" || true)
+  [ -n "$value" ] || return 0
+  parse_env_assignment_rhs "$value"
+}
+
 python_db_format_needs_import() {
   local format="$1"
   case "$format" in
@@ -712,10 +827,91 @@ python_db_format_needs_import() {
   esac
 }
 
+probe_database_format_with_sqlite() {
+  local db_path="$1"
+  local saw_integer=0
+  local saw_text=0
+  local saw_rows=0
+  local text_tables=""
+  local table=""
+  local column=""
+  local type_str=""
+  local row_present=""
+  local type_query=""
+  local row_query=""
+
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  [ -f "$db_path" ] || return 1
+
+  while IFS=: read -r table column; do
+    sqlite3 "$db_path" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='${table}' LIMIT 1;" >/dev/null 2>&1 || continue
+    sqlite3 "$db_path" "SELECT 1 FROM pragma_table_info('${table}') WHERE name='${column}' LIMIT 1;" >/dev/null 2>&1 || continue
+
+    row_query="SELECT 1 FROM ${table} LIMIT 1;"
+    row_present=$(sqlite3 "$db_path" "$row_query" 2>/dev/null | head -1 || true)
+    [ -n "$row_present" ] && saw_rows=1
+
+    type_query="SELECT typeof(${column}) FROM ${table} WHERE ${column} IS NOT NULL LIMIT 1;"
+    type_str=$(sqlite3 "$db_path" "$type_query" 2>/dev/null | head -1 || true)
+    case "$type_str" in
+      integer|real)
+        saw_integer=1
+        ;;
+      text)
+        saw_text=1
+        case ",${text_tables}," in
+          *",${table},"*) ;;
+          *) text_tables="${text_tables}${text_tables:+, }${table}" ;;
+        esac
+        ;;
+      *)
+        ;;
+    esac
+  done <<'EOF'
+projects:created_at
+products:created_at
+product_project_links:created_at
+agents:inception_ts
+agents:last_active_ts
+messages:created_ts
+message_recipients:read_ts
+message_recipients:ack_ts
+file_reservations:created_ts
+file_reservations:expires_ts
+file_reservations:released_ts
+agent_links:created_ts
+agent_links:updated_ts
+agent_links:expires_ts
+project_sibling_suggestions:created_ts
+project_sibling_suggestions:evaluated_ts
+project_sibling_suggestions:confirmed_ts
+project_sibling_suggestions:dismissed_ts
+EOF
+
+  if [ "$saw_text" -eq 1 ] && [ "$saw_integer" -eq 0 ]; then
+    PYTHON_DB_FORMAT="TEXT timestamps (installer sqlite fallback, needs migration)"
+    return 0
+  fi
+  if [ "$saw_text" -eq 1 ] && [ "$saw_integer" -eq 1 ]; then
+    PYTHON_DB_FORMAT="mixed format (TEXT in: ${text_tables})"
+    return 0
+  fi
+  if [ "$saw_integer" -eq 1 ]; then
+    PYTHON_DB_FORMAT="i64 microseconds (installer sqlite fallback)"
+    return 0
+  fi
+  if [ "$saw_rows" -eq 1 ]; then
+    PYTHON_DB_FORMAT="unknown format: existing rows without readable timestamp columns"
+    return 0
+  fi
+
+  return 1
+}
+
 probe_database_format_with_installed_am() {
   local db_path="$1"
   local cli_bin="${DEST}/${BIN_CLI}"
-  local output="" fallback_output=""
+  local output="" fallback_output="" cli_format=""
   PYTHON_DB_FORMAT=""
   PYTHON_DB_PROBE_OUTPUT=""
 
@@ -745,7 +941,24 @@ probe_database_format_with_installed_am() {
   fi
 
   PYTHON_DB_PROBE_OUTPUT="$output"
-  if [ -n "$PYTHON_DB_FORMAT" ]; then
+  cli_format="$PYTHON_DB_FORMAT"
+
+  if [ -n "$cli_format" ] && [ "${cli_format#empty database (}" = "$cli_format" ]; then
+    verbose "db_probe:format db=${db_path} format=${PYTHON_DB_FORMAT}"
+    return 0
+  fi
+
+  if probe_database_format_with_sqlite "$db_path"; then
+    if [ -n "$cli_format" ] && [ "$cli_format" != "$PYTHON_DB_FORMAT" ]; then
+      verbose "db_probe:sqlite_override db=${db_path} cli_format=${cli_format} sqlite_format=${PYTHON_DB_FORMAT}"
+    else
+      verbose "db_probe:sqlite_format db=${db_path} format=${PYTHON_DB_FORMAT}"
+    fi
+    return 0
+  fi
+
+  if [ -n "$cli_format" ]; then
+    PYTHON_DB_FORMAT="$cli_format"
     verbose "db_probe:format db=${db_path} format=${PYTHON_DB_FORMAT}"
     return 0
   fi
@@ -774,13 +987,21 @@ detect_python_installation() {
 
   # If we found an alias, extract the path from it
   if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && [ -n "$PYTHON_ALIAS_CONTENT" ]; then
+    local alias_payload
+    alias_payload="$(python_alias_entry_body 2>/dev/null || true)"
+    [ -z "$alias_payload" ] && alias_payload="$PYTHON_ALIAS_CONTENT"
     local alias_path
     # Extract path from patterns like: alias am='cd "/path/to/dir" && ...'
-    alias_path=$(echo "$PYTHON_ALIAS_CONTENT" | sed -n "s/.*cd [\"']*\([^\"'&]*\)[\"']*.*/\1/p")
+    alias_path=$(printf '%s\n' "$alias_payload" | sed -n "s/.*cd [\"']*\([^\"'&]*\)[\"']*.*/\1/p" | head -1)
     [ -n "$alias_path" ] && candidates+=("$alias_path")
     # Also try: alias am='cd /path/to/dir && ...'
-    alias_path=$(echo "$PYTHON_ALIAS_CONTENT" | sed -n 's/.*cd \([^ &"'"'"']*\).*/\1/p')
+    alias_path=$(printf '%s\n' "$alias_payload" | sed -n 's/.*cd \([^ &"'"'"']*\).*/\1/p' | head -1)
     [ -n "$alias_path" ] && candidates+=("$alias_path")
+    # If the helper path itself is referenced directly, infer the clone root from it.
+    alias_path=$(printf '%s\n' "$alias_payload" | sed -n "s|.*['\"]\{0,1\}\([^\"'[:space:]]*/scripts/run_server_with_token\\.sh\).*|\1|p" | head -1)
+    if [ -n "$alias_path" ]; then
+      candidates+=("$(dirname "$(dirname "$alias_path")")")
+    fi
   fi
 
   for dir in "${candidates[@]}"; do
@@ -988,10 +1209,15 @@ displace_python_alias() {
   local displaced=0
 
   PYTHON_ALIAS_DISPLACED_COUNT=0
+  PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE=1
 
   while [ "$pass" -lt "$max_passes" ]; do
     detect_python_alias
     [ "$PYTHON_ALIAS_FOUND" -eq 1 ] || break
+
+    if ! python_alias_targets_rewritable_helper; then
+      PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE=0
+    fi
 
     if ! displace_single_python_alias; then
       warn "Failed to disable one of the detected 'am' alias/function entries."
@@ -1011,7 +1237,12 @@ displace_python_alias() {
     return 1
   fi
 
-  if [ "$PYTHON_ALIAS_DISPLACED_COUNT" -gt 0 ]; then
+  if [ "$PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE" -eq 1 ] && \
+     { [ "$PYTHON_CLONE_FOUND" -ne 1 ] || [ -z "${PYTHON_CLONE_PATH:-}" ]; }; then
+    PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE=0
+  fi
+
+  if [ "$PYTHON_ALIAS_DISPLACED_COUNT" -gt 0 ] && [ "$PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE" -eq 0 ]; then
     warn "If this shell already loaded an old 'am' alias/function, clear it now:"
     warn "  unalias am 2>/dev/null || true"
     warn "  unset -f am 2>/dev/null || true"
@@ -1094,6 +1325,127 @@ EOF
   if [ "$displaced_count" -eq 0 ]; then
     verbose "displace_python_binary:no_displacements"
   fi
+}
+
+install_legacy_launcher_takeover_shims() {
+  LEGACY_LAUNCHER_SHIM_COUNT=0
+
+  [ "$PYTHON_CLONE_FOUND" -eq 1 ] || return 0
+  [ -n "${PYTHON_CLONE_PATH:-}" ] || return 0
+
+  local helper_path="${PYTHON_CLONE_PATH}/scripts/run_server_with_token.sh"
+  local helper_dir
+  helper_dir=$(dirname "$helper_path")
+
+  if [ ! -d "$helper_dir" ]; then
+    if ! mkdir -p "$helper_dir"; then
+      warn "Failed to create legacy helper directory for current-shell takeover: $helper_dir"
+      return 1
+    fi
+  fi
+
+  if [ -e "$helper_path" ] && [ ! -w "$helper_path" ]; then
+    warn "Cannot replace legacy helper launcher (not writable): $helper_path"
+    return 1
+  fi
+  if [ ! -w "$helper_dir" ]; then
+    warn "Cannot write legacy helper launcher directory: $helper_dir"
+    return 1
+  fi
+
+  local timestamp
+  timestamp=$(date +%Y%m%d_%H%M%S)
+  local backup=""
+  if [ -f "$helper_path" ]; then
+    backup="${helper_path}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
+    if ! cp -p "$helper_path" "$backup"; then
+      warn "Failed to backup legacy helper launcher before takeover: $helper_path"
+      return 1
+    fi
+    info "Backed up legacy helper $helper_path -> $backup"
+  fi
+
+  local tmpfile="${helper_path}.tmp.mcp-agent-mail.$$"
+  cat > "$tmpfile" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+AM_RUST_BIN="${DEST}/${BIN_CLI}"
+AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/config.env"
+
+trim_ascii_whitespace() {
+  local value="\${1:-}"
+  value="\${value#\"\${value%%[![:space:]]*}\"}"
+  value="\${value%\"\${value##*[![:space:]]}\"}"
+  printf '%s\n' "\$value"
+}
+
+load_env_key() {
+  local key="\$1"
+  [ -f "\$AM_RUST_ENV_FILE" ] || return 0
+
+  local raw
+  raw=\$(grep -E "^[[:space:]]*(export[[:space:]]+)?\${key}[[:space:]]*=" "\$AM_RUST_ENV_FILE" 2>/dev/null | tail -1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?\${key}[[:space:]]*=[[:space:]]*//" || true)
+  [ -n "\$raw" ] || return 0
+
+  raw=\$(trim_ascii_whitespace "\$raw")
+  local parsed="" quote="" prev="" char=""
+  local raw_len=\${#raw}
+  local i=0
+  while [ "\$i" -lt "\$raw_len" ]; do
+    char="\${raw:\$i:1}"
+    if [ -n "\$quote" ]; then
+      parsed="\${parsed}\${char}"
+      if [ "\$char" = "\$quote" ]; then
+        quote=""
+      fi
+    else
+      if [ "\$char" = '"' ] || [ "\$char" = "'" ]; then
+        quote="\$char"
+        parsed="\${parsed}\${char}"
+      elif [ "\$char" = "#" ]; then
+        if [ -z "\$prev" ] || [[ "\$prev" =~ [[:space:]] ]]; then
+          break
+        fi
+        parsed="\${parsed}\${char}"
+      else
+        parsed="\${parsed}\${char}"
+      fi
+    fi
+    prev="\$char"
+    i=\$((i + 1))
+  done
+
+  raw=\$(trim_ascii_whitespace "\$parsed")
+  raw="\${raw%\"}"
+  raw="\${raw#\"}"
+  raw="\${raw%\\'}"
+  raw="\${raw#\\'}"
+  export "\${key}=\${raw}"
+}
+
+for key in DATABASE_URL STORAGE_ROOT HTTP_HOST HTTP_PORT HTTP_PATH HTTP_BEARER_TOKEN TUI_ENABLED LLM_ENABLED LLM_DEFAULT_MODEL WORKTREES_ENABLED; do
+  load_env_key "\$key"
+done
+
+if [ ! -x "\$AM_RUST_BIN" ]; then
+  echo "mcp-agent-mail Rust CLI not found at \$AM_RUST_BIN" >&2
+  exit 1
+fi
+
+exec "\$AM_RUST_BIN" "\$@"
+EOF
+  chmod 0755 "$tmpfile"
+  if ! mv "$tmpfile" "$helper_path"; then
+    warn "Failed to install legacy helper takeover shim at: $helper_path"
+    rm -f "$tmpfile" 2>/dev/null || true
+    return 1
+  fi
+
+  ok "Legacy helper now hands off to Rust at $helper_path"
+  [ -n "$backup" ] && ok "Backup at $backup"
+  LEGACY_LAUNCHER_SHIM_COUNT=1
+  return 0
 }
 
 # T1.5: Stop running Python server processes
@@ -1221,7 +1573,7 @@ resolve_database_path() {
   local rust_env="$HOME/.config/mcp-agent-mail/config.env"
   if [ -f "$rust_env" ]; then
     local cfg_db_url cfg_db_path cfg_storage_root
-    cfg_db_url=$(grep -E '^[[:space:]]*DATABASE_URL=' "$rust_env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+    cfg_db_url=$(read_env_assignment_value "$rust_env" "DATABASE_URL")
     if [ -n "$cfg_db_url" ]; then
       cfg_db_path=$(echo "$cfg_db_url" | sed -n 's|^sqlite[^:]*:///||p')
       cfg_db_path="${cfg_db_path/#\~/$HOME}"
@@ -1232,7 +1584,7 @@ resolve_database_path() {
       fi
     fi
     if [ -z "$RUST_DB_PATH" ]; then
-      cfg_storage_root=$(grep -E '^[[:space:]]*STORAGE_ROOT=' "$rust_env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+      cfg_storage_root=$(read_env_assignment_value "$rust_env" "STORAGE_ROOT")
       if [ -n "$cfg_storage_root" ]; then
         cfg_storage_root="${cfg_storage_root/#\~/$HOME}"
         case "$cfg_storage_root" in
@@ -1276,6 +1628,7 @@ resolve_database_path() {
   local env_files=(
     "$HOME/mcp_agent_mail/.env"
     "$HOME/mcp-agent-mail/.env"
+    "$HOME/.mcp_agent_mail/.env"
     "$HOME/.env"
   )
   [ "$PYTHON_CLONE_FOUND" -eq 1 ] && [ -n "$PYTHON_CLONE_PATH" ] && env_files+=("$PYTHON_CLONE_PATH/.env")
@@ -1283,7 +1636,7 @@ resolve_database_path() {
   for env_file in "${env_files[@]}"; do
     if [ -f "$env_file" ]; then
       local db_url
-      db_url=$(grep -E '^DATABASE_URL=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- || true)
+      db_url=$(read_env_assignment_value "$env_file" "DATABASE_URL")
       if [ -n "$db_url" ]; then
         local env_path
         env_path=$(echo "$db_url" | sed -n 's|^sqlite[^:]*:///||p')
@@ -1313,12 +1666,12 @@ resolve_database_path() {
           continue
         fi
         case "$PYTHON_DB_FORMAT" in
-          TEXT\ timestamps\ \(*|mixed\ format\ \(*)
+          TEXT\ timestamps\ \(*|mixed\ format\ \(*|i64\ microseconds\ \(*)
             PYTHON_DB_FOUND=1
             PYTHON_DB_PATH="$candidate"
             break
             ;;
-          i64\ microseconds\ \(*|empty\ database\ \(*)
+          empty\ database\ \(*)
             verbose "resolve_database_path:skip_non_migratable candidate=${candidate} format=${PYTHON_DB_FORMAT}"
             ;;
           *)
@@ -1331,7 +1684,7 @@ resolve_database_path() {
 
   if [ "$PYTHON_DB_FOUND" -eq 0 ]; then
     if [ "$PYTHON_DETECTED" -eq 1 ]; then
-      info "No legacy Python timestamp database found that requires automatic import"
+      info "No legacy Python database snapshot found for automatic takeover"
     fi
     return 0
   fi
@@ -1405,30 +1758,47 @@ migrate_env_config() {
     fi
   done
 
-  if [ -z "$env_file" ]; then
-    return 0  # No .env found, nothing to migrate
-  fi
-
-  info "Found Python .env at: $env_file"
-
   # Rust config location
   local rust_config_dir="$HOME/.config/mcp-agent-mail"
   local rust_env="$rust_config_dir/config.env"
+  mkdir -p "$rust_config_dir"
 
-  # Don't overwrite if Rust config already exists
+  local source_env=""
+  local updating_existing=0
+  local legacy_http_bearer_token="${MIGRATED_BEARER_TOKEN:-}"
   if [ -f "$rust_env" ]; then
-    if [ -z "${MIGRATED_BEARER_TOKEN:-}" ]; then
-      MIGRATED_BEARER_TOKEN=$(grep -E '^[[:space:]]*HTTP_BEARER_TOKEN=' "$rust_env" 2>/dev/null | head -1 | cut -d= -f2- || true)
-      MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN%\"}"
-      MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN#\"}"
-      MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN%\'}"
-      MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN#\'}"
-    fi
-    info "Rust config already exists at $rust_env — preserving"
-    return 0
+    source_env="$rust_env"
+    updating_existing=1
+  elif [ -n "$env_file" ]; then
+    source_env="$env_file"
   fi
 
-  mkdir -p "$rust_config_dir"
+  if [ -n "$env_file" ]; then
+    info "Found Python .env at: $env_file"
+    if [ -z "$legacy_http_bearer_token" ]; then
+      legacy_http_bearer_token=$(read_env_assignment_value "$env_file" "HTTP_BEARER_TOKEN")
+    fi
+  fi
+  if [ -f "$rust_env" ] && [ -z "$legacy_http_bearer_token" ]; then
+    legacy_http_bearer_token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
+  fi
+  MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
+
+  if [ "$updating_existing" -eq 1 ]; then
+    local timestamp backup
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup="${rust_env}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
+    if ! cp -p "$rust_env" "$backup"; then
+      warn "Failed to back up existing Rust config before rewrite: $rust_env"
+      return 1
+    fi
+    info "Updating Rust config at $rust_env to adopt legacy Python data paths"
+    info "Backed up $rust_env -> $backup"
+  elif [ -n "$env_file" ]; then
+    info "Migrating Python .env config into $rust_env"
+  else
+    info "Writing Rust config at $rust_env with adopted legacy data paths"
+  fi
 
   # Vars that are compatible between Python and Rust
   local compat_vars="HTTP_HOST HTTP_PORT HTTP_PATH HTTP_BEARER_TOKEN STORAGE_ROOT DATABASE_URL TUI_ENABLED LLM_ENABLED LLM_DEFAULT_MODEL WORKTREES_ENABLED"
@@ -1436,21 +1806,30 @@ migrate_env_config() {
   local skip_pattern="^(SQLALCHEMY_|ALEMBIC_|UVICORN_|ASYNC_)"
   local seen_database_url=0
   local seen_storage_root=0
+  local seen_http_bearer_token=0
 
   local tmpfile="${rust_env}.tmp.$$"
   {
-    echo "# Migrated from Python .env: $env_file"
-    echo "# Migration date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ "$updating_existing" -eq 1 ]; then
+      echo "# Updated by Rust installer to adopt legacy Python data paths"
+    elif [ -n "$env_file" ]; then
+      echo "# Migrated from Python .env: $env_file"
+    else
+      echo "# Created by Rust installer during Python takeover"
+    fi
+    echo "# Update date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo ""
 
     while IFS= read -r line || [ -n "$line" ]; do
       # Skip comments and empty lines
-      case "$line" in
-        \#*|"") echo "$line"; continue;;
-      esac
+      if printf '%s\n' "$line" | grep -qE '^[[:space:]]*(#|$)'; then
+        echo "$line"
+        continue
+      fi
 
-      local key val
-      key="${line%%=*}"
+      local raw_key key val
+      raw_key="${line%%=*}"
+      key=$(printf '%s\n' "$raw_key" | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]+$//')
       val="${line#*=}"
 
       # Skip Python-specific vars
@@ -1472,17 +1851,23 @@ migrate_env_config() {
         continue
       fi
 
-      if [ "$key" = "HTTP_BEARER_TOKEN" ] && [ -z "${MIGRATED_BEARER_TOKEN:-}" ]; then
-        MIGRATED_BEARER_TOKEN="$val"
-        MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN%\"}"
-        MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN#\"}"
-        MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN%\'}"
-        MIGRATED_BEARER_TOKEN="${MIGRATED_BEARER_TOKEN#\'}"
+      if [ "$key" = "HTTP_BEARER_TOKEN" ]; then
+        seen_http_bearer_token=1
+        if [ -z "${legacy_http_bearer_token:-}" ]; then
+          legacy_http_bearer_token=$(strip_wrapping_quotes "$val")
+          MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
+        fi
+        if [ -n "${legacy_http_bearer_token:-}" ]; then
+          echo "HTTP_BEARER_TOKEN=$legacy_http_bearer_token"
+        else
+          echo "HTTP_BEARER_TOKEN=$val"
+        fi
+        continue
       fi
 
       # Pass through compatible vars as-is
       echo "$line"
-    done < "$env_file"
+    done < <(if [ -n "$source_env" ] && [ -f "$source_env" ]; then cat "$source_env"; fi)
 
     if [ "$seen_database_url" -eq 0 ]; then
       echo "DATABASE_URL=sqlite:///$RUST_DB_PATH"
@@ -1490,11 +1875,22 @@ migrate_env_config() {
     if [ "$seen_storage_root" -eq 0 ]; then
       echo "STORAGE_ROOT=$RUST_STORAGE_ROOT"
     fi
+    if [ "$seen_http_bearer_token" -eq 0 ] && [ -n "${legacy_http_bearer_token:-}" ]; then
+      echo "HTTP_BEARER_TOKEN=$legacy_http_bearer_token"
+    fi
   } > "$tmpfile"
+
+  if ! grep -qE '^[[:space:]]*HTTP_BEARER_TOKEN=' "$tmpfile" 2>/dev/null && [ -n "${legacy_http_bearer_token:-}" ]; then
+    printf '\nHTTP_BEARER_TOKEN=%s\n' "$legacy_http_bearer_token" >> "$tmpfile"
+  fi
 
   mv "$tmpfile" "$rust_env"
   chmod 600 "$rust_env"  # Restrict access (may contain tokens)
-  ok "Migrated .env config to $rust_env"
+  if [ "$updating_existing" -eq 1 ]; then
+    ok "Updated Rust config at $rust_env"
+  else
+    ok "Wrote Rust config to $rust_env"
+  fi
 }
 
 resolve_migrated_bearer_token() {
@@ -1506,11 +1902,7 @@ resolve_migrated_bearer_token() {
   local rust_env="$HOME/.config/mcp-agent-mail/config.env"
   if [ -f "$rust_env" ]; then
     local token
-    token=$(grep -E '^[[:space:]]*HTTP_BEARER_TOKEN=' "$rust_env" 2>/dev/null | head -1 | cut -d= -f2- || true)
-    token="${token%\"}"
-    token="${token#\"}"
-    token="${token%\'}"
-    token="${token#\'}"
+    token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
     printf '%s' "$token"
     return 0
   fi
@@ -4375,6 +4767,18 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   fi
 fi
 
+if [ "${MIGRATE_PYTHON:-0}" -eq 1 ] && [ "$PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE" -eq 1 ]; then
+  if ! install_legacy_launcher_takeover_shims; then
+    err "Failed to install the legacy current-shell handoff shim."
+    err "Without this shim, an already-loaded legacy 'am' alias may continue to run Python in the current shell."
+    error_support_hint
+    exit 1
+  fi
+  if [ "$LEGACY_LAUNCHER_SHIM_COUNT" -gt 0 ]; then
+    ok "Already-loaded legacy 'am' aliases that call run_server_with_token.sh now hand off to Rust automatically"
+  fi
+fi
+
 ensure_remote_http_client_readiness
 
 # T2.4: Post-install verification
@@ -4456,7 +4860,7 @@ verify_installation() {
   # 5. If Python was displaced, verify the alias is gone
   if [ "$PYTHON_DETECTED" -eq 1 ] && [ "${MIGRATE_PYTHON:-0}" -eq 1 ]; then
     if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && [ -n "$PYTHON_ALIAS_FILE" ]; then
-      if grep -qE "^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\\(\\))" "$PYTHON_ALIAS_FILE" 2>/dev/null; then
+      if grep -qE "^[[:space:]]*(alias am=|alias am |function am($|[[:space:](])|am[[:space:]]*\\(\\))" "$PYTHON_ALIAS_FILE" 2>/dev/null; then
         warn "VERIFY: Python 'am' alias/function still active in $PYTHON_ALIAS_FILE"
         issues=$((issues + 1))
       else
