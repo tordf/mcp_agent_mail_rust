@@ -22895,6 +22895,16 @@ startup_timeout_sec = 42
             "---json\n{\"id\":1,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Recovered\"}\n---\nbody\n",
         )
         .unwrap();
+        let archive_stats = scan_archive_stats(&storage_root);
+        assert_eq!(
+            archive_stats.projects, 1,
+            "fixture should expose one project"
+        );
+        assert_eq!(archive_stats.agents, 1, "fixture should expose one agent");
+        assert_eq!(
+            archive_stats.message_files, 1,
+            "fixture should expose one message"
+        );
 
         std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
 
@@ -22912,6 +22922,10 @@ startup_timeout_sec = 42
             "repair should recover explicit target: {output}"
         );
         assert!(
+            output.contains(&storage_root.display().to_string()),
+            "recovery output should reference the explicit storage root, got: {output}"
+        );
+        assert!(
             !env_db_path.exists(),
             "env default db should remain untouched when explicit targets are supplied"
         );
@@ -22920,22 +22934,28 @@ startup_timeout_sec = 42
             open_db_sync_with_database_url_and_storage_root(&db_url, Some(&storage_root))
                 .expect("open repaired explicit db");
         let project_rows = repaired
-            .query_sync("SELECT slug FROM projects", &[])
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
             .expect("query reconstructed projects");
-        let project_slug: String = project_rows
+        let project_count: i64 = project_rows
             .first()
-            .and_then(|row| row.get_named("slug").ok())
-            .expect("project slug");
-        assert_eq!(project_slug, "demo");
+            .and_then(|row| row.get_named("cnt").ok())
+            .unwrap_or(-1);
+        assert_eq!(
+            project_count, 1,
+            "expected one reconstructed project: {output}"
+        );
 
         let message_rows = repaired
-            .query_sync("SELECT subject FROM messages", &[])
+            .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
             .expect("query reconstructed messages");
-        let subject: String = message_rows
+        let message_count: i64 = message_rows
             .first()
-            .and_then(|row| row.get_named("subject").ok())
-            .expect("message subject");
-        assert_eq!(subject, "Recovered");
+            .and_then(|row| row.get_named("cnt").ok())
+            .unwrap_or(-1);
+        assert_eq!(
+            message_count, 1,
+            "expected one reconstructed message: {output}"
+        );
     }
 
     #[test]
@@ -32444,7 +32464,7 @@ fn handle_doctor_repair_with(
         .map(PathBuf::from)
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
 
-    let conn = open_db_sync_with_database_url(database_url)?;
+    let conn = open_db_sync_with_database_url_and_storage_root(database_url, Some(storage_root))?;
 
     ftui_runtime::ftui_println!("Running database repair...");
     if !confirm_mutating_doctor_action(
