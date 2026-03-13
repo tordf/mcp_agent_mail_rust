@@ -1559,18 +1559,66 @@ maybe_add_path() {
     *:"$DEST":*) dest_in_path=1 ;;
   esac
 
+  # Helper: idempotently add a PATH guard to a file (creates it if needed)
+  _ensure_path_in_file() {
+    local target="$1"
+    local guard_line='[ -d "'"$DEST"'" ] && case ":$PATH:" in *:"'"$DEST"'":*) ;; *) export PATH="'"$DEST"':$PATH" ;; esac'
+    # Check for the expanded path, $HOME form, and ~ form
+    if [ -e "$target" ]; then
+      local dest_home_form="${DEST/#$HOME/\$HOME}"
+      local dest_tilde_form="${DEST/#$HOME/\~}"
+      if grep -qF "$DEST" "$target" 2>/dev/null \
+         || grep -qF "$dest_home_form" "$target" 2>/dev/null \
+         || grep -qF "$dest_tilde_form" "$target" 2>/dev/null; then
+        verbose "maybe_add_path:already_in ${target}"
+        return 0
+      fi
+    fi
+    # Check parent directory is writable (for file creation) and file is writable (if exists)
+    local target_dir
+    target_dir=$(dirname "$target")
+    if [ -e "$target" ] && [ ! -w "$target" ]; then
+      verbose "maybe_add_path:not_writable ${target}"
+      return 0
+    fi
+    if [ ! -w "$target_dir" ]; then
+      verbose "maybe_add_path:dir_not_writable ${target_dir}"
+      return 0
+    fi
+    # Append with a blank line separator
+    { [ ! -s "$target" ] || echo ""; echo "# Ensure $DEST is in PATH"; echo "$guard_line"; } >> "$target"
+    verbose "maybe_add_path:appended guard to ${target}"
+    return 1  # signal that we made a change
+  }
+
   if [ "$EASY" -eq 1 ]; then
+    # Interactive shell rc files (zsh, bash)
+    local dest_home_form="${DEST/#$HOME/\$HOME}"
+    local dest_tilde_form="${DEST/#$HOME/\~}"
     for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
       if [ -e "$rc" ] && [ -w "$rc" ]; then
-        if ! grep -F "export PATH=\"$DEST:\$PATH\"" "$rc" >/dev/null 2>&1; then
+        if ! grep -qF "$DEST" "$rc" 2>/dev/null \
+           && ! grep -qF "$dest_home_form" "$rc" 2>/dev/null \
+           && ! grep -qF "$dest_tilde_form" "$rc" 2>/dev/null; then
           echo "export PATH=\"$DEST:\$PATH\"" >> "$rc"
           verbose "maybe_add_path:appended rc=${rc} export PATH=\"$DEST:\$PATH\""
           updated=1
         fi
       fi
     done
+
+    # Login/env files: .zshenv (ALL zsh instances), .profile (bash login shells)
+    # .zshenv is critical because zsh login shells (zsh -l) do NOT source .zshrc
+    for env_file in "$HOME/.zshenv" "$HOME/.profile"; do
+      if _ensure_path_in_file "$env_file"; then
+        : # already present
+      else
+        updated=1
+      fi
+    done
+
     if [ "$updated" -eq 1 ]; then
-      warn "PATH precedence updated in ~/.zshrc/.bashrc; restart shell to use Rust am/mcp-agent-mail"
+      warn "PATH updated in shell config files; restart shell to use Rust am/mcp-agent-mail"
       verbose "maybe_add_path:updated_shell_rc=1"
     elif [ "$dest_in_path" -eq 0 ]; then
       warn "Add $DEST to PATH to use am / mcp-agent-mail"
@@ -2936,7 +2984,7 @@ remove_installed_binaries() {
 }
 
 remove_path_exports() {
-  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.config/fish/config.fish")
+  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.zshenv" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.config/fish/config.fish")
   local removed=0
   local rc
   for rc in "${rc_files[@]}"; do
