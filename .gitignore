@@ -257,3 +257,6 @@ ubs-output.txt
 
 # Release build artifacts
 release-artifacts/
+
+# Codex CLI ephemeral target directories
+.codex-target-*/
