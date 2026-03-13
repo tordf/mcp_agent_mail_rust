@@ -97,6 +97,8 @@ pub fn generate_plan(
     inputs: &WizardInputs,
     env: Option<DetectedEnvironment>,
 ) -> PlanResult<DeploymentPlan> {
+    validate_inputs(inputs)?;
+
     // Validate and resolve bundle path
     let bundle_path = resolve_bundle_path(inputs)?;
 
@@ -1049,6 +1051,19 @@ mod tests {
         };
         let result = validate_inputs(&inputs);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn generate_plan_rejects_invalid_bundle_path_before_planning() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::GithubPages),
+            bundle_path: Some(PathBuf::from("/nonexistent/bundle")),
+            ..Default::default()
+        };
+
+        let err = generate_plan(&inputs, Some(DetectedEnvironment::default()))
+            .expect_err("invalid bundle path should fail before plan generation");
+        assert_eq!(err.code, WizardErrorCode::BundleNotFound);
     }
 
     #[test]
