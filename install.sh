@@ -3205,6 +3205,84 @@ check_installed_version() {
   return 1
 }
 
+EXISTING_INSTALL_REPAIR_REASON=""
+
+interactive_shell_am_descriptor() {
+  local shell_name
+  shell_name=$(basename "${SHELL:-/bin/sh}")
+
+  case "$shell_name" in
+    zsh)
+      zsh -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      ;;
+    bash)
+      bash -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      ;;
+    fish)
+      fish -i -c 'type -a am 2>/dev/null | head -1; or echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      ;;
+    *)
+      sh -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      ;;
+  esac
+}
+
+existing_rust_binaries_are_skip_safe() {
+  EXISTING_INSTALL_REPAIR_REASON=""
+
+  if [ ! -x "$DEST/$BIN_CLI" ]; then
+    EXISTING_INSTALL_REPAIR_REASON="$DEST/$BIN_CLI is missing or not executable"
+    return 1
+  fi
+  if [ ! -x "$DEST/$BIN_SERVER" ]; then
+    EXISTING_INSTALL_REPAIR_REASON="$DEST/$BIN_SERVER is missing or not executable"
+    return 1
+  fi
+
+  local cli_help=""
+  cli_help=$("$DEST/$BIN_CLI" --help 2>&1 || true)
+  if ! printf '%s\n' "$cli_help" | grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)'; then
+    EXISTING_INSTALL_REPAIR_REASON="'$DEST/$BIN_CLI --help' is missing the expected CLI surface"
+    return 1
+  fi
+
+  local server_help=""
+  server_help=$("$DEST/$BIN_SERVER" --help 2>&1 || true)
+  if ! printf '%s\n' "$server_help" | grep -qE '^Usage: mcp-agent-mail ' || \
+     ! printf '%s\n' "$server_help" | grep -qE '(^|[[:space:]])serve([[:space:]]|$)'; then
+    EXISTING_INSTALL_REPAIR_REASON="'$DEST/$BIN_SERVER --help' is missing the expected server surface"
+    return 1
+  fi
+
+  local actual_resolution=""
+  actual_resolution=$(interactive_shell_am_descriptor)
+  if [ -z "$actual_resolution" ] || [ "$actual_resolution" = "NOT_FOUND" ]; then
+    EXISTING_INSTALL_REPAIR_REASON="interactive shell cannot resolve 'am'"
+    return 1
+  fi
+  if printf '%s\n' "$actual_resolution" | grep -qiE 'alias|function'; then
+    EXISTING_INSTALL_REPAIR_REASON="interactive shell still resolves 'am' via ${actual_resolution}"
+    return 1
+  fi
+  if ! printf '%s\n' "$actual_resolution" | grep -Fq "$DEST/$BIN_CLI"; then
+    EXISTING_INSTALL_REPAIR_REASON="interactive shell resolves 'am' to ${actual_resolution}"
+    return 1
+  fi
+
+  return 0
+}
+
+existing_install_can_skip() {
+  EXISTING_INSTALL_REPAIR_REASON=""
+
+  if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 0 ]; then
+    EXISTING_INSTALL_REPAIR_REASON="legacy Python installation is still present and takeover/displacement has not been re-run"
+    return 1
+  fi
+
+  existing_rust_binaries_are_skip_safe
+}
+
 usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
@@ -3357,9 +3435,15 @@ detect_python
 
 # Check if already at target version (skip download if so, unless --force)
 if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
-  ok "mcp-agent-mail $VERSION is already installed at $DEST"
-  info "Use --force to reinstall"
-  exit 0
+  if existing_install_can_skip; then
+    ok "mcp-agent-mail $VERSION is already installed at $DEST"
+    info "Use --force to reinstall"
+    exit 0
+  fi
+
+  warn "Installed version matches $VERSION, but the existing install still needs repair."
+  [ -n "$EXISTING_INSTALL_REPAIR_REASON" ] && warn "  Reason: $EXISTING_INSTALL_REPAIR_REASON"
+  info "Continuing with reinstall/remediation instead of exiting early."
 fi
 
 # ── Install plan preview / dry-run / piped confirmation ─────────────────────
@@ -4345,58 +4429,28 @@ verify_installation() {
   fi
   verbose "verify_installation:surface_guard cli_ok=${cli_surface_ok} server_ok=${server_surface_ok}"
 
-  # 4. Check that 'am' resolves to the Rust binary in a login shell
-  local shell_name
-  shell_name=$(basename "${SHELL:-/bin/sh}")
-  local resolved_path
-  case "$shell_name" in
-    zsh)
-      resolved_path=$(zsh -l -c 'whence -p am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND")
-      ;;
-    bash)
-      resolved_path=$(bash -l -c 'type -P am 2>/dev/null || which am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND")
-      ;;
-    fish)
-      resolved_path=$(fish -l -c 'type -P am 2>/dev/null; or which am 2>/dev/null; or echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND")
-      ;;
-    *)
-      resolved_path=$(sh -l -c 'which am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND")
-      ;;
-  esac
-  verbose "verify_installation:path_resolution_result resolved=${resolved_path:-NOT_FOUND} expected=${DEST}/${BIN_CLI}"
+  # 4. Check that 'am' resolves to the Rust binary in an interactive shell.
+  local am_descriptor=""
+  am_descriptor=$(interactive_shell_am_descriptor)
+  verbose "verify_installation:path_resolution_result descriptor=${am_descriptor:-NOT_FOUND} expected=${DEST}/${BIN_CLI}"
 
-  if [ "$resolved_path" = "NOT_FOUND" ] || [ -z "$resolved_path" ]; then
-    warn "VERIFY: 'am' not found in login shell PATH"
+  if [ "$am_descriptor" = "NOT_FOUND" ] || [ -z "$am_descriptor" ]; then
+    warn "VERIFY: 'am' not found in interactive shell PATH"
     warn "  You may need to restart your shell or run: export PATH=\"$DEST:\$PATH\""
     issues=$((issues + 1))
-  elif [ "$resolved_path" != "$DEST/$BIN_CLI" ]; then
-    # Check if it's an alias shadowing the binary
-    local alias_check=""
-    case "$shell_name" in
-      zsh)
-        alias_check=$(zsh -l -c 'alias am 2>/dev/null || true' 2>/dev/null || true)
-        ;;
-      bash)
-        alias_check=$(bash -l -c 'alias am 2>/dev/null || true' 2>/dev/null || true)
-        ;;
-      fish)
-        alias_check=$(fish -l -c 'alias am 2>/dev/null || true' 2>/dev/null || true)
-        ;;
-      *)
-        alias_check=""
-        ;;
-    esac
-    if [ -n "$alias_check" ]; then
-      warn "VERIFY: 'am' is still aliased in your shell!"
-      warn "  Alias: $alias_check"
-      warn "  Expected: $DEST/$BIN_CLI"
-      warn "  Fix: restart your shell or run: unalias am"
-      issues=$((issues + 1))
-    else
-      info "VERIFY: 'am' resolves to $resolved_path (expected $DEST/$BIN_CLI)"
-    fi
+  elif printf '%s\n' "$am_descriptor" | grep -qiE 'alias|function'; then
+    warn "VERIFY: interactive shell still resolves 'am' via:"
+    warn "  $am_descriptor"
+    warn "  Expected binary: $DEST/$BIN_CLI"
+    warn "  Fix: restart your shell or run: unalias am"
+    issues=$((issues + 1))
+  elif ! printf '%s\n' "$am_descriptor" | grep -Fq "$DEST/$BIN_CLI"; then
+    warn "VERIFY: interactive shell resolves 'am' to:"
+    warn "  $am_descriptor"
+    warn "  Expected binary: $DEST/$BIN_CLI"
+    issues=$((issues + 1))
   else
-    ok "VERIFY: 'am' resolves to $DEST/$BIN_CLI"
+    ok "VERIFY: interactive shell resolves 'am' to $DEST/$BIN_CLI"
   fi
 
   # 5. If Python was displaced, verify the alias is gone

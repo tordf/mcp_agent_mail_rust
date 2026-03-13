@@ -22,6 +22,7 @@ DEST="${TEST_HOME}/.local/bin"
 STORAGE_ROOT="${TEST_HOME}/storage_root"
 MCP_CONFIG="${RUN_DIR}/codex.mcp.json"
 PATH_BASE="/usr/bin:/bin"
+TEST_SHELL="$(command -v zsh 2>/dev/null || command -v bash 2>/dev/null || echo /bin/sh)"
 
 mkdir -p "${RUN_DIR}" "${DEST}" "${TEST_HOME}/.config/fish"
 
@@ -57,6 +58,17 @@ case "\$cmd" in
   --version|-V|version)
     echo "am \${VERSION}"
     ;;
+  --help|-h|help)
+    cat <<'EOH'
+Usage: am [COMMAND]
+
+Commands:
+  serve-http
+  doctor
+  list-projects
+  migrate
+EOH
+    ;;
   doctor)
     echo "all green"
     ;;
@@ -83,6 +95,15 @@ case "\$cmd" in
   --version|-V|version)
     echo "mcp-agent-mail \${VERSION}"
     ;;
+  --help|-h|help)
+    cat <<'EOH'
+Usage: mcp-agent-mail [COMMAND]
+
+Commands:
+  serve
+  config
+EOH
+    ;;
   *)
     echo "mcp-agent-mail \${VERSION}"
     ;;
@@ -105,6 +126,7 @@ run_installer() {
     (
         cd "$RUN_DIR"
         HOME="$TEST_HOME" \
+        SHELL="$TEST_SHELL" \
         STORAGE_ROOT="$STORAGE_ROOT" \
         PATH="$PATH_BASE" \
         bash "$INSTALL_SH" \
@@ -260,7 +282,53 @@ set -e
 e2e_assert_exit_code "storage root git repo integrity preserved (second install)" "0" "$GIT_FSCK_RC_SECOND"
 
 # ===========================================================================
-# Case 3: Upgrade path v0.1.0 -> v0.1.1
+# Case 3: Same-version reinstall repairs active Python alias shadow
+# ===========================================================================
+e2e_case_banner "Same-version reinstall repairs active Python am shadow"
+
+printf "\nalias am='python -m mcp_agent_mail'\n" >> "${TEST_HOME}/.zshrc"
+printf "\nalias am='python -m mcp_agent_mail'\n" >> "${TEST_HOME}/.bashrc"
+
+run_installer "case_03_same_version_repairs_python_shadow" "0.1.0" "$ARTIFACT_V010"
+e2e_assert_exit_code "shadow-repair reinstall exits 0" "0" "$LAST_INSTALL_RC"
+e2e_assert_not_contains "shadow-repair reinstall does not short-circuit as healthy" "$LAST_INSTALL_STDOUT" "ok mcp-agent-mail v0.1.0 is already installed"
+e2e_assert_contains "shadow-repair reinstall explains repair requirement" "$LAST_INSTALL_STDOUT" "still needs repair"
+e2e_assert_contains "shadow-repair reinstall continues into remediation" "$LAST_INSTALL_STDOUT" "Continuing with reinstall/remediation instead of exiting early."
+e2e_assert_contains "shadow-repair reinstall disables python alias" "$LAST_INSTALL_STDOUT" "Python alias disabled in"
+e2e_assert_contains "shadow-repair reinstall prints current-shell cleanup hint" "$LAST_INSTALL_STDOUT" "unalias am 2>/dev/null || true"
+
+if grep -Eq '^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\(\))' "${TEST_HOME}/.zshrc"; then
+    e2e_fail "shadow-repair reinstall removed active python alias from .zshrc"
+else
+    e2e_pass "shadow-repair reinstall removed active python alias from .zshrc"
+fi
+
+if grep -Eq '^[[:space:]]*(alias am=|alias am |function am[[:space:](]|am[[:space:]]*\(\))' "${TEST_HOME}/.bashrc"; then
+    e2e_fail "shadow-repair reinstall removed active python alias from .bashrc"
+else
+    e2e_pass "shadow-repair reinstall removed active python alias from .bashrc"
+fi
+
+ZSH_ALIAS_DISABLE_COUNT_REPAIR="$(count_literal_in_file "${TEST_HOME}/.zshrc" "Disabled by mcp-agent-mail Rust installer: alias am='python -m mcp_agent_mail'")"
+BASH_ALIAS_DISABLE_COUNT_REPAIR="$(count_literal_in_file "${TEST_HOME}/.bashrc" "Disabled by mcp-agent-mail Rust installer: alias am='python -m mcp_agent_mail'")"
+e2e_assert_eq "shadow-repair reinstall comments zsh alias once" "1" "$ZSH_ALIAS_DISABLE_COUNT_REPAIR"
+e2e_assert_eq "shadow-repair reinstall comments bash alias once" "1" "$BASH_ALIAS_DISABLE_COUNT_REPAIR"
+
+set +e
+INTERACTIVE_RESOLUTION="$(
+    HOME="$TEST_HOME" \
+    SHELL="$TEST_SHELL" \
+    PATH="$PATH_BASE" \
+    "$TEST_SHELL" -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null
+)"
+INTERACTIVE_RESOLUTION_RC=$?
+set -e
+e2e_assert_exit_code "interactive shell resolution probe exits 0 after repair" "0" "$INTERACTIVE_RESOLUTION_RC"
+e2e_assert_contains "interactive shell resolves am to installed Rust binary after repair" "$INTERACTIVE_RESOLUTION" "$DEST/am"
+e2e_assert_not_contains "interactive shell no longer resolves am via alias after repair" "$INTERACTIVE_RESOLUTION" "alias"
+
+# ===========================================================================
+# Case 4: Upgrade path v0.1.0 -> v0.1.1
 # ===========================================================================
 e2e_case_banner "Upgrade path installs new version safely"
 
