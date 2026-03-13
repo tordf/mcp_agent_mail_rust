@@ -1840,10 +1840,18 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
 fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
     let config = mcp_agent_mail_core::Config::from_env();
     let storage_root_path = config.storage_root.as_path();
-    if storage_root_path.is_dir() {
+    if is_real_directory(storage_root_path) {
         return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
     }
     ensure_sqlite_file_healthy(primary_path)
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
@@ -1859,7 +1867,7 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     };
 
     let bak = primary_path.with_file_name(format!("{file_name}.bak"));
-    if bak.is_file() {
+    if is_real_file(&bak) {
         let modified = bak
             .metadata()
             .and_then(|meta| meta.modified())
@@ -1873,7 +1881,10 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() || file_type.is_symlink() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -2018,7 +2029,54 @@ fn quarantine_sidecar(primary_path: &Path, suffix: &str, timestamp: &str) -> Res
 }
 
 #[allow(clippy::result_large_err)]
+fn quarantine_reconstructed_candidate(
+    primary_path: &Path,
+    timestamp: &str,
+    reason: &str,
+) -> Result<Option<PathBuf>, SqlError> {
+    if !primary_path.exists() {
+        return Ok(None);
+    }
+
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    let quarantined = primary_path.with_file_name(format!("{base_name}.{reason}-{timestamp}"));
+    std::fs::rename(primary_path, &quarantined).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to quarantine reconstructed database candidate {}: {e}",
+            primary_path.display()
+        ))
+    })?;
+
+    if let Err(e) = quarantine_sidecar(primary_path, "-wal", timestamp) {
+        tracing::warn!(
+            sidecar = %format!("{}-wal", primary_path.display()),
+            error = %e,
+            "failed to quarantine WAL sidecar for reconstructed candidate; continuing"
+        );
+    }
+    if let Err(e) = quarantine_sidecar(primary_path, "-shm", timestamp) {
+        tracing::warn!(
+            sidecar = %format!("{}-shm", primary_path.display()),
+            error = %e,
+            "failed to quarantine SHM sidecar for reconstructed candidate; continuing"
+        );
+    }
+
+    Ok(Some(quarantined))
+}
+
+#[allow(clippy::result_large_err)]
 fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), SqlError> {
+    if !is_real_file(backup_path) {
+        return Err(SqlError::Custom(format!(
+            "refusing to restore sqlite backup from non-regular file {}",
+            backup_path.display()
+        )));
+    }
+
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let base_name = primary_path
         .file_name()
@@ -2188,6 +2246,7 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
 /// 1. `.bak` / `.bak.*` / `.backup-*` / `.recovery*` backup files
 /// 2. Git archive reconstruction (recovers messages + agents)
 /// 3. Blank reinitialization (empty database)
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::result_large_err)]
 pub fn ensure_sqlite_file_healthy_with_archive(
     primary_path: &Path,
@@ -2229,7 +2288,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
                 primary_path.display()
             )));
         }
-        if !storage_root.join("projects").is_dir() {
+        if !is_real_directory(storage_root) || !is_real_directory(&storage_root.join("projects")) {
             // Normal fresh startup (no projects directory).
             return Ok(());
         }
@@ -2265,6 +2324,17 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         Ok(stats) => {
             if sqlite_file_is_healthy(primary_path)? {
                 if had_primary && stats.agents == 0 && stats.messages == 0 {
+                    if let Some(quarantined) = quarantine_reconstructed_candidate(
+                        primary_path,
+                        &timestamp,
+                        "reconstruct-empty",
+                    )? {
+                        tracing::warn!(
+                            primary = %primary_path.display(),
+                            quarantined = %quarantined.display(),
+                            "quarantined empty reconstructed database candidate"
+                        );
+                    }
                     return Err(SqlError::Custom(format!(
                         "database file {} was quarantined for archive-aware recovery, but archive reconstruction restored no durable mail state; refusing blank reinitialization to avoid data loss",
                         primary_path.display()
@@ -2289,6 +2359,15 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     }
 
     if had_primary {
+        if let Some(quarantined) =
+            quarantine_reconstructed_candidate(primary_path, &timestamp, "reconstruct-failed")?
+        {
+            tracing::warn!(
+                primary = %primary_path.display(),
+                quarantined = %quarantined.display(),
+                "quarantined reconstructed database candidate after failed archive recovery"
+            );
+        }
         return Err(SqlError::Custom(format!(
             "database file {} was quarantined for archive-aware recovery, but reconstruction did not produce a healthy database; refusing blank reinitialization to avoid data loss",
             primary_path.display()
@@ -2938,6 +3017,28 @@ mod tests {
             candidates.first().map(PathBuf::as_path),
             Some(backup_bak_series.as_path()),
             "timestamped .bak.* backups should be discovered and prioritized over .backup-*"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_backup_candidates_skip_symlinked_backups() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let real_backup = dir.path().join("outside.sqlite3");
+        let symlinked_bak = dir.path().join("storage.sqlite3.bak");
+        let symlinked_series = dir.path().join("storage.sqlite3.backup-20260212_000000");
+        std::fs::write(&primary, b"primary").expect("write primary");
+        std::fs::write(&real_backup, b"backup").expect("write real backup");
+        symlink(&real_backup, &symlinked_bak).expect("symlink .bak");
+        symlink(&real_backup, &symlinked_series).expect("symlink .backup- series");
+
+        let candidates = sqlite_backup_candidates(&primary);
+        assert!(
+            candidates.is_empty(),
+            "symlinked backup candidates must be ignored"
         );
     }
 
@@ -4022,6 +4123,41 @@ mod tests {
             .and_then(|r| r.get_named::<i64>("n").ok())
             .unwrap_or(0);
         assert!(count >= 1, "should have at least 1 message from archive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_recovery_rejects_symlinked_storage_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let real_storage = dir.path().join("real-storage");
+        let storage_root = dir.path().join("storage");
+
+        std::fs::write(&primary, b"corrupted-data").unwrap();
+
+        let proj_dir = real_storage.join("projects").join("test-proj");
+        let agent_dir = proj_dir.join("agents").join("SwiftFox");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"SwiftFox","registered_ts":"2026-01-15T10:00:00"}"#,
+        )
+        .unwrap();
+        symlink(&real_storage, &storage_root).unwrap();
+
+        let err = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("symlinked storage roots must not be trusted for archive recovery");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("refusing blank reinitialization to avoid data loss"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !primary.exists(),
+            "fail-closed recovery should not leave behind a fresh empty database"
+        );
     }
 
     /// Archive-aware recovery must fail closed when a real DB was quarantined

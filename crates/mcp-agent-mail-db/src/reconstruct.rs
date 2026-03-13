@@ -95,6 +95,15 @@ impl std::fmt::Display for ReconstructStats {
 /// in `parse_errors`).
 #[allow(clippy::too_many_lines)]
 pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
+    let mut stats = ReconstructStats::default();
+    if !is_real_directory(storage_root) {
+        stats.warnings.push(format!(
+            "Storage root {} is missing or not a real directory",
+            storage_root.display()
+        ));
+        return Ok(stats);
+    }
+
     let db_str = db_path.to_string_lossy();
     let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
         DbError::Sqlite(format!(
@@ -205,8 +214,6 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         conn.execute_raw(stmt)
             .map_err(|e| DbError::Sqlite(format!("reconstruct: fts cleanup ({stmt}): {e}")))?;
     }
-
-    let mut stats = ReconstructStats::default();
 
     // Maps for deduplication: ((project_id, name) → agent_id)
     let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
@@ -1747,6 +1754,36 @@ mod tests {
         assert_eq!(stats.projects, 0);
         assert_eq!(stats.agents, 0);
         assert_eq!(stats.messages, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconstruct_warns_on_symlinked_storage_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let real_storage = tmp.path().join("real-storage");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(real_storage.join("projects")).unwrap();
+        symlink(&real_storage, &storage_root).unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.projects, 0);
+        assert_eq!(stats.agents, 0);
+        assert_eq!(stats.messages, 0);
+        assert!(
+            !db_path.exists(),
+            "symlinked storage roots should not create a reconstructed database file"
+        );
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not a real directory")),
+            "expected symlinked storage root warning, got {:?}",
+            stats.warnings
+        );
     }
 
     #[test]
