@@ -4863,6 +4863,7 @@ dependencies = [
  "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",
  "minijinja",
+ "nix 0.31.1",
  "proptest",
  "serde",
  "serde_json",

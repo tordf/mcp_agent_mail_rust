@@ -3747,34 +3747,7 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             no_prepush,
         } => {
             let install_prepush = if prepush { true } else { !no_prepush };
-            let config = Config::from_env();
-            let db_cfg = mcp_agent_mail_db::DbPoolConfig {
-                database_url: config.database_url.clone(),
-                ..Default::default()
-            };
-            let abs_db_path = db_cfg
-                .sqlite_path()
-                .ok()
-                .map(|s| {
-                    let p = PathBuf::from(s);
-                    if p.exists() {
-                        p.canonicalize().unwrap_or(p)
-                    } else {
-                        if p.is_absolute() {
-                            p
-                        } else {
-                            std::env::current_dir().unwrap_or_default().join(p)
-                        }
-                    }
-                })
-                .map(|p| p.to_string_lossy().to_string());
-
-            mcp_agent_mail_guard::install_guard(
-                &project,
-                repo.as_path(),
-                abs_db_path.as_deref(),
-                install_prepush,
-            )?;
+            mcp_agent_mail_guard::install_guard(&project, repo.as_path(), install_prepush)?;
             ftui_runtime::ftui_println!("Guard installed successfully.");
             Ok(())
         }
@@ -3837,18 +3810,7 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             };
 
             let config = mcp_agent_mail_core::Config::from_env();
-            let archive_root = if repo_path.join("file_reservations").is_dir() {
-                repo_path.clone()
-            } else {
-                let human_key = repo_path.to_string_lossy().to_string();
-                let identity = mcp_agent_mail_core::identity::resolve_project_identity(&human_key);
-                let candidate = config.storage_root.join("projects").join(&identity.slug);
-                if candidate.join("file_reservations").is_dir() {
-                    candidate
-                } else {
-                    repo_path.clone()
-                }
-            };
+            let archive_root = resolve_guard_archive_root_for_check(&repo_path, &config);
 
             let conflicts =
                 mcp_agent_mail_guard::guard_check(&archive_root, &repo_path, &paths, advisory)?;
@@ -3869,6 +3831,25 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn path_is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn resolve_guard_archive_root_for_check(repo_path: &Path, config: &Config) -> PathBuf {
+    if path_is_real_directory(&repo_path.join("file_reservations")) {
+        return repo_path.to_path_buf();
+    }
+
+    let human_key = repo_path.to_string_lossy().to_string();
+    let identity = resolve_project_identity(&human_key);
+    let candidate = config.storage_root.join("projects").join(&identity.slug);
+    if path_is_real_directory(&candidate.join("file_reservations")) {
+        candidate
+    } else {
+        repo_path.to_path_buf()
     }
 }
 
@@ -4001,10 +3982,6 @@ fn is_sqlite_recovery_error_message(message: &str) -> bool {
         || lower.contains("called `option::unwrap()` on a `none` value")
         || lower.contains("internal error")
         || lower.contains("cursor must be on a leaf")
-}
-
-fn path_is_real_directory(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
 fn path_is_real_file(path: &Path) -> bool {
@@ -14304,7 +14281,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown");
-                        match mcp_agent_mail_guard::install_guard(project_slug, &cwd, None, true) {
+                        match mcp_agent_mail_guard::install_guard(project_slug, &cwd, true) {
                             Ok(()) => {
                                 ftui_runtime::ftui_eprintln!("[fix] Installed guard hooks");
                                 results.push(serde_json::json!({
@@ -23331,6 +23308,54 @@ startup_timeout_sec = 42
             }
             other => panic!("expected Guard Check, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_guard_archive_root_prefers_real_project_archive() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_path = td.path().join("repo");
+        std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+
+        let config = Config {
+            storage_root: td.path().join("storage"),
+            ..Config::default()
+        };
+
+        let identity = resolve_project_identity(&repo_path.to_string_lossy());
+        let candidate = config.storage_root.join("projects").join(&identity.slug);
+        std::fs::create_dir_all(candidate.join("file_reservations")).expect("mkdir archive");
+
+        let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
+        assert_eq!(resolved, candidate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guard_archive_root_ignores_symlinked_repo_reservations_dir() {
+        use std::os::unix::fs::symlink;
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_path = td.path().join("repo");
+        let outside = td.path().join("outside");
+        std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+        std::fs::create_dir_all(outside.join("file_reservations")).expect("mkdir outside");
+        symlink(
+            outside.join("file_reservations"),
+            repo_path.join("file_reservations"),
+        )
+        .expect("symlink repo reservations dir");
+
+        let config = Config {
+            storage_root: td.path().join("storage"),
+            ..Config::default()
+        };
+
+        let identity = resolve_project_identity(&repo_path.to_string_lossy());
+        let candidate = config.storage_root.join("projects").join(&identity.slug);
+        std::fs::create_dir_all(candidate.join("file_reservations")).expect("mkdir archive");
+
+        let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
+        assert_eq!(resolved, candidate);
     }
 
     #[test]
