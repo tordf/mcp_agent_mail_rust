@@ -508,6 +508,19 @@ impl DbPoller {
                 continue;
             }
 
+            // When the DB engine lacks PRAGMA data_version (e.g. FrankenSQLite),
+            // the poller cannot cheaply detect changes and must run full
+            // snapshots periodically.  Extend the sleep interval between polls
+            // to avoid burning CPU on expensive no-op queries.
+            let effective_interval = if connection_state
+                .as_ref()
+                .is_some_and(|s| s.last_data_version.is_none())
+            {
+                self.interval.max(Duration::from_secs(5))
+            } else {
+                self.interval
+            };
+
             // Block until the next interval or an explicit stop wakeup.
             let (lock, cvar) = &*self.wake;
             let _ = cvar.wait_timeout(
@@ -515,7 +528,7 @@ impl DbPoller {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 },
-                self.interval,
+                effective_interval,
             );
             if self.stop.load(Ordering::Relaxed) {
                 break;

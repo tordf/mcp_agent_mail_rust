@@ -283,6 +283,10 @@ fn reservation_key(project: &str, agent: &str, path_pattern: &str) -> String {
     format!("{project}:{agent}:{path_pattern}")
 }
 
+const fn reservation_exclusive_cell_label(exclusive: bool) -> &'static str {
+    if exclusive { "Yes" } else { "No" }
+}
+
 pub struct ReservationsScreen {
     table_state: TableState,
     /// All tracked reservations keyed by composite key.
@@ -1842,11 +1846,7 @@ impl MailScreen for ReservationsScreen {
                 let res = self.reservations.get(key)?;
                 let batch_selected = self.selected_reservation_keys.contains(key);
                 let checkbox = if batch_selected { "[x]" } else { "[ ]" };
-                let excl_str = if res.exclusive {
-                    "\u{2713}"
-                } else {
-                    "\u{2717}"
-                };
+                let excl_str = reservation_exclusive_cell_label(res.exclusive);
                 let remaining = res.remaining_secs();
                 let ratio = res.ttl_ratio();
                 let ttl_text = format_ttl(remaining);
@@ -3556,6 +3556,50 @@ mod tests {
         assert_eq!(format_ttl(30), "30s left");
         assert_eq!(format_ttl(300), "5m left");
         assert_eq!(format_ttl(7200), "2h left");
+    }
+
+    #[test]
+    fn reservation_exclusive_cell_label_uses_explicit_text() {
+        assert_eq!(reservation_exclusive_cell_label(true), "Yes");
+        assert_eq!(reservation_exclusive_cell_label(false), "No");
+    }
+
+    #[test]
+    fn narrow_table_renders_no_for_shared_reservations() {
+        let state = test_state();
+        let mut screen = ReservationsScreen::new();
+        let key = reservation_key("proj", "BlueLake", "tests/**");
+        screen.reservations.insert(
+            key.clone(),
+            ActiveReservation {
+                reservation_id: Some(11),
+                agent: "BlueLake".into(),
+                path_pattern: "tests/**".into(),
+                exclusive: false,
+                granted_ts: chrono::Utc::now()
+                    .timestamp_micros()
+                    .saturating_sub(5_000_000),
+                ttl_s: 3600,
+                project: "proj".into(),
+                released: false,
+            },
+        );
+        screen.sorted_keys.push(key);
+        screen.detail_visible = false;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(70, 14, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 70, 14), &state);
+        let text = buffer_to_text(&frame.buffer);
+
+        assert!(
+            text.contains("No"),
+            "shared reservations should render explicit No label in narrow table: {text}"
+        );
+        assert!(
+            !text.contains('\u{2717}'),
+            "shared reservations should not render ambiguous x glyphs: {text}"
+        );
     }
 
     #[test]
