@@ -340,6 +340,10 @@ struct PollerConnectionState {
     sqlite_path: String,
     last_data_version: Option<i64>,
     last_reservation_snapshot_gap_refresh_micros: i64,
+    /// Tracks last full snapshot time for the fallback path when
+    /// `PRAGMA data_version` is unavailable.  Prevents running expensive
+    /// aggregate queries on every 2-second poll cycle.
+    last_full_snapshot_micros: i64,
 }
 
 /// Handle returned by [`DbPoller::start`].
@@ -596,6 +600,7 @@ fn open_poller_connection_state(database_url: &str) -> Option<PollerConnectionSt
         sqlite_path,
         last_data_version: None,
         last_reservation_snapshot_gap_refresh_micros: 0,
+        last_full_snapshot_micros: 0,
     })
 }
 
@@ -617,12 +622,13 @@ fn fetch_db_stats_with_connection(
         state.last_reservation_snapshot_gap_refresh_micros,
     );
     let must_refresh_for_detail_gap = snapshot_has_missing_detail_lists(previous);
-    if let Some(version) = data_version
-        && state
-            .last_data_version
-            .is_some_and(|previous_version| previous_version == version)
-        && previous.timestamp_micros > 0
-    {
+    // When `PRAGMA data_version` is available, use it to skip full snapshots
+    // when nothing has changed.
+    let version_unchanged = match (data_version, state.last_data_version) {
+        (Some(current), Some(prev)) => current == prev,
+        _ => false,
+    };
+    if version_unchanged && previous.timestamp_micros > 0 {
         let update = if must_refresh_for_detail_gap {
             DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
                 .fetch_snapshot(Some(previous))
@@ -647,8 +653,22 @@ fn fetch_db_stats_with_connection(
         );
         return Some(DbPollSnapshotUpdate::Snapshot(update));
     }
+    // When data_version is unavailable (e.g. FrankenSQLite), throttle
+    // expensive full snapshots to once every 10 seconds to avoid burning
+    // CPU on 2-second poll cycles.
+    const NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS: i64 = 30_000_000;
+    if data_version.is_none()
+        && previous.timestamp_micros > 0
+        && !must_refresh_for_detail_gap
+        && !must_refresh_for_expiry
+        && !must_refresh_for_snapshot_gap
+        && (now - state.last_full_snapshot_micros) < NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS
+    {
+        return Some(DbPollSnapshotUpdate::TimestampOnly(now));
+    }
     let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
         .fetch_snapshot(Some(previous));
+    state.last_full_snapshot_micros = now;
     if snapshot_is_empty(&snapshot)
         && required_mail_schema_state(&state.conn) != RequiredMailSchemaState::Present
     {
@@ -2726,6 +2746,7 @@ mod tests {
             sqlite_path,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
+            last_full_snapshot_micros: 0,
         };
 
         let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
@@ -2752,6 +2773,7 @@ mod tests {
             sqlite_path,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
+            last_full_snapshot_micros: 0,
         };
 
         let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
@@ -2794,6 +2816,7 @@ mod tests {
             sqlite_path,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
+            last_full_snapshot_micros: 0,
         };
 
         let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
@@ -2883,6 +2906,7 @@ mod tests {
             sqlite_path,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
+            last_full_snapshot_micros: 0,
         };
 
         let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
@@ -3085,6 +3109,7 @@ mod tests {
             sqlite_path: ":memory:".to_string(),
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
+            last_full_snapshot_micros: 0,
         };
         let previous = DbStatSnapshot {
             file_reservations: 2,

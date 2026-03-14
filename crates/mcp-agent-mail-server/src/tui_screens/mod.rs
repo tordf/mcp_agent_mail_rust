@@ -537,11 +537,11 @@ pub(super) fn poller_db_context_banner(
     tick_count: u64,
 ) -> Option<&'static str> {
     let warmup_state = state.db_warmup_state();
-    if applied_db_stats_gen == 0
-        && tick_count < POLLER_DB_GRACE_TICKS
-        && !state.db_context_available()
-        && warmup_state == crate::tui_bridge::DbWarmupState::Pending
-    {
+    // During startup, suppress the "waiting for data" banner entirely
+    // while the poller is still warming up.  The banner adds no
+    // actionable information — the data arrives automatically within
+    // a few seconds.
+    if applied_db_stats_gen == 0 && tick_count < POLLER_DB_GRACE_TICKS {
         return None;
     }
     if state.db_context_available() {

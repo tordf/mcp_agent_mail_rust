@@ -1418,8 +1418,11 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
     let cfg = state.config_snapshot();
     let env_cfg = Config::from_env();
 
+    // Show the MCP endpoint URL rather than the non-functional `/mail` web
+    // UI path so the remote URL is actually usable by agents.
     let remote_url = tailscale_ip.map(|ip| {
-        crate::build_web_ui_url(ip, env_cfg.http_port, env_cfg.http_bearer_token.as_deref())
+        let path = env_cfg.http_path.trim_end_matches('/');
+        format!("http://{ip}:{}{path}/", env_cfg.http_port)
     });
 
     let mut out = DiagnosticsSnapshot {

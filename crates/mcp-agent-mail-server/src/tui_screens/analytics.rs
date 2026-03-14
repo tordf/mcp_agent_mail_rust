@@ -1497,26 +1497,67 @@ fn render_status_strip(
     active_count: usize,
     total_count: usize,
     detail_visible: bool,
+    compact_hint_visible: bool,
 ) {
     if area.is_empty() {
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let line = analytics_status_strip_line(
+        area.width,
+        focus.label(),
+        filter.label(),
+        sort_mode.label(),
+        active_count,
+        total_count,
+        detail_visible,
+        compact_hint_visible,
+    );
+    Paragraph::new(line)
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(area, frame);
+}
+
+fn analytics_status_strip_line(
+    area_width: u16,
+    focus_label: &str,
+    filter_label: &str,
+    sort_label: &str,
+    active_count: usize,
+    total_count: usize,
+    detail_visible: bool,
+    compact_hint_visible: bool,
+) -> String {
     let detail_state = if detail_visible {
         "detail:visible"
     } else {
         "detail:hidden"
     };
-    let line = format!(
-        "{} • {} • {} • {} • cards:{active_count}/{total_count} • Tab focus • s/o modes • Enter link",
-        focus.label(),
-        filter.label(),
-        sort_mode.label(),
-        detail_state
-    );
-    Paragraph::new(line)
-        .style(crate::tui_theme::text_hint(&tp))
-        .render(area, frame);
+
+    if compact_hint_visible {
+        if area_width >= 72 {
+            return format!("cards:{active_count}/{total_count} • {filter_label} • {sort_label}");
+        }
+        if area_width >= 48 {
+            return format!("{active_count}/{total_count} • {filter_label} • {sort_label}");
+        }
+        return format!("{active_count}/{total_count} • {filter_label}");
+    }
+
+    if area_width >= 104 {
+        return format!(
+            "{focus_label} • {filter_label} • {sort_label} • {detail_state} • cards:{active_count}/{total_count} • Tab focus • s/o modes • Enter link"
+        );
+    }
+    if area_width >= 80 {
+        return format!(
+            "{focus_label} • {filter_label} • {sort_label} • {detail_state} • cards:{active_count}/{total_count}"
+        );
+    }
+    if area_width >= 60 {
+        return format!("{focus_label} • {filter_label} • cards:{active_count}/{total_count}");
+    }
+    format!("{filter_label} • cards:{active_count}/{total_count}")
 }
 
 fn render_compact_detail_hint(frame: &mut Frame<'_>, area: Rect, card: &InsightCard) {
@@ -1524,19 +1565,82 @@ fn render_compact_detail_hint(frame: &mut Frame<'_>, area: Rect, card: &InsightC
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let status = compact_detail_hint_line(area.width, card);
+    Paragraph::new(status)
+        .style(crate::tui_theme::text_hint(&tp))
+        .render(area, frame);
+}
+
+fn compact_detail_hint_line(area_width: u16, card: &InsightCard) -> String {
     let first_step = card.next_steps.first().map_or_else(
         || "No suggested next step".to_string(),
         |step| format!("Next: {step}"),
     );
-    let first_link = card.deep_links.first().map_or("none", String::as_str);
-    let status = format!(
-        "Detail hidden on short terminal • {} {}% • {first_step} • Enter:{first_link}",
+    let severity_summary = format!(
+        "Detail hidden • {} {}%",
         severity_badge(card.severity).trim(),
         (card.confidence * 100.0).round()
     );
-    Paragraph::new(status)
-        .style(crate::tui_theme::text_hint(&tp))
-        .render(area, frame);
+    let enter_hint = card
+        .deep_links
+        .first()
+        .map_or_else(String::new, |_| " • Enter".to_string());
+    let full_status = format!("{severity_summary} • {first_step}{enter_hint}");
+    if ftui::text::display_width(&full_status) <= usize::from(area_width) {
+        return full_status;
+    }
+
+    let reserved = ftui::text::display_width(&severity_summary)
+        .saturating_add(ftui::text::display_width(&enter_hint))
+        .saturating_add(3);
+    let available_step_width = usize::from(area_width).saturating_sub(reserved);
+    if available_step_width >= 12 {
+        let step = truncate_display_width(&first_step, available_step_width);
+        return format!("{severity_summary} • {step}{enter_hint}");
+    }
+    if !enter_hint.is_empty()
+        && ftui::text::display_width(&severity_summary)
+            .saturating_add(ftui::text::display_width(&enter_hint))
+            <= usize::from(area_width)
+    {
+        return format!("{severity_summary}{enter_hint}");
+    }
+    truncate_display_width(&severity_summary, usize::from(area_width))
+}
+
+fn truncate_display_width(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if ftui::text::display_width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut out = String::new();
+    let mut used = 0usize;
+    let budget = max_width - 1;
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let ch_s = ch.encode_utf8(&mut buf);
+        let ch_w = ftui::text::display_width(ch_s);
+        if used.saturating_add(ch_w) > budget {
+            break;
+        }
+        out.push(ch);
+        used = used.saturating_add(ch_w);
+    }
+    out.push('…');
+    while ftui::text::display_width(out.as_str()) > max_width {
+        let _ = out.pop();
+        if out.pop().is_none() {
+            return "…".to_string();
+        }
+        out.push('…');
+    }
+    out
 }
 
 #[allow(dead_code)]
@@ -2257,6 +2361,7 @@ impl MailScreen for AnalyticsScreen {
                     active_cards.len(),
                     self.feed.cards.len(),
                     false,
+                    false,
                 );
             }
             return;
@@ -2462,6 +2567,7 @@ impl MailScreen for AnalyticsScreen {
                     active_cards.len(),
                     self.feed.cards.len(),
                     true,
+                    false,
                 );
             }
             return;
@@ -2606,6 +2712,7 @@ impl MailScreen for AnalyticsScreen {
                     active_cards.len(),
                     self.feed.cards.len(),
                     true,
+                    false,
                 );
             }
             return;
@@ -2645,6 +2752,7 @@ impl MailScreen for AnalyticsScreen {
                 active_cards.len(),
                 self.feed.cards.len(),
                 false,
+                hint_h > 0,
             );
         }
     }
@@ -3131,8 +3239,41 @@ mod tests {
         let state = crate::tui_bridge::TuiSharedState::new(&config);
         screen.view(&mut frame, Rect::new(0, 0, 80, 9), &state);
         let text = frame_text(&frame);
-        assert!(text.contains("Detail hidden on short terminal"));
+        assert!(text.contains("Detail hidden"));
         assert!(text.contains("focus:list"));
+        assert!(text.contains("cards:1/1"));
+        assert!(text.contains("Enter"));
+        assert!(!text.contains("Tab focus"));
+        assert!(!text.contains("Enter link"));
+        assert!(!text.contains("Tab fo"));
+    }
+
+    #[test]
+    fn compact_status_strip_elides_redundant_controls() {
+        let line = analytics_status_strip_line(
+            80,
+            AnalyticsFocus::List.label(),
+            AnalyticsSeverityFilter::All.label(),
+            AnalyticsSortMode::Priority.label(),
+            1,
+            1,
+            false,
+            true,
+        );
+        assert_eq!(line, "cards:1/1 • filter:all • sort:priority");
+    }
+
+    #[test]
+    fn compact_detail_hint_preserves_enter_cue_when_step_is_long() {
+        let mut card = sample_card("card", AnomalySeverity::High, 0.88);
+        card.next_steps = vec![
+            "Drill into the hottest tool latency timeline and compare it with the last healthy baseline".to_string(),
+        ];
+        let line = compact_detail_hint_line(80, &card);
+        assert!(line.contains("Detail hidden"));
+        assert!(line.contains("Enter"));
+        assert!(line.ends_with("Enter"));
+        assert!(ftui::text::display_width(&line) <= 80);
     }
 
     #[test]
