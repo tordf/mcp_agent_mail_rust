@@ -337,24 +337,22 @@ fn build_inline_diff(expected: &str, actual: &str, context_lines: usize) -> Stri
     let end = max_len.min(mismatch_idx + context_lines + 1);
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "@@ mismatch around line {} @@\n",
-        mismatch_idx + 1
-    ));
+    use std::fmt::Write;
+    let _ = writeln!(out, "@@ mismatch around line {} @@", mismatch_idx + 1);
     for idx in start..end {
         match (expected_lines.get(idx), actual_lines.get(idx)) {
             (Some(exp), Some(act)) if exp == act => {
-                out.push_str(&format!(" {:>5} | {exp}\n", idx + 1));
+                let _ = writeln!(out, " {:>5} | {exp}", idx + 1);
             }
             (Some(exp), Some(act)) => {
-                out.push_str(&format!("-{:>5} | {exp}\n", idx + 1));
-                out.push_str(&format!("+{:>5} | {act}\n", idx + 1));
+                let _ = writeln!(out, "-{:>5} | {exp}", idx + 1);
+                let _ = writeln!(out, "+{:>5} | {act}", idx + 1);
             }
             (Some(exp), None) => {
-                out.push_str(&format!("-{:>5} | {exp}\n", idx + 1));
+                let _ = writeln!(out, "-{:>5} | {exp}", idx + 1);
             }
             (None, Some(act)) => {
-                out.push_str(&format!("+{:>5} | {act}\n", idx + 1));
+                let _ = writeln!(out, "+{:>5} | {act}", idx + 1);
             }
             (None, None) => {}
         }

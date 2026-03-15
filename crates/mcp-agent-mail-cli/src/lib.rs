@@ -2323,20 +2323,48 @@ fn wait_for_port_release(host: &str, port: u16, timeout: std::time::Duration) ->
 }
 
 #[cfg(target_os = "linux")]
-fn conflicting_systemd_service_port() -> Option<u16> {
+/// Check if the systemd user service is actively running.
+///
+/// Uses `systemctl --user is-active` which returns "active" if the service
+/// is running.  This is more reliable than parsing the unit file — it
+/// checks actual runtime state, not configuration.
+#[cfg(target_os = "linux")]
+fn is_systemd_service_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", SYSTEMD_UNIT_NAME])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Extract the configured port from the systemd unit file.
+///
+/// Handles quoted ExecStart lines and --port=VALUE syntax in addition
+/// to --port VALUE.  Falls back to None on any parsing ambiguity.
+#[cfg(target_os = "linux")]
+fn systemd_service_configured_port() -> Option<u16> {
     let home = std::env::var("HOME").ok()?;
     let unit_path = PathBuf::from(home)
         .join(".config/systemd/user")
         .join(SYSTEMD_UNIT_NAME);
     let content = std::fs::read_to_string(unit_path).ok()?;
     for line in content.lines() {
-        let Some(exec_start) = line.strip_prefix("ExecStart=") else {
-            continue;
-        };
-        let mut parts = exec_start.split_whitespace();
-        while let Some(part) = parts.next() {
-            if part == "--port" {
-                return parts.next().and_then(|value| value.parse::<u16>().ok());
+        let exec_start = line
+            .strip_prefix("ExecStart=")
+            .or_else(|| line.strip_prefix("ExecStart ="))?;
+        // Strip surrounding quotes from the entire value if present.
+        let exec_start = exec_start.trim().trim_matches('"');
+        // Split on whitespace (handles both quoted and unquoted paths).
+        let parts: Vec<&str> = exec_start.split_whitespace().collect();
+        for (i, part) in parts.iter().enumerate() {
+            // Handle --port VALUE
+            if *part == "--port" {
+                return parts
+                    .get(i + 1)
+                    .and_then(|v| v.trim_matches('"').parse::<u16>().ok());
+            }
+            // Handle --port=VALUE
+            if let Some(val) = part.strip_prefix("--port=") {
+                return val.trim_matches('"').parse::<u16>().ok();
             }
         }
     }
@@ -2344,7 +2372,12 @@ fn conflicting_systemd_service_port() -> Option<u16> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn conflicting_systemd_service_port() -> Option<u16> {
+fn is_systemd_service_active() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn systemd_service_configured_port() -> Option<u16> {
     None
 }
 
@@ -2357,20 +2390,30 @@ fn maybe_stop_conflicting_managed_service(
         return Ok(());
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        if conflicting_systemd_service_port() == Some(port) {
+    // Only stop if ALL of:
+    // 1. The systemd service is ACTUALLY running (not just configured)
+    // 2. The service is configured for THIS port
+    // 3. The port is currently occupied
+    //
+    // This eliminates the TOCTOU race: we verify runtime state, not
+    // just configuration, before stopping anything.
+    if is_systemd_service_active() && systemd_service_configured_port() == Some(port) {
+        eprintln!(
+            "[info] agent-mail.service is active on port {port} — stopping it before launching the interactive TUI"
+        );
+        if let Err(e) = run_cmd("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME]) {
             eprintln!(
-                "[info] agent-mail.service is configured for port {port} — stopping it before launching the interactive TUI"
+                "[warn] Failed to stop agent-mail.service: {e}. \
+                 You may need to stop it manually: systemctl --user stop {SYSTEMD_UNIT_NAME}"
             );
-            run_cmd("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME])?;
-            if wait_for_port_release(host, port, std::time::Duration::from_secs(6)) {
-                return Ok(());
-            }
-            return Err(CliError::Other(format!(
-                "Stopped agent-mail.service, but port {host}:{port} did not become free"
-            )));
+            // Don't fail hard — the port check below will catch if it's still occupied.
         }
+        if wait_for_port_release(host, port, std::time::Duration::from_secs(6)) {
+            return Ok(());
+        }
+        return Err(CliError::Other(format!(
+            "Stopped agent-mail.service, but port {host}:{port} did not become free"
+        )));
     }
 
     Ok(())
@@ -2488,15 +2531,15 @@ fn send_sigkill(pid: u32) {
 
 #[cfg(not(unix))]
 fn send_sigterm(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-15", &pid.to_string()])
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
         .status();
 }
 
 #[cfg(not(unix))]
 fn send_sigkill(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
         .status();
 }
 
@@ -5062,18 +5105,13 @@ fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
                     &e.to_string(),
                 )
             })?;
-        for stmt in mcp_agent_mail_db::schema::init_schema_sql_base().split(';') {
-            let stmt = stmt.trim();
-            if stmt.is_empty() {
-                continue;
-            }
-            conn.execute_raw(&format!("{stmt};")).map_err(|e| {
-                sqlite_retryable_error(
-                    format!("schema init failed for {path} via canonical sqlite: {e}"),
-                    &e.to_string(),
-                )
-            })?;
-        }
+        let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
+        conn.execute_raw(&init_sql).map_err(|e| {
+            sqlite_retryable_error(
+                format!("schema init failed for {path} via canonical sqlite: {e}"),
+                &e.to_string(),
+            )
+        })?;
 
         conn.execute_raw(&format!(
             "CREATE TABLE IF NOT EXISTS {} (\
@@ -5122,6 +5160,13 @@ fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
                 )
             })?;
         }
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| {
+                sqlite_retryable_error(
+                    format!("failed to checkpoint canonical init for {path}: {e}"),
+                    &e.to_string(),
+                )
+            })?;
         Ok(())
     })
 }
@@ -7827,9 +7872,7 @@ fn handle_list_acks_with_conn(
     let project_id = crate::context::resolve_project(conn, project_key)?.id;
     let agent_id = match crate::context::resolve_agent(conn, project_id, agent_name) {
         Ok(agent) => agent.id,
-        Err(CliError::InvalidArgument(message))
-            if message.starts_with("agent not found:") =>
-        {
+        Err(CliError::InvalidArgument(message)) if message.starts_with("agent not found:") => {
             output::empty_result(
                 false,
                 &format!("No ack-required messages for {agent_name}."),
@@ -8993,6 +9036,7 @@ fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), St
         if tmp_old.exists() {
             let _ = std::fs::rename(&tmp_old, target_path);
         }
+        let _ = std::fs::remove_file(&tmp_new);
         return Err(format!("atomic rename failed: {e}"));
     }
 
@@ -9033,6 +9077,7 @@ fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), St
         if tmp_old.exists() {
             let _ = std::fs::rename(&tmp_old, target_path);
         }
+        let _ = std::fs::remove_file(&tmp_new);
         return Err(format!("rename failed: {e}"));
     }
 
@@ -17313,7 +17358,10 @@ fn service_probe_http() {
 
     let addr = "127.0.0.1:8765";
     match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(500)) {
-        Ok(_) => ftui_runtime::ftui_println!("Port 8765: reachable (server responding)"),
+        Ok(stream) => {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            ftui_runtime::ftui_println!("Port 8765: reachable (server responding)")
+        }
         Err(_) => ftui_runtime::ftui_println!("Port 8765: not reachable"),
     }
 }
@@ -19775,6 +19823,7 @@ command = "mcp-agent-mail"
                     headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
                 }
             }
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             (code, headers, body.to_vec())
         }
 
@@ -19901,6 +19950,7 @@ command = "mcp-agent-mail"
                 .unwrap_or("0")
                 .parse()
                 .unwrap_or(0);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             (code, body.to_vec())
         }
 
@@ -21487,23 +21537,27 @@ command = "mcp-agent-mail"
         let proj_beta_key = proj_beta_dir.canonicalize().unwrap().display().to_string();
 
         let db_path = root.path().join("mailbox.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .unwrap_or_else(|e| {
-                panic!(
-                    "seed_products_cli_db: open db at {}: {e}",
-                    db_path.display()
-                )
-            });
-        // Use base schema (no FTS5/triggers) because this DB will be opened
-        // by FrankenConnection via the pool. FrankenConnection cannot read
-        // database files containing FTS5 shadow table pages.
+        let db_path_str = db_path.display().to_string();
+        // Use the current base-mode initializer so the fixture matches the
+        // schema that the pooled query layer now expects, without creating
+        // FTS artifacts that FrankenConnection cannot read.
+        init_schema_sqlite_canonical(&db_path_str).unwrap_or_else(|e| {
+            panic!(
+                "seed_products_cli_db: initialize canonical schema at {}: {e}",
+                db_path.display()
+            )
+        });
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path_str).unwrap_or_else(|e| {
+            panic!(
+                "seed_products_cli_db: open db at {}: {e}",
+                db_path.display()
+            )
+        });
         // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
         // any operation panics before COMMIT.
         conn.execute_raw("BEGIN IMMEDIATE").unwrap_or_else(|e| {
             panic!("seed_products_cli_db: BEGIN at {}: {e}", db_path.display())
         });
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("init schema");
 
         // Projects
         conn.execute_sync(
@@ -21844,8 +21898,16 @@ command = "mcp-agent-mail"
         let projects = status_json["projects"].as_array_mut().unwrap();
         projects.sort_by_key(|p| p["id"].as_i64().unwrap_or_default());
         assert_eq!(projects.len(), 2);
-        assert_eq!(projects[0]["slug"].as_str(), Some("proj-alpha"));
-        assert_eq!(projects[1]["slug"].as_str(), Some("proj-beta"));
+        let expected_alpha_slug = mcp_agent_mail_core::compute_project_slug(&proj_alpha_key);
+        let expected_beta_slug = mcp_agent_mail_core::compute_project_slug(&proj_beta_key);
+        assert_eq!(
+            projects[0]["slug"].as_str(),
+            Some(expected_alpha_slug.as_str())
+        );
+        assert_eq!(
+            projects[1]["slug"].as_str(),
+            Some(expected_beta_slug.as_str())
+        );
 
         // Search JSON should find only the unicorn message.
         let (res, out) = run_products_cmd_capture(
@@ -33014,7 +33076,7 @@ fn handle_doctor_repair_with(
     };
     let reconstruct_db_path = repair_cfg
         .sqlite_path()
-        .map(PathBuf::from)
+        .map(|path| PathBuf::from(resolve_sqlite_path_with_absolute_candidate(&path)))
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
 
     let conn = open_db_sync_with_database_url_and_storage_root(database_url, Some(storage_root))?;
@@ -33029,25 +33091,10 @@ fn handle_doctor_repair_with(
         return Ok(());
     }
 
-    // 1. Integrity check
-    let integrity_ok = match conn.query_sync("PRAGMA integrity_check", &[]) {
-        Ok(rows) => sqlite_pragma_check_rows_ok(&rows, mcp_agent_mail_db::CheckKind::Full),
-        Err(error) => {
-            if !dry_run && is_sqlite_recovery_error_message(&error.to_string()) {
-                ftui_runtime::ftui_eprintln!(
-                    "  Integrity probe failed with a recovery-class error ({error}). Automatically falling back to archive reconstruction..."
-                );
-                return handle_doctor_reconstruct_with(
-                    Some(&reconstruct_db_path),
-                    Some(storage_root),
-                    false,
-                    yes,
-                    false,
-                );
-            }
-            return Err(CliError::Other(format!("integrity check failed: {error}")));
-        }
-    };
+    // 1. File sanity check via canonical SQLite so doctor repair does not
+    // misclassify healthy FrankenConnection databases as corrupt.
+    let (integrity_ok, integrity_detail, _used_absolute_fallback, _missing_configured_path) =
+        sqlite_doctor_file_sanity(&reconstruct_db_path.display().to_string())?;
 
     ftui_runtime::ftui_println!(
         "  Integrity: {}",
@@ -33056,7 +33103,7 @@ fn handle_doctor_repair_with(
 
     if !integrity_ok && !dry_run {
         ftui_runtime::ftui_eprintln!(
-            "  Database corruption detected. Automatically falling back to archive reconstruction..."
+            "  Database corruption detected ({integrity_detail}). Automatically falling back to archive reconstruction..."
         );
         // Fall back to reconstruction from archive
         return handle_doctor_reconstruct_with(
@@ -33077,9 +33124,8 @@ fn handle_doctor_repair_with(
             database_url: database_url.to_string(),
             ..Default::default()
         };
-        let db_path = resolve_sqlite_path_with_absolute_candidate(
-            &cfg.sqlite_path().unwrap_or_default(),
-        );
+        let db_path =
+            resolve_sqlite_path_with_absolute_candidate(&cfg.sqlite_path().unwrap_or_default());
         if std::path::Path::new(&db_path).exists() {
             let bak_path = backup_dir.join(&bak_name);
             copy_sqlite_backup_consistently(Path::new(&db_path), &bak_path)?;
@@ -33088,7 +33134,7 @@ fn handle_doctor_repair_with(
             // Also create a .bak sibling next to the primary DB so that the
             // pool's auto-recovery (find_healthy_backup) can discover it.
             let sibling_bak = PathBuf::from(format!("{db_path}.bak"));
-            if let Err(e) = std::fs::copy(&bak_path, &sibling_bak) {
+            if let Err(e) = copy_sqlite_backup_consistently(Path::new(&db_path), &sibling_bak) {
                 ftui_runtime::ftui_eprintln!(
                     "  Warning: could not create sibling backup {}: {e}",
                     sibling_bak.display()

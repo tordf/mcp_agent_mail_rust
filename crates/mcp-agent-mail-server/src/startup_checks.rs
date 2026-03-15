@@ -132,7 +132,14 @@ pub(crate) const HEALTH_SIGNATURE_HEADER_VALUE: &str = "1";
 struct ListenerPidHint {
     pid: u32,
     exe_path: Option<String>,
+    /// Unix timestamp (seconds) when the hint was written.
+    /// Used to reject stale hints from recycled PIDs.
+    created_epoch_secs: Option<u64>,
 }
+
+/// Maximum age of a PID hint file before it's considered stale (seconds).
+/// Stale hints are ignored to prevent PID recycling attacks.
+const PID_HINT_MAX_AGE_SECS: u64 = 86400; // 24 hours
 
 /// Check the status of a port: free, occupied by Agent Mail, or occupied by another process.
 ///
@@ -382,9 +389,14 @@ pub fn write_listener_pid_hint(host: &str, port: u16) -> PathBuf {
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let hint = ListenerPidHint {
         pid: std::process::id(),
         exe_path: current_executable_hint_path(),
+        created_epoch_secs: Some(now_secs),
     };
     let content = format_listener_pid_hint(&hint);
     // Write via temp file + rename to avoid symlink TOCTOU attacks:
@@ -461,9 +473,19 @@ fn current_executable_hint_path() -> Option<String> {
 }
 
 fn format_listener_pid_hint(hint: &ListenerPidHint) -> String {
+    let ts = hint
+        .created_epoch_secs
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
     match hint.exe_path.as_deref() {
-        Some(exe_path) if !exe_path.trim().is_empty() => format!("{}\n{exe_path}\n", hint.pid),
-        _ => format!("{}\n", hint.pid),
+        Some(exe_path) if !exe_path.trim().is_empty() => {
+            format!("{}\n{exe_path}\n{ts}\n", hint.pid)
+        }
+        _ => format!("{}\n\n{ts}\n", hint.pid),
     }
 }
 
@@ -482,15 +504,45 @@ fn sanitize_pid_hint_component(value: &str) -> String {
 fn parse_listener_pid_hint(content: &str) -> Option<ListenerPidHint> {
     let mut lines = content.lines();
     let pid = lines.next()?.trim().parse::<u32>().ok()?;
-    let exe_path = lines
-        .find(|line| !line.trim().is_empty())
-        .map(std::string::ToString::to_string);
-    Some(ListenerPidHint { pid, exe_path })
+    // Line 2: exe_path (may be empty)
+    let exe_line = lines.next().unwrap_or("");
+    let exe_path = if exe_line.trim().is_empty() {
+        None
+    } else {
+        Some(exe_line.trim().to_string())
+    };
+    // Line 3: creation timestamp (epoch seconds) — optional for
+    // backwards compatibility with older hint files.
+    let created_epoch_secs = lines
+        .next()
+        .and_then(|line| line.trim().parse::<u64>().ok());
+    Some(ListenerPidHint {
+        pid,
+        exe_path,
+        created_epoch_secs,
+    })
 }
 
 fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
     let content = std::fs::read_to_string(listener_pid_hint_path(host, port)).ok()?;
-    parse_listener_pid_hint(&content)
+    let hint = parse_listener_pid_hint(&content)?;
+    // Reject stale hints to prevent PID recycling attacks.
+    // If no timestamp is present (old format), accept the hint but log a warning.
+    if let Some(created) = hint.created_epoch_secs {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(created) > PID_HINT_MAX_AGE_SECS {
+            tracing::debug!(
+                pid = hint.pid,
+                age_secs = now.saturating_sub(created),
+                "rejecting stale PID hint file (older than {PID_HINT_MAX_AGE_SECS}s)"
+            );
+            return None;
+        }
+    }
+    Some(hint)
 }
 
 fn hinted_pid_matches_listener(hint: &ListenerPidHint, listeners: &[u32]) -> bool {

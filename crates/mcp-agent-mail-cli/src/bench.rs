@@ -682,6 +682,14 @@ fn run_once(
     working_dir: Option<&Path>,
 ) -> (Option<i32>, Option<String>, i64, bool) {
     let started = Instant::now();
+    if command.is_empty() {
+        return (
+            None,
+            Some("Empty command".to_string()),
+            elapsed_us(started.elapsed()),
+            false,
+        );
+    }
     let mut process = Command::new(&command[0]);
     process.args(&command[1..]);
     process.stdout(Stdio::null());
@@ -967,7 +975,7 @@ impl BenchResult {
             .collect();
         samples_ms.sort_by(|a, b| a.total_cmp(b));
 
-        let mean_ms = samples_ms.iter().sum::<f64>() / samples_ms.len() as f64;
+        let mean_ms = round_to(samples_ms.iter().sum::<f64>() / samples_ms.len() as f64, 2);
         let variance_ms2 = samples_ms
             .iter()
             .map(|sample| {
@@ -976,21 +984,21 @@ impl BenchResult {
             })
             .sum::<f64>()
             / samples_ms.len() as f64;
-        let stddev_ms = variance_ms2.sqrt();
+        let stddev_ms = round_to(variance_ms2.sqrt(), 2);
 
-        let p95_ms = round_to(percentile(&samples_ms, 95.0), 2);
+        let p95_ms = percentile(&samples_ms, 95.0);
         let delta_p95_ms = baseline_p95_ms.map(|base| round_to(p95_ms - base, 2));
 
         Ok(Self {
             name: name.into(),
-            mean_ms: round_to(mean_ms, 2),
-            stddev_ms: round_to(stddev_ms, 2),
+            mean_ms,
+            stddev_ms,
             variance_ms2: round_to(variance_ms2, 4),
             min_ms: round_to(*samples_ms.first().unwrap_or(&0.0), 2),
             max_ms: round_to(*samples_ms.last().unwrap_or(&0.0), 2),
             median_ms: round_to(percentile(&samples_ms, 50.0), 2),
             p95_ms,
-            p99_ms: round_to(percentile(&samples_ms, 99.0), 2),
+            p99_ms: percentile(&samples_ms, 99.0),
             timeseries_ms: samples_ms,
             command: command.into(),
             fixture_signature: fixture_signature.into(),

@@ -4540,9 +4540,10 @@ impl Model for MailAppModel {
             let sections = self
                 .keymap
                 .contextual_help(&screen_bindings, screen_label, screen_tip);
+            let help_scroll = self.help_scroll;
             tui_chrome::render_help_overlay_sections(
                 &sections,
-                self.help_scroll,
+                help_scroll,
                 effects_enabled,
                 frame,
                 area,

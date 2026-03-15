@@ -1802,11 +1802,10 @@ impl Runner {
 
     /// Truncates output to max bytes.
     fn truncate_output(bytes: &[u8], max_bytes: usize) -> String {
-        let s = String::from_utf8_lossy(bytes);
-        if s.len() <= max_bytes {
-            s.into_owned()
+        if bytes.len() <= max_bytes {
+            String::from_utf8_lossy(bytes).into_owned()
         } else {
-            let truncated = &s[..max_bytes];
+            let truncated = String::from_utf8_lossy(&bytes[..max_bytes]);
             format!("{truncated}\n... [output truncated at {max_bytes} bytes]")
         }
     }
@@ -2529,7 +2528,7 @@ exit 1
 
     #[test]
     fn output_excerpt_exactly_at_limit() {
-        assert_eq!(Runner::output_excerpt(b"abcde", 5), "abcde");
+        assert_eq!(Runner::output_excerpt(b"12345", 5), "12345");
     }
 
     #[test]

@@ -332,7 +332,7 @@ fn dir_size(path: &Path) -> u64 {
 
                 let p = entry.path();
                 if ft.is_file() {
-                    total += p.metadata().map_or(0, |m| m.len());
+                    total += entry.metadata().map_or(0, |m| m.len());
                 } else if ft.is_dir() {
                     stack.push(p);
                 }
@@ -448,7 +448,7 @@ fn count_old_files_recursive(dir: &Path, cutoff: std::time::SystemTime) -> u64 {
 
                 let p = entry.path();
                 if ft.is_file() && p.extension().is_some_and(|e| e == "md") {
-                    if let Ok(metadata) = p.metadata()
+                    if let Ok(metadata) = entry.metadata()
                         && let Ok(modified) = metadata.modified()
                         && modified < cutoff
                     {
