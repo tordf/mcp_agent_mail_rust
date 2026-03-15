@@ -1950,7 +1950,7 @@ impl MailAppModel {
 
     fn resolve_export_dir() -> PathBuf {
         let env_export = std::env::var("AM_EXPORT_DIR").ok();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = dirs::home_dir();
         resolve_export_dir_from_sources(env_export.as_deref(), home.as_deref())
     }
 
