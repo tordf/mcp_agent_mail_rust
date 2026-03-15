@@ -3406,3 +3406,272 @@ mod load_routing_tests {
         assert!(model.throughput_ewma > first, "EWMA should increase");
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Predictive Coordination Intelligence (Track 12)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Thread participation graph — tracks which agents are active in which
+/// threads.  Agents sharing multiple threads are at higher conflict risk.
+#[derive(Debug, Clone, Default)]
+pub struct ThreadParticipationGraph {
+    /// thread_id → set of participating agent names.
+    thread_agents: HashMap<String, HashSet<String>>,
+    /// agent → set of thread_ids they're active in.
+    agent_threads: HashMap<String, HashSet<String>>,
+}
+
+impl ThreadParticipationGraph {
+    /// Record an agent participating in a thread.
+    pub fn record_participation(&mut self, agent: &str, thread_id: &str) {
+        if agent == ATC_AGENT_NAME {
+            return;
+        }
+        self.thread_agents
+            .entry(thread_id.to_string())
+            .or_default()
+            .insert(agent.to_string());
+        self.agent_threads
+            .entry(agent.to_string())
+            .or_default()
+            .insert(thread_id.to_string());
+    }
+
+    /// Count how many threads two agents share.
+    #[must_use]
+    pub fn shared_thread_count(&self, agent_a: &str, agent_b: &str) -> usize {
+        let threads_a = match self.agent_threads.get(agent_a) {
+            Some(t) => t,
+            None => return 0,
+        };
+        let threads_b = match self.agent_threads.get(agent_b) {
+            Some(t) => t,
+            None => return 0,
+        };
+        threads_a.intersection(threads_b).count()
+    }
+
+    /// Find all agent pairs that share >= `min_shared` threads.
+    /// These pairs are at elevated conflict risk.
+    #[must_use]
+    pub fn high_risk_pairs(&self, min_shared: usize) -> Vec<(String, String, usize)> {
+        let agents: Vec<&str> = self.agent_threads.keys().map(String::as_str).collect();
+        let mut pairs = Vec::new();
+        for i in 0..agents.len() {
+            for j in (i + 1)..agents.len() {
+                let count = self.shared_thread_count(agents[i], agents[j]);
+                if count >= min_shared {
+                    pairs.push((
+                        agents[i].to_string(),
+                        agents[j].to_string(),
+                        count,
+                    ));
+                }
+            }
+        }
+        pairs.sort_by(|a, b| b.2.cmp(&a.2));
+        pairs
+    }
+
+    /// Number of tracked agents.
+    #[must_use]
+    pub fn agent_count(&self) -> usize {
+        self.agent_threads.len()
+    }
+
+    /// Number of tracked threads.
+    #[must_use]
+    pub fn thread_count(&self) -> usize {
+        self.thread_agents.len()
+    }
+}
+
+/// Compute the expected information gain from probing an agent.
+///
+/// Based on the entropy of the posterior belief about their liveness.
+/// High entropy = high uncertainty = high info gain from probing.
+/// Near-certain agents (entropy ≈ 0) don't need probes.
+#[must_use]
+pub fn probe_information_gain(posterior: &[(LivenessState, f64)]) -> f64 {
+    posterior
+        .iter()
+        .filter(|(_, p)| *p > 0.0)
+        .map(|(_, p)| -p * p.ln())
+        .sum()
+}
+
+/// Rank agents by probe priority (highest information gain first).
+///
+/// Only includes agents above the `min_gain` threshold to avoid
+/// wasting probes on agents we're already confident about.
+#[must_use]
+pub fn rank_probe_targets(
+    agents: &HashMap<String, AgentLivenessEntry>,
+    min_gain: f64,
+) -> Vec<(String, f64)> {
+    let mut targets: Vec<(String, f64)> = agents
+        .iter()
+        .filter(|(name, _)| name.as_str() != ATC_AGENT_NAME)
+        .map(|(name, entry)| {
+            let gain = probe_information_gain(entry.core.posterior());
+            (name.clone(), gain)
+        })
+        .filter(|(_, gain)| *gain >= min_gain)
+        .collect();
+    targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    targets
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Track 12 Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod predictive_tests {
+    use super::*;
+
+    #[test]
+    fn empty_graph() {
+        let graph = ThreadParticipationGraph::default();
+        assert_eq!(graph.agent_count(), 0);
+        assert_eq!(graph.thread_count(), 0);
+        assert_eq!(graph.shared_thread_count("A", "B"), 0);
+    }
+
+    #[test]
+    fn record_participation() {
+        let mut graph = ThreadParticipationGraph::default();
+        graph.record_participation("BlueFox", "thread-1");
+        graph.record_participation("RedHawk", "thread-1");
+        graph.record_participation("BlueFox", "thread-2");
+
+        assert_eq!(graph.agent_count(), 2);
+        assert_eq!(graph.thread_count(), 2);
+        assert_eq!(graph.shared_thread_count("BlueFox", "RedHawk"), 1);
+    }
+
+    #[test]
+    fn shared_threads_symmetric() {
+        let mut graph = ThreadParticipationGraph::default();
+        graph.record_participation("A", "t1");
+        graph.record_participation("B", "t1");
+        graph.record_participation("A", "t2");
+        graph.record_participation("B", "t2");
+
+        assert_eq!(graph.shared_thread_count("A", "B"), 2);
+        assert_eq!(graph.shared_thread_count("B", "A"), 2);
+    }
+
+    #[test]
+    fn high_risk_pairs_filters_by_threshold() {
+        let mut graph = ThreadParticipationGraph::default();
+        // A and B share 3 threads
+        for t in ["t1", "t2", "t3"] {
+            graph.record_participation("A", t);
+            graph.record_participation("B", t);
+        }
+        // A and C share 1 thread
+        graph.record_participation("C", "t1");
+
+        let pairs = graph.high_risk_pairs(2);
+        assert_eq!(pairs.len(), 1, "only A-B should exceed threshold 2");
+        assert_eq!(pairs[0].2, 3);
+
+        let all_pairs = graph.high_risk_pairs(1);
+        // A-B share 3, A-C share 1, B-C share 1 (both in t1) = 3 pairs
+        assert_eq!(all_pairs.len(), 3, "all three pairs should exceed threshold 1");
+    }
+
+    #[test]
+    fn atc_excluded_from_participation() {
+        let mut graph = ThreadParticipationGraph::default();
+        graph.record_participation(ATC_AGENT_NAME, "t1");
+        graph.record_participation("BlueFox", "t1");
+        assert_eq!(graph.agent_count(), 1, "ATC should be excluded");
+        assert_eq!(graph.shared_thread_count(ATC_AGENT_NAME, "BlueFox"), 0);
+    }
+
+    #[test]
+    fn probe_information_gain_high_for_uncertain() {
+        // Uniform posterior = max entropy
+        let uniform = vec![
+            (LivenessState::Alive, 1.0 / 3.0),
+            (LivenessState::Flaky, 1.0 / 3.0),
+            (LivenessState::Dead, 1.0 / 3.0),
+        ];
+        let gain_uniform = probe_information_gain(&uniform);
+
+        // Certain posterior = zero entropy
+        let certain = vec![
+            (LivenessState::Alive, 1.0),
+            (LivenessState::Flaky, 0.0),
+            (LivenessState::Dead, 0.0),
+        ];
+        let gain_certain = probe_information_gain(&certain);
+
+        assert!(gain_uniform > gain_certain);
+        assert!(gain_certain < 0.01, "certain posterior should have ~0 entropy");
+        assert!(gain_uniform > 1.0, "uniform should have high entropy");
+    }
+
+    #[test]
+    fn rank_probe_targets_orders_by_gain() {
+        let mut agents = HashMap::new();
+
+        // Uncertain agent (uniform posterior)
+        let mut uncertain = AgentLivenessEntry {
+            name: "Uncertain".to_string(),
+            state: LivenessState::Alive,
+            rhythm: AgentRhythm::new(60.0),
+            suspect_since: 0,
+            probe_sent_at: 0,
+            sprt_log_lr: 0.0,
+            core: default_liveness_core(),
+        };
+        // Push posterior toward uncertainty
+        for _ in 0..5 {
+            uncertain.core.update_posterior(&[
+                (LivenessState::Alive, 0.5),
+                (LivenessState::Flaky, 0.5),
+                (LivenessState::Dead, 0.5),
+            ]);
+        }
+        agents.insert("Uncertain".to_string(), uncertain);
+
+        // Confident agent (strong alive posterior — default)
+        let confident = AgentLivenessEntry {
+            name: "Confident".to_string(),
+            state: LivenessState::Alive,
+            rhythm: AgentRhythm::new(60.0),
+            suspect_since: 0,
+            probe_sent_at: 0,
+            sprt_log_lr: 0.0,
+            core: default_liveness_core(),
+        };
+        agents.insert("Confident".to_string(), confident);
+
+        let ranked = rank_probe_targets(&agents, 0.0);
+        assert!(!ranked.is_empty());
+        assert_eq!(ranked[0].0, "Uncertain", "most uncertain should be probed first");
+    }
+
+    #[test]
+    fn rank_probe_targets_excludes_atc() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            ATC_AGENT_NAME.to_string(),
+            AgentLivenessEntry {
+                name: ATC_AGENT_NAME.to_string(),
+                state: LivenessState::Alive,
+                rhythm: AgentRhythm::new(60.0),
+                suspect_since: 0,
+                probe_sent_at: 0,
+                sprt_log_lr: 0.0,
+                core: default_liveness_core(),
+            },
+        );
+
+        let ranked = rank_probe_targets(&agents, 0.0);
+        assert!(ranked.is_empty(), "ATC should be excluded from probe targets");
+    }
+}
