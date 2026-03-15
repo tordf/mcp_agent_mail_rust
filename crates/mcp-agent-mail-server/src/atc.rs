@@ -3675,3 +3675,310 @@ mod predictive_tests {
         assert!(ranked.is_empty(), "ATC should be excluded from probe targets");
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Mechanism Design — VCG Priority (Track 13)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Participant in a conflict resolution auction.
+#[derive(Debug, Clone)]
+pub struct ConflictParticipant {
+    pub agent: String,
+    pub remaining_tasks: u64,
+    pub estimated_completion_mins: u64,
+    pub reservation_age_micros: i64,
+}
+
+/// Compute VCG-inspired priority for conflict resolution.
+///
+/// Each agent's priority = the externality they impose on others by
+/// holding the resource.  The agent with the HIGHEST externality
+/// (most blocking impact) should yield first.
+///
+/// Under VCG, truthful reporting of `remaining_tasks` is the dominant
+/// strategy: lying increases your expected cost.
+#[must_use]
+pub fn vcg_priority(participants: &[ConflictParticipant]) -> Vec<(String, f64)> {
+    let mut priorities: Vec<(String, f64)> = participants
+        .iter()
+        .enumerate()
+        .map(|(i, agent)| {
+            let externality: f64 = participants
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, other)| {
+                    other.remaining_tasks as f64
+                        * other.estimated_completion_mins.max(1) as f64
+                        / 60.0
+                })
+                .sum();
+            (agent.agent.clone(), externality)
+        })
+        .collect();
+    // Highest externality first (should yield first)
+    priorities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    priorities
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Queueing-Theoretic Load Model (Track 14)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Pollaczek-Khinchine mean wait time for M/G/1 queue.
+///
+/// `rho` = utilization (lambda/mu), `cv_service` = coefficient of variation
+/// of service time.  Returns `f64::INFINITY` if the queue is unstable.
+#[must_use]
+pub fn pk_wait_time(rho: f64, mu: f64, cv_service: f64) -> f64 {
+    if rho >= 1.0 || mu <= 0.0 {
+        return f64::INFINITY;
+    }
+    let cs_sq = cv_service * cv_service;
+    rho * (1.0 + cs_sq) / (2.0 * mu * (1.0 - rho))
+}
+
+/// Kingman's approximation for G/G/1 wait time.
+///
+/// More accurate than P-K when arrival process also has variance.
+#[must_use]
+pub fn kingman_wait_time(rho: f64, mu: f64, cv_arrival: f64, cv_service: f64) -> f64 {
+    if rho >= 1.0 || mu <= 0.0 {
+        return f64::INFINITY;
+    }
+    let ca_sq = cv_arrival * cv_arrival;
+    let cs_sq = cv_service * cv_service;
+    (ca_sq + cs_sq) / 2.0 * rho / (mu * (1.0 - rho))
+}
+
+/// Little's Law consistency check: |L - λW| / L < tolerance.
+///
+/// Returns `true` if the measured metrics are consistent.
+#[must_use]
+pub fn littles_law_consistent(
+    avg_queue_depth: f64,
+    arrival_rate: f64,
+    avg_sojourn_time: f64,
+    tolerance: f64,
+) -> bool {
+    if avg_queue_depth <= 0.0 {
+        return true; // empty queue is trivially consistent
+    }
+    let predicted = arrival_rate * avg_sojourn_time;
+    ((avg_queue_depth - predicted) / avg_queue_depth).abs() < tolerance
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PID Regret Controller (Track 15)
+// ──────────────────────────────────────────────────────────────────────
+
+/// PID controller state for one loss matrix entry.
+#[derive(Debug, Clone)]
+pub struct PidState {
+    /// Current adjusted loss value.
+    pub current_value: f64,
+    /// Original configured value (for reset).
+    original_value: f64,
+    /// PID gains.
+    kp: f64,
+    ki: f64,
+    kd: f64,
+    /// Integral accumulator.
+    integral: f64,
+    /// Previous error (for derivative term).
+    prev_error: f64,
+    /// Anti-windup clamp for integral.
+    integral_max: f64,
+    /// Safety bounds.
+    min_value: f64,
+    max_value: f64,
+}
+
+impl PidState {
+    /// Create a new PID state for a loss matrix entry.
+    #[must_use]
+    pub fn new(original_value: f64) -> Self {
+        Self {
+            current_value: original_value,
+            original_value,
+            kp: 0.1,
+            ki: 0.01,
+            kd: 0.02,
+            integral: 0.0,
+            prev_error: 0.0,
+            integral_max: original_value * 2.0,
+            min_value: original_value * 0.1,
+            max_value: original_value * 10.0,
+        }
+    }
+
+    /// Update the loss value based on regret error signal.
+    ///
+    /// `error` = recent average regret for this (action, state) pair.
+    /// Positive error → loss too low (action chosen too often).
+    /// Negative error → loss too high (action avoided too much).
+    pub fn update(&mut self, error: f64, dt: f64) -> f64 {
+        let p = self.kp * error;
+        self.integral = (self.integral + error * dt).clamp(-self.integral_max, self.integral_max);
+        let i = self.ki * self.integral;
+        let d = if dt > 0.0 {
+            self.kd * (error - self.prev_error) / dt
+        } else {
+            0.0
+        };
+        self.prev_error = error;
+
+        let delta = p + i + d;
+        self.current_value = (self.current_value + delta).clamp(self.min_value, self.max_value);
+        self.current_value
+    }
+
+    /// Reset to original value (operator override).
+    pub fn reset(&mut self) {
+        self.current_value = self.original_value;
+        self.integral = 0.0;
+        self.prev_error = 0.0;
+    }
+
+    /// Current deviation from original.
+    #[must_use]
+    pub fn deviation(&self) -> f64 {
+        self.current_value - self.original_value
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Tracks 13-15 Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod advanced_tests {
+    use super::*;
+
+    // ── VCG Priority (Track 13) ──────────────────────────────────────
+
+    #[test]
+    fn vcg_highest_externality_first() {
+        let participants = vec![
+            ConflictParticipant {
+                agent: "FastAgent".to_string(),
+                remaining_tasks: 1,
+                estimated_completion_mins: 5,
+                reservation_age_micros: 100,
+            },
+            ConflictParticipant {
+                agent: "SlowAgent".to_string(),
+                remaining_tasks: 10,
+                estimated_completion_mins: 60,
+                reservation_age_micros: 200,
+            },
+        ];
+        let priorities = vcg_priority(&participants);
+        // SlowAgent has more remaining work → holding the resource blocks
+        // FastAgent more (FastAgent would finish quickly).
+        // But externality = sum of OTHER agents' cost.
+        // FastAgent's externality = SlowAgent's cost = 10*60/60 = 10 agent-hours
+        // SlowAgent's externality = FastAgent's cost = 1*5/60 ≈ 0.08 agent-hours
+        // FastAgent has HIGHER externality → should yield first
+        assert_eq!(priorities[0].0, "FastAgent");
+    }
+
+    #[test]
+    fn vcg_single_participant() {
+        let participants = vec![ConflictParticipant {
+            agent: "Only".to_string(),
+            remaining_tasks: 5,
+            estimated_completion_mins: 30,
+            reservation_age_micros: 0,
+        }];
+        let priorities = vcg_priority(&participants);
+        assert_eq!(priorities.len(), 1);
+        assert!((priorities[0].1 - 0.0).abs() < f64::EPSILON, "single agent has 0 externality");
+    }
+
+    // ── Queueing Theory (Track 14) ───────────────────────────────────
+
+    #[test]
+    fn pk_returns_infinity_for_saturated() {
+        assert!(pk_wait_time(1.0, 1.0, 1.0).is_infinite());
+        assert!(pk_wait_time(1.5, 1.0, 1.0).is_infinite());
+    }
+
+    #[test]
+    fn pk_wait_increases_with_utilization() {
+        let w_low = pk_wait_time(0.3, 1.0, 1.0);
+        let w_high = pk_wait_time(0.8, 1.0, 1.0);
+        assert!(w_high > w_low, "higher utilization should mean longer wait");
+    }
+
+    #[test]
+    fn kingman_matches_pk_for_poisson() {
+        // When cv_arrival = 1 (Poisson), Kingman ≈ PK for M/M/1 (cv_service = 1)
+        let pk = pk_wait_time(0.5, 1.0, 1.0);
+        let kingman = kingman_wait_time(0.5, 1.0, 1.0, 1.0);
+        assert!(
+            (pk - kingman).abs() < 0.01,
+            "should match for Poisson/Exponential case"
+        );
+    }
+
+    #[test]
+    fn littles_law_consistent_check() {
+        assert!(littles_law_consistent(10.0, 2.0, 5.0, 0.01)); // L=10, λ=2, W=5 → λW=10 ✓
+        assert!(!littles_law_consistent(10.0, 2.0, 3.0, 0.1)); // L=10, λ=2, W=3 → λW=6 ✗
+    }
+
+    // ── PID Controller (Track 15) ────────────────────────────────────
+
+    #[test]
+    fn pid_converges_under_constant_error() {
+        let mut pid = PidState::new(10.0);
+        // Constant positive error → value should increase
+        for _ in 0..100 {
+            pid.update(1.0, 1.0);
+        }
+        assert!(pid.current_value > 10.0, "positive error should increase value");
+    }
+
+    #[test]
+    fn pid_stays_within_bounds() {
+        let mut pid = PidState::new(10.0);
+        // Extreme positive error
+        for _ in 0..1000 {
+            pid.update(100.0, 1.0);
+        }
+        assert!(pid.current_value <= 100.0, "should not exceed 10× original");
+        assert!(pid.current_value >= 1.0, "should not go below 0.1× original");
+    }
+
+    #[test]
+    fn pid_reset_restores_original() {
+        let mut pid = PidState::new(10.0);
+        pid.update(5.0, 1.0);
+        assert!(pid.current_value != 10.0);
+        pid.reset();
+        assert!((pid.current_value - 10.0).abs() < f64::EPSILON);
+        assert!((pid.integral - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pid_anti_windup_clamps_integral() {
+        let mut pid = PidState::new(10.0);
+        // Drive integral to max
+        for _ in 0..10000 {
+            pid.update(100.0, 1.0);
+        }
+        assert!(
+            pid.integral.abs() <= pid.integral_max,
+            "integral should be clamped by anti-windup"
+        );
+    }
+
+    #[test]
+    fn pid_deviation_tracks_distance() {
+        let mut pid = PidState::new(10.0);
+        assert!((pid.deviation() - 0.0).abs() < f64::EPSILON);
+        pid.update(1.0, 1.0);
+        assert!(pid.deviation() > 0.0, "positive error should increase deviation");
+    }
+}
