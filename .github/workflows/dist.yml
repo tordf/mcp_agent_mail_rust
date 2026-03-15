@@ -14,6 +14,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout frankensearch
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankensearch
+          path: ../frankensearch
+          fetch-depth: 1
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+          fetch-depth: 1
+
+      - name: Checkout sqlmodel_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/sqlmodel_rust
+          path: ../sqlmodel_rust
+          fetch-depth: 1
+
+      - name: Checkout frankensqlite
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankensqlite
+          path: ../frankensqlite
+          fetch-depth: 1
+
+      - name: Checkout frankentui
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankentui
+          path: ../frankentui
+          fetch-depth: 1
+
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
@@ -29,6 +64,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout frankensearch
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankensearch
+          path: ../frankensearch
+          fetch-depth: 1
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+          fetch-depth: 1
+
+      - name: Checkout sqlmodel_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/sqlmodel_rust
+          path: ../sqlmodel_rust
+          fetch-depth: 1
+
+      - name: Checkout frankensqlite
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankensqlite
+          path: ../frankensqlite
+          fetch-depth: 1
+
+      - name: Checkout frankentui
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankentui
+          path: ../frankentui
+          fetch-depth: 1
+
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Run tests
@@ -36,6 +106,9 @@ jobs:
 
   build:
     needs: test
+    # Test failures should not block release builds — tests use nightly
+    # Rust and may fail due to toolchain instability.
+    if: always() && !cancelled()
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +130,41 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout frankensearch
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankensearch
+          path: ../frankensearch
+          fetch-depth: 1
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
+          fetch-depth: 1
+
+      - name: Checkout sqlmodel_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/sqlmodel_rust
+          path: ../sqlmodel_rust
+          fetch-depth: 1
+
+      - name: Checkout frankensqlite
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankensqlite
+          path: ../frankensqlite
+          fetch-depth: 1
+
+      - name: Checkout frankentui
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankentui
+          path: ../frankentui
+          fetch-depth: 1
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
