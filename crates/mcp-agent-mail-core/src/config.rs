@@ -591,6 +591,52 @@ impl ConsoleThemeId {
     }
 }
 
+// ---------------------------------------------------------------------------
+// XDG Base Directory helpers
+// ---------------------------------------------------------------------------
+
+/// Application directory name used under XDG base directories.
+const XDG_APP_DIR: &str = "mcp-agent-mail";
+
+/// Return the XDG-compliant config directory for this application.
+///
+/// Resolution order:
+///   1. `$XDG_CONFIG_HOME/mcp-agent-mail/` (or `~/.config/mcp-agent-mail/`)
+///
+/// The caller is responsible for backward-compat checks (i.e. preferring a
+/// legacy path when it already exists on disk).
+fn xdg_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join(XDG_APP_DIR))
+}
+
+/// Return the XDG-compliant data directory for this application.
+///
+/// Resolution order:
+///   1. `$XDG_DATA_HOME/mcp-agent-mail/` (or `~/.local/share/mcp-agent-mail/`)
+fn xdg_data_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(XDG_APP_DIR))
+}
+
+/// Resolve a *data* path with backward compatibility.
+///
+/// `legacy_base` is the old parent directory (e.g. `~/.mcp_agent_mail`).
+/// `subdir` is the child path within that base (e.g. `"signals"`,
+/// `"exports"`).
+///
+/// If `legacy_base` already exists on disk, return `legacy_base/subdir` so
+/// that existing installations are not disrupted.  Otherwise return the XDG
+/// data dir joined with `subdir`.
+///
+/// Falls back to `legacy_base/subdir` if `dirs::data_dir()` is unavailable.
+fn resolve_data_path(legacy_base: &Path, subdir: &str) -> PathBuf {
+    if legacy_base.exists() {
+        return legacy_base.join(subdir);
+    }
+    xdg_data_dir()
+        .map(|d| d.join(subdir))
+        .unwrap_or_else(|| legacy_base.join(subdir))
+}
+
 impl Default for Config {
     #[allow(clippy::too_many_lines)]
     fn default() -> Self {
@@ -619,9 +665,18 @@ impl Default for Config {
             fsqlite_concurrent_retries: 5,
 
             // Storage
-            storage_root: dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".mcp_agent_mail_git_mailbox_repo"),
+            storage_root: {
+                let legacy = dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".mcp_agent_mail_git_mailbox_repo");
+                if legacy.exists() {
+                    legacy
+                } else {
+                    xdg_data_dir()
+                        .map(|d| d.join("git_mailbox_repo"))
+                        .unwrap_or(legacy)
+                }
+            },
             git_author_name: "mcp-agent".to_string(),
             git_author_email: "mcp-agent@example.com".to_string(),
             inline_image_max_bytes: 65536,
@@ -743,10 +798,12 @@ impl Default for Config {
 
             // Notifications
             notifications_enabled: false,
-            notifications_signals_dir: dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".mcp_agent_mail")
-                .join("signals"),
+            notifications_signals_dir: resolve_data_path(
+                &dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".mcp_agent_mail"),
+                "signals",
+            ),
             notifications_include_metadata: true,
             notifications_debounce_ms: 100,
 
@@ -793,10 +850,13 @@ impl Default for Config {
             log_json_enabled: false,
 
             // Console / TUI layout + persistence
-            console_persist_path: dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".config")
-                .join("mcp-agent-mail")
+            console_persist_path: xdg_config_dir()
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join(".config")
+                        .join(XDG_APP_DIR)
+                })
                 .join("config.env"),
             console_auto_save: true,
             console_interactive_enabled: true,
@@ -821,10 +881,12 @@ impl Default for Config {
             tui_effects: true,
             tui_ambient: "subtle".to_string(),
             tui_debug: false,
-            export_dir: dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".mcp_agent_mail")
-                .join("exports"),
+            export_dir: resolve_data_path(
+                &dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".mcp_agent_mail"),
+                "exports",
+            ),
             tui_tree_style: "rounded".to_string(),
             tui_theme: "default".to_string(),
             tui_toast_enabled: true,
@@ -1673,7 +1735,8 @@ pub enum ConfigSource {
     ProcessEnv,
     /// Project-local `.env` file in working directory.
     ProjectDotenv,
-    /// User-global `~/.mcp_agent_mail/.env` (or legacy `~/mcp_agent_mail/.env`).
+    /// User-global env file: `~/.mcp_agent_mail/.env`, `~/mcp_agent_mail/.env`,
+    /// or `$XDG_CONFIG_HOME/mcp-agent-mail/.env`.
     UserEnvFile,
     /// CLI argument override.
     CliArg,
@@ -1904,14 +1967,18 @@ pub fn dotenv_value(key: &str) -> Option<String> {
 
 /// Candidate paths for the user-global env file, checked in order.
 ///
-/// - `~/.mcp_agent_mail/.env` — preferred (matches signals dir convention)
-/// - `~/mcp_agent_mail/.env`  — legacy (matches old shell wrapper)
+/// 1. `~/.mcp_agent_mail/.env`            — legacy preferred
+/// 2. `~/mcp_agent_mail/.env`             — legacy (old shell wrapper)
+/// 3. `$XDG_CONFIG_HOME/mcp-agent-mail/.env` — XDG (new installs)
 fn user_env_file_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    let candidates = [
+    let mut candidates = vec![
         home.join(".mcp_agent_mail").join(".env"),
         home.join("mcp_agent_mail").join(".env"),
     ];
+    if let Some(xdg) = xdg_config_dir() {
+        candidates.push(xdg.join(".env"));
+    }
     candidates.into_iter().find(|p| p.is_file())
 }
 
@@ -2913,10 +2980,12 @@ mod tests {
         assert!(config.tui_effects);
         assert_eq!(config.tui_ambient, "subtle");
         assert!(!config.tui_debug);
-        let expected_export_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".mcp_agent_mail")
-            .join("exports");
+        let expected_export_dir = resolve_data_path(
+            &dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".mcp_agent_mail"),
+            "exports",
+        );
         assert_eq!(config.export_dir, expected_export_dir);
         assert_eq!(config.tui_tree_style, "rounded");
         assert_eq!(config.tui_theme, "default");
@@ -2958,10 +3027,12 @@ mod tests {
         ]);
         let config = Config::from_env();
         assert_eq!(config.tui_ambient, "subtle");
-        let expected_export_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".mcp_agent_mail")
-            .join("exports");
+        let expected_export_dir = resolve_data_path(
+            &dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".mcp_agent_mail"),
+            "exports",
+        );
         assert_eq!(config.export_dir, expected_export_dir);
         assert_eq!(config.tui_tree_style, "rounded");
         assert_eq!(config.tui_theme, "default");

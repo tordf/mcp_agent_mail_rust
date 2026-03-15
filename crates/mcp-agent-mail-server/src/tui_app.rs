@@ -515,6 +515,17 @@ fn resolve_export_dir_from_sources(
     if let Some(path) = env_export_dir.map(str::trim).filter(|v| !v.is_empty()) {
         return PathBuf::from(path);
     }
+    // Backward compat: use legacy path if it already exists on disk.
+    if let Some(home) = home_dir {
+        let legacy = home.join(".mcp_agent_mail");
+        if legacy.exists() {
+            return legacy.join("exports");
+        }
+    }
+    // XDG data dir for new installations.
+    if let Some(data) = dirs::data_dir() {
+        return data.join("mcp-agent-mail").join("exports");
+    }
     if let Some(home) = home_dir {
         return home.join(".mcp_agent_mail").join("exports");
     }
@@ -7516,14 +7527,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_export_dir_prefers_env_and_falls_back_to_home() {
+    fn resolve_export_dir_prefers_env_and_falls_back_to_xdg() {
         let home = PathBuf::from("/tmp/fake-home");
         let from_env =
             resolve_export_dir_from_sources(Some("/tmp/custom-export"), Some(home.as_path()));
         assert_eq!(from_env, PathBuf::from("/tmp/custom-export"));
 
+        // With a non-existent home, it should fall back to the XDG data dir
+        // (if available) or ultimately fall back to the legacy path.
         let from_home = resolve_export_dir_from_sources(None, Some(home.as_path()));
-        assert_eq!(from_home, home.join(".mcp_agent_mail").join("exports"));
+        if let Some(data) = dirs::data_dir() {
+            assert_eq!(from_home, data.join("mcp-agent-mail").join("exports"));
+        } else {
+            assert_eq!(from_home, home.join(".mcp_agent_mail").join("exports"));
+        }
     }
 
     #[test]
