@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-const PATTERN_CACHE_CAPACITY: usize = 256;
+const PATTERN_CACHE_CAPACITY: usize = 4096;
 
 thread_local! {
     static PATTERN_CACHE: RefCell<PatternCache> = RefCell::new(PatternCache::new(PATTERN_CACHE_CAPACITY));
@@ -29,11 +29,6 @@ impl PatternCache {
 
     fn get_or_insert(&mut self, raw: &str) -> Arc<CompiledPattern> {
         if let Some(compiled) = self.entries.get(raw) {
-            if let Some(pos) = self.order.iter().position(|x| x == raw)
-                && let Some(key) = self.order.remove(pos)
-            {
-                self.order.push_back(key);
-            }
             return Arc::clone(compiled);
         }
 
@@ -171,6 +166,12 @@ impl CompiledPattern {
             first_literal_segment_end,
             segments,
         }
+    }
+
+    /// Get a compiled pattern from the thread-local cache, or compile it if missing.
+    #[must_use]
+    pub fn cached(raw: &str) -> Arc<Self> {
+        PATTERN_CACHE.with(|cache| cache.borrow_mut().get_or_insert(raw))
     }
 
     /// Returns the normalized pattern string.

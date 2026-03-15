@@ -882,7 +882,11 @@ mod tests {
         cache.insert(1, 6);
 
         // If 1 was recognized as ghost, it went to main.
-        assert_eq!(cache.main_len(), 1, "If 1 went to small, ghost was forgotten!");
+        assert_eq!(
+            cache.main_len(),
+            1,
+            "If 1 went to small, ghost was forgotten!"
+        );
         assert_eq!(cache.small_len(), 1); // '4' is still in small
     }
 

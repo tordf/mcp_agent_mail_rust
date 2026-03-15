@@ -610,7 +610,7 @@ pub fn normalize_agent_name(name: &str) -> Option<String> {
     // Update cache with simple capacity management.
     NORM_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
-        if cache.len() >= 128 {
+        if cache.len() >= 8192 {
             cache.clear();
         }
         cache.insert(lower.into_owned(), normalized.clone());

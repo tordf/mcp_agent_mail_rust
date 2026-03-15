@@ -2132,7 +2132,13 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
     let pid = std::process::id();
     let tmp_path = parent.join(format!(".{file_name}.{pid}.tmp"));
     fs::write(&tmp_path, out)?;
-    fs::rename(&tmp_path, path)
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
 }
 
 fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {

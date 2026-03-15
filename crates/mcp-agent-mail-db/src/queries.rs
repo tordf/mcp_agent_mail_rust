@@ -1019,11 +1019,11 @@ async fn cleanup_committed_agent_after_consistency_failure(
     );
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     drop(conn);
-
     crate::cache::read_cache().invalidate_agent_scoped(
         &cache_scope_for_pool(pool),
         project_id,
         agent_name,
+        Some(agent_id),
     );
     Outcome::Ok(())
 }

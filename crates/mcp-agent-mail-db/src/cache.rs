@@ -472,21 +472,27 @@ impl ReadCache {
     }
 
     /// Invalidate a specific agent entry (call after `register_agent` update).
-    pub fn invalidate_agent(&self, project_id: i64, name: &str) {
-        self.invalidate_agent_scoped("", project_id, name);
+    pub fn invalidate_agent(&self, project_id: i64, name: &str, id: Option<i64>) {
+        self.invalidate_agent_scoped("", project_id, name, id);
     }
 
     /// Invalidate a specific agent entry in a DB scope.
-    pub fn invalidate_agent_scoped(&self, scope: &str, project_id: i64, name: &str) {
+    pub fn invalidate_agent_scoped(
+        &self,
+        scope: &str,
+        project_id: i64,
+        name: &str,
+        id: Option<i64>,
+    ) {
         let scope_fp = scope_fingerprint(scope);
         let key = (scope_fp, project_id, InternedStr::new(name));
         let mut cache = self.agents_by_key.write();
-        if let Some(agent) = cache.remove(&key)
-            && let Some(id) = agent.value.id
-        {
-            drop(cache); // release key map lock first
+        let removed_id = cache.remove(&key).and_then(|a| a.value.id);
+        drop(cache); // release key map lock first
+
+        if let Some(agent_id) = id.or(removed_id) {
             let mut id_cache = self.agents_by_id.write();
-            id_cache.remove(&(scope_fp, id));
+            id_cache.remove(&(scope_fp, agent_id));
         }
     }
 
@@ -598,6 +604,11 @@ impl ReadCache {
     pub fn drain_touches_scoped(&self, scope: &str) -> HashMap<i64, i64> {
         let scope_fp = scope_fingerprint(scope);
 
+        // Optimistically clear the flag BEFORE the loop.
+        // If a concurrent enqueue happens while we are draining, it will set it to true.
+        // A false positive (where the enqueue is drained by us but the flag remains true) is harmless.
+        self.has_pending.store(false, Ordering::Release);
+
         let mut merged = HashMap::new();
         let mut has_remaining = false;
         for shard in &self.deferred_touch_shards {
@@ -627,11 +638,9 @@ impl ReadCache {
             }
         }
 
-        // Clear the pending flag only if NO shard has any entries left.
-        // We do this AFTER the loop to ensure we don't miss any touches added
-        // to a shard we already processed.
-        if !has_remaining {
-            self.has_pending.store(false, Ordering::Release);
+        // Restore the pending flag if ANY shard still has entries left (e.g. from other scopes).
+        if has_remaining {
+            self.has_pending.store(true, Ordering::Release);
         }
 
         let mut last = self.last_touch_flush.lock();
@@ -811,7 +820,7 @@ mod tests {
         assert!(cache.get_agent(2, "RedCat").is_some());
         assert!(cache.get_agent_by_id(55).is_some());
 
-        cache.invalidate_agent(2, "RedCat");
+        cache.invalidate_agent(2, "RedCat", None);
         assert!(cache.get_agent(2, "RedCat").is_none());
         assert!(cache.get_agent_by_id(55).is_none());
     }
@@ -1281,7 +1290,7 @@ mod tests {
                     cache.get_agent(project_id, &name).is_some(),
                     "agent should be cached after put"
                 );
-                cache.invalidate_agent(project_id, &name);
+                cache.invalidate_agent(project_id, &name, None);
                 prop_assert!(
                     cache.get_agent(project_id, &name).is_none(),
                     "agent should be evicted after invalidate"
@@ -1439,7 +1448,7 @@ mod tests {
         assert_eq!(a_by_id.program, "codex-cli");
         assert_eq!(b_by_id.program, "e2e-test");
 
-        cache.invalidate_agent_scoped("/tmp/a.sqlite3", 1, "BlueLake");
+        cache.invalidate_agent_scoped("/tmp/a.sqlite3", 1, "BlueLake", None);
         assert!(
             cache
                 .get_agent_scoped("/tmp/a.sqlite3", 1, "BlueLake")
@@ -1505,7 +1514,7 @@ mod tests {
         assert!(cache.get_agent_by_id(42).is_some());
 
         // Invalidate via key -> id index also cleared
-        cache.invalidate_agent(1, "RedFox");
+        cache.invalidate_agent(1, "RedFox", None);
         assert!(cache.get_agent(1, "RedFox").is_none());
         assert!(cache.get_agent_by_id(42).is_none());
 

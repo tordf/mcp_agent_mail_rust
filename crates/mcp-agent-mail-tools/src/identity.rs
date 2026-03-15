@@ -603,7 +603,7 @@ Check that all parameters have valid values."
     enqueue_agent_semantic_index(&row);
 
     // Invalidate + repopulate read cache after mutation
-    mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);
+    mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
     mcp_agent_mail_db::read_cache().put_agent(&row);
 
     // Write agent profile to git archive (best-effort)
@@ -801,7 +801,7 @@ Choose a different name (or omit the name to auto-generate one)."
     enqueue_agent_semantic_index(&row);
 
     // Invalidate + repopulate read cache after mutation
-    mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);
+    mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
     mcp_agent_mail_db::read_cache().put_agent(&row);
 
     // Write agent profile to git archive (best-effort)
