@@ -21,9 +21,9 @@ use std::hash::Hash;
 /// An entry in the S3-FIFO index.
 #[derive(Debug)]
 enum Node<V> {
-    Small { value: V, freq: u8 },
-    Main { value: V, freq: u8 },
-    Ghost { ghost_gen: u64 },
+    Small { value: V, freq: u8, seq: u64 },
+    Main { value: V, freq: u8, seq: u64 },
+    Ghost { seq: u64 },
 }
 
 /// S3-FIFO cache with O(1) amortized insert, get, and eviction.
@@ -43,18 +43,20 @@ enum Node<V> {
 /// assert_eq!(cache.get(&"key1"), Some(&100));
 /// ```
 pub struct S3FifoCache<K, V> {
-    small: VecDeque<K>,
-    main: VecDeque<K>,
+    small: VecDeque<(K, u64)>,
+    main: VecDeque<(K, u64)>,
     ghost: VecDeque<(K, u64)>,
     index: HashMap<K, Node<V>>,
     small_capacity: usize,
     main_capacity: usize,
     ghost_capacity: usize,
-    ghost_gen: u64,
+    seq_gen: u64,
     /// Number of entries in `small` that are actually in `index`.
     small_live_count: usize,
     /// Number of entries in `main` that are actually in `index`.
     main_live_count: usize,
+    /// Number of entries in `ghost` that are actually in `index`.
+    ghost_live_count: usize,
 }
 
 impl<K, V> S3FifoCache<K, V>
@@ -83,9 +85,10 @@ where
             small_capacity: small_cap,
             main_capacity: main_cap,
             ghost_capacity: capacity,
-            ghost_gen: 0,
+            seq_gen: 0,
             small_live_count: 0,
             main_live_count: 0,
+            ghost_live_count: 0,
         }
     }
 
@@ -99,7 +102,7 @@ where
         Q: std::hash::Hash + Eq + ?Sized,
     {
         match self.index.get_mut(key) {
-            Some(Node::Small { value, freq } | Node::Main { value, freq }) => {
+            Some(Node::Small { value, freq, .. } | Node::Main { value, freq, .. }) => {
                 *freq = (*freq + 1).min(3);
                 Some(value)
             }
@@ -117,7 +120,7 @@ where
         Q: std::hash::Hash + Eq + ?Sized,
     {
         match self.index.get_mut(key) {
-            Some(Node::Small { value, freq } | Node::Main { value, freq }) => {
+            Some(Node::Small { value, freq, .. } | Node::Main { value, freq, .. }) => {
                 *freq = (*freq + 1).min(3);
                 Some(value)
             }
@@ -144,11 +147,16 @@ where
     /// If the key exists in Small or Main, its value is updated in place.
     /// Otherwise, it enters Small.
     pub fn insert(&mut self, key: K, value: V) {
+        self.seq_gen += 1;
+        let seq = self.seq_gen;
+
         let is_ghost = if let Some(node) = self.index.get_mut(&key) {
             match node {
-                Node::Small { value: v, freq } | Node::Main { value: v, freq } => {
+                Node::Small { value: v, freq, seq: n_seq } | Node::Main { value: v, freq, seq: n_seq } => {
                     *v = value;
                     *freq = (*freq + 1).min(3);
+                    // Update seq to avoid eviction from old tombstone
+                    *n_seq = seq;
                     return;
                 }
                 Node::Ghost { .. } => true,
@@ -158,25 +166,26 @@ where
         };
 
         if is_ghost {
+            self.ghost_live_count -= 1;
             // We do not remove the key from self.ghost here to preserve O(1) amortized performance.
             // It will naturally be purged by evict_ghost_if_full when it reaches the front.
             if self.main_capacity == 0 {
                 self.evict_small_if_full();
-                self.small.push_back(key.clone());
-                self.index.insert(key, Node::Small { value, freq: 0 });
+                self.small.push_back((key.clone(), seq));
+                self.index.insert(key, Node::Small { value, freq: 0, seq });
                 self.small_live_count += 1;
             } else {
                 self.evict_main_if_full();
-                self.main.push_back(key.clone());
-                self.index.insert(key, Node::Main { value, freq: 0 });
+                self.main.push_back((key.clone(), seq));
+                self.index.insert(key, Node::Main { value, freq: 0, seq });
                 self.main_live_count += 1;
             }
             return;
         }
 
         self.evict_small_if_full();
-        self.small.push_back(key.clone());
-        self.index.insert(key, Node::Small { value, freq: 0 });
+        self.small.push_back((key.clone(), seq));
+        self.index.insert(key, Node::Small { value, freq: 0, seq });
         self.small_live_count += 1;
     }
 
@@ -217,7 +226,11 @@ where
                 self.main_live_count -= 1;
                 Some(value)
             }
-            Some(Node::Ghost { .. }) | None => None,
+            Some(Node::Ghost { .. }) => {
+                self.ghost_live_count -= 1;
+                None
+            }
+            None => None,
         }
     }
 
@@ -226,14 +239,17 @@ where
     /// Items with `freq >= 1` promote to Main; others go to Ghost.
     fn evict_small_if_full(&mut self) {
         while self.small_live_count >= self.small_capacity {
-            let Some(key) = self.small.pop_front() else {
+            let Some((key, expected_seq)) = self.small.pop_front() else {
                 break;
             };
 
             // Peek before remove: if this key was already promoted to Main or removed,
-            // the entry in the index won't be Node::Small. Unconditionally calling
-            // remove() would steal the live entry from the other queue.
-            if !matches!(self.index.get(&key), Some(Node::Small { .. })) {
+            // the entry in the index won't be Node::Small with the same seq.
+            if let Some(Node::Small { seq: current_seq, .. }) = self.index.get(&key) {
+                if *current_seq != expected_seq {
+                    continue;
+                }
+            } else {
                 continue;
             }
 
@@ -242,39 +258,40 @@ where
             };
             self.small_live_count -= 1;
 
-            let Node::Small { value, freq } = node else {
-                // This should be unreachable due to matches! check above, but
-                // we handle it gracefully just in case.
+            let Node::Small { value, freq, .. } = node else {
                 continue;
             };
+
+            self.seq_gen += 1;
+            let new_seq = self.seq_gen;
 
             if freq >= 1 {
                 if self.main_capacity == 0 {
                     self.evict_ghost_if_full();
-                    self.ghost_gen += 1;
-                    self.ghost.push_back((key.clone(), self.ghost_gen));
+                    self.ghost.push_back((key.clone(), new_seq));
                     self.index.insert(
                         key,
                         Node::Ghost {
-                            ghost_gen: self.ghost_gen,
+                            seq: new_seq,
                         },
                     );
+                    self.ghost_live_count += 1;
                 } else {
                     self.evict_main_if_full();
-                    self.main.push_back(key.clone());
-                    self.index.insert(key, Node::Main { value, freq: 0 });
+                    self.main.push_back((key.clone(), new_seq));
+                    self.index.insert(key, Node::Main { value, freq: 0, seq: new_seq });
                     self.main_live_count += 1;
                 }
             } else {
                 self.evict_ghost_if_full();
-                self.ghost_gen += 1;
-                self.ghost.push_back((key.clone(), self.ghost_gen));
+                self.ghost.push_back((key.clone(), new_seq));
                 self.index.insert(
                     key,
                     Node::Ghost {
-                        ghost_gen: self.ghost_gen,
+                        seq: new_seq,
                     },
                 );
+                self.ghost_live_count += 1;
             }
         }
     }
@@ -285,27 +302,29 @@ where
     /// Others are permanently evicted.
     fn evict_main_if_full(&mut self) {
         if self.main_capacity == 0 {
-            while let Some(key) = self.main.pop_front() {
-                if matches!(self.index.get(&key), Some(Node::Main { .. }))
-                    && let Some(Node::Main { .. }) = self.index.remove(&key)
-                {
-                    self.main_live_count -= 1;
+            while let Some((key, expected_seq)) = self.main.pop_front() {
+                if let Some(Node::Main { seq: current_seq, .. }) = self.index.get(&key) {
+                    if *current_seq == expected_seq {
+                        self.index.remove(&key);
+                        self.main_live_count -= 1;
+                    }
                 }
             }
             return;
         }
 
-        // Max frequency is 3. In the absolute worst case where every item in main
-        // has freq=3, we would need to inspect each item up to 4 times to decrement
-        // its frequency to 0 and finally evict it.
         let mut budget = self.main.len() * 4 + 1;
         while self.main_live_count >= self.main_capacity && budget > 0 {
             budget -= 1;
-            let Some(key) = self.main.pop_front() else {
+            let Some((key, expected_seq)) = self.main.pop_front() else {
                 break;
             };
 
-            if !matches!(self.index.get(&key), Some(Node::Main { .. })) {
+            if let Some(Node::Main { seq: current_seq, .. }) = self.index.get(&key) {
+                if *current_seq != expected_seq {
+                    continue;
+                }
+            } else {
                 continue;
             }
 
@@ -314,19 +333,20 @@ where
             };
             self.main_live_count -= 1;
 
-            let Node::Main { value, freq } = node else {
-                // This should be unreachable due to matches! check above, but
-                // we handle it gracefully just in case.
+            let Node::Main { value, freq, .. } = node else {
                 continue;
             };
 
             if freq >= 1 {
-                self.main.push_back(key.clone());
+                self.seq_gen += 1;
+                let new_seq = self.seq_gen;
+                self.main.push_back((key.clone(), new_seq));
                 self.index.insert(
                     key,
                     Node::Main {
                         value,
                         freq: freq - 1,
+                        seq: new_seq,
                     },
                 );
                 self.main_live_count += 1;
@@ -336,14 +356,18 @@ where
 
     /// Evict from Ghost until it is below capacity.
     fn evict_ghost_if_full(&mut self) {
-        while self.ghost.len() >= self.ghost_capacity {
-            if let Some((key, expected_gen)) = self.ghost.pop_front()
-                && let Some(Node::Ghost {
-                    ghost_gen: current_gen,
-                }) = self.index.get(&key)
-                && *current_gen == expected_gen
-            {
-                self.index.remove(&key);
+        while self.ghost_live_count >= self.ghost_capacity {
+            let Some((key, expected_seq)) = self.ghost.pop_front() else {
+                break;
+            };
+            
+            if let Some(Node::Ghost {
+                seq: current_seq,
+            }) = self.index.get(&key) {
+                if *current_seq == expected_seq {
+                    self.index.remove(&key);
+                    self.ghost_live_count -= 1;
+                }
             }
         }
     }
@@ -356,29 +380,30 @@ where
         self.index.clear();
         self.small_live_count = 0;
         self.main_live_count = 0;
+        self.ghost_live_count = 0;
     }
 
     /// Number of entries in the Ghost queue (for diagnostics).
     #[must_use]
     pub fn ghost_len(&self) -> usize {
-        self.ghost.len()
+        self.ghost_live_count
     }
 
     /// Number of entries in the Small queue (for diagnostics).
     #[must_use]
     pub fn small_len(&self) -> usize {
-        self.small.len()
+        self.small_live_count
     }
 
     /// Number of entries in the Main queue (for diagnostics).
     #[must_use]
     pub fn main_len(&self) -> usize {
-        self.main.len()
+        self.main_live_count
     }
 
     /// Iterate over all live keys (Small + Main queues, excluding Ghost).
     pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.small.iter().chain(self.main.iter())
+        self.small.iter().map(|(k, _)| k).chain(self.main.iter().map(|(k, _)| k))
     }
 }
 
@@ -772,6 +797,44 @@ mod tests {
             *val = 42;
         }
         assert_eq!(cache.get(&"a"), Some(&42));
+    }
+
+    #[test]
+    fn s3fifo_ghost_forgotten_bug() {
+        let mut cache = S3FifoCache::new(5);
+        // Capacity 5 means Ghost capacity is 5, Small capacity is 1, Main is 4.
+
+        // 1. Insert "a" -> goes to small.
+        cache.insert("a", 1);
+        
+        // 2. Insert "b" -> evicts "a" from small (freq=0) -> goes to ghost.
+        cache.insert("b", 2);
+
+        // 3. Insert "a" -> is_ghost=true -> goes to main.
+        cache.insert("a", 3);
+
+        // 4. Remove "a".
+        cache.remove(&"a");
+
+        // 5. Insert "a" -> goes to small.
+        cache.insert("a", 4);
+
+        // 6. Insert "c" -> evicts "a" from small (freq=0) -> goes to ghost.
+        cache.insert("c", 5);
+
+        // 7. Fill ghost queue to trigger evict_ghost_if_full.
+        for i in 0..10 {
+            let key = format!("k{}", i);
+            cache.insert(key.clone(), i);
+            cache.insert(format!("dummy{}", i), i);
+        }
+
+        // 8. Re-insert "a". It should be recognized as ghost and go to main.
+        cache.insert("a", 6);
+        
+        // If "a" was recognized as ghost, it went to main.
+        assert_eq!(cache.main_len(), 1, "If a went to small, ghost was forgotten!");
+        assert_eq!(cache.small_len(), 0);
     }
 
     // ── Additional coverage tests ────────────────────────────────────
