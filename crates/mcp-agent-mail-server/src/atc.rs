@@ -15,9 +15,38 @@
 //! All downstream subsystems (liveness, conflict, routing, calibration)
 //! are built on top of these two primitives.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
+use std::time::Duration;
+
+const TWO_POW_32_F64: f64 = 4_294_967_296.0;
+const MICROS_PER_SECOND_F64: f64 = 1_000_000.0;
+
+fn u64_to_f64(value: u64) -> f64 {
+    let upper = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lower = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(upper).mul_add(TWO_POW_32_F64, f64::from(lower))
+}
+
+fn usize_to_f64(value: usize) -> f64 {
+    u64_to_f64(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
+fn nonnegative_i64_to_f64(value: i64) -> f64 {
+    u64_to_f64(u64::try_from(value.max(0)).unwrap_or(0))
+}
+
+fn micros_f64_to_i64(value: f64) -> i64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+
+    let seconds = value / MICROS_PER_SECOND_F64;
+    let micros = Duration::from_secs_f64(seconds).as_micros();
+    i64::try_from(micros).unwrap_or(i64::MAX)
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Decision Core (Track 1)
@@ -624,8 +653,7 @@ mod tests {
             .posterior()
             .iter()
             .find(|(s, _)| *s == LivenessState::Flaky)
-            .map(|(_, p)| *p)
-            .unwrap_or(0.0);
+            .map_or(0.0, |(_, p)| *p);
 
         assert!(
             flaky_prob > 0.5,
@@ -911,8 +939,7 @@ mod tests {
             .posterior()
             .iter()
             .find(|(s, _)| *s == LivenessState::Alive)
-            .map(|(_, p)| *p)
-            .unwrap_or(0.0);
+            .map_or(0.0, |(_, p)| *p);
         assert!(
             alive_prob > 0.5,
             "posterior should recover toward Alive after evidence shift, got {alive_prob:.6}"
@@ -1306,11 +1333,16 @@ impl AgentRhythm {
     /// Record a new activity observation.
     pub fn observe(&mut self, timestamp_micros: i64) {
         if self.last_activity_ts > 0 {
-            let delta = (timestamp_micros - self.last_activity_ts).max(0) as f64;
+            let delta_micros = timestamp_micros.saturating_sub(self.last_activity_ts);
+            let delta = nonnegative_i64_to_f64(delta_micros);
             let old_avg = self.effective_avg();
-            self.avg_interval = (1.0 - self.alpha) * self.avg_interval + self.alpha * delta;
-            self.var_interval =
-                (1.0 - self.alpha) * self.var_interval + self.alpha * (delta - old_avg).powi(2);
+            self.avg_interval = self
+                .alpha
+                .mul_add(delta, (1.0 - self.alpha) * self.avg_interval);
+            self.var_interval = self.alpha.mul_add(
+                (delta - old_avg).powi(2),
+                (1.0 - self.alpha) * self.var_interval,
+            );
             self.observation_count = self.observation_count.saturating_add(1);
         }
         self.last_activity_ts = timestamp_micros;
@@ -1322,9 +1354,9 @@ impl AgentRhythm {
     /// the observed average takes over.
     #[must_use]
     pub fn effective_avg(&self) -> f64 {
-        let n = self.observation_count as f64;
+        let n = u64_to_f64(self.observation_count);
         let prior_weight = 3.0; // pseudo-count for the prior
-        (n * self.avg_interval + prior_weight * self.prior_interval) / (n + prior_weight)
+        n.mul_add(self.avg_interval, prior_weight * self.prior_interval) / (n + prior_weight)
     }
 
     /// Standard deviation of inter-activity interval.
@@ -1339,7 +1371,7 @@ impl AgentRhythm {
     /// under Gaussian assumption).
     #[must_use]
     pub fn suspicion_threshold(&self, k: f64) -> f64 {
-        self.effective_avg() + k * self.std_dev()
+        k.mul_add(self.std_dev(), self.effective_avg())
     }
 
     /// How long since the last activity (microseconds).
@@ -1355,7 +1387,7 @@ impl AgentRhythm {
     /// Whether the agent has exceeded the suspicion threshold.
     #[must_use]
     pub fn is_suspicious(&self, now_micros: i64, k: f64) -> bool {
-        let silence = self.silence_duration(now_micros) as f64;
+        let silence = nonnegative_i64_to_f64(self.silence_duration(now_micros));
         self.last_activity_ts > 0 && silence > self.suspicion_threshold(k)
     }
 }
@@ -1385,9 +1417,8 @@ pub struct AgentLivenessEntry {
 pub fn program_prior_interval_secs(program: &str) -> f64 {
     match program.to_ascii_lowercase().as_str() {
         "claude-code" | "claude_code" => 60.0,
-        "codex-cli" | "codex_cli" | "codex" => 120.0,
-        "gemini-cli" | "gemini_cli" | "gemini" => 120.0,
-        "copilot-cli" | "copilot_cli" | "copilot" => 120.0,
+        "codex-cli" | "codex_cli" | "codex" | "gemini-cli" | "gemini_cli" | "gemini"
+        | "copilot-cli" | "copilot_cli" | "copilot" => 120.0,
         _ => 300.0, // conservative default for unknown programs
     }
 }
@@ -1423,6 +1454,65 @@ pub struct ProjectConflictGraph {
     pub generation: u64,
 }
 
+struct TarjanScc<'a> {
+    adj: &'a [Vec<usize>],
+    agents: &'a [&'a str],
+    index_counter: usize,
+    stack: Vec<usize>,
+    on_stack: Vec<bool>,
+    indices: Vec<usize>,
+    lowlinks: Vec<usize>,
+    sccs: Vec<Vec<String>>,
+}
+
+impl<'a> TarjanScc<'a> {
+    fn new(adj: &'a [Vec<usize>], agents: &'a [&'a str]) -> Self {
+        let node_count = agents.len();
+        Self {
+            adj,
+            agents,
+            index_counter: 0,
+            stack: Vec::new(),
+            on_stack: vec![false; node_count],
+            indices: vec![usize::MAX; node_count],
+            lowlinks: vec![0; node_count],
+            sccs: Vec::new(),
+        }
+    }
+
+    fn strongconnect(&mut self, node: usize) {
+        self.indices[node] = self.index_counter;
+        self.lowlinks[node] = self.index_counter;
+        self.index_counter += 1;
+        self.stack.push(node);
+        self.on_stack[node] = true;
+
+        for &neighbor in &self.adj[node] {
+            if self.indices[neighbor] == usize::MAX {
+                self.strongconnect(neighbor);
+                self.lowlinks[node] = self.lowlinks[node].min(self.lowlinks[neighbor]);
+            } else if self.on_stack[neighbor] {
+                self.lowlinks[node] = self.lowlinks[node].min(self.indices[neighbor]);
+            }
+        }
+
+        if self.lowlinks[node] == self.indices[node] {
+            let mut scc = Vec::new();
+            while let Some(member) = self.stack.pop() {
+                self.on_stack[member] = false;
+                scc.push(self.agents[member].to_string());
+                if member == node {
+                    break;
+                }
+            }
+
+            if scc.len() > 1 {
+                self.sccs.push(scc);
+            }
+        }
+    }
+}
+
 /// Find all deadlock cycles in the hard conflict graph using Tarjan's SCC.
 ///
 /// Returns only SCCs with |V| > 1 (true cycles).  O(V+E).
@@ -1453,92 +1543,24 @@ pub fn find_deadlock_cycles(graph: &ProjectConflictGraph) -> Vec<Vec<String>> {
     for (holder, edges) in &graph.hard_edges {
         if let Some(&from) = index_of.get(holder.as_str()) {
             for edge in edges {
-                if let Some(&to) = index_of.get(edge.blocked.as_str()) {
-                    if !adj[from].contains(&to) {
-                        adj[from].push(to);
-                    }
+                let Some(&to) = index_of.get(edge.blocked.as_str()) else {
+                    continue;
+                };
+                if !adj[from].contains(&to) {
+                    adj[from].push(to);
                 }
             }
         }
     }
 
-    // Tarjan's SCC algorithm.
-    let mut index_counter: usize = 0;
-    let mut stack: Vec<usize> = Vec::new();
-    let mut on_stack = vec![false; n];
-    let mut indices = vec![usize::MAX; n]; // usize::MAX = unvisited
-    let mut lowlinks = vec![0_usize; n];
-    let mut sccs: Vec<Vec<String>> = Vec::new();
-
-    fn strongconnect(
-        v: usize,
-        adj: &[Vec<usize>],
-        index_counter: &mut usize,
-        stack: &mut Vec<usize>,
-        on_stack: &mut [bool],
-        indices: &mut [usize],
-        lowlinks: &mut [usize],
-        sccs: &mut Vec<Vec<String>>,
-        agents: &[&str],
-    ) {
-        indices[v] = *index_counter;
-        lowlinks[v] = *index_counter;
-        *index_counter += 1;
-        stack.push(v);
-        on_stack[v] = true;
-
-        for &w in &adj[v] {
-            if indices[w] == usize::MAX {
-                strongconnect(
-                    w,
-                    adj,
-                    index_counter,
-                    stack,
-                    on_stack,
-                    indices,
-                    lowlinks,
-                    sccs,
-                    agents,
-                );
-                lowlinks[v] = lowlinks[v].min(lowlinks[w]);
-            } else if on_stack[w] {
-                lowlinks[v] = lowlinks[v].min(indices[w]);
-            }
-        }
-
-        if lowlinks[v] == indices[v] {
-            let mut scc = Vec::new();
-            while let Some(w) = stack.pop() {
-                on_stack[w] = false;
-                scc.push(agents[w].to_string());
-                if w == v {
-                    break;
-                }
-            }
-            // Only keep SCCs with multiple nodes (true cycles).
-            if scc.len() > 1 {
-                sccs.push(scc);
-            }
+    let mut tarjan = TarjanScc::new(&adj, &agents);
+    for node in 0..n {
+        if tarjan.indices[node] == usize::MAX {
+            tarjan.strongconnect(node);
         }
     }
 
-    for v in 0..n {
-        if indices[v] == usize::MAX {
-            strongconnect(
-                v,
-                &adj,
-                &mut index_counter,
-                &mut stack,
-                &mut on_stack,
-                &mut indices,
-                &mut lowlinks,
-                &mut sccs,
-                &agents,
-            );
-        }
-    }
-
-    sccs
+    tarjan.sccs
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1723,7 +1745,9 @@ mod liveness_tests {
 
         // Silence just above avg should trigger suspicion
         let last_ts = rhythm.last_activity_ts;
-        let barely_above = last_ts + (threshold as i64) + 1;
+        let barely_above = last_ts
+            .saturating_add(micros_f64_to_i64(threshold))
+            .saturating_add(1);
         assert!(
             rhythm.is_suspicious(barely_above, 3.0),
             "silence just above threshold should be suspicious"
@@ -1925,7 +1949,7 @@ impl OnsState {
         self.sum_sq += centered * centered;
 
         let lambda = self.adaptive_bet_size(alpha);
-        let factor = 1.0 + lambda * centered;
+        let factor = lambda.mul_add(centered, 1.0);
         // factor is guaranteed non-negative by the lambda bounds.
         // Cap at 1e100 to prevent f64 overflow during sustained miscalibration
         // (the e-value is evidence, not a probability — any value > threshold
@@ -1952,8 +1976,8 @@ impl OnsState {
 
 /// E-process martingale monitor for anytime-valid miscalibration detection.
 ///
-/// Maintains a non-negative supermartingale E_t starting at 1.0 under H₀
-/// ("predictions are well-calibrated").  If E_t >= threshold at ANY time,
+/// Maintains a non-negative supermartingale `E_t` starting at `1.0` under `H0`
+/// ("predictions are well-calibrated"). If `E_t >= threshold` at any time,
 /// we have statistically valid evidence of miscalibration — no multiple-
 /// testing correction needed.
 ///
@@ -2022,7 +2046,7 @@ impl EProcessMonitor {
 
     /// Current global e-value.
     #[must_use]
-    pub fn e_value(&self) -> f64 {
+    pub const fn e_value(&self) -> f64 {
         self.global.e_value
     }
 
@@ -2102,7 +2126,7 @@ impl CusumDetector {
     /// - `threshold`: detection sensitivity (higher = fewer false alarms)
     /// - `delta`: minimum shift to detect (e.g., 0.1 = 10% shift)
     #[must_use]
-    pub fn new(expected_rate: f64, threshold: f64, delta: f64) -> Self {
+    pub const fn new(expected_rate: f64, threshold: f64, delta: f64) -> Self {
         Self {
             s_pos: 0.0,
             s_neg: 0.0,
@@ -2175,7 +2199,7 @@ impl CusumDetector {
 /// recent regret trend for loss matrix tuning.
 #[derive(Debug, Clone)]
 pub struct RegretTracker {
-    /// Cumulative regret per action (action_name → total regret).
+    /// Cumulative regret per action (`action_name` → total regret).
     cumulative_regret: HashMap<String, f64>,
     /// Recent regret entries for trend analysis.
     recent: VecDeque<RegretEntry>,
@@ -2200,7 +2224,7 @@ pub struct RegretEntry {
     pub best_action: String,
     /// Loss the best action would have incurred.
     pub best_loss: f64,
-    /// Regret = actual_loss - best_loss (always >= 0).
+    /// `regret = actual_loss - best_loss` (always `>= 0`).
     pub regret: f64,
     /// Timestamp.
     pub timestamp: i64,
@@ -2263,7 +2287,7 @@ impl RegretTracker {
         if self.outcome_count == 0 {
             0.0
         } else {
-            self.total_regret / self.outcome_count as f64
+            self.total_regret / u64_to_f64(self.outcome_count)
         }
     }
 
@@ -2274,7 +2298,7 @@ impl RegretTracker {
             return 0.0;
         }
         let sum: f64 = self.recent.iter().map(|r| r.regret).sum();
-        sum / self.recent.len() as f64
+        sum / usize_to_f64(self.recent.len())
     }
 
     /// Which actions have the highest cumulative regret (candidates for
@@ -2363,13 +2387,11 @@ mod martingale_tests {
         let liveness_e = monitor
             .per_subsystem
             .get(&AtcSubsystem::Liveness)
-            .map(|o| o.e_value)
-            .unwrap_or(0.0);
+            .map_or(0.0, |o| o.e_value);
         let conflict_e = monitor
             .per_subsystem
             .get(&AtcSubsystem::Conflict)
-            .map(|o| o.e_value)
-            .unwrap_or(0.0);
+            .map_or(0.0, |o| o.e_value);
         assert!(
             liveness_e > conflict_e,
             "liveness (all wrong) should have higher e-value than conflict (mostly right)"
@@ -2385,18 +2407,10 @@ mod martingale_tests {
             monitor.update(true, AtcSubsystem::Liveness, Some("AgentB"));
         }
 
-        let agent_a_e = monitor
-            .per_agent
-            .get("AgentA")
-            .map(|o| o.e_value)
-            .unwrap_or(0.0);
-        let agent_b_e = monitor
-            .per_agent
-            .get("AgentB")
-            .map(|o| o.e_value)
-            .unwrap_or(0.0);
+        let wrong_prediction_e_value = monitor.per_agent.get("AgentA").map_or(0.0, |o| o.e_value);
+        let correct_prediction_e_value = monitor.per_agent.get("AgentB").map_or(0.0, |o| o.e_value);
         assert!(
-            agent_a_e > agent_b_e,
+            wrong_prediction_e_value > correct_prediction_e_value,
             "AgentA (all wrong) should have higher e-value than AgentB (all right)"
         );
     }
@@ -2440,7 +2454,7 @@ mod martingale_tests {
         let mut detected = false;
         for i in 50..200 {
             let result = cusum.update(i % 2 == 0, i * 1_000_000);
-            if let Some(ChangeDirection::Degradation) = result {
+            if result == Some(ChangeDirection::Degradation) {
                 detected = true;
                 break;
             }
@@ -2459,7 +2473,7 @@ mod martingale_tests {
         let mut detected = false;
         for i in 50..200 {
             let result = cusum.update(i % 20 == 0, i * 1_000_000);
-            if let Some(ChangeDirection::Improvement) = result {
+            if result == Some(ChangeDirection::Improvement) {
                 detected = true;
                 break;
             }
@@ -2473,7 +2487,7 @@ mod martingale_tests {
         // Feed errors until first detection fires, then stop
         let mut detected = false;
         for i in 0..100 {
-            if let Some(ChangeDirection::Degradation) = cusum.update(true, i * 1_000_000) {
+            if cusum.update(true, i * 1_000_000) == Some(ChangeDirection::Degradation) {
                 detected = true;
                 break;
             }
@@ -2495,8 +2509,15 @@ mod martingale_tests {
     fn regret_tracker_zero_when_optimal() {
         let mut tracker = RegretTracker::new(100);
         // Every decision was optimal (actual = best)
-        for i in 0..10 {
-            tracker.record_outcome(i, "DeclareAlive", 0.0, "DeclareAlive", 0.0, i as i64);
+        for i in 0_i64..10 {
+            tracker.record_outcome(
+                u64::try_from(i).unwrap_or(0),
+                "DeclareAlive",
+                0.0,
+                "DeclareAlive",
+                0.0,
+                i,
+            );
         }
         assert!(
             tracker.average_regret().abs() < f64::EPSILON,
@@ -2530,8 +2551,15 @@ mod martingale_tests {
     #[test]
     fn regret_tracker_recent_window() {
         let mut tracker = RegretTracker::new(3);
-        for i in 0_u64..5 {
-            tracker.record_outcome(i, "A", i as f64 * 2.0, "B", 0.0, i as i64);
+        for i in 0_u32..5 {
+            tracker.record_outcome(
+                u64::from(i),
+                "A",
+                f64::from(i) * 2.0,
+                "B",
+                0.0,
+                i64::from(i),
+            );
         }
         assert_eq!(tracker.recent.len(), 3, "should cap at max_recent");
         // Recent window should contain the last 3 entries (ids 2,3,4)
@@ -2575,7 +2603,7 @@ pub struct CalibrationGuard {
 impl CalibrationGuard {
     /// Create a new calibration guard.
     #[must_use]
-    pub fn new(recovery_count: u64) -> Self {
+    pub const fn new(recovery_count: u64) -> Self {
         Self {
             safe_mode: false,
             safe_mode_since: 0,
@@ -2641,7 +2669,7 @@ impl CalibrationGuard {
     }
 
     /// Force safe mode on/off (operator override).
-    pub fn set_safe_mode(&mut self, active: bool, timestamp_micros: i64) {
+    pub const fn set_safe_mode(&mut self, active: bool, timestamp_micros: i64) {
         self.safe_mode = active;
         self.safe_mode_since = if active { timestamp_micros } else { 0 };
         if active {
@@ -2784,7 +2812,7 @@ impl AtcEngine {
 
     /// Whether safe mode is active.
     #[must_use]
-    pub fn is_safe_mode(&self) -> bool {
+    pub const fn is_safe_mode(&self) -> bool {
         self.calibration.is_safe_mode()
     }
 
@@ -2831,7 +2859,7 @@ impl AtcEngine {
     }
 
     /// Force safe mode on/off (operator override).
-    pub fn set_safe_mode(&mut self, active: bool, timestamp_micros: i64) {
+    pub const fn set_safe_mode(&mut self, active: bool, timestamp_micros: i64) {
         self.calibration.set_safe_mode(active, timestamp_micros);
     }
 
@@ -2879,7 +2907,7 @@ impl AtcEngine {
 
     /// Evaluate liveness for all tracked agents.
     ///
-    /// Returns a list of (agent_name, recommended_action) for agents
+    /// Returns a list of `(agent_name, recommended_action)` tuples for agents
     /// that need intervention.
     #[must_use]
     pub fn evaluate_liveness(&mut self, now_micros: i64) -> Vec<(String, LivenessAction)> {
@@ -2898,8 +2926,9 @@ impl AtcEngine {
             // Check if the agent is suspicious
             if entry.rhythm.is_suspicious(now_micros, k) {
                 // Update posterior toward flaky/dead
-                let silence_ratio = entry.rhythm.silence_duration(now_micros) as f64
-                    / entry.rhythm.effective_avg().max(1.0);
+                let silence_ratio =
+                    nonnegative_i64_to_f64(entry.rhythm.silence_duration(now_micros))
+                        / entry.rhythm.effective_avg().max(1.0);
 
                 let alive_lk = (-silence_ratio * 0.5).exp().max(0.01);
                 let flaky_lk = (-silence_ratio * 0.1).exp().max(0.05);
@@ -2926,7 +2955,7 @@ impl AtcEngine {
                         evidence_summary: &format!(
                             "silence {}s (avg {}s, {:.1}σ)",
                             entry.rhythm.silence_duration(now_micros) / 1_000_000,
-                            entry.rhythm.effective_avg() as i64 / 1_000_000,
+                            micros_f64_to_i64(entry.rhythm.effective_avg()) / 1_000_000,
                             silence_ratio,
                         ),
                         calibration_healthy: !self.calibration.is_safe_mode(),
@@ -3384,7 +3413,7 @@ mod engine_tests {
 /// more information (no regressions).
 ///
 /// NOT a pure join-semilattice (counters use increment, not max).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSummary {
     // ── Monotone Counters (increment only) ──
     pub messages_sent: u64,
@@ -3551,7 +3580,7 @@ impl SessionSummary {
             .iter()
             .map(|(a, c)| (a.as_str(), *c))
             .collect();
-        agent_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        agent_counts.sort_by_key(|entry| Reverse(entry.1));
         if !agent_counts.is_empty() {
             let top: Vec<String> = agent_counts
                 .iter()
@@ -3567,7 +3596,7 @@ impl SessionSummary {
             .iter()
             .map(|(t, c)| (t.as_str(), *c))
             .collect();
-        thread_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        thread_counts.sort_by_key(|entry| Reverse(entry.1));
         if !thread_counts.is_empty() {
             let top: Vec<String> = thread_counts
                 .iter()
@@ -3634,7 +3663,7 @@ mod synthesis_tests {
     fn msg_sent(from: &str, to: &[&str], thread: Option<&str>, ts: i64) -> SynthesisEvent {
         SynthesisEvent::MessageSent {
             from: from.to_string(),
-            to: to.iter().map(|s| s.to_string()).collect(),
+            to: to.iter().map(ToString::to_string).collect(),
             thread_id: thread.map(str::to_string),
             timestamp_micros: ts,
         }
@@ -3812,7 +3841,7 @@ pub struct AgentLoadModel {
 impl AgentLoadModel {
     /// Create a new load model.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             throughput_ewma: 0.0,
             active_reservations: 0,
@@ -3826,8 +3855,8 @@ impl AgentLoadModel {
     /// Update from observed agent activity.
     pub fn observe_activity(&mut self, messages_processed: u64, interval_secs: f64) {
         if interval_secs > 0.0 {
-            let rate = messages_processed as f64 / interval_secs * 3600.0;
-            self.throughput_ewma = 0.8 * self.throughput_ewma + 0.2 * rate;
+            let rate = u64_to_f64(messages_processed) / interval_secs * 3600.0;
+            self.throughput_ewma = 0.8_f64.mul_add(self.throughput_ewma, 0.2 * rate);
         }
         self.recompute_capacity();
     }
@@ -3841,8 +3870,8 @@ impl AgentLoadModel {
 
     fn recompute_capacity(&mut self) {
         // Capacity decreases with more reservations and pending messages
-        let reservation_load = (self.active_reservations as f64 * 0.15).min(1.0);
-        let inbox_load = (self.pending_inbox as f64 * 0.05).min(1.0);
+        let reservation_load = (u64_to_f64(self.active_reservations) * 0.15).min(1.0);
+        let inbox_load = (u64_to_f64(self.pending_inbox) * 0.05).min(1.0);
         self.predicted_capacity = (1.0 - reservation_load - inbox_load).max(0.0);
     }
 
@@ -3852,24 +3881,27 @@ impl AgentLoadModel {
             / expected_response_secs.max(1.0))
         .abs();
         let correct = if error < 0.5 { 1.0 } else { 0.0 };
-        self.prediction_accuracy = 0.9 * self.prediction_accuracy + 0.1 * correct;
+        self.prediction_accuracy = 0.9_f64.mul_add(self.prediction_accuracy, 0.1 * correct);
         self.observation_count += 1;
     }
 
     /// Classical routing score (no prediction needed): 1/(1 + reservations).
     #[must_use]
     pub fn classical_score(&self) -> f64 {
-        1.0 / (1.0 + self.active_reservations as f64)
+        1.0 / (1.0 + u64_to_f64(self.active_reservations))
     }
 
     /// Blended routing score using consistency-robustness tradeoff.
     ///
-    /// λ = prediction_accuracy (trust the predictor when it's been right).
-    /// score = λ * predicted_capacity + (1-λ) * classical_score.
+    /// `lambda = prediction_accuracy` (trust the predictor when it's been right).
+    /// `score = lambda * predicted_capacity + (1 - lambda) * classical_score()`.
     #[must_use]
     pub fn routing_score(&self) -> f64 {
         let lambda = self.prediction_accuracy;
-        lambda * self.predicted_capacity + (1.0 - lambda) * self.classical_score()
+        lambda.mul_add(
+            self.predicted_capacity,
+            (1.0 - lambda) * self.classical_score(),
+        )
     }
 }
 
@@ -3883,8 +3915,8 @@ impl Default for AgentLoadModel {
 ///
 /// Returns `None` if all agents are saturated (all scores below threshold).
 #[must_use]
-pub fn select_route_target<'a>(
-    agents: &'a HashMap<String, AgentLoadModel>,
+pub fn select_route_target<'a, S: BuildHasher>(
+    agents: &'a HashMap<String, AgentLoadModel, S>,
     exclude: &str, // don't route to the requester
     min_score: f64,
 ) -> Option<&'a str> {
@@ -4027,9 +4059,9 @@ mod load_routing_tests {
 /// threads.  Agents sharing multiple threads are at higher conflict risk.
 #[derive(Debug, Clone, Default)]
 pub struct ThreadParticipationGraph {
-    /// thread_id → set of participating agent names.
+    /// `thread_id` → set of participating agent names.
     thread_agents: HashMap<String, HashSet<String>>,
-    /// agent → set of thread_ids they're active in.
+    /// `agent` → set of `thread_id` values they are active in.
     agent_threads: HashMap<String, HashSet<String>>,
 }
 
@@ -4052,13 +4084,11 @@ impl ThreadParticipationGraph {
     /// Count how many threads two agents share.
     #[must_use]
     pub fn shared_thread_count(&self, agent_a: &str, agent_b: &str) -> usize {
-        let threads_a = match self.agent_threads.get(agent_a) {
-            Some(t) => t,
-            None => return 0,
+        let Some(threads_a) = self.agent_threads.get(agent_a) else {
+            return 0;
         };
-        let threads_b = match self.agent_threads.get(agent_b) {
-            Some(t) => t,
-            None => return 0,
+        let Some(threads_b) = self.agent_threads.get(agent_b) else {
+            return 0;
         };
         threads_a.intersection(threads_b).count()
     }
@@ -4077,7 +4107,7 @@ impl ThreadParticipationGraph {
                 }
             }
         }
-        pairs.sort_by(|a, b| b.2.cmp(&a.2));
+        pairs.sort_by_key(|pair| Reverse(pair.2));
         pairs
     }
 
@@ -4113,8 +4143,8 @@ pub fn probe_information_gain(posterior: &[(LivenessState, f64)]) -> f64 {
 /// Only includes agents above the `min_gain` threshold to avoid
 /// wasting probes on agents we're already confident about.
 #[must_use]
-pub fn rank_probe_targets(
-    agents: &HashMap<String, AgentLivenessEntry>,
+pub fn rank_probe_targets<S: BuildHasher>(
+    agents: &HashMap<String, AgentLivenessEntry, S>,
     min_gain: f64,
 ) -> Vec<(String, f64)> {
     let mut targets: Vec<(String, f64)> = agents
@@ -4330,7 +4360,8 @@ pub fn vcg_priority(participants: &[ConflictParticipant]) -> Vec<(String, f64)> 
                 .enumerate()
                 .filter(|(j, _)| *j != i)
                 .map(|(_, other)| {
-                    other.remaining_tasks as f64 * other.estimated_completion_mins.max(1) as f64
+                    u64_to_f64(other.remaining_tasks)
+                        * u64_to_f64(other.estimated_completion_mins.max(1))
                         / 60.0
                 })
                 .sum();
@@ -4367,9 +4398,9 @@ pub fn kingman_wait_time(rho: f64, mu: f64, cv_arrival: f64, cv_service: f64) ->
     if rho >= 1.0 || mu <= 0.0 {
         return f64::INFINITY;
     }
-    let ca_sq = cv_arrival * cv_arrival;
-    let cs_sq = cv_service * cv_service;
-    (ca_sq + cs_sq) / 2.0 * rho / (mu * (1.0 - rho))
+    let arrival_cv_sq = cv_arrival * cv_arrival;
+    let service_cv_sq = cv_service * cv_service;
+    arrival_cv_sq.midpoint(service_cv_sq) * rho / (mu * (1.0 - rho))
 }
 
 /// Little's Law consistency check: |L - λW| / L < tolerance.
@@ -4440,7 +4471,9 @@ impl PidState {
     /// Negative error → loss too high (action avoided too much).
     pub fn update(&mut self, error: f64, dt: f64) -> f64 {
         let p = self.kp * error;
-        self.integral = (self.integral + error * dt).clamp(-self.integral_max, self.integral_max);
+        self.integral = error
+            .mul_add(dt, self.integral)
+            .clamp(-self.integral_max, self.integral_max);
         let i = self.ki * self.integral;
         let d = if dt > 0.0 {
             self.kd * (error - self.prev_error) / dt
@@ -4455,7 +4488,7 @@ impl PidState {
     }
 
     /// Reset to original value (operator override).
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.current_value = self.original_value;
         self.integral = 0.0;
         self.prev_error = 0.0;
@@ -4585,7 +4618,7 @@ mod advanced_tests {
     fn pid_reset_restores_original() {
         let mut pid = PidState::new(10.0);
         pid.update(5.0, 1.0);
-        assert!(pid.current_value != 10.0);
+        assert!((pid.current_value - 10.0).abs() > f64::EPSILON);
         pid.reset();
         assert!((pid.current_value - 10.0).abs() < f64::EPSILON);
         assert!((pid.integral - 0.0).abs() < f64::EPSILON);
@@ -4781,7 +4814,7 @@ mod edge_case_tests {
     fn ledger_all_returns_oldest_first() {
         let mut ledger = EvidenceLedger::new(100);
         let core = default_liveness_core();
-        for i in 0..5 {
+        for i in 0_i64..5 {
             let subject = format!("Agent{i}");
             ledger.record(&DecisionBuilder {
                 subsystem: AtcSubsystem::Liveness,
@@ -4793,7 +4826,7 @@ mod edge_case_tests {
                 evidence_summary: "test",
                 calibration_healthy: true,
                 safe_mode_active: false,
-                timestamp_micros: i as i64,
+                timestamp_micros: i,
             });
         }
         let ids: Vec<u64> = ledger.all().map(|r| r.id).collect();
@@ -4832,7 +4865,7 @@ mod edge_case_tests {
     fn ledger_capacity_one() {
         let mut ledger = EvidenceLedger::new(1);
         let core = default_liveness_core();
-        for i in 0..3 {
+        for i in 0_i64..3 {
             let subject = format!("Agent{i}");
             ledger.record(&DecisionBuilder {
                 subsystem: AtcSubsystem::Liveness,
@@ -4844,7 +4877,7 @@ mod edge_case_tests {
                 evidence_summary: "test",
                 calibration_healthy: true,
                 safe_mode_active: false,
-                timestamp_micros: i as i64,
+                timestamp_micros: i,
             });
         }
         assert_eq!(
@@ -4894,11 +4927,10 @@ mod edge_case_tests {
 
         let now = 9 * 60_000_000 + 600_000_000;
         let actions = engine.evaluate_liveness(now);
-        let dead_actions: Vec<_> = actions
-            .iter()
-            .filter(|(name, _)| name == "DeadAgent")
-            .collect();
-        assert!(dead_actions.is_empty(), "should skip Dead agents");
+        assert!(
+            !actions.iter().any(|(name, _)| name == "DeadAgent"),
+            "should skip Dead agents"
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ const IDLE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
 /// Max sparkline history samples.
 const SPARKLINE_CAP: usize = 30;
 const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
-/// Mirror the poller-side cap when reconstructing richer rows from SQLite.
+/// Mirror the poller-side cap when reconstructing richer rows from `SQLite`.
 const SQLITE_AGENT_RECOVERY_LIMIT: usize = 500;
 
 /// Agent names are unique only within a project, so screen-local caches must

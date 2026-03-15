@@ -1505,29 +1505,43 @@ fn render_status_strip(
     let tp = crate::tui_theme::TuiThemePalette::current();
     let line = analytics_status_strip_line(
         area.width,
-        focus.label(),
-        filter.label(),
-        sort_mode.label(),
-        active_count,
-        total_count,
-        detail_visible,
-        compact_hint_visible,
+        AnalyticsStatusStripLine {
+            focus_label: focus.label(),
+            filter_label: filter.label(),
+            sort_label: sort_mode.label(),
+            active_count,
+            total_count,
+            detail_visible,
+            compact_hint_visible,
+        },
     );
     Paragraph::new(line)
         .style(crate::tui_theme::text_hint(&tp))
         .render(area, frame);
 }
 
-fn analytics_status_strip_line(
-    area_width: u16,
-    focus_label: &str,
-    filter_label: &str,
-    sort_label: &str,
+#[derive(Debug, Clone, Copy)]
+struct AnalyticsStatusStripLine<'a> {
+    focus_label: &'a str,
+    filter_label: &'a str,
+    sort_label: &'a str,
     active_count: usize,
     total_count: usize,
     detail_visible: bool,
     compact_hint_visible: bool,
-) -> String {
+}
+
+fn analytics_status_strip_line(area_width: u16, status: AnalyticsStatusStripLine<'_>) -> String {
+    let AnalyticsStatusStripLine {
+        focus_label,
+        filter_label,
+        sort_label,
+        active_count,
+        total_count,
+        detail_visible,
+        compact_hint_visible,
+    } = status;
+
     let detail_state = if detail_visible {
         "detail:visible"
     } else {
@@ -3252,13 +3266,15 @@ mod tests {
     fn compact_status_strip_elides_redundant_controls() {
         let line = analytics_status_strip_line(
             80,
-            AnalyticsFocus::List.label(),
-            AnalyticsSeverityFilter::All.label(),
-            AnalyticsSortMode::Priority.label(),
-            1,
-            1,
-            false,
-            true,
+            AnalyticsStatusStripLine {
+                focus_label: AnalyticsFocus::List.label(),
+                filter_label: AnalyticsSeverityFilter::All.label(),
+                sort_label: AnalyticsSortMode::Priority.label(),
+                active_count: 1,
+                total_count: 1,
+                detail_visible: false,
+                compact_hint_visible: true,
+            },
         );
         assert_eq!(line, "cards:1/1 • filter:all • sort:priority");
     }

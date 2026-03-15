@@ -66,10 +66,9 @@ impl WebRoot {
 
     fn read_relative_file(&self, relative_path: &Path) -> FileLookup {
         match open_relative_file(&self.root, relative_path) {
-            RelativeFile::Found(file) => match Self::read_file(relative_path, file) {
-                Some(response) => FileLookup::Found(response),
-                None => FileLookup::Blocked,
-            },
+            RelativeFile::Found(file) => {
+                Self::read_file(relative_path, file).map_or(FileLookup::Blocked, FileLookup::Found)
+            }
             RelativeFile::Missing => FileLookup::Missing,
             RelativeFile::Blocked => FileLookup::Blocked,
         }

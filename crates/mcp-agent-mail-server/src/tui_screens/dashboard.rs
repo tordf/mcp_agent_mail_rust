@@ -1534,8 +1534,7 @@ impl MailScreen for DashboardScreen {
         let latency_rows = self.tool_latency_rows(&visible_entries);
         let insight_layout = comp
             .rect(PanelSlot::Inspector)
-            .map(classify_insight_rail_layout)
-            .unwrap_or(InsightRailLayout::Hidden);
+            .map_or(InsightRailLayout::Hidden, classify_insight_rail_layout);
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
             render_insight_rail(
                 frame,
@@ -1555,12 +1554,14 @@ impl MailScreen for DashboardScreen {
             render_bottom_rail(
                 frame,
                 preview_rect,
-                quick_query,
-                db_snapshot,
-                &visible_entries,
-                preview,
-                &latency_rows,
-                insight_layout,
+                &BottomRailContext {
+                    query_text: quick_query,
+                    db_snapshot,
+                    entries: &visible_entries,
+                    preview,
+                    latency_rows: &latency_rows,
+                    insight_layout,
+                },
             );
         }
         if let Some(log_rect) = comp.rect(PanelSlot::Sidebar) {
@@ -3096,17 +3097,26 @@ fn render_insight_rail(
     );
 }
 
-#[allow(clippy::too_many_lines)]
-fn render_bottom_rail(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    query_text: &str,
-    db_snapshot: &DbStatSnapshot,
-    entries: &[&EventEntry],
-    preview: Option<&RecentMessagePreview>,
-    latency_rows: &[ToolLatencyRow],
+struct BottomRailContext<'a, 'entry> {
+    query_text: &'a str,
+    db_snapshot: &'a DbStatSnapshot,
+    entries: &'a [&'entry EventEntry],
+    preview: Option<&'a RecentMessagePreview>,
+    latency_rows: &'a [ToolLatencyRow],
     insight_layout: InsightRailLayout,
-) {
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailContext<'_, '_>) {
+    let BottomRailContext {
+        query_text,
+        db_snapshot,
+        entries,
+        preview,
+        latency_rows,
+        insight_layout,
+    } = *context;
+
     if area.width < 24 || area.height < 4 {
         return;
     }

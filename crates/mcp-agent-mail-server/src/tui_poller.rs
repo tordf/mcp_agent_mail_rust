@@ -37,6 +37,9 @@ const RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL: Duration = Duration::from_mins(
 /// After readiness warmup fails, let the poller retry opening `SQLite` only
 /// occasionally so degraded startup does not turn into repeated DB hammering.
 const DB_WARMUP_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// When `data_version` is unavailable, throttle full snapshots to avoid
+/// expensive no-op scans on every poll cycle.
+const NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS: i64 = 30_000_000;
 
 /// Maximum agents to fetch per poll cycle.  Raised from 50 to 500 to avoid
 /// silently truncating the agent list in large deployments (B4 truthfulness).
@@ -667,9 +670,8 @@ fn fetch_db_stats_with_connection(
         return Some(DbPollSnapshotUpdate::Snapshot(update));
     }
     // When data_version is unavailable (e.g. FrankenSQLite), throttle
-    // expensive full snapshots to once every 10 seconds to avoid burning
-    // CPU on 2-second poll cycles.
-    const NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS: i64 = 30_000_000;
+    // expensive full snapshots to once every 30 seconds to avoid burning
+    // CPU on repeated no-op poll cycles.
     if data_version.is_none()
         && previous.timestamp_micros > 0
         && !must_refresh_for_detail_gap

@@ -478,12 +478,12 @@ fn hinted_pid_matches_listener(hint: &ListenerPidHint, listeners: &[u32]) -> boo
         return false;
     }
 
-    match hint.exe_path.as_deref() {
-        Some(expected_path) => {
+    hint.exe_path.as_deref().map_or_else(
+        || pid_is_agent_mail(hint.pid),
+        |expected_path| {
             pid_executable_path_matches(hint.pid, expected_path) || pid_is_agent_mail(hint.pid)
-        }
-        None => pid_is_agent_mail(hint.pid),
-    }
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -776,15 +776,12 @@ fn pid_executable_path_matches(pid: u32, expected_path: &str) -> bool {
     };
 
     canonicalize_process_path(expected_path)
-        .zip(canonicalize_process_path(
-            actual_path.to_string_lossy().as_ref(),
-        ))
-        .is_some_and(|(expected, actual)| expected == actual)
+        == canonicalize_process_path(actual_path.to_string_lossy().as_ref())
 }
 
-fn canonicalize_process_path(path: &str) -> Option<PathBuf> {
+fn canonicalize_process_path(path: &str) -> PathBuf {
     let candidate = PathBuf::from(path);
-    Some(std::fs::canonicalize(&candidate).unwrap_or(candidate))
+    std::fs::canonicalize(&candidate).unwrap_or(candidate)
 }
 
 fn command_line_has_agent_mail_signature(command: &str) -> bool {
