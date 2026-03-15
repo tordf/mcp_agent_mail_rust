@@ -44,15 +44,9 @@ fn legacy_active_reservation_predicate_sql(
 }
 
 fn has_file_reservation_release_ledger(conn: &DbConn) -> bool {
-    conn.query_sync(
-        "SELECT 1
-         FROM sqlite_master
-         WHERE type = 'table' AND name = 'file_reservation_releases'
-         LIMIT 1",
-        &[],
-    )
-    .ok()
-    .is_some_and(|rows| !rows.is_empty())
+    conn.query_sync("PRAGMA table_info(file_reservation_releases)", &[])
+        .ok()
+        .is_some_and(|rows| !rows.is_empty())
 }
 
 fn active_reservation_release_join_sql(
@@ -116,6 +110,58 @@ fn reservation_released_ts_sql(
 
 fn reservation_is_released(released_ts: Option<i64>) -> bool {
     released_ts.is_some_and(|ts| ts > 0)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn truncated_f64_to_i64(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let truncated = value.trunc();
+    if !(i64::MIN as f64..=i64::MAX as f64).contains(&truncated) {
+        return None;
+    }
+    Some(truncated as i64)
+}
+
+fn value_to_micros(value: &sqlmodel_core::Value) -> Option<i64> {
+    match value {
+        sqlmodel_core::Value::Null => None,
+        sqlmodel_core::Value::Bool(v) => Some(i64::from(*v)),
+        sqlmodel_core::Value::TinyInt(v) => Some(i64::from(*v)),
+        sqlmodel_core::Value::SmallInt(v) => Some(i64::from(*v)),
+        sqlmodel_core::Value::Int(v) => Some(i64::from(*v)),
+        sqlmodel_core::Value::BigInt(v)
+        | sqlmodel_core::Value::Time(v)
+        | sqlmodel_core::Value::Timestamp(v)
+        | sqlmodel_core::Value::TimestampTz(v) => Some(*v),
+        sqlmodel_core::Value::Float(v) => truncated_f64_to_i64(f64::from(*v)),
+        sqlmodel_core::Value::Double(v) => truncated_f64_to_i64(*v),
+        sqlmodel_core::Value::Decimal(text) | sqlmodel_core::Value::Text(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("null")
+                || trimmed.eq_ignore_ascii_case("none")
+            {
+                return None;
+            }
+            if let Ok(parsed) = trimmed.parse::<i64>() {
+                return Some(parsed);
+            }
+            if let Ok(parsed) = trimmed.parse::<f64>() {
+                if let Some(parsed) = truncated_f64_to_i64(parsed) {
+                    return Some(parsed);
+                }
+            }
+            mcp_agent_mail_db::iso_to_micros(trimmed)
+        }
+        sqlmodel_core::Value::Date(v) => Some(i64::from(*v)),
+        sqlmodel_core::Value::Bytes(_)
+        | sqlmodel_core::Value::Uuid(_)
+        | sqlmodel_core::Value::Json(_)
+        | sqlmodel_core::Value::Array(_)
+        | sqlmodel_core::Value::Default => None,
+    }
 }
 
 fn canonical_thread_ref_for_row(message_id: i64, thread_id: Option<&str>) -> String {
@@ -1448,32 +1494,35 @@ fn archive_project_dir_for_key(storage_root: &Path, project_key: &str) -> Option
         return Some(project_dir);
     }
 
-    std::fs::read_dir(&projects_dir).ok()?.flatten().find_map(|entry| {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            return None;
-        };
-        if !file_type.is_dir() || file_type.is_symlink() {
-            return None;
-        }
-        let metadata = std::fs::read_to_string(path.join("project.json")).ok()?;
-        let project_meta = serde_json::from_str::<serde_json::Value>(&metadata).ok()?;
-        let human_key = project_meta
-            .get("human_key")
-            .and_then(serde_json::Value::as_str)
-            .map(|value| value.replace('\\', "/"));
-        let slug = project_meta
-            .get("slug")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        if human_key.as_deref() == Some(normalized_project_key.as_str())
-            || slug.as_deref() == Some(project_key)
-        {
-            Some(path)
-        } else {
-            None
-        }
-    })
+    std::fs::read_dir(&projects_dir)
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                return None;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return None;
+            }
+            let metadata = std::fs::read_to_string(path.join("project.json")).ok()?;
+            let project_meta = serde_json::from_str::<serde_json::Value>(&metadata).ok()?;
+            let human_key = project_meta
+                .get("human_key")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.replace('\\', "/"));
+            let slug = project_meta
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if human_key.as_deref() == Some(normalized_project_key.as_str())
+                || slug.as_deref() == Some(project_key)
+            {
+                Some(path)
+            } else {
+                None
+            }
+        })
 }
 
 fn archive_has_agent_profile(project_dir: &Path, agent_name: &str) -> bool {
@@ -4201,7 +4250,12 @@ fn build_navigate_from_canonical_resource(
             let conn = crate::open_db_sync_robot()?;
             let (resolved_project_id, resolved_project_slug) =
                 resolve_project_sync(&conn, project_key)?;
-            build_navigate_file_reservations(&conn, resolved_project_id, &resolved_project_slug, &query)
+            build_navigate_file_reservations(
+                &conn,
+                resolved_project_id,
+                &resolved_project_slug,
+                &query,
+            )
         }
         ["file_reservations"] | ["reservations"] => {
             let Some(project_key) = query
@@ -4217,7 +4271,12 @@ fn build_navigate_from_canonical_resource(
             let conn = crate::open_db_sync_robot()?;
             let (resolved_project_id, resolved_project_slug) =
                 resolve_project_sync(&conn, &project_key)?;
-            build_navigate_file_reservations(&conn, resolved_project_id, &resolved_project_slug, &query)
+            build_navigate_file_reservations(
+                &conn,
+                resolved_project_id,
+                &resolved_project_slug,
+                &query,
+            )
         }
         _ => Err(CliError::InvalidArgument(format!(
             "unsupported canonical navigate resource URI pattern: {uri}"
@@ -4281,12 +4340,16 @@ fn build_navigate_file_reservations(
     let reservations: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
+            let released_ts = r
+                .get_as::<sqlmodel_core::Value>(4)
+                .ok()
+                .and_then(|value| value_to_micros(&value));
             serde_json::json!({
-                "path": r.get_named::<String>("path_pattern").unwrap_or_default(),
-                "agent": r.get_named::<String>("name").unwrap_or_default(),
-                "exclusive": r.get_named::<i64>("exclusive").unwrap_or(0) == 1,
-                "expires_ts": r.get_named::<i64>("expires_ts").unwrap_or(0),
-                "released": reservation_is_released(r.get_named::<i64>("released_ts").ok()),
+                "path": r.get_as::<String>(0).unwrap_or_default(),
+                "agent": r.get_as::<String>(1).unwrap_or_default(),
+                "exclusive": r.get_as::<i64>(2).unwrap_or(0) == 1,
+                "expires_ts": r.get_as::<i64>(3).unwrap_or(0),
+                "released": reservation_is_released(released_ts),
             })
         })
         .collect();
@@ -5591,7 +5654,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Attachments => {
-            let conn = crate::open_db_sync_robot()?;
+            let conn = crate::open_db_sync_robot_attachments()?;
             let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
 
             let rows = conn

@@ -1685,26 +1685,22 @@ mod tests {
         assert_eq!(report.inserted_messages, BENCH_SEED_TOTAL_MESSAGES);
         assert!(report.elapsed_us >= 0);
 
-        // FrankenConnection: JOIN + COUNT(*) returns NULL; use IN subqueries.
+        let blue_id = select_agent_id(&conn, report.project_id, BENCH_AGENT_BLUE)
+            .expect("select BlueLake")
+            .expect("BlueLake id");
+        let red_id = select_agent_id(&conn, report.project_id, BENCH_AGENT_RED)
+            .expect("select RedFox")
+            .expect("RedFox id");
+
         let blue_messages = count_with_params(
             &conn,
-            "SELECT COUNT(*) AS count \
-             FROM messages \
-             WHERE project_id = ? AND sender_id IN (SELECT id FROM agents WHERE name = ?)",
-            &[
-                Value::BigInt(report.project_id),
-                Value::Text(BENCH_AGENT_BLUE.to_string()),
-            ],
+            "SELECT COUNT(*) AS count FROM messages WHERE project_id = ? AND sender_id = ?",
+            &[Value::BigInt(report.project_id), Value::BigInt(blue_id)],
         );
         let red_messages = count_with_params(
             &conn,
-            "SELECT COUNT(*) AS count \
-             FROM messages \
-             WHERE project_id = ? AND sender_id IN (SELECT id FROM agents WHERE name = ?)",
-            &[
-                Value::BigInt(report.project_id),
-                Value::Text(BENCH_AGENT_RED.to_string()),
-            ],
+            "SELECT COUNT(*) AS count FROM messages WHERE project_id = ? AND sender_id = ?",
+            &[Value::BigInt(report.project_id), Value::BigInt(red_id)],
         );
         let recipient_rows = count_with_params(
             &conn,

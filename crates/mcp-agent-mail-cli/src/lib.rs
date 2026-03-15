@@ -4114,6 +4114,31 @@ fn sqlite_conn_has_column(
         .any(|name| name == column))
 }
 
+fn sqlite_conn_has_table(conn: &mcp_agent_mail_db::DbConn, table: &str) -> CliResult<bool> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .map_err(|e| CliError::Other(format!("PRAGMA table_info({table}) failed: {e}")))?;
+    Ok(!rows.is_empty())
+}
+
+fn sqlite_conn_supports_required_reads(
+    conn: &mcp_agent_mail_db::DbConn,
+    tables: &[&str],
+    columns: &[(&str, &str)],
+) -> CliResult<bool> {
+    for table in tables {
+        if !sqlite_conn_has_table(conn, table)? {
+            return Ok(false);
+        }
+    }
+    for (table, column) in columns {
+        if !sqlite_conn_has_column(conn, table, column)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn sqlite_conn_requires_canonical_init(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     let rows = conn
         .query_sync(
@@ -4196,32 +4221,34 @@ const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 40] = [
     ("agent_links", "updated_ts"),
 ];
 
+const SQLITE_ROBOT_ATTACHMENTS_READ_TABLES: [&str; 3] = ["projects", "agents", "messages"];
+
+const SQLITE_ROBOT_ATTACHMENTS_READ_COLUMNS: [(&str, &str); 11] = [
+    ("projects", "id"),
+    ("projects", "slug"),
+    ("projects", "human_key"),
+    ("agents", "id"),
+    ("agents", "name"),
+    ("messages", "id"),
+    ("messages", "project_id"),
+    ("messages", "sender_id"),
+    ("messages", "subject"),
+    ("messages", "attachments"),
+    ("messages", "created_ts"),
+];
+
 fn sqlite_conn_supports_robot_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
-    let rows = conn
-        .query_sync(
-            "SELECT name FROM sqlite_master \
-             WHERE type='table' \
-               AND name IN ('projects', 'agents', 'messages', 'message_recipients', \
-                            'file_reservations', 'agent_links')",
-            &[],
-        )
-        .map_err(|e| CliError::Other(format!("sqlite_master robot probe failed: {e}")))?;
-    let existing: std::collections::HashSet<String> = rows
-        .into_iter()
-        .filter_map(|row| row.get_named::<String>("name").ok())
-        .collect();
-    if SQLITE_ROBOT_READ_TABLES
-        .iter()
-        .any(|table| !existing.contains(*table))
-    {
-        return Ok(false);
-    }
-    for (table, column) in SQLITE_ROBOT_READ_COLUMNS {
-        if !sqlite_conn_has_column(conn, table, column)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    sqlite_conn_supports_required_reads(conn, &SQLITE_ROBOT_READ_TABLES, &SQLITE_ROBOT_READ_COLUMNS)
+}
+
+fn sqlite_conn_supports_robot_attachment_reads(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> CliResult<bool> {
+    sqlite_conn_supports_required_reads(
+        conn,
+        &SQLITE_ROBOT_ATTACHMENTS_READ_TABLES,
+        &SQLITE_ROBOT_ATTACHMENTS_READ_COLUMNS,
+    )
 }
 
 fn is_resource_busy_cli_error(error: &CliError) -> bool {
@@ -5182,6 +5209,25 @@ fn open_db_sync_robot_best_effort_with_database_url(
     ))
 }
 
+fn open_db_sync_robot_attachments_best_effort_with_database_url(
+    database_url: &str,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let (conn, _opened_path) = open_sqlite_with_fallback(&path)?;
+    if sqlite_conn_supports_robot_attachment_reads(&conn)? {
+        return Ok(conn);
+    }
+    Err(CliError::Other(
+        "robot attachments fallback requires the attachments read schema".to_string(),
+    ))
+}
+
 pub(crate) fn open_db_sync_robot_with_database_url(
     database_url: &str,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
@@ -5203,9 +5249,23 @@ pub(crate) fn open_db_sync_robot_with_database_url(
     }
 }
 
+pub(crate) fn open_db_sync_robot_attachments_with_database_url(
+    database_url: &str,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
+    if let Ok(conn) = open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
+        return Ok(conn);
+    }
+    open_db_sync_with_database_url(database_url)
+}
+
 pub(crate) fn open_db_sync_robot() -> CliResult<mcp_agent_mail_db::DbConn> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     open_db_sync_robot_with_database_url(&cfg.database_url)
+}
+
+pub(crate) fn open_db_sync_robot_attachments() -> CliResult<mcp_agent_mail_db::DbConn> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    open_db_sync_robot_attachments_with_database_url(&cfg.database_url)
 }
 
 fn handle_config(action: ConfigCommand) -> CliResult<()> {
