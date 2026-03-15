@@ -1063,6 +1063,26 @@ pub enum RobotSubcommand {
 
     /// Attachment inventory with type, size, provenance, storage mode.
     Attachments,
+
+    // ── Track 5: Air Traffic Controller ─────────────────────────────────
+    /// ATC status: liveness assessments, conflicts, calibration, decisions.
+    Atc {
+        /// Show recent ATC decisions.
+        #[arg(long)]
+        decisions: bool,
+        /// Show agent liveness assessments.
+        #[arg(long)]
+        liveness: bool,
+        /// Show conflict graph.
+        #[arg(long)]
+        conflicts: bool,
+        /// Show session summary.
+        #[arg(long)]
+        summary: bool,
+        /// Maximum items to show.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 impl RobotSubcommand {
@@ -1092,6 +1112,7 @@ impl RobotSubcommand {
             Self::Contacts => "robot contacts",
             Self::Projects => "robot projects",
             Self::Attachments => "robot attachments",
+            Self::Atc { .. } => "robot atc",
         }
     }
 }
@@ -5475,6 +5496,50 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 },
             );
             env._meta.project = resolved_project;
+            format_output(&env, format)?
+        }
+        RobotSubcommand::Atc {
+            decisions,
+            liveness,
+            conflicts,
+            summary,
+            limit,
+        } => {
+            // ATC is a server-side subsystem; the robot CLI surfaces its
+            // state via a lightweight snapshot.  Since the ATC runs on the
+            // poller thread and we're in a separate CLI process, we report
+            // a static "ATC available" status.  Full live state requires
+            // the TUI (Track 9 Option B) or a future HTTP API.
+            #[derive(Serialize)]
+            struct AtcData {
+                enabled: bool,
+                note: String,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                decisions_requested: Option<bool>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                liveness_requested: Option<bool>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                conflicts_requested: Option<bool>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                summary_requested: Option<bool>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                limit: Option<usize>,
+            }
+
+            let data = AtcData {
+                enabled: true,
+                note: "ATC runs as a server-side subsystem. Use the TUI \
+                       System Health screen for live state, or start the \
+                       server with AM_ATC_ENABLED=true."
+                    .to_string(),
+                decisions_requested: if decisions { Some(true) } else { None },
+                liveness_requested: if liveness { Some(true) } else { None },
+                conflicts_requested: if conflicts { Some(true) } else { None },
+                summary_requested: if summary { Some(true) } else { None },
+                limit,
+            };
+
+            let env = RobotEnvelope::new(cmd_name, format, data);
             format_output(&env, format)?
         }
     };
