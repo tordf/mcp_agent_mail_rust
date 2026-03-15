@@ -2354,23 +2354,19 @@ resolve_setup_http_bearer_token() {
 
 # Insert or create an mcp-agent-mail entry in a TOML config file.
 # Handles Codex CLI's ~/.codex/config.toml with [mcp_servers.mcp_agent_mail].
+# Uses stdio/command transport (not HTTP URL), matching current Codex CLI behavior.
 # Returns: 0=configured, 1=unchanged, 2=error.
 setup_single_toml_config() {
   local tool="$1"
   local config_path="$2"
-  local _binary_path="${3:-}"
+  local binary_path="${3:-}"
   local section_header='[mcp_servers.mcp_agent_mail]'
-  local desired_url
-  desired_url="$(desired_mcp_http_url)"
-  local desired_startup_timeout_sec="30"
-  local bearer_token
-  bearer_token="$(resolve_setup_http_bearer_token)"
-  local desired_auth_header=""
   local tmp_file="${config_path}.tmp.mcp-agent-mail.$$"
   local backup=""
 
-  if [ -n "$bearer_token" ]; then
-    desired_auth_header="Bearer ${bearer_token}"
+  # Resolve the binary path for the stdio command entry.
+  if [ -z "$binary_path" ]; then
+    binary_path="${DEST:-/usr/local/bin}/${BIN_CLI:-mcp-agent-mail}"
   fi
 
   if [ ! -f "$config_path" ]; then
@@ -2381,41 +2377,30 @@ setup_single_toml_config() {
 
     cat > "$config_path" <<TOMLEOF
 ${section_header}
-url = "${desired_url}"
-startup_timeout_sec = ${desired_startup_timeout_sec}
+command = "${binary_path}"
+args = []
 TOMLEOF
-    if [ -n "$desired_auth_header" ]; then
-      cat >> "$config_path" <<TOMLEOF
-http_headers = { Authorization = "${desired_auth_header}" }
-TOMLEOF
-    fi
     verbose "setup_toml_config:created tool=${tool} path=${config_path}"
     return 0
   fi
 
   if ! awk \
     -v section_header="$section_header" \
-    -v desired_url="$desired_url" \
-    -v desired_startup_timeout_sec="$desired_startup_timeout_sec" \
-    -v desired_auth_header="$desired_auth_header" '
+    -v desired_command="$binary_path" '
     function flush_section() {
-      if (!saw_url_in_section) {
-        print "url = \"" desired_url "\""
+      if (!saw_command_in_section) {
+        print "command = \"" desired_command "\""
       }
-      if (!saw_startup_timeout_in_section) {
-        print "startup_timeout_sec = " desired_startup_timeout_sec
-      }
-      if (!saw_http_headers_in_section && desired_auth_header != "") {
-        print "http_headers = { Authorization = \"" desired_auth_header "\" }"
+      if (!saw_args_in_section) {
+        print "args = []"
       }
     }
 
     BEGIN {
       in_section = 0
       saw_section = 0
-      saw_url_in_section = 0
-      saw_startup_timeout_in_section = 0
-      saw_http_headers_in_section = 0
+      saw_command_in_section = 0
+      saw_args_in_section = 0
     }
 
     /^\[mcp_servers\.mcp_agent_mail\]([[:space:]]*#.*)?[[:space:]]*$/ || /^\[mcp_servers\."mcp-agent-mail"\]([[:space:]]*#.*)?[[:space:]]*$/ {
@@ -2424,9 +2409,8 @@ TOMLEOF
       }
       in_section = 1
       saw_section = 1
-      saw_url_in_section = 0
-      saw_startup_timeout_in_section = 0
-      saw_http_headers_in_section = 0
+      saw_command_in_section = 0
+      saw_args_in_section = 0
       print
       next
     }
@@ -2439,33 +2423,18 @@ TOMLEOF
     }
 
     {
-      if (in_section && $0 ~ /^[[:space:]]*(url|httpUrl)[[:space:]]*=/) {
-        print "url = \"" desired_url "\""
-        saw_url_in_section = 1
+      if (in_section && $0 ~ /^[[:space:]]*command[[:space:]]*=/) {
+        print "command = \"" desired_command "\""
+        saw_command_in_section = 1
         next
       }
-      if (in_section && $0 ~ /^[[:space:]]*startup_timeout_sec[[:space:]]*=/) {
-        print "startup_timeout_sec = " desired_startup_timeout_sec
-        saw_startup_timeout_in_section = 1
+      if (in_section && $0 ~ /^[[:space:]]*args[[:space:]]*=/) {
+        print "args = []"
+        saw_args_in_section = 1
         next
       }
-      if (in_section && $0 ~ /^[[:space:]]*http_headers[[:space:]]*=/) {
-        if (desired_auth_header != "") {
-          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
-        } else {
-          print
-        }
-        saw_http_headers_in_section = 1
-        next
-      }
-      if (in_section && $0 ~ /^[[:space:]]*bearer_token_env_var[[:space:]]*=/) {
-        if (desired_auth_header != "") {
-          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
-          saw_http_headers_in_section = 1
-        }
-        next
-      }
-      if (in_section && $0 ~ /^[[:space:]]*(command|args)[[:space:]]*=/) {
+      # Remove stale HTTP-oriented keys that conflict with stdio transport
+      if (in_section && $0 ~ /^[[:space:]]*(url|httpUrl|http_headers|bearer_token_env_var|startup_timeout_sec)[[:space:]]*=/) {
         next
       }
       print
@@ -2480,11 +2449,8 @@ TOMLEOF
           print ""
         }
         print section_header
-        print "url = \"" desired_url "\""
-        print "startup_timeout_sec = " desired_startup_timeout_sec
-        if (desired_auth_header != "") {
-          print "http_headers = { Authorization = \"" desired_auth_header "\" }"
-        }
+        print "command = \"" desired_command "\""
+        print "args = []"
       }
     }
   ' "$config_path" > "$tmp_file"; then
