@@ -4085,12 +4085,13 @@ mod predictive_tests {
             sprt_log_lr: 0.0,
             core: default_liveness_core(),
         };
-        // Push posterior toward uncertainty
-        for _ in 0..5 {
+        // Push posterior toward uncertainty by boosting Flaky/Dead
+        // relative to the strong Alive prior (0.95)
+        for _ in 0..20 {
             uncertain.core.update_posterior(&[
-                (LivenessState::Alive, 0.5),
-                (LivenessState::Flaky, 0.5),
-                (LivenessState::Dead, 0.5),
+                (LivenessState::Alive, 0.3),
+                (LivenessState::Flaky, 0.9),
+                (LivenessState::Dead, 0.9),
             ]);
         }
         agents.insert("Uncertain".to_string(), uncertain);
@@ -4437,5 +4438,430 @@ mod advanced_tests {
         assert!((pid.deviation() - 0.0).abs() < f64::EPSILON);
         pid.update(1.0, 1.0);
         assert!(pid.deviation() > 0.0, "positive error should increase deviation");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Edge Case & Boundary Condition Tests (Test Coverage Beads)
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod edge_case_tests {
+    use super::*;
+
+    // ── DecisionCore edge cases (br-1u8gy) ───────────────────────────
+
+    #[test]
+    fn partial_likelihoods_only_update_specified_states() {
+        let mut core = default_liveness_core();
+        let before = core.posterior().to_vec();
+        // Only update Alive likelihood, leave Flaky and Dead at default 1.0
+        core.update_posterior(&[(LivenessState::Alive, 0.01)]);
+        let after = core.posterior().to_vec();
+        // Alive probability should decrease (low likelihood)
+        let alive_before = before.iter().find(|(s, _)| *s == LivenessState::Alive).unwrap().1;
+        let alive_after = after.iter().find(|(s, _)| *s == LivenessState::Alive).unwrap().1;
+        assert!(
+            alive_after < alive_before,
+            "alive should decrease: before={alive_before:.4}, after={alive_after:.4}"
+        );
+        // Posterior should still be normalized
+        let total: f64 = after.iter().map(|(_, p)| *p).sum();
+        assert!((total - 1.0).abs() < 1e-10, "should stay normalized: {total}");
+    }
+
+    #[test]
+    fn two_action_core_runner_up_is_other_action() {
+        // Create a core with only 2 actions
+        let core = DecisionCore::new(
+            &[(LivenessState::Alive, 0.9), (LivenessState::Dead, 0.1)],
+            &[
+                (LivenessAction::DeclareAlive, LivenessState::Alive, 0.0),
+                (LivenessAction::DeclareAlive, LivenessState::Dead, 50.0),
+                (LivenessAction::ReleaseReservations, LivenessState::Alive, 100.0),
+                (LivenessAction::ReleaseReservations, LivenessState::Dead, 1.0),
+            ],
+            0.3,
+        );
+        let (_best, best_loss, runner_up) = core.choose_action();
+        assert!(runner_up.is_finite(), "runner_up should not be INFINITY with 2 actions");
+        assert!(runner_up > best_loss);
+    }
+
+    #[test]
+    fn uniform_posterior_picks_globally_cheapest() {
+        let core = DecisionCore::new(
+            &[
+                (ConflictState::NoConflict, 1.0 / 3.0),
+                (ConflictState::MildOverlap, 1.0 / 3.0),
+                (ConflictState::SevereCollision, 1.0 / 3.0),
+            ],
+            &[
+                (ConflictAction::Ignore, ConflictState::NoConflict, 0.0),
+                (ConflictAction::Ignore, ConflictState::MildOverlap, 15.0),
+                (ConflictAction::Ignore, ConflictState::SevereCollision, 100.0),
+                (ConflictAction::AdvisoryMessage, ConflictState::NoConflict, 3.0),
+                (ConflictAction::AdvisoryMessage, ConflictState::MildOverlap, 1.0),
+                (ConflictAction::AdvisoryMessage, ConflictState::SevereCollision, 8.0),
+                (ConflictAction::ForceReservation, ConflictState::NoConflict, 12.0),
+                (ConflictAction::ForceReservation, ConflictState::MildOverlap, 4.0),
+                (ConflictAction::ForceReservation, ConflictState::SevereCollision, 2.0),
+            ],
+            0.3,
+        );
+        let (action, _, _) = core.choose_action();
+        // Under uniform: Advisory=(3+1+8)/3=4, Ignore=(0+15+100)/3=38.3, Force=(12+4+2)/3=6
+        assert_eq!(action, ConflictAction::AdvisoryMessage, "advisory has lowest expected loss under uniform");
+    }
+
+    #[test]
+    fn alpha_clamped_to_minimum() {
+        let core = DecisionCore::new(
+            &[(LivenessState::Alive, 1.0)],
+            &[(LivenessAction::DeclareAlive, LivenessState::Alive, 0.0)],
+            -5.0, // negative alpha
+        );
+        assert!((core.alpha - 0.01).abs() < f64::EPSILON, "alpha should be clamped to 0.01");
+    }
+
+    #[test]
+    fn empty_likelihoods_no_change() {
+        let mut core = default_liveness_core();
+        let before = core.posterior().to_vec();
+        core.update_posterior(&[]);
+        let after = core.posterior().to_vec();
+        // With empty likelihoods, all states get likelihood 1.0.
+        // After raising to alpha and normalizing, proportions are unchanged.
+        for i in 0..before.len() {
+            assert!(
+                (before[i].1 - after[i].1).abs() < 1e-10,
+                "state {:?} should be unchanged: {:.6} vs {:.6}",
+                before[i].0, before[i].1, after[i].1,
+            );
+        }
+    }
+
+    // ── EvidenceLedger edge cases (br-w5phh) ─────────────────────────
+
+    #[test]
+    fn ledger_all_returns_oldest_first() {
+        let mut ledger = EvidenceLedger::new(100);
+        let core = default_liveness_core();
+        for i in 0..5 {
+            let subject = format!("Agent{i}");
+            ledger.record(&DecisionBuilder {
+                subsystem: AtcSubsystem::Liveness,
+                subject: &subject,
+                core: &core,
+                action: LivenessAction::DeclareAlive,
+                expected_loss: 1.0,
+                runner_up_loss: 2.0,
+                evidence_summary: "test",
+                calibration_healthy: true,
+                safe_mode_active: false,
+                timestamp_micros: i as i64,
+            });
+        }
+        let ids: Vec<u64> = ledger.all().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5], "all() should return oldest first");
+    }
+
+    #[test]
+    fn ledger_latest_id_when_empty() {
+        let ledger = EvidenceLedger::new(100);
+        assert_eq!(ledger.latest_id(), 0, "empty ledger should return 0");
+    }
+
+    #[test]
+    fn format_message_with_empty_posterior() {
+        let record = AtcDecisionRecord {
+            id: 1,
+            timestamp_micros: 0,
+            subsystem: AtcSubsystem::Liveness,
+            subject: "Test".to_string(),
+            posterior: vec![],
+            action: "Test".to_string(),
+            expected_loss: 0.0,
+            runner_up_loss: 0.0,
+            evidence_summary: "test".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+        };
+        let msg = record.format_message();
+        assert!(msg.contains("Decision #1"), "should not panic with empty posterior");
+    }
+
+    #[test]
+    fn ledger_capacity_one() {
+        let mut ledger = EvidenceLedger::new(1);
+        let core = default_liveness_core();
+        for i in 0..3 {
+            let subject = format!("Agent{i}");
+            ledger.record(&DecisionBuilder {
+                subsystem: AtcSubsystem::Liveness,
+                subject: &subject,
+                core: &core,
+                action: LivenessAction::DeclareAlive,
+                expected_loss: 1.0,
+                runner_up_loss: 2.0,
+                evidence_summary: "test",
+                calibration_healthy: true,
+                safe_mode_active: false,
+                timestamp_micros: i as i64,
+            });
+        }
+        assert_eq!(ledger.len(), 1, "capacity-1 ledger should hold only 1 record");
+        assert!(ledger.get(3).is_some(), "should hold the last record");
+        assert!(ledger.get(1).is_none(), "first record should be evicted");
+    }
+
+    // ── AgentRhythm edge cases (br-oco5x) ────────────────────────────
+
+    #[test]
+    fn observe_out_of_order_timestamps() {
+        let mut rhythm = AgentRhythm::new(60.0);
+        rhythm.observe(100_000_000); // 100s
+        rhythm.observe(50_000_000);  // 50s (before previous!)
+        // Delta should be clamped to 0 via .max(0)
+        assert!(rhythm.avg_interval >= 0.0, "avg should not go negative");
+        assert!(rhythm.var_interval >= 0.0, "variance should not go negative");
+    }
+
+    #[test]
+    fn observe_same_timestamp_twice() {
+        let mut rhythm = AgentRhythm::new(60.0);
+        rhythm.observe(100_000_000);
+        rhythm.observe(100_000_000); // delta = 0
+        assert!(rhythm.avg_interval.is_finite(), "should not produce NaN");
+        assert!(rhythm.var_interval.is_finite(), "variance should be finite");
+    }
+
+    #[test]
+    fn evaluate_liveness_skips_dead_agent() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("DeadAgent", "claude-code");
+        // Force to Dead
+        engine.agents.get_mut("DeadAgent").unwrap().state = LivenessState::Dead;
+        for i in 0..10 {
+            engine.observe_activity("DeadAgent", i * 60_000_000);
+        }
+        // Reset to Dead again (observe_activity resurrects)
+        engine.agents.get_mut("DeadAgent").unwrap().state = LivenessState::Dead;
+
+        let now = 9 * 60_000_000 + 600_000_000;
+        let actions = engine.evaluate_liveness(now);
+        let dead_actions: Vec<_> = actions.iter().filter(|(name, _)| name == "DeadAgent").collect();
+        assert!(dead_actions.is_empty(), "should skip Dead agents");
+    }
+
+    #[test]
+    fn observe_activity_unregistered_agent_ignored() {
+        let mut engine = AtcEngine::new_for_testing();
+        // Don't register "Ghost" — just observe activity
+        engine.observe_activity("Ghost", 1_000_000);
+        assert!(
+            engine.agent_liveness("Ghost").is_none(),
+            "unregistered agent should not be auto-created"
+        );
+    }
+
+    // ── Martingale edge cases (br-ems9z) ─────────────────────────────
+
+    #[test]
+    fn drift_sources_empty_when_well_calibrated() {
+        let monitor = EProcessMonitor::new(0.85, 20.0);
+        let sources = monitor.drift_sources();
+        assert!(sources.is_empty(), "no observations → no drift sources");
+    }
+
+    #[test]
+    fn cusum_recent_changes_ordering() {
+        let mut cusum = CusumDetector::new(0.15, 3.0, 0.1);
+        // Trigger 3 degradation detections by feeding errors in bursts
+        for burst in 0..3 {
+            for i in 0..50 {
+                let ts = (burst * 100 + i) * 1_000_000;
+                cusum.update(true, ts);
+            }
+        }
+        let recent: Vec<_> = cusum.recent_changes(2).collect();
+        assert!(recent.len() <= 2, "should return at most 2");
+        if recent.len() == 2 {
+            assert!(
+                recent[0].timestamp >= recent[1].timestamp,
+                "recent_changes should return newest first"
+            );
+        }
+    }
+
+    #[test]
+    fn calibration_guard_dual_alert() {
+        let mut guard = CalibrationGuard::new(20);
+        // Both eprocess AND cusum in alert state
+        let mut eprocess = EProcessMonitor::new(0.85, 20.0);
+        for _ in 0..200 {
+            eprocess.update(false, AtcSubsystem::Liveness, None);
+        }
+        let mut cusum = CusumDetector::new(0.15, 5.0, 0.1);
+        for i in 0..100 {
+            cusum.update(true, i * 1_000_000);
+        }
+        assert!(eprocess.miscalibrated());
+        assert!(cusum.degradation_detected());
+
+        guard.update(&eprocess, &cusum, false, 1_000_000);
+        assert!(guard.is_safe_mode(), "both signals should trigger safe mode");
+
+        // Recovery requires BOTH to clear
+        let healthy_ep = EProcessMonitor::new(0.85, 20.0);
+        // cusum still degraded → should NOT exit
+        for i in 0..25 {
+            guard.update(&healthy_ep, &cusum, true, (i + 2) * 1_000_000);
+        }
+        assert!(guard.is_safe_mode(), "should stay in safe mode while cusum degraded");
+    }
+
+    #[test]
+    fn eprocess_target_coverage_one() {
+        // alpha = 0.0 edge case
+        let mut monitor = EProcessMonitor::new(1.0, 20.0);
+        monitor.update(true, AtcSubsystem::Liveness, None);
+        monitor.update(false, AtcSubsystem::Liveness, None);
+        assert!(monitor.e_value().is_finite(), "should handle alpha=0 without panic");
+    }
+
+    #[test]
+    fn eprocess_target_coverage_zero() {
+        // alpha = 1.0 edge case
+        let mut monitor = EProcessMonitor::new(0.0, 20.0);
+        monitor.update(true, AtcSubsystem::Liveness, None);
+        monitor.update(false, AtcSubsystem::Liveness, None);
+        assert!(monitor.e_value().is_finite(), "should handle alpha=1 without panic");
+    }
+
+    #[test]
+    fn regret_tracker_zero_capacity() {
+        let mut tracker = RegretTracker::new(0);
+        // Should not panic
+        tracker.record_outcome(1, "A", 5.0, "B", 0.0, 1);
+        assert_eq!(tracker.outcome_count(), 1);
+        assert!((tracker.average_regret() - 5.0).abs() < f64::EPSILON);
+    }
+
+    // ── SessionSummary + LoadRouter edge cases (br-kgew5) ────────────
+
+    #[test]
+    fn absorb_message_received() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&SynthesisEvent::MessageReceived {
+            agent: "BlueFox".to_string(),
+            timestamp_micros: 1_000_000,
+        });
+        assert_eq!(summary.messages_received, 1);
+        assert!(summary.active_agents.contains("BlueFox"));
+    }
+
+    #[test]
+    fn absorb_with_timestamp_zero() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&SynthesisEvent::MessageSent {
+            from: "A".to_string(),
+            to: vec!["B".to_string()],
+            thread_id: None,
+            timestamp_micros: 0,
+        });
+        assert_eq!(summary.first_event_ts, 0, "timestamp 0 should be accepted");
+        assert_eq!(summary.last_event_ts, 0);
+    }
+
+    #[test]
+    fn select_route_empty_agents() {
+        let agents: HashMap<String, AgentLoadModel> = HashMap::new();
+        let target = select_route_target(&agents, "Requester", 0.1);
+        assert!(target.is_none(), "empty map should return None");
+    }
+
+    #[test]
+    fn load_model_zero_interval() {
+        let mut model = AgentLoadModel::new();
+        model.observe_activity(10, 0.0); // zero interval
+        // Should not panic or produce NaN
+        assert!(model.throughput_ewma.is_finite());
+    }
+
+    #[test]
+    fn pid_negative_error_decreases_value() {
+        let mut pid = PidState::new(10.0);
+        for _ in 0..50 {
+            pid.update(-1.0, 1.0);
+        }
+        assert!(pid.current_value < 10.0, "negative error should decrease value");
+    }
+
+    #[test]
+    fn pid_zero_dt_no_panic() {
+        let mut pid = PidState::new(10.0);
+        let val = pid.update(1.0, 0.0);
+        assert!(val.is_finite(), "dt=0 should not cause panic or NaN");
+    }
+
+    #[test]
+    fn vcg_three_participants() {
+        let participants = vec![
+            ConflictParticipant {
+                agent: "A".to_string(),
+                remaining_tasks: 1,
+                estimated_completion_mins: 10,
+                reservation_age_micros: 0,
+            },
+            ConflictParticipant {
+                agent: "B".to_string(),
+                remaining_tasks: 5,
+                estimated_completion_mins: 30,
+                reservation_age_micros: 0,
+            },
+            ConflictParticipant {
+                agent: "C".to_string(),
+                remaining_tasks: 10,
+                estimated_completion_mins: 60,
+                reservation_age_micros: 0,
+            },
+        ];
+        let priorities = vcg_priority(&participants);
+        assert_eq!(priorities.len(), 3);
+        // A's externality = B_cost + C_cost = (5*30/60) + (10*60/60) = 2.5 + 10 = 12.5
+        // B's externality = A_cost + C_cost = (1*10/60) + (10*60/60) = 0.167 + 10 = 10.167
+        // C's externality = A_cost + B_cost = (1*10/60) + (5*30/60) = 0.167 + 2.5 = 2.667
+        // A has highest externality → should yield first
+        assert_eq!(priorities[0].0, "A", "A should yield first (highest externality)");
+    }
+
+    #[test]
+    fn probe_gain_binary_posterior() {
+        let binary = vec![
+            (LivenessState::Alive, 0.5),
+            (LivenessState::Dead, 0.5),
+        ];
+        let gain = probe_information_gain(&binary);
+        // Binary entropy at p=0.5 = ln(2) ≈ 0.693
+        assert!((gain - 2.0_f64.ln()).abs() < 0.01, "should be ln(2) for binary uniform");
+    }
+
+    #[test]
+    fn littles_law_zero_arrival_nonzero_queue() {
+        assert!(
+            !littles_law_consistent(10.0, 0.0, 5.0, 0.2),
+            "nonzero queue with zero arrival should be inconsistent"
+        );
+    }
+
+    #[test]
+    fn kingman_lower_cv_means_shorter_wait() {
+        let det = kingman_wait_time(0.5, 1.0, 0.0, 0.0); // deterministic
+        let var = kingman_wait_time(0.5, 1.0, 1.0, 1.0);  // variable
+        assert!(
+            det < var,
+            "deterministic service should have shorter wait: {det} vs {var}"
+        );
     }
 }
