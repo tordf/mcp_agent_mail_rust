@@ -3186,3 +3186,223 @@ mod synthesis_tests {
         assert_eq!(s1.reservations_granted, s2.reservations_granted);
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Load Router (Track 6)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Per-agent load model for capacity-based routing.
+#[derive(Debug, Clone)]
+pub struct AgentLoadModel {
+    /// EWMA of messages processed per hour.
+    throughput_ewma: f64,
+    /// Current active reservation count.
+    pub active_reservations: u64,
+    /// Current unread inbox count.
+    pub pending_inbox: u64,
+    /// Predicted capacity [0.0 = fully loaded, 1.0 = idle].
+    predicted_capacity: f64,
+    /// EWMA of prediction accuracy |predicted - actual|.
+    prediction_accuracy: f64,
+    /// Number of routing observations.
+    observation_count: u64,
+}
+
+impl AgentLoadModel {
+    /// Create a new load model.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            throughput_ewma: 0.0,
+            active_reservations: 0,
+            pending_inbox: 0,
+            predicted_capacity: 1.0, // assume idle initially
+            prediction_accuracy: 0.5, // neutral accuracy
+            observation_count: 0,
+        }
+    }
+
+    /// Update from observed agent activity.
+    pub fn observe_activity(&mut self, messages_processed: u64, interval_secs: f64) {
+        if interval_secs > 0.0 {
+            let rate = messages_processed as f64 / interval_secs * 3600.0;
+            self.throughput_ewma = 0.8 * self.throughput_ewma + 0.2 * rate;
+        }
+        self.recompute_capacity();
+    }
+
+    /// Update reservation and inbox counts.
+    pub fn update_counts(&mut self, reservations: u64, inbox: u64) {
+        self.active_reservations = reservations;
+        self.pending_inbox = inbox;
+        self.recompute_capacity();
+    }
+
+    fn recompute_capacity(&mut self) {
+        // Capacity decreases with more reservations and pending messages
+        let reservation_load = (self.active_reservations as f64 * 0.15).min(1.0);
+        let inbox_load = (self.pending_inbox as f64 * 0.05).min(1.0);
+        self.predicted_capacity = (1.0 - reservation_load - inbox_load).max(0.0);
+    }
+
+    /// Record whether a routing prediction was accurate.
+    pub fn record_accuracy(&mut self, actual_response_secs: f64, expected_response_secs: f64) {
+        let error = ((actual_response_secs - expected_response_secs) / expected_response_secs.max(1.0)).abs();
+        let correct = if error < 0.5 { 1.0 } else { 0.0 };
+        self.prediction_accuracy = 0.9 * self.prediction_accuracy + 0.1 * correct;
+        self.observation_count += 1;
+    }
+
+    /// Classical routing score (no prediction needed): 1/(1 + reservations).
+    #[must_use]
+    pub fn classical_score(&self) -> f64 {
+        1.0 / (1.0 + self.active_reservations as f64)
+    }
+
+    /// Blended routing score using consistency-robustness tradeoff.
+    ///
+    /// λ = prediction_accuracy (trust the predictor when it's been right).
+    /// score = λ * predicted_capacity + (1-λ) * classical_score.
+    #[must_use]
+    pub fn routing_score(&self) -> f64 {
+        let lambda = self.prediction_accuracy;
+        lambda * self.predicted_capacity + (1.0 - lambda) * self.classical_score()
+    }
+}
+
+impl Default for AgentLoadModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Select the best agent to route a message to.
+///
+/// Returns `None` if all agents are saturated (all scores below threshold).
+#[must_use]
+pub fn select_route_target<'a>(
+    agents: &'a HashMap<String, AgentLoadModel>,
+    exclude: &str, // don't route to the requester
+    min_score: f64,
+) -> Option<&'a str> {
+    agents
+        .iter()
+        .filter(|(name, _)| name.as_str() != exclude && name.as_str() != ATC_AGENT_NAME)
+        .max_by(|(_, a), (_, b)| {
+            a.routing_score()
+                .partial_cmp(&b.routing_score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .filter(|(_, model)| model.routing_score() >= min_score)
+        .map(|(name, _)| name.as_str())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Track 6 Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod load_routing_tests {
+    use super::*;
+
+    #[test]
+    fn new_agent_has_high_capacity() {
+        let model = AgentLoadModel::new();
+        assert!((model.predicted_capacity - 1.0).abs() < f64::EPSILON);
+        assert!(model.routing_score() > 0.5);
+    }
+
+    #[test]
+    fn reservations_reduce_capacity() {
+        let mut model = AgentLoadModel::new();
+        model.update_counts(5, 0);
+        assert!(model.predicted_capacity < 0.5, "5 reservations should reduce capacity");
+        assert!(model.routing_score() < 0.5);
+    }
+
+    #[test]
+    fn pending_inbox_reduces_capacity() {
+        let mut model = AgentLoadModel::new();
+        model.update_counts(0, 10);
+        assert!(model.predicted_capacity < 0.8, "10 pending messages should reduce capacity");
+    }
+
+    #[test]
+    fn classical_score_inversely_proportional_to_reservations() {
+        let mut m0 = AgentLoadModel::new();
+        let mut m5 = AgentLoadModel::new();
+        m0.update_counts(0, 0);
+        m5.update_counts(5, 0);
+        assert!(m0.classical_score() > m5.classical_score());
+    }
+
+    #[test]
+    fn lambda_anneals_toward_classical_when_inaccurate() {
+        let mut model = AgentLoadModel::new();
+        // Record many inaccurate predictions
+        for _ in 0..50 {
+            model.record_accuracy(100.0, 10.0); // 10× off
+        }
+        // prediction_accuracy should be near 0 → routing_score ≈ classical
+        let blended = model.routing_score();
+        let classical = model.classical_score();
+        assert!(
+            (blended - classical).abs() < 0.15,
+            "with low accuracy, blended should approach classical"
+        );
+    }
+
+    #[test]
+    fn select_route_picks_least_loaded() {
+        let mut agents = HashMap::new();
+        let mut heavy = AgentLoadModel::new();
+        heavy.update_counts(8, 5);
+        let idle = AgentLoadModel::new(); // 0 reservations, 0 inbox
+
+        agents.insert("HeavyAgent".to_string(), heavy);
+        agents.insert("IdleAgent".to_string(), idle);
+
+        let target = select_route_target(&agents, "Requester", 0.1);
+        assert_eq!(target, Some("IdleAgent"));
+    }
+
+    #[test]
+    fn select_route_excludes_requester() {
+        let mut agents = HashMap::new();
+        agents.insert("OnlyAgent".to_string(), AgentLoadModel::new());
+
+        let target = select_route_target(&agents, "OnlyAgent", 0.1);
+        assert!(target.is_none(), "should not route to the requester");
+    }
+
+    #[test]
+    fn select_route_excludes_atc() {
+        let mut agents = HashMap::new();
+        agents.insert(ATC_AGENT_NAME.to_string(), AgentLoadModel::new());
+        agents.insert("RealAgent".to_string(), AgentLoadModel::new());
+
+        let target = select_route_target(&agents, "Requester", 0.1);
+        assert_eq!(target, Some("RealAgent"), "should not route to ATC");
+    }
+
+    #[test]
+    fn select_route_none_when_all_saturated() {
+        let mut agents = HashMap::new();
+        let mut saturated = AgentLoadModel::new();
+        saturated.update_counts(20, 30);
+        agents.insert("SaturatedAgent".to_string(), saturated);
+
+        let target = select_route_target(&agents, "Requester", 0.5);
+        assert!(target.is_none(), "should return None when all below threshold");
+    }
+
+    #[test]
+    fn throughput_ewma_updates() {
+        let mut model = AgentLoadModel::new();
+        model.observe_activity(10, 60.0); // 10 msgs in 60s = 600/hr
+        assert!(model.throughput_ewma > 0.0);
+        let first = model.throughput_ewma;
+        model.observe_activity(20, 60.0); // 20 msgs in 60s = 1200/hr
+        assert!(model.throughput_ewma > first, "EWMA should increase");
+    }
+}
