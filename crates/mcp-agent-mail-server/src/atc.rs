@@ -15,8 +15,7 @@
 //! All downstream subsystems (liveness, conflict, routing, calibration)
 //! are built on top of these two primitives.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 
@@ -2069,5 +2068,1105 @@ mod martingale_tests {
             tracker.average_regret() >= 0.0,
             "regret should be clamped to non-negative"
         );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Calibration Guard (Track 5)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Safe mode policy that consumes signals from the martingale engine
+/// (Track 11) and decides when to enter/exit conservative mode.
+///
+/// Track 5 owns the POLICY (when to switch modes).
+/// Track 11 owns the EVIDENCE (e-process, CUSUM, regret).
+#[derive(Debug, Clone)]
+pub struct CalibrationGuard {
+    /// Whether safe mode is currently active.
+    safe_mode: bool,
+    /// When safe mode was last activated (0 if never).
+    safe_mode_since: i64,
+    /// Consecutive correct predictions since last incorrect (for recovery).
+    consecutive_correct: u64,
+    /// Required consecutive correct predictions to exit safe mode.
+    recovery_count: u64,
+}
+
+impl CalibrationGuard {
+    /// Create a new calibration guard.
+    #[must_use]
+    pub fn new(recovery_count: u64) -> Self {
+        Self {
+            safe_mode: false,
+            safe_mode_since: 0,
+            consecutive_correct: 0,
+            recovery_count,
+        }
+    }
+
+    /// Update the guard based on the latest martingale engine signals.
+    ///
+    /// Returns `true` if the safe mode state changed (entered or exited).
+    pub fn update(
+        &mut self,
+        eprocess: &EProcessMonitor,
+        cusum: &CusumDetector,
+        prediction_correct: bool,
+        timestamp_micros: i64,
+    ) -> bool {
+        let was_safe = self.safe_mode;
+
+        // Track consecutive correct predictions for recovery
+        if prediction_correct {
+            self.consecutive_correct = self.consecutive_correct.saturating_add(1);
+        } else {
+            self.consecutive_correct = 0;
+        }
+
+        // Enter safe mode if ANY of these signals fire:
+        // 1. E-process exceeds threshold (sustained miscalibration)
+        // 2. CUSUM detected a degradation regime change
+        if !self.safe_mode
+            && (eprocess.miscalibrated() || cusum.degradation_detected())
+        {
+            self.safe_mode = true;
+            self.safe_mode_since = timestamp_micros;
+            self.consecutive_correct = 0;
+        }
+
+        // Exit safe mode only when ALL of:
+        // 1. Enough consecutive correct predictions (hysteresis)
+        // 2. E-process has recovered (below threshold)
+        // 3. CUSUM not showing active degradation
+        if self.safe_mode
+            && self.consecutive_correct >= self.recovery_count
+            && !eprocess.miscalibrated()
+            && !cusum.degradation_detected()
+        {
+            self.safe_mode = false;
+            self.safe_mode_since = 0;
+        }
+
+        self.safe_mode != was_safe
+    }
+
+    /// Whether safe mode is currently active.
+    #[must_use]
+    pub const fn is_safe_mode(&self) -> bool {
+        self.safe_mode
+    }
+
+    /// When safe mode was last activated (0 if never or not active).
+    #[must_use]
+    pub const fn safe_mode_since(&self) -> i64 {
+        self.safe_mode_since
+    }
+
+    /// Force safe mode on/off (operator override).
+    pub fn set_safe_mode(&mut self, active: bool, timestamp_micros: i64) {
+        self.safe_mode = active;
+        self.safe_mode_since = if active { timestamp_micros } else { 0 };
+        if active {
+            self.consecutive_correct = 0;
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Engine Integration (Track 8) — AtcEngine
+// ──────────────────────────────────────────────────────────────────────
+
+/// Configuration for the ATC engine.
+#[derive(Debug, Clone)]
+pub struct AtcConfig {
+    /// Master switch.
+    pub enabled: bool,
+    /// Health probe interval (microseconds).
+    pub probe_interval_micros: i64,
+    /// Minimum interval between advisories to the same agent (microseconds).
+    pub advisory_cooldown_micros: i64,
+    /// Session summary posting interval (microseconds).
+    pub summary_interval_micros: i64,
+    /// Calibration guard recovery count.
+    pub safe_mode_recovery_count: u64,
+    /// E-process alert threshold.
+    pub eprocess_alert_threshold: f64,
+    /// CUSUM detection threshold.
+    pub cusum_threshold: f64,
+    /// CUSUM minimum shift to detect.
+    pub cusum_delta: f64,
+    /// Evidence ledger ring buffer capacity.
+    pub ledger_capacity: usize,
+    /// Tick budget (microseconds) — warn if exceeded.
+    pub tick_budget_micros: u64,
+    /// Suspicion k-factor for rhythm-based detection.
+    pub suspicion_k: f64,
+}
+
+impl Default for AtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            probe_interval_micros: 120 * 1_000_000,
+            advisory_cooldown_micros: 300 * 1_000_000,
+            summary_interval_micros: 300 * 1_000_000,
+            safe_mode_recovery_count: 20,
+            eprocess_alert_threshold: 20.0,
+            cusum_threshold: 5.0,
+            cusum_delta: 0.1,
+            ledger_capacity: 1000,
+            tick_budget_micros: 5_000,
+            suspicion_k: 3.0,
+        }
+    }
+}
+
+/// Top-level ATC engine that orchestrates all subsystems.
+#[derive(Debug)]
+pub struct AtcEngine {
+    /// Configuration.
+    config: AtcConfig,
+    /// Whether the ATC has registered itself as an agent.
+    registered: bool,
+    /// Liveness decision core.
+    liveness_core: DecisionCore<LivenessState, LivenessAction>,
+    /// Conflict decision core.
+    conflict_core: DecisionCore<ConflictState, ConflictAction>,
+    /// Per-agent liveness tracking.
+    agents: HashMap<String, AgentLivenessEntry>,
+    /// Per-project conflict graphs.
+    conflict_graphs: HashMap<String, ProjectConflictGraph>,
+    /// Calibration guard (safe mode policy).
+    calibration: CalibrationGuard,
+    /// E-process martingale monitor.
+    eprocess: EProcessMonitor,
+    /// CUSUM regime change detector.
+    cusum: CusumDetector,
+    /// Counterfactual regret tracker.
+    regret: RegretTracker,
+    /// Evidence ledger.
+    ledger: EvidenceLedger,
+    /// Last processed event sequence number (incremental computation).
+    last_event_seq: u64,
+    /// Engine tick count.
+    tick_count: u64,
+}
+
+impl AtcEngine {
+    /// Create a new ATC engine with the given configuration.
+    #[must_use]
+    pub fn new(config: AtcConfig) -> Self {
+        let calibration = CalibrationGuard::new(config.safe_mode_recovery_count);
+        let eprocess = EProcessMonitor::new(0.85, config.eprocess_alert_threshold);
+        let cusum = CusumDetector::new(0.15, config.cusum_threshold, config.cusum_delta);
+        let regret = RegretTracker::new(100);
+        let ledger = EvidenceLedger::new(config.ledger_capacity);
+
+        Self {
+            config,
+            registered: false,
+            liveness_core: default_liveness_core(),
+            conflict_core: default_conflict_core(),
+            agents: HashMap::new(),
+            conflict_graphs: HashMap::new(),
+            calibration,
+            eprocess,
+            cusum,
+            regret,
+            ledger,
+            last_event_seq: 0,
+            tick_count: 0,
+        }
+    }
+
+    /// Create an engine for testing (disabled by default, in-memory).
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_for_testing() -> Self {
+        Self::new(AtcConfig {
+            enabled: true,
+            ..AtcConfig::default()
+        })
+    }
+
+    /// Whether the ATC is enabled.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Whether the ATC has registered itself.
+    #[must_use]
+    pub const fn registered(&self) -> bool {
+        self.registered
+    }
+
+    /// Whether safe mode is active.
+    #[must_use]
+    pub fn is_safe_mode(&self) -> bool {
+        self.calibration.is_safe_mode()
+    }
+
+    /// Access the evidence ledger.
+    #[must_use]
+    pub const fn ledger(&self) -> &EvidenceLedger {
+        &self.ledger
+    }
+
+    /// Access the e-process monitor.
+    #[must_use]
+    pub const fn eprocess(&self) -> &EProcessMonitor {
+        &self.eprocess
+    }
+
+    /// Access the CUSUM detector.
+    #[must_use]
+    pub const fn cusum(&self) -> &CusumDetector {
+        &self.cusum
+    }
+
+    /// Access the regret tracker.
+    #[must_use]
+    pub const fn regret(&self) -> &RegretTracker {
+        &self.regret
+    }
+
+    /// Current tick count.
+    #[must_use]
+    pub const fn tick_count(&self) -> u64 {
+        self.tick_count
+    }
+
+    /// Get liveness state for an agent.
+    #[must_use]
+    pub fn agent_liveness(&self, name: &str) -> Option<LivenessState> {
+        self.agents.get(name).map(|e| e.state)
+    }
+
+    /// Get all tracked agent names.
+    #[must_use]
+    pub fn tracked_agents(&self) -> Vec<&str> {
+        self.agents.keys().map(String::as_str).collect()
+    }
+
+    /// Force safe mode on/off (operator override).
+    pub fn set_safe_mode(&mut self, active: bool, timestamp_micros: i64) {
+        self.calibration.set_safe_mode(active, timestamp_micros);
+    }
+
+    /// Check whether an event is from/to the ATC itself (self-exclusion).
+    fn is_self_event(from: &str, to: &[String]) -> bool {
+        from == ATC_AGENT_NAME || to.iter().any(|t| t == ATC_AGENT_NAME)
+    }
+
+    /// Register a new agent for liveness tracking.
+    pub fn register_agent(&mut self, name: &str, program: &str) {
+        if name == ATC_AGENT_NAME {
+            return; // self-exclusion
+        }
+        self.agents.entry(name.to_string()).or_insert_with(|| {
+            let prior_secs = program_prior_interval_secs(program);
+            AgentLivenessEntry {
+                name: name.to_string(),
+                state: LivenessState::Alive,
+                rhythm: AgentRhythm::new(prior_secs),
+                suspect_since: 0,
+                probe_sent_at: 0,
+                sprt_log_lr: 0.0,
+                core: default_liveness_core(),
+            }
+        });
+    }
+
+    /// Process an agent activity signal (message, reservation, commit).
+    pub fn observe_activity(&mut self, agent: &str, timestamp_micros: i64) {
+        if agent == ATC_AGENT_NAME {
+            return;
+        }
+        if let Some(entry) = self.agents.get_mut(agent) {
+            entry.rhythm.observe(timestamp_micros);
+            // Any activity resets to Alive (resurrection)
+            if entry.state != LivenessState::Alive {
+                entry.state = LivenessState::Alive;
+                entry.suspect_since = 0;
+                entry.probe_sent_at = 0;
+                entry.sprt_log_lr = 0.0;
+            }
+        }
+    }
+
+    /// Evaluate liveness for all tracked agents.
+    ///
+    /// Returns a list of (agent_name, recommended_action) for agents
+    /// that need intervention.
+    #[must_use]
+    pub fn evaluate_liveness(&mut self, now_micros: i64) -> Vec<(String, LivenessAction)> {
+        let k = self.config.suspicion_k;
+        let mut actions = Vec::new();
+
+        let agent_names: Vec<String> = self.agents.keys().cloned().collect();
+        for name in agent_names {
+            let entry = self.agents.get_mut(&name).unwrap();
+
+            // Skip agents already declared dead
+            if entry.state == LivenessState::Dead {
+                continue;
+            }
+
+            // Check if the agent is suspicious
+            if entry.rhythm.is_suspicious(now_micros, k) {
+                // Update posterior toward flaky/dead
+                let silence_ratio = entry.rhythm.silence_duration(now_micros) as f64
+                    / entry.rhythm.effective_avg().max(1.0);
+
+                let alive_lk = (-silence_ratio * 0.5).exp().max(0.01);
+                let flaky_lk = (-silence_ratio * 0.1).exp().max(0.05);
+                let dead_lk = 1.0 - alive_lk;
+
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, alive_lk),
+                    (LivenessState::Flaky, flaky_lk),
+                    (LivenessState::Dead, dead_lk),
+                ]);
+
+                let (action, expected_loss, runner_up) = entry.core.choose_action();
+
+                // Only act if the action is different from DeclareAlive
+                if action != LivenessAction::DeclareAlive {
+                    // Log to evidence ledger
+                    self.ledger.record(&DecisionBuilder {
+                        subsystem: AtcSubsystem::Liveness,
+                        subject: &name,
+                        core: &entry.core,
+                        action,
+                        expected_loss,
+                        runner_up_loss: runner_up,
+                        evidence_summary: &format!(
+                            "silence {}s (avg {}s, {:.1}σ)",
+                            entry.rhythm.silence_duration(now_micros) / 1_000_000,
+                            entry.rhythm.effective_avg() as i64 / 1_000_000,
+                            silence_ratio,
+                        ),
+                        calibration_healthy: !self.calibration.is_safe_mode(),
+                        safe_mode_active: self.calibration.is_safe_mode(),
+                        timestamp_micros: now_micros,
+                    });
+
+                    // Apply state transition
+                    match action {
+                        LivenessAction::Suspect => {
+                            if entry.state != LivenessState::Flaky {
+                                entry.state = LivenessState::Flaky;
+                                entry.suspect_since = now_micros;
+                            }
+                        }
+                        LivenessAction::ReleaseReservations => {
+                            if !self.calibration.is_safe_mode() {
+                                entry.state = LivenessState::Dead;
+                            }
+                            // In safe mode, downgrade to Suspect only
+                            else if entry.state != LivenessState::Flaky {
+                                entry.state = LivenessState::Flaky;
+                                entry.suspect_since = now_micros;
+                            }
+                        }
+                        LivenessAction::DeclareAlive => {}
+                    }
+
+                    actions.push((name.clone(), action));
+                }
+            }
+        }
+
+        actions
+    }
+
+    /// Check for deadlock cycles in all project conflict graphs.
+    #[must_use]
+    pub fn detect_deadlocks(&self) -> Vec<(String, Vec<Vec<String>>)> {
+        let mut results = Vec::new();
+        for (project, graph) in &self.conflict_graphs {
+            let cycles = find_deadlock_cycles(graph);
+            if !cycles.is_empty() {
+                results.push((project.clone(), cycles));
+            }
+        }
+        results
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Track 5 + Track 8 Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+
+    fn make_miscalibrated_eprocess() -> EProcessMonitor {
+        let mut monitor = EProcessMonitor::new(0.85, 20.0);
+        for _ in 0..200 {
+            monitor.update(false, AtcSubsystem::Liveness, None);
+        }
+        assert!(monitor.miscalibrated());
+        monitor
+    }
+
+    fn make_healthy_eprocess() -> EProcessMonitor {
+        EProcessMonitor::new(0.85, 20.0)
+    }
+
+    fn make_degraded_cusum() -> CusumDetector {
+        let mut cusum = CusumDetector::new(0.15, 5.0, 0.1);
+        for i in 0..100 {
+            cusum.update(true, i * 1_000_000);
+        }
+        assert!(cusum.degradation_detected());
+        cusum
+    }
+
+    fn make_clean_cusum() -> CusumDetector {
+        CusumDetector::new(0.15, 5.0, 0.1)
+    }
+
+    #[test]
+    fn starts_not_in_safe_mode() {
+        let guard = CalibrationGuard::new(20);
+        assert!(!guard.is_safe_mode());
+    }
+
+    #[test]
+    fn enters_safe_mode_on_eprocess_alert() {
+        let mut guard = CalibrationGuard::new(20);
+        let eprocess = make_miscalibrated_eprocess();
+        let cusum = make_clean_cusum();
+        let changed = guard.update(&eprocess, &cusum, false, 1_000_000);
+        assert!(changed, "should return true when state changes");
+        assert!(guard.is_safe_mode());
+    }
+
+    #[test]
+    fn enters_safe_mode_on_cusum_degradation() {
+        let mut guard = CalibrationGuard::new(20);
+        let eprocess = make_healthy_eprocess();
+        let cusum = make_degraded_cusum();
+        guard.update(&eprocess, &cusum, true, 1_000_000);
+        assert!(guard.is_safe_mode());
+    }
+
+    #[test]
+    fn exits_safe_mode_after_recovery() {
+        let mut guard = CalibrationGuard::new(20);
+        let eprocess = make_miscalibrated_eprocess();
+        let cusum = make_clean_cusum();
+        guard.update(&eprocess, &cusum, false, 1_000_000);
+        assert!(guard.is_safe_mode());
+
+        let healthy_ep = make_healthy_eprocess();
+        for i in 0..20 {
+            guard.update(&healthy_ep, &cusum, true, (i + 2) * 1_000_000);
+        }
+        assert!(!guard.is_safe_mode());
+    }
+
+    #[test]
+    fn does_not_exit_if_eprocess_still_miscalibrated() {
+        let mut guard = CalibrationGuard::new(20);
+        let eprocess = make_miscalibrated_eprocess();
+        let cusum = make_clean_cusum();
+        guard.update(&eprocess, &cusum, false, 1_000_000);
+        assert!(guard.is_safe_mode());
+
+        for i in 0..20 {
+            guard.update(&eprocess, &cusum, true, (i + 2) * 1_000_000);
+        }
+        assert!(guard.is_safe_mode(), "should NOT exit while eprocess is miscalibrated");
+    }
+
+    #[test]
+    fn operator_override_forces_safe_mode() {
+        let mut guard = CalibrationGuard::new(20);
+        guard.set_safe_mode(true, 1_000_000);
+        assert!(guard.is_safe_mode());
+        guard.set_safe_mode(false, 2_000_000);
+        assert!(!guard.is_safe_mode());
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    #[test]
+    fn engine_creates_with_defaults() {
+        let engine = AtcEngine::new_for_testing();
+        assert!(engine.enabled());
+        assert!(!engine.registered());
+        assert!(!engine.is_safe_mode());
+        assert_eq!(engine.tick_count(), 0);
+    }
+
+    #[test]
+    fn engine_registers_agent() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("BlueFox", "claude-code");
+        assert!(engine.agent_liveness("BlueFox").is_some());
+        assert_eq!(engine.agent_liveness("BlueFox"), Some(LivenessState::Alive));
+    }
+
+    #[test]
+    fn engine_excludes_atc_from_registration() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent(ATC_AGENT_NAME, "mcp-agent-mail");
+        assert!(engine.agent_liveness(ATC_AGENT_NAME).is_none());
+    }
+
+    #[test]
+    fn engine_excludes_atc_from_activity() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("BlueFox", "claude-code");
+        engine.observe_activity(ATC_AGENT_NAME, 1_000_000);
+        // ATC activity should be silently ignored
+        assert!(engine.agent_liveness(ATC_AGENT_NAME).is_none());
+    }
+
+    #[test]
+    fn activity_resets_to_alive() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("BlueFox", "claude-code");
+
+        // Manually set to Flaky
+        engine.agents.get_mut("BlueFox").unwrap().state = LivenessState::Flaky;
+        assert_eq!(engine.agent_liveness("BlueFox"), Some(LivenessState::Flaky));
+
+        // Activity resets to Alive
+        engine.observe_activity("BlueFox", 1_000_000);
+        assert_eq!(engine.agent_liveness("BlueFox"), Some(LivenessState::Alive));
+    }
+
+    #[test]
+    fn evaluate_liveness_detects_silent_agent() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("BlueFox", "claude-code");
+
+        // Establish a rhythm (60s intervals, 10 observations)
+        for i in 0..10 {
+            engine.observe_activity("BlueFox", i * 60_000_000);
+        }
+
+        // 5 minutes of silence (5× the 60s avg) → should trigger
+        let now = 9 * 60_000_000 + 300_000_000;
+        let actions = engine.evaluate_liveness(now);
+        assert!(
+            !actions.is_empty(),
+            "should detect silent agent after 5× average interval"
+        );
+
+        // Verify the action is Suspect (not immediate release — too cautious)
+        let (agent, action) = &actions[0];
+        assert_eq!(agent, "BlueFox");
+        assert!(
+            *action == LivenessAction::Suspect || *action == LivenessAction::ReleaseReservations,
+            "action should be Suspect or Release, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_liveness_ignores_active_agent() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("BlueFox", "claude-code");
+
+        // Agent is active right now
+        for i in 0..10 {
+            engine.observe_activity("BlueFox", i * 60_000_000);
+        }
+        let now = 9 * 60_000_000 + 30_000_000; // only 30s since last activity
+        let actions = engine.evaluate_liveness(now);
+        assert!(actions.is_empty(), "active agent should not trigger any action");
+    }
+
+    #[test]
+    fn safe_mode_blocks_release() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("BlueFox", "claude-code");
+        engine.set_safe_mode(true, 0);
+
+        // Establish rhythm then go very silent
+        for i in 0..10 {
+            engine.observe_activity("BlueFox", i * 60_000_000);
+        }
+        // Force posterior toward Dead
+        let entry = engine.agents.get_mut("BlueFox").unwrap();
+        for _ in 0..30 {
+            entry.core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+
+        let now = 9 * 60_000_000 + 600_000_000; // 10 min silence
+        let actions = engine.evaluate_liveness(now);
+
+        // In safe mode, even if the core says Release, we downgrade to Suspect
+        for (_, action) in &actions {
+            assert_ne!(
+                *action,
+                LivenessAction::ReleaseReservations,
+                "safe mode should prevent release, only allow suspect"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_deadlocks_empty_graphs() {
+        let engine = AtcEngine::new_for_testing();
+        assert!(engine.detect_deadlocks().is_empty());
+    }
+
+    #[test]
+    fn detect_deadlocks_finds_cycle() {
+        let mut engine = AtcEngine::new_for_testing();
+        let mut graph = ProjectConflictGraph::default();
+        graph.hard_edges.insert(
+            "AgentA".to_string(),
+            vec![HardEdge {
+                holder: "AgentA".to_string(),
+                blocked: "AgentB".to_string(),
+                contested_patterns: vec!["src/lib.rs".to_string()],
+                since: 1,
+            }],
+        );
+        graph.hard_edges.insert(
+            "AgentB".to_string(),
+            vec![HardEdge {
+                holder: "AgentB".to_string(),
+                blocked: "AgentA".to_string(),
+                contested_patterns: vec!["src/main.rs".to_string()],
+                since: 2,
+            }],
+        );
+        engine.conflict_graphs.insert("test-project".to_string(), graph);
+
+        let deadlocks = engine.detect_deadlocks();
+        assert_eq!(deadlocks.len(), 1);
+        assert_eq!(deadlocks[0].0, "test-project");
+        assert_eq!(deadlocks[0].1.len(), 1);
+        assert_eq!(deadlocks[0].1[0].len(), 2);
+    }
+
+    #[test]
+    fn is_self_event_filters_correctly() {
+        assert!(AtcEngine::is_self_event(ATC_AGENT_NAME, &[]));
+        assert!(AtcEngine::is_self_event("other", &[ATC_AGENT_NAME.to_string()]));
+        assert!(!AtcEngine::is_self_event("other", &["another".to_string()]));
+    }
+
+    #[test]
+    fn ledger_records_liveness_decisions() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("BlueFox", "claude-code");
+
+        // Establish rhythm then go silent
+        for i in 0..10 {
+            engine.observe_activity("BlueFox", i * 60_000_000);
+        }
+        let now = 9 * 60_000_000 + 300_000_000;
+        let _actions = engine.evaluate_liveness(now);
+
+        // Check that decisions were logged
+        if !engine.ledger().is_empty() {
+            let record = engine.ledger().recent(1).next().unwrap();
+            assert_eq!(record.subsystem, AtcSubsystem::Liveness);
+            assert_eq!(record.subject, "BlueFox");
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Session Synthesizer (Track 7)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Monotonically-growing session summary.
+///
+/// Every field only increases — counters increment, sets grow, timestamps
+/// advance.  This guarantees two consecutive reads always see the same or
+/// more information (no regressions).
+///
+/// NOT a pure join-semilattice (counters use increment, not max).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionSummary {
+    // ── Monotone Counters (increment only) ──
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub reservations_granted: u64,
+    pub reservations_released: u64,
+    pub conflicts_detected: u64,
+    pub conflicts_resolved: u64,
+    pub atc_interventions: u64,
+
+    // ── Sets (union only) ──
+    pub active_agents: HashSet<String>,
+    pub active_threads: HashSet<String>,
+
+    // ── Timestamps (max only) ──
+    /// First event ever absorbed (set once, never changes).
+    pub first_event_ts: i64,
+    /// Most recent event timestamp.
+    pub last_event_ts: i64,
+
+    // ── Per-entity counters ──
+    pub agent_message_counts: HashMap<String, u64>,
+    pub thread_message_counts: HashMap<String, u64>,
+
+    // ── Incremental rendering ──
+    input_generation: u64,
+    rendered_generation: u64,
+    cached_output: Option<String>,
+}
+
+/// Recognized event types for session synthesis.
+#[derive(Debug, Clone)]
+pub enum SynthesisEvent {
+    MessageSent {
+        from: String,
+        to: Vec<String>,
+        thread_id: Option<String>,
+        timestamp_micros: i64,
+    },
+    MessageReceived {
+        agent: String,
+        timestamp_micros: i64,
+    },
+    ReservationGranted {
+        agent: String,
+        timestamp_micros: i64,
+    },
+    ReservationReleased {
+        agent: String,
+        timestamp_micros: i64,
+    },
+    ConflictDetected {
+        timestamp_micros: i64,
+    },
+    ConflictResolved {
+        timestamp_micros: i64,
+    },
+    AtcIntervention {
+        timestamp_micros: i64,
+    },
+}
+
+impl SynthesisEvent {
+    /// Get the timestamp of this event.
+    #[must_use]
+    pub const fn timestamp_micros(&self) -> i64 {
+        match self {
+            Self::MessageSent { timestamp_micros, .. }
+            | Self::MessageReceived { timestamp_micros, .. }
+            | Self::ReservationGranted { timestamp_micros, .. }
+            | Self::ReservationReleased { timestamp_micros, .. }
+            | Self::ConflictDetected { timestamp_micros }
+            | Self::ConflictResolved { timestamp_micros }
+            | Self::AtcIntervention { timestamp_micros } => *timestamp_micros,
+        }
+    }
+}
+
+impl SessionSummary {
+    /// Absorb a single event.  O(1) per event.
+    pub fn absorb(&mut self, event: &SynthesisEvent) {
+        let ts = event.timestamp_micros();
+        self.last_event_ts = self.last_event_ts.max(ts);
+        if self.first_event_ts == 0 {
+            self.first_event_ts = ts;
+        }
+        self.input_generation += 1;
+
+        match event {
+            SynthesisEvent::MessageSent { from, to, thread_id, .. } => {
+                self.messages_sent += 1;
+                self.active_agents.insert(from.clone());
+                for recipient in to {
+                    self.active_agents.insert(recipient.clone());
+                }
+                *self.agent_message_counts.entry(from.clone()).or_insert(0) += 1;
+                if let Some(tid) = thread_id {
+                    self.active_threads.insert(tid.clone());
+                    *self.thread_message_counts.entry(tid.clone()).or_insert(0) += 1;
+                }
+            }
+            SynthesisEvent::MessageReceived { agent, .. } => {
+                self.messages_received += 1;
+                self.active_agents.insert(agent.clone());
+            }
+            SynthesisEvent::ReservationGranted { agent, .. } => {
+                self.reservations_granted += 1;
+                self.active_agents.insert(agent.clone());
+            }
+            SynthesisEvent::ReservationReleased { agent, .. } => {
+                self.reservations_released += 1;
+                self.active_agents.insert(agent.clone());
+            }
+            SynthesisEvent::ConflictDetected { .. } => {
+                self.conflicts_detected += 1;
+            }
+            SynthesisEvent::ConflictResolved { .. } => {
+                self.conflicts_resolved += 1;
+            }
+            SynthesisEvent::AtcIntervention { .. } => {
+                self.atc_interventions += 1;
+            }
+        }
+    }
+
+    /// Format a human-readable summary.  Uses incremental rendering —
+    /// only regenerates the string when inputs have changed.
+    pub fn formatted(&mut self) -> &str {
+        if self.rendered_generation < self.input_generation {
+            self.cached_output = Some(self.render());
+            self.rendered_generation = self.input_generation;
+        }
+        self.cached_output.as_deref().unwrap_or("(no data)")
+    }
+
+    /// Force a fresh render (bypasses cache).
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut lines = Vec::new();
+
+        lines.push(format!(
+            "Messages: {} sent, {} received across {} threads",
+            self.messages_sent,
+            self.messages_received,
+            self.active_threads.len(),
+        ));
+
+        // Top agents by message count
+        let mut agent_counts: Vec<(&str, u64)> = self
+            .agent_message_counts
+            .iter()
+            .map(|(a, c)| (a.as_str(), *c))
+            .collect();
+        agent_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        if !agent_counts.is_empty() {
+            let top: Vec<String> = agent_counts
+                .iter()
+                .take(5)
+                .map(|(a, c)| format!("{a}: {c}"))
+                .collect();
+            lines.push(format!("Top agents: {}", top.join(", ")));
+        }
+
+        // Top threads by message count
+        let mut thread_counts: Vec<(&str, u64)> = self
+            .thread_message_counts
+            .iter()
+            .map(|(t, c)| (t.as_str(), *c))
+            .collect();
+        thread_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        if !thread_counts.is_empty() {
+            let top: Vec<String> = thread_counts
+                .iter()
+                .take(5)
+                .map(|(t, c)| format!("{t}: {c}"))
+                .collect();
+            lines.push(format!("Hot threads: {}", top.join(", ")));
+        }
+
+        if self.reservations_granted > 0 || self.reservations_released > 0 {
+            lines.push(format!(
+                "Reservations: {} granted, {} released",
+                self.reservations_granted, self.reservations_released,
+            ));
+        }
+
+        if self.conflicts_detected > 0 {
+            lines.push(format!(
+                "Conflicts: {} detected, {} resolved",
+                self.conflicts_detected, self.conflicts_resolved,
+            ));
+        }
+
+        if self.atc_interventions > 0 {
+            lines.push(format!("ATC interventions: {}", self.atc_interventions));
+        }
+
+        lines.push(format!("Active agents: {}", self.active_agents.len()));
+
+        lines.join("\n")
+    }
+
+    /// Check monotonicity: every field in `self` is >= `previous`.
+    #[cfg(test)]
+    fn is_monotone_vs(&self, previous: &Self) -> bool {
+        self.messages_sent >= previous.messages_sent
+            && self.messages_received >= previous.messages_received
+            && self.reservations_granted >= previous.reservations_granted
+            && self.reservations_released >= previous.reservations_released
+            && self.conflicts_detected >= previous.conflicts_detected
+            && self.conflicts_resolved >= previous.conflicts_resolved
+            && self.atc_interventions >= previous.atc_interventions
+            && self.last_event_ts >= previous.last_event_ts
+            && previous.active_agents.is_subset(&self.active_agents)
+            && previous.active_threads.is_subset(&self.active_threads)
+            // Per-entity counters must also be monotone
+            && previous.agent_message_counts.iter().all(|(agent, &prev_count)| {
+                self.agent_message_counts.get(agent).copied().unwrap_or(0) >= prev_count
+            })
+            && previous.thread_message_counts.iter().all(|(thread, &prev_count)| {
+                self.thread_message_counts.get(thread).copied().unwrap_or(0) >= prev_count
+            })
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Track 7 Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod synthesis_tests {
+    use super::*;
+
+    fn msg_sent(from: &str, to: &[&str], thread: Option<&str>, ts: i64) -> SynthesisEvent {
+        SynthesisEvent::MessageSent {
+            from: from.to_string(),
+            to: to.iter().map(|s| s.to_string()).collect(),
+            thread_id: thread.map(str::to_string),
+            timestamp_micros: ts,
+        }
+    }
+
+    #[test]
+    fn empty_summary() {
+        let summary = SessionSummary::default();
+        assert_eq!(summary.messages_sent, 0);
+        assert_eq!(summary.first_event_ts, 0);
+        assert!(summary.active_agents.is_empty());
+    }
+
+    #[test]
+    fn absorb_message_sent() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&msg_sent("BlueFox", &["RedHawk"], Some("t1"), 1_000_000));
+
+        assert_eq!(summary.messages_sent, 1);
+        assert!(summary.active_agents.contains("BlueFox"));
+        assert!(summary.active_agents.contains("RedHawk"));
+        assert!(summary.active_threads.contains("t1"));
+        assert_eq!(summary.agent_message_counts.get("BlueFox"), Some(&1));
+        assert_eq!(summary.thread_message_counts.get("t1"), Some(&1));
+        assert_eq!(summary.first_event_ts, 1_000_000);
+        assert_eq!(summary.last_event_ts, 1_000_000);
+    }
+
+    #[test]
+    fn absorb_multiple_events() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&msg_sent("A", &["B"], Some("t1"), 1_000_000));
+        summary.absorb(&msg_sent("B", &["A"], Some("t1"), 2_000_000));
+        summary.absorb(&msg_sent("C", &["A", "B"], Some("t2"), 3_000_000));
+
+        assert_eq!(summary.messages_sent, 3);
+        assert_eq!(summary.active_agents.len(), 3);
+        assert_eq!(summary.active_threads.len(), 2);
+        assert_eq!(summary.first_event_ts, 1_000_000);
+        assert_eq!(summary.last_event_ts, 3_000_000);
+    }
+
+    #[test]
+    fn absorb_reservation_events() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&SynthesisEvent::ReservationGranted {
+            agent: "A".to_string(),
+            timestamp_micros: 1,
+        });
+        summary.absorb(&SynthesisEvent::ReservationReleased {
+            agent: "A".to_string(),
+            timestamp_micros: 2,
+        });
+
+        assert_eq!(summary.reservations_granted, 1);
+        assert_eq!(summary.reservations_released, 1);
+    }
+
+    #[test]
+    fn absorb_conflict_events() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&SynthesisEvent::ConflictDetected { timestamp_micros: 1 });
+        summary.absorb(&SynthesisEvent::ConflictResolved { timestamp_micros: 2 });
+
+        assert_eq!(summary.conflicts_detected, 1);
+        assert_eq!(summary.conflicts_resolved, 1);
+    }
+
+    #[test]
+    fn monotonicity_holds() {
+        let mut summary = SessionSummary::default();
+
+        for i in 0..20 {
+            let prev = summary.clone();
+            let from = format!("Agent{}", i % 3);
+            let to_name = format!("Agent{}", (i + 1) % 3);
+            let thread = format!("t{}", i % 5);
+            summary.absorb(&msg_sent(&from, &[&to_name], Some(&thread), i * 1_000_000));
+            assert!(
+                summary.is_monotone_vs(&prev),
+                "monotonicity violated at event {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn formatted_caches_output() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&msg_sent("A", &["B"], Some("t1"), 1));
+
+        let out1 = summary.formatted().to_string();
+        // Same generation → returns cached
+        let out2 = summary.formatted().to_string();
+        assert_eq!(out1, out2);
+
+        // New event → re-renders
+        summary.absorb(&msg_sent("C", &["D"], Some("t2"), 2));
+        let out3 = summary.formatted().to_string();
+        assert_ne!(out1, out3, "should re-render after new event");
+    }
+
+    #[test]
+    fn formatted_includes_key_info() {
+        let mut summary = SessionSummary::default();
+        for i in 0..10 {
+            summary.absorb(&msg_sent("BlueFox", &["RedHawk"], Some("feat-1"), i));
+        }
+        summary.absorb(&SynthesisEvent::ConflictDetected { timestamp_micros: 100 });
+        summary.absorb(&SynthesisEvent::AtcIntervention { timestamp_micros: 101 });
+
+        let output = summary.formatted().to_string();
+        assert!(output.contains("10 sent"), "should show message count");
+        assert!(output.contains("BlueFox"), "should show agent name");
+        assert!(output.contains("feat-1"), "should show thread");
+        assert!(output.contains("Conflicts: 1"), "should show conflicts");
+        assert!(output.contains("ATC interventions: 1"), "should show interventions");
+    }
+
+    #[test]
+    fn determinism_same_events_same_output() {
+        let events = vec![
+            msg_sent("A", &["B"], Some("t1"), 1),
+            msg_sent("B", &["C"], Some("t2"), 2),
+            SynthesisEvent::ReservationGranted { agent: "A".to_string(), timestamp_micros: 3 },
+        ];
+
+        let mut s1 = SessionSummary::default();
+        let mut s2 = SessionSummary::default();
+        for e in &events {
+            s1.absorb(e);
+            s2.absorb(e);
+        }
+
+        assert_eq!(s1.messages_sent, s2.messages_sent);
+        assert_eq!(s1.active_agents, s2.active_agents);
+        assert_eq!(s1.reservations_granted, s2.reservations_granted);
     }
 }
