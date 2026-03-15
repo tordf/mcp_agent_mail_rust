@@ -805,22 +805,22 @@ mod tests {
         // Capacity 5 means Ghost capacity is 5, Small capacity is 1, Main is 4.
 
         // 1. Insert "a" -> goes to small.
-        cache.insert("a", 1);
+        cache.insert(String::from("a"), 1);
         
         // 2. Insert "b" -> evicts "a" from small (freq=0) -> goes to ghost.
-        cache.insert("b", 2);
+        cache.insert(String::from("b"), 2);
 
         // 3. Insert "a" -> is_ghost=true -> goes to main.
-        cache.insert("a", 3);
+        cache.insert(String::from("a"), 3);
 
         // 4. Remove "a".
-        cache.remove(&"a");
+        cache.remove(&String::from("a"));
 
         // 5. Insert "a" -> goes to small.
-        cache.insert("a", 4);
+        cache.insert(String::from("a"), 4);
 
         // 6. Insert "c" -> evicts "a" from small (freq=0) -> goes to ghost.
-        cache.insert("c", 5);
+        cache.insert(String::from("c"), 5);
 
         // 7. Fill ghost queue to trigger evict_ghost_if_full.
         for i in 0..10 {
@@ -830,7 +830,7 @@ mod tests {
         }
 
         // 8. Re-insert "a". It should be recognized as ghost and go to main.
-        cache.insert("a", 6);
+        cache.insert(String::from("a"), 6);
         
         // If "a" was recognized as ghost, it went to main.
         assert_eq!(cache.main_len(), 1, "If a went to small, ghost was forgotten!");
