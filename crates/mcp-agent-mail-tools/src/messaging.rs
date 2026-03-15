@@ -1516,7 +1516,7 @@ effective_free_bytes={free}"
     let cc_list = cc.unwrap_or_default();
     let bcc_list = bcc.unwrap_or_default();
 
-    if to.is_empty() && cc_list.is_empty() && bcc_list.is_empty() {
+    if !has_any_recipients(&to, &cc_list, &bcc_list) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             "At least one recipient is required. Provide agent names in to, cc, or bcc.",
