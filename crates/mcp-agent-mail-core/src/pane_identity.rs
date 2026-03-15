@@ -106,14 +106,14 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
     //     A composite key contains `:`, e.g., `main:0:2`. The bare pane env var
     //     is something like `%3`. We check the env so we can find files written
     //     before the composite key migration.
-    if pane_id.contains(':') {
-        if let Ok(bare) = std::env::var("TMUX_PANE") {
-            let bare = bare.trim().to_string();
-            if !bare.is_empty() {
-                let legacy_canonical = canonical_identity_path(project_key, &bare);
-                if let Some(name) = read_identity_file(&legacy_canonical) {
-                    return Some((name, legacy_canonical));
-                }
+    if pane_id.contains(':')
+        && let Ok(bare) = std::env::var("TMUX_PANE")
+    {
+        let bare = bare.trim().to_string();
+        if !bare.is_empty() {
+            let legacy_canonical = canonical_identity_path(project_key, &bare);
+            if let Some(name) = read_identity_file(&legacy_canonical) {
+                return Some((name, legacy_canonical));
             }
         }
     }
@@ -130,17 +130,17 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
         }
 
         // 2b. If composite key, also try bare pane ID for legacy Claude Code path
-        if pane_id.contains(':') {
-            if let Ok(bare) = std::env::var("TMUX_PANE") {
-                let bare_sanitized = sanitize_pane_id(bare.trim());
-                if bare_sanitized != sanitized {
-                    let legacy_claude_bare = home
-                        .join(".claude")
-                        .join("agent-mail")
-                        .join(format!("identity.{bare_sanitized}"));
-                    if let Some(name) = read_identity_file(&legacy_claude_bare) {
-                        return Some((name, legacy_claude_bare));
-                    }
+        if pane_id.contains(':')
+            && let Ok(bare) = std::env::var("TMUX_PANE")
+        {
+            let bare_sanitized = sanitize_pane_id(bare.trim());
+            if bare_sanitized != sanitized {
+                let legacy_claude_bare = home
+                    .join(".claude")
+                    .join("agent-mail")
+                    .join(format!("identity.{bare_sanitized}"));
+                if let Some(name) = read_identity_file(&legacy_claude_bare) {
+                    return Some((name, legacy_claude_bare));
                 }
             }
         }
@@ -155,15 +155,15 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
     }
 
     // 3b. If composite key, also try bare pane ID for legacy NTM path
-    if pane_id.contains(':') {
-        if let Ok(bare) = std::env::var("TMUX_PANE") {
-            let bare_sanitized = sanitize_pane_id(bare.trim());
-            if bare_sanitized != sanitized {
-                let legacy_ntm_bare =
-                    PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{bare_sanitized}"));
-                if let Some(name) = read_identity_file(&legacy_ntm_bare) {
-                    return Some((name, legacy_ntm_bare));
-                }
+    if pane_id.contains(':')
+        && let Ok(bare) = std::env::var("TMUX_PANE")
+    {
+        let bare_sanitized = sanitize_pane_id(bare.trim());
+        if bare_sanitized != sanitized {
+            let legacy_ntm_bare =
+                PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{bare_sanitized}"));
+            if let Some(name) = read_identity_file(&legacy_ntm_bare) {
+                return Some((name, legacy_ntm_bare));
             }
         }
     }
@@ -452,6 +452,7 @@ fn list_live_tmux_panes() -> Vec<String> {
 ///
 /// Returns `None` if neither the composite key nor `$TMUX_PANE` can be
 /// determined.
+#[must_use]
 pub fn get_composite_tmux_pane_id() -> Option<String> {
     // Try the composite key first via tmux display-message.
     let output = std::process::Command::new("tmux")
@@ -462,12 +463,12 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
         ])
         .output();
 
-    if let Ok(out) = output {
-        if out.status.success() {
-            let composite = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !composite.is_empty() && composite.contains(':') {
-                return Some(composite);
-            }
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        let composite = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !composite.is_empty() && composite.contains(':') {
+            return Some(composite);
         }
     }
 

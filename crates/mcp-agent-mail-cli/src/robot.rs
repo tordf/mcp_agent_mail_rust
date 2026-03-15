@@ -1422,18 +1422,58 @@ fn archive_project_dir_for_key(storage_root: &Path, project_key: &str) -> Option
         return None;
     }
 
-    let mut candidate_slugs = vec![project_key.to_string()];
-    if Path::new(project_key).is_absolute() {
+    let project_path = Path::new(project_key);
+    let normalized_project_key = project_key.replace('\\', "/");
+    let mut candidate_slugs = Vec::new();
+    if project_path.is_absolute() {
+        if let Some(file_name) = project_path.file_name().and_then(|value| value.to_str()) {
+            let file_name = file_name.trim();
+            if !file_name.is_empty() {
+                candidate_slugs.push(file_name.to_string());
+            }
+        }
         let derived = mcp_agent_mail_core::resolve_project_identity(project_key).slug;
         if !candidate_slugs.iter().any(|existing| existing == &derived) {
             candidate_slugs.push(derived);
         }
+    } else {
+        candidate_slugs.push(project_key.to_string());
     }
 
-    candidate_slugs
+    if let Some(project_dir) = candidate_slugs
         .into_iter()
         .map(|slug| projects_dir.join(slug))
         .find(|path| path.is_dir())
+    {
+        return Some(project_dir);
+    }
+
+    std::fs::read_dir(&projects_dir).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            return None;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            return None;
+        }
+        let metadata = std::fs::read_to_string(path.join("project.json")).ok()?;
+        let project_meta = serde_json::from_str::<serde_json::Value>(&metadata).ok()?;
+        let human_key = project_meta
+            .get("human_key")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.replace('\\', "/"));
+        let slug = project_meta
+            .get("slug")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if human_key.as_deref() == Some(normalized_project_key.as_str())
+            || slug.as_deref() == Some(project_key)
+        {
+            Some(path)
+        } else {
+            None
+        }
+    })
 }
 
 fn archive_has_agent_profile(project_dir: &Path, agent_name: &str) -> bool {
@@ -3019,15 +3059,41 @@ fn build_reservations(
             // Check overlap using glob pattern matching
             if glob_matches(&a.path, &b.path) || glob_matches(&b.path, &a.path) || a.path == b.path
             {
+                let left = (a.agent.as_deref().unwrap_or_default(), a.path.as_str());
+                let right = (b.agent.as_deref().unwrap_or_default(), b.path.as_str());
+                let ((agent_a, path_a), (agent_b, path_b)) = if left <= right {
+                    (
+                        (a.agent.clone().unwrap_or_default(), a.path.clone()),
+                        (b.agent.clone().unwrap_or_default(), b.path.clone()),
+                    )
+                } else {
+                    (
+                        (b.agent.clone().unwrap_or_default(), b.path.clone()),
+                        (a.agent.clone().unwrap_or_default(), a.path.clone()),
+                    )
+                };
                 conflicts.push(ReservationConflict {
-                    agent_a: a.agent.clone().unwrap_or_default(),
-                    path_a: a.path.clone(),
-                    agent_b: b.agent.clone().unwrap_or_default(),
-                    path_b: b.path.clone(),
+                    agent_a,
+                    path_a,
+                    agent_b,
+                    path_b,
                 });
             }
         }
     }
+    conflicts.sort_by(|left, right| {
+        left.agent_a
+            .cmp(&right.agent_a)
+            .then(left.path_a.cmp(&right.path_a))
+            .then(left.agent_b.cmp(&right.agent_b))
+            .then(left.path_b.cmp(&right.path_b))
+    });
+    conflicts.dedup_by(|left, right| {
+        left.agent_a == right.agent_a
+            && left.path_a == right.path_a
+            && left.agent_b == right.agent_b
+            && left.path_b == right.path_b
+    });
 
     let scoped_agent_name = if !show_all {
         agent.as_ref().map(|(_, name)| name.as_str())
@@ -3119,7 +3185,38 @@ fn build_reservations(
 
 /// Check whether two reservation path patterns can overlap.
 fn glob_matches(pattern: &str, path: &str) -> bool {
-    mcp_agent_mail_core::pattern_overlap::patterns_overlap(pattern, path)
+    if pattern == path {
+        return true;
+    }
+
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    if glob::Pattern::new(pattern)
+        .ok()
+        .is_some_and(|compiled| compiled.matches_with(path, options))
+    {
+        return true;
+    }
+    if glob::Pattern::new(path)
+        .ok()
+        .is_some_and(|compiled| compiled.matches_with(pattern, options))
+    {
+        return true;
+    }
+
+    if !pattern.is_empty() && !path.is_empty() {
+        if path.starts_with(pattern) && path.as_bytes().get(pattern.len()) == Some(&b'/') {
+            return true;
+        }
+        if pattern.starts_with(path) && pattern.as_bytes().get(path.len()) == Some(&b'/') {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ── Timeline command implementation ─────────────────────────────────────────
@@ -3957,16 +4054,80 @@ fn build_navigate_from_canonical_resource(
 
     match parts_ref.as_slice() {
         ["projects"] => {
-            if query.is_empty() {
-                navigate_async_resource("projects", None, |ctx| async move {
-                    mcp_agent_mail_tools::projects_list(&ctx).await
-                })
-            } else {
-                let query_string = navigate_query_string(&query);
-                navigate_async_resource("projects", None, move |ctx| async move {
-                    mcp_agent_mail_tools::projects_list_query(&ctx, query_string).await
-                })
+            let conn = crate::open_db_sync_robot()?;
+            let mut rows = conn
+                .query_sync(
+                    "SELECT id, slug, human_key, created_at
+                     FROM projects
+                     ORDER BY created_at ASC, id ASC",
+                    &[],
+                )
+                .map_err(|e| CliError::Other(format!("projects resource query failed: {e}")))?;
+
+            if let Some(contains) = query
+                .get("contains")
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+            {
+                rows.retain(|row| {
+                    let slug = row
+                        .get_named::<String>("slug")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let human_key = row
+                        .get_named::<String>("human_key")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    slug.contains(&contains) || human_key.contains(&contains)
+                });
             }
+
+            if let Some(format) = query.get("format") {
+                let format = format.trim();
+                if !format.is_empty() && !format.eq_ignore_ascii_case("json") {
+                    return Err(CliError::InvalidArgument(format!(
+                        "Unsupported projects format '{format}'. Supported values: json"
+                    )));
+                }
+            }
+
+            let limit = query
+                .get("limit")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(|raw| {
+                    raw.parse::<usize>().map_err(|_| {
+                        CliError::InvalidArgument(format!(
+                            "Invalid limit '{raw}'. Expected a non-negative integer."
+                        ))
+                    })
+                })
+                .transpose()?;
+            if let Some(limit) = limit {
+                rows.truncate(limit);
+            }
+
+            Ok((
+                NavigateResult::Generic {
+                    resource_type: "projects".to_string(),
+                    data: serde_json::Value::Array(
+                        rows.into_iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "id": row.get_named::<i64>("id").unwrap_or(0),
+                                    "slug": row.get_named::<String>("slug").unwrap_or_default(),
+                                    "human_key": row.get_named::<String>("human_key").unwrap_or_default(),
+                                    "created_at": row
+                                        .get_named::<i64>("created_at")
+                                        .ok()
+                                        .map(mcp_agent_mail_db::micros_to_iso),
+                                })
+                            })
+                            .collect(),
+                    ),
+                },
+                None,
+            ))
         }
         ["inbox", agent_name] => {
             let effective_query = navigate_query_with_default_project(&query, default_project);
@@ -4037,16 +4198,15 @@ fn build_navigate_from_canonical_resource(
             })
         }
         ["file_reservations", project_key] | ["reservations", project_key] => {
-            let scope = Some((*project_key).to_string());
-            let slug = navigate_param_with_query(project_key, &query);
-            navigate_async_resource("file_reservations", scope, move |ctx| async move {
-                mcp_agent_mail_tools::file_reservations(&ctx, slug).await
-            })
+            let conn = crate::open_db_sync_robot()?;
+            let (resolved_project_id, resolved_project_slug) =
+                resolve_project_sync(&conn, project_key)?;
+            build_navigate_file_reservations(&conn, resolved_project_id, &resolved_project_slug, &query)
         }
         ["file_reservations"] | ["reservations"] => {
-            let mut effective_query = query.clone();
-            let Some(project_key) = effective_query
-                .remove("project")
+            let Some(project_key) = query
+                .get("project")
+                .cloned()
                 .or_else(|| default_project.map(str::to_string))
                 .filter(|value| !value.trim().is_empty())
             else {
@@ -4054,11 +4214,10 @@ fn build_navigate_from_canonical_resource(
                     "project query parameter is required".to_string(),
                 ));
             };
-            let scope = Some(project_key.clone());
-            let slug = navigate_param_with_query(&project_key, &effective_query);
-            navigate_async_resource("file_reservations", scope, move |ctx| async move {
-                mcp_agent_mail_tools::file_reservations(&ctx, slug).await
-            })
+            let conn = crate::open_db_sync_robot()?;
+            let (resolved_project_id, resolved_project_slug) =
+                resolve_project_sync(&conn, &project_key)?;
+            build_navigate_file_reservations(&conn, resolved_project_id, &resolved_project_slug, &query)
         }
         _ => Err(CliError::InvalidArgument(format!(
             "unsupported canonical navigate resource URI pattern: {uri}"
@@ -4075,7 +4234,6 @@ fn build_navigate_file_reservations(
     let active_only = query
         .get("active_only")
         .is_none_or(|value| parse_resource_bool(Some(value)));
-    let now_us = mcp_agent_mail_db::now_micros();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let active_reservation_join =
@@ -4099,10 +4257,10 @@ fn build_navigate_file_reservations(
                 "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
                  FROM file_reservations fr{active_reservation_join}
                  JOIN agents a ON a.id = fr.agent_id
-                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate})
                  ORDER BY fr.created_ts DESC LIMIT 50"
             ),
-            vec![Value::BigInt(project_id), Value::BigInt(now_us)],
+            vec![Value::BigInt(project_id)],
         )
     } else {
         (
@@ -4140,6 +4298,17 @@ fn build_navigate_file_reservations(
         },
         Some(project_slug.to_string()),
     ))
+}
+
+fn emit_robot_output(out: &str) {
+    #[cfg(test)]
+    {
+        let _ = out;
+    }
+    #[cfg(not(test))]
+    {
+        println!("{out}");
+    }
 }
 
 fn build_navigate_config_environment() -> (NavigateResult, Option<String>) {
@@ -5544,7 +5713,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
     };
 
-    println!("{out}");
+    emit_robot_output(&out);
     Ok(())
 }
 

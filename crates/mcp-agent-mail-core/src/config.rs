@@ -632,9 +632,7 @@ fn resolve_data_path(legacy_base: &Path, subdir: &str) -> PathBuf {
     if legacy_base.exists() {
         return legacy_base.join(subdir);
     }
-    xdg_data_dir()
-        .map(|d| d.join(subdir))
-        .unwrap_or_else(|| legacy_base.join(subdir))
+    xdg_data_dir().map_or_else(|| legacy_base.join(subdir), |d| d.join(subdir))
 }
 
 impl Default for Config {

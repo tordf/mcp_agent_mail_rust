@@ -2707,8 +2707,10 @@ pub struct AtcEngine {
     /// Whether the ATC has registered itself as an agent.
     registered: bool,
     /// Liveness decision core.
+    #[allow(dead_code)]
     liveness_core: DecisionCore<LivenessState, LivenessAction>,
     /// Conflict decision core.
+    #[allow(dead_code)]
     conflict_core: DecisionCore<ConflictState, ConflictAction>,
     /// Per-agent liveness tracking.
     agents: HashMap<String, AgentLivenessEntry>,
@@ -2725,6 +2727,7 @@ pub struct AtcEngine {
     /// Evidence ledger.
     ledger: EvidenceLedger,
     /// Last processed event sequence number (incremental computation).
+    #[allow(dead_code)]
     last_event_seq: u64,
     /// Engine tick count.
     tick_count: u64,
@@ -2833,6 +2836,7 @@ impl AtcEngine {
     }
 
     /// Check whether an event is from/to the ATC itself (self-exclusion).
+    #[allow(dead_code)]
     fn is_self_event(from: &str, to: &[String]) -> bool {
         from == ATC_AGENT_NAME || to.iter().any(|t| t == ATC_AGENT_NAME)
     }
