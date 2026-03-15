@@ -374,12 +374,32 @@ pub fn write_listener_pid_hint(host: &str, port: u16) -> PathBuf {
     let path = listener_pid_hint_path(host, port);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        // Restrict directory permissions to owner-only (0o700) so other
+        // users cannot plant symlinks inside it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let hint = ListenerPidHint {
         pid: std::process::id(),
         exe_path: current_executable_hint_path(),
     };
-    let _ = std::fs::write(&path, format_listener_pid_hint(&hint));
+    let content = format_listener_pid_hint(&hint);
+    // Write via temp file + rename to avoid symlink TOCTOU attacks:
+    // rename() is atomic on POSIX, so there's no window for an attacker
+    // to substitute a symlink between creation and write.
+    let tmp_path = path.with_extension("pid.tmp");
+    // Remove stale symlinks or files at the target path first.
+    let _ = std::fs::remove_file(&path);
+    if std::fs::write(&tmp_path, &content).is_ok() {
+        if std::fs::rename(&tmp_path, &path).is_err() {
+            let _ = std::fs::write(&path, &content);
+        }
+    } else {
+        let _ = std::fs::write(&path, &content);
+    }
     path
 }
 
