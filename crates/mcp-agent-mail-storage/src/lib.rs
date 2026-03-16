@@ -4785,6 +4785,11 @@ pub fn process_markdown_images(
     embed_policy: EmbedPolicy,
 ) -> Result<(String, Vec<AttachmentMeta>, Vec<String>)> {
     let re = image_pattern_re();
+    
+    let canonical_base = match base_dir.canonicalize() {
+        Ok(b) => b,
+        Err(_) => return Ok((body_md.to_string(), Vec::new(), Vec::new())),
+    };
 
     // Collect and filter matches: (full_match, alt, resolved_path)
     let processable: Vec<(String, String, PathBuf)> = re
@@ -4815,7 +4820,7 @@ pub fn process_markdown_images(
             }
 
             // Resolve best-effort: missing/unresolvable paths don't fail the message.
-            let resolved = resolve_source_attachment_path_opt(base_dir, config, &path)?;
+            let resolved = resolve_source_attachment_path_opt(&canonical_base, config, &path)?;
             Some((full, alt, resolved))
         })
         .collect();
@@ -4897,13 +4902,17 @@ pub fn markdown_has_processable_local_images(
     base_dir: &Path,
     body_md: &str,
 ) -> bool {
+    let canonical_base = match base_dir.canonicalize() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
     image_pattern_re().captures_iter(body_md).any(|cap| {
         let path = cap.name("path").unwrap_or_else(|| unreachable!()).as_str();
         if path.starts_with("data:") || path.starts_with("http://") || path.starts_with("https://")
         {
             return false;
         }
-        resolve_source_attachment_path_opt(base_dir, config, path).is_some()
+        resolve_source_attachment_path_opt(&canonical_base, config, path).is_some()
     })
 }
 
@@ -4980,7 +4989,7 @@ pub fn resolve_attachment_source_path(
 
 /// Best-effort variant for Markdown image conversion (skip missing/unresolvable paths).
 fn resolve_source_attachment_path_opt(
-    base_dir: &Path,
+    canonical_base: &Path,
     config: &Config,
     raw_path: &str,
 ) -> Option<PathBuf> {
@@ -4989,13 +4998,12 @@ fn resolve_source_attachment_path_opt(
         return None;
     }
 
-    let base = base_dir.canonicalize().ok()?;
     let input = PathBuf::from(raw);
     let input_is_absolute = input.is_absolute();
     let candidate = if input_is_absolute {
         input
     } else {
-        base.join(input)
+        canonical_base.join(input)
     };
     if !candidate.exists() {
         return None;
@@ -5003,11 +5011,11 @@ fn resolve_source_attachment_path_opt(
     let resolved = candidate.canonicalize().ok()?;
 
     // Relative paths must never escape the project directory.
-    if !input_is_absolute && !resolved.starts_with(&base) {
+    if !input_is_absolute && !resolved.starts_with(canonical_base) {
         return None;
     }
 
-    if resolved.starts_with(&base) {
+    if resolved.starts_with(canonical_base) {
         return Some(resolved);
     }
 

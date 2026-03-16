@@ -441,7 +441,7 @@ pub async fn file_reservation_paths(
     )?;
 
     let mut paths_to_grant: SmallVec<[&str; 8]> = SmallVec::new();
-    let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut seen_paths: HashSet<&str> = HashSet::new();
 
     let mut pending_conflicts: Vec<PendingReservationConflict> = Vec::new();
 
@@ -478,9 +478,7 @@ pub async fn file_reservation_paths(
     );
 
     // Precompile requested patterns once.
-    let requested_compiled: Vec<
-        std::sync::Arc<mcp_agent_mail_core::pattern_overlap::CompiledPattern>,
-    > = normalized_paths
+    let requested_compiled: Vec<std::sync::Arc<mcp_agent_mail_core::pattern_overlap::CompiledPattern>> = normalized_paths
         .iter()
         .map(|p| CompiledPattern::cached(p))
         .collect();
@@ -488,7 +486,7 @@ pub async fn file_reservation_paths(
     let mut conflict_refs = Vec::new();
 
     for (path, path_pat) in normalized_paths.iter().zip(requested_compiled.iter()) {
-        if !seen_paths.insert(path.clone()) {
+        if !seen_paths.insert(path.as_str()) {
             continue;
         }
 
