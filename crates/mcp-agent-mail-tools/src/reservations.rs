@@ -20,7 +20,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::messaging::{enqueue_message_semantic_index, try_write_message_archive};
+use crate::messaging::{
+    enqueue_message_semantic_index, try_dispatch_archive_write, try_write_message_archive,
+};
 use crate::reservation_index::{ReservationIndex, ReservationRef};
 use crate::resources::{
     reservation_compute_pattern_activity, reservation_open_repo_root,
@@ -609,18 +611,10 @@ pub async fn file_reservation_paths(
             config: config.clone(),
             reservations: res_jsons,
         };
-        match mcp_agent_mail_storage::wbq_enqueue(op) {
-            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-            | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
-                // Disk pressure guard: archive writes may be disabled; DB remains authoritative.
-            }
-            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-                tracing::warn!(
-                    "WBQ enqueue failed; skipping reservation artifacts archive write project={}",
-                    project.slug
-                );
-            }
-        }
+        try_dispatch_archive_write(
+            op,
+            &format!("reservation archive write project={}", project.slug),
+        );
     }
 
     let conflicts_len = conflicts.len();
@@ -743,16 +737,10 @@ pub async fn release_file_reservations(
             reservations: res_jsons,
         };
         // Use match to ignore result (consistent with create path)
-        match mcp_agent_mail_storage::wbq_enqueue(op) {
-            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-            | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
-            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-                tracing::warn!(
-                    "WBQ enqueue failed; skipping reservation release artifacts archive write project={}",
-                    project.slug
-                );
-            }
-        }
+        try_dispatch_archive_write(
+            op,
+            &format!("reservation release archive write project={}", project.slug),
+        );
     }
 
     let response = ReleaseResult {
@@ -860,16 +848,10 @@ pub async fn renew_file_reservations(
             config: Config::get(),
             reservations: res_jsons,
         };
-        match mcp_agent_mail_storage::wbq_enqueue(op) {
-            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-            | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
-            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-                tracing::warn!(
-                    "WBQ enqueue failed; skipping reservation renewal artifacts archive write project={}",
-                    project.slug
-                );
-            }
-        }
+        try_dispatch_archive_write(
+            op,
+            &format!("reservation renewal archive write project={}", project.slug),
+        );
     }
 
     let extend_micros = extend.saturating_mul(1_000_000);
@@ -1124,7 +1106,13 @@ pub async fn force_release_file_reservation(
             config: Config::get(),
             reservations: vec![res_json],
         };
-        mcp_agent_mail_storage::wbq_enqueue(op);
+        try_dispatch_archive_write(
+            op,
+            &format!(
+                "forced reservation release archive write project={}",
+                project.slug
+            ),
+        );
     }
 
     // Optionally send notification to previous holder

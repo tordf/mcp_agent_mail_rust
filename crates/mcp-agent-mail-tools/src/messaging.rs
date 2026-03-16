@@ -25,11 +25,26 @@ use crate::tool_util::{
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
-/// Write a message bundle to the git archive (best-effort, non-blocking).
+pub(crate) fn try_dispatch_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
+    match mcp_agent_mail_storage::wbq_enqueue(op.clone()) {
+        mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+        | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
+            // Disk pressure guard: archive writes may be disabled; DB remains authoritative.
+        }
+        mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+            tracing::warn!("{context}; WBQ unavailable, falling back to direct archive write");
+            if let Err(error) = mcp_agent_mail_storage::write_op_sync(&op) {
+                tracing::warn!(error = %error, "{context}; direct archive write failed");
+            }
+        }
+    }
+}
+
+/// Write a message bundle to the git archive (best-effort).
 /// Failures are logged but never fail the tool call.
 ///
 /// Uses the write-behind queue when available. If the queue is unavailable,
-/// logs a warning and skips the archive write (DB remains the source of truth).
+/// falls back to the direct storage path before giving up.
 pub fn try_write_message_archive(
     config: &Config,
     project_slug: &str,
@@ -48,17 +63,7 @@ pub fn try_write_message_archive(
         recipients: all_recipient_names.to_vec(),
         extra_paths: extra_paths.to_vec(),
     };
-    match mcp_agent_mail_storage::wbq_enqueue(op) {
-        mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-        | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
-            // Disk pressure guard: archive writes may be disabled; DB remains authoritative.
-        }
-        mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-            tracing::warn!(
-                "WBQ enqueue failed; skipping message archive write project={project_slug}"
-            );
-        }
-    }
+    try_dispatch_archive_write(op, &format!("message archive write project={project_slug}"));
 }
 
 pub(crate) fn enqueue_message_semantic_index(
