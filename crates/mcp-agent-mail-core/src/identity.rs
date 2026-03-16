@@ -407,7 +407,9 @@ pub fn compute_project_slug(human_key: &str) -> String {
     }
 }
 
-static IDENTITY_CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, (ProjectIdentity, Instant)>>> = std::sync::OnceLock::new();
+static IDENTITY_CACHE: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<String, (ProjectIdentity, Instant)>>,
+> = std::sync::OnceLock::new();
 
 /// Resolve identity details for a given `human_key` path.
 #[must_use]

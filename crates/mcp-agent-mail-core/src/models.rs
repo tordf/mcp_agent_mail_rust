@@ -870,12 +870,12 @@ fn split_valid_agent_name(name: &str) -> Option<(&'static str, &'static str)> {
         }
 
         let (adjective_candidate, noun_candidate) = lower_name.split_at(adjective_len);
-        
+
         let Ok(adj_idx) = VALID_ADJECTIVE_LOOKUP.binary_search(&adjective_candidate) else {
             continue;
         };
         let adjective = VALID_ADJECTIVE_LOOKUP[adj_idx];
-        
+
         let Ok(noun_idx) = VALID_NOUN_LOOKUP.binary_search(&noun_candidate) else {
             continue;
         };
