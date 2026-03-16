@@ -240,6 +240,47 @@ fn insert_message_recipients(
     Ok(())
 }
 
+fn sync_message_recipients_json(conn: &DbConn, msg_id: i64) -> Result<(), DbError> {
+    let rows = conn
+        .query_sync(
+            "SELECT a.name AS name, mr.kind AS kind \
+             FROM message_recipients mr \
+             JOIN agents a ON a.id = mr.agent_id \
+             WHERE mr.message_id = ? \
+             ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, \
+                      a.name COLLATE NOCASE",
+            &[Value::BigInt(msg_id)],
+        )
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
+
+    let recipients_json = rows
+        .into_iter()
+        .map(|row| {
+            let name = row
+                .get_named::<String>("name")
+                .map_err(|e| DbError::Sqlite(e.to_string()))?;
+            let kind = row
+                .get_named::<String>("kind")
+                .map_err(|e| DbError::Sqlite(e.to_string()))?;
+            Ok(serde_json::json!({
+                "name": name,
+                "kind": kind,
+            }))
+        })
+        .collect::<Result<Vec<_>, DbError>>()
+        .and_then(|payload| {
+            serde_json::to_string(&payload)
+                .map_err(|e| DbError::Internal(format!("failed to encode recipients JSON: {e}")))
+        })?;
+
+    conn.execute_sync(
+        "UPDATE messages SET recipients_json = ? WHERE id = ?",
+        &[Value::Text(recipients_json), Value::BigInt(msg_id)],
+    )
+    .map(|_| ())
+    .map_err(|e| DbError::Sqlite(e.to_string()))
+}
+
 /// Dispatch a message from the first available project (TUI context).
 ///
 /// Handles project resolution, sender auto-registration (for overseer),
@@ -269,6 +310,7 @@ pub fn dispatch_root_message(
         };
         let msg_id = insert_root_message(conn, project_id, sender_id, now, &message_input)?;
         insert_message_recipients(conn, project_id, msg_id, recipients)?;
+        sync_message_recipients_json(conn, msg_id)?;
         Ok(msg_id)
     })();
 
@@ -635,6 +677,20 @@ mod tests {
             .and_then(|r| r.get_named::<i64>("cnt").ok())
             .unwrap();
         assert_eq!(cnt, 2, "should have 2 recipients");
+
+        let message_rows = conn
+            .query_sync(
+                "SELECT recipients_json FROM messages WHERE id = ?",
+                &[Value::BigInt(msg_id)],
+            )
+            .unwrap();
+        let recipients_json = message_rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<String>("recipients_json").ok())
+            .unwrap();
+        assert!(recipients_json.contains("Recipient1"));
+        assert!(recipients_json.contains("Recipient2"));
     }
 
     #[test]

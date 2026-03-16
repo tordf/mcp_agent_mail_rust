@@ -442,7 +442,8 @@ fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> V
     };
 
     if let Some(index) = results.iter().position(|result| {
-        result.id == cursor.id && cursor_sort_score(result, query.ranking).to_bits() == cursor.score.to_bits()
+        result.id == cursor.id
+            && cursor_sort_score(result, query.ranking).to_bits() == cursor.score.to_bits()
     }) {
         results.drain(..=index);
         return results;
@@ -655,12 +656,13 @@ async fn canonicalize_message_results(
     }
 
     let ids: Vec<i64> = deduped.iter().map(|r| r.id).collect();
-    let details = match crate::queries::get_messages_details_by_ids(cx, pool, &ids, query.project_id).await {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(err) => return Outcome::Err(err),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
+    let details =
+        match crate::queries::get_messages_details_by_ids(cx, pool, &ids, query.project_id).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
     let details_by_id: HashMap<i64, crate::queries::ThreadMessageRow> =
         details.into_iter().map(|row| (row.id, row)).collect();
     let recipient_names_by_message = if query_needs_recipient_filter(query) {
@@ -787,7 +789,10 @@ fn lexical_init_guard() -> &'static Mutex<()> {
 
 fn direct_surface_index_dir() -> &'static PathBuf {
     DIRECT_SURFACE_INDEX_DIR.get_or_init(|| {
-        std::env::temp_dir().join(format!("mcp-agent-mail-search-index-{}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "mcp-agent-mail-search-index-{}",
+            std::process::id()
+        ))
     })
 }
 
@@ -3365,14 +3370,7 @@ pub async fn execute_search(
 
     if matches!(query.doc_kind, DocKind::Agent | DocKind::Project) {
         return execute_sql_plan_search(
-            cx,
-            pool,
-            query,
-            options,
-            cache,
-            cache_key,
-            assistance,
-            timer,
+            cx, pool, query, options, cache, cache_key, assistance, timer,
         )
         .await;
     }
@@ -3519,7 +3517,10 @@ pub async fn execute_search(
     if engine == SearchEngine::Lexical {
         let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
         let mut lexical_query = query.clone();
-        lexical_query.limit = Some(pagination_fetch_limit(query, lexical_candidate_limit(query)));
+        lexical_query.limit = Some(pagination_fetch_limit(
+            query,
+            lexical_candidate_limit(query),
+        ));
 
         if let Some(mut raw_results) = try_tantivy_search(&lexical_query) {
             if raw_results.is_empty() && !explicit_lexical && pool.sqlite_path() != ":memory:" {
@@ -3831,7 +3832,9 @@ async fn execute_sql_plan_search(
     if options.track_telemetry {
         record_query("search_service_sql_plan", latency_us);
     }
-    global_metrics().search.record_legacy_query(latency_us, false);
+    global_metrics()
+        .search
+        .record_legacy_query(latency_us, false);
     let resp = finish_scoped_response(raw_results, query, options, assistance, explain);
     if let Outcome::Ok(ref val) = resp {
         cache.put(cache_key, val.clone());
