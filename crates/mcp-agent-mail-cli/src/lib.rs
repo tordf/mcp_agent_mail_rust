@@ -2348,9 +2348,12 @@ fn systemd_service_configured_port() -> Option<u16> {
         .join(SYSTEMD_UNIT_NAME);
     let content = std::fs::read_to_string(unit_path).ok()?;
     for line in content.lines() {
-        let exec_start = line
+        let Some(exec_start) = line
             .strip_prefix("ExecStart=")
-            .or_else(|| line.strip_prefix("ExecStart ="))?;
+            .or_else(|| line.strip_prefix("ExecStart ="))
+        else {
+            continue;
+        };
         // Strip surrounding quotes from the entire value if present.
         let exec_start = exec_start.trim().trim_matches('"');
         // Split on whitespace (handles both quoted and unquoted paths).
@@ -2461,9 +2464,8 @@ fn kill_port_holder(host: &str, port: u16) -> CliResult<()> {
 }
 
 /// Choose the listener PIDs we can safely terminate for a verified Agent Mail
-/// server. Prefer explicit Agent Mail signatures, but once the server has
-/// positively identified itself via the health check, fall back to the raw
-/// listener PID set so installations launched as `am` still restart cleanly.
+/// server. Only explicit Agent Mail signatures or a current PID hint qualify;
+/// the HTTP health probe alone is not enough to authorize termination.
 fn resolved_agent_mail_listener_pids(host: &str, port: u16) -> Vec<u32> {
     use mcp_agent_mail_server::startup_checks::{
         agent_mail_port_holder_pids_with_hint, check_port_status,
@@ -2487,17 +2489,8 @@ fn select_killable_agent_mail_pids(
     agent_mail_pids: Vec<u32>,
     listener_pids: Vec<u32>,
 ) -> Vec<u32> {
-    if !agent_mail_pids.is_empty() {
-        agent_mail_pids
-    } else if matches!(
-        status,
-        mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer
-    ) && listener_pids.len() == 1
-    {
-        listener_pids
-    } else {
-        Vec::new()
-    }
+    let _ = (status, listener_pids);
+    agent_mail_pids
 }
 
 fn select_remaining_kill_pids(
@@ -2651,10 +2644,10 @@ mod port_kill_tests {
     }
 
     #[test]
-    fn select_killable_agent_mail_pids_uses_verified_listener_when_alias_is_unsigned() {
-        assert_eq!(
-            select_killable_agent_mail_pids(&PortStatus::AgentMailServer, vec![], vec![22]),
-            vec![22]
+    fn select_killable_agent_mail_pids_rejects_unsigned_listener_even_when_health_checks_pass() {
+        assert!(
+            select_killable_agent_mail_pids(&PortStatus::AgentMailServer, vec![], vec![22])
+                .is_empty()
         );
     }
 
@@ -17065,6 +17058,89 @@ fn handle_service_install(host: Option<String>, port: Option<u16>, no_auth: bool
     }
 }
 
+fn validate_service_bind_addr(host: &str, port: u16) -> CliResult<()> {
+    resolve_socket_bind_addr(host, port)
+        .map(|_| ())
+        .map_err(|error| {
+            CliError::Other(format!(
+                "cannot install service for invalid bind address {host}:{port}: {error}"
+            ))
+        })
+}
+
+fn systemd_escape_exec_arg(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    if value.chars().any(char::is_whitespace) || escaped != value {
+        format!("\"{escaped}\"")
+    } else {
+        value.to_string()
+    }
+}
+
+fn build_systemd_exec_start(
+    am_bin: &Path,
+    listen_host: &str,
+    listen_port: u16,
+    no_auth: bool,
+) -> String {
+    let mut args = vec![
+        systemd_escape_exec_arg(&am_bin.display().to_string()),
+        "serve-http".to_string(),
+        "--host".to_string(),
+        systemd_escape_exec_arg(listen_host),
+        "--port".to_string(),
+        listen_port.to_string(),
+        "--no-tui".to_string(),
+    ];
+    if no_auth {
+        args.push("--no-auth".to_string());
+    }
+    args.join(" ")
+}
+
+fn xml_escape_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn launchd_program_argument(value: &str) -> String {
+    format!("        <string>{}</string>", xml_escape_text(value))
+}
+
+fn build_launchd_args_xml(
+    am_bin: &Path,
+    listen_host: &str,
+    listen_port: u16,
+    no_auth: bool,
+) -> String {
+    let mut args = vec![
+        am_bin.display().to_string(),
+        "serve-http".to_string(),
+        "--host".to_string(),
+        listen_host.to_string(),
+        "--port".to_string(),
+        listen_port.to_string(),
+        "--no-tui".to_string(),
+    ];
+    if no_auth {
+        args.push("--no-auth".to_string());
+    }
+    args.into_iter()
+        .map(|arg| launchd_program_argument(&arg))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn service_install_systemd(
     am_bin: &Path,
     host: Option<String>,
@@ -17079,16 +17155,8 @@ fn service_install_systemd(
 
     let listen_host = host.as_deref().unwrap_or("127.0.0.1");
     let listen_port = port.unwrap_or(8765);
-
-    let mut exec_args = format!(
-        "{} serve-http --host {} --port {} --no-tui",
-        am_bin.display(),
-        listen_host,
-        listen_port,
-    );
-    if no_auth {
-        exec_args.push_str(" --no-auth");
-    }
+    validate_service_bind_addr(listen_host, listen_port)?;
+    let exec_args = build_systemd_exec_start(am_bin, listen_host, listen_port, no_auth);
 
     let unit_content = format!(
         r#"[Unit]
@@ -17139,23 +17207,12 @@ fn service_install_launchd(
 
     let listen_host = host.as_deref().unwrap_or("127.0.0.1");
     let listen_port = port.unwrap_or(8765);
+    validate_service_bind_addr(listen_host, listen_port)?;
 
     let log_dir = PathBuf::from(&home).join("Library/Logs/agent-mail");
     std::fs::create_dir_all(&log_dir)?;
-
-    let mut args_xml = format!(
-        r#"        <string>{am_bin}</string>
-        <string>serve-http</string>
-        <string>--host</string>
-        <string>{listen_host}</string>
-        <string>--port</string>
-        <string>{listen_port}</string>
-        <string>--no-tui</string>"#,
-        am_bin = am_bin.display(),
-    );
-    if no_auth {
-        args_xml.push_str("\n        <string>--no-auth</string>");
-    }
+    let uid = current_uid()?;
+    let args_xml = build_launchd_args_xml(am_bin, listen_host, listen_port, no_auth);
 
     let plist_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -17188,7 +17245,7 @@ fn service_install_launchd(
 </dict>
 </plist>
 "#,
-        log_dir = log_dir.display(),
+        log_dir = xml_escape_text(log_dir.display().to_string().as_str()),
     );
 
     // Stop existing job first (ignore errors — may not be loaded).
@@ -17196,7 +17253,7 @@ fn service_install_launchd(
         "launchctl",
         &[
             "bootout",
-            &format!("gui/{}", get_uid()),
+            &format!("gui/{uid}"),
             &plist_path.display().to_string(),
         ],
     );
@@ -17208,7 +17265,7 @@ fn service_install_launchd(
         "launchctl",
         &[
             "bootstrap",
-            &format!("gui/{}", get_uid()),
+            &format!("gui/{uid}"),
             &plist_path.display().to_string(),
         ],
     )?;
@@ -17257,11 +17314,12 @@ fn service_uninstall_launchd() -> CliResult<()> {
         .join(format!("{LAUNCHD_LABEL}.plist"));
 
     if plist_path.exists() {
+        let uid = current_uid()?;
         let _ = run_cmd(
             "launchctl",
             &[
                 "bootout",
-                &format!("gui/{}", get_uid()),
+                &format!("gui/{uid}"),
                 &plist_path.display().to_string(),
             ],
         );
@@ -17319,8 +17377,9 @@ fn service_status_systemd() -> CliResult<()> {
 }
 
 fn service_status_launchd() -> CliResult<()> {
+    let uid = current_uid()?;
     let output = std::process::Command::new("launchctl")
-        .args(["print", &format!("gui/{}/{LAUNCHD_LABEL}", get_uid())])
+        .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -17465,6 +17524,7 @@ fn service_restart_launchd() -> CliResult<()> {
     ftui_runtime::ftui_println!("Restarting {SERVICE_NAME} via launchd...");
 
     let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
+    let uid = current_uid()?;
     let plist_path = PathBuf::from(&home)
         .join("Library/LaunchAgents")
         .join(format!("{LAUNCHD_LABEL}.plist"));
@@ -17475,7 +17535,7 @@ fn service_restart_launchd() -> CliResult<()> {
         ));
     }
 
-    let domain_target = format!("gui/{}/{LAUNCHD_LABEL}", get_uid());
+    let domain_target = format!("gui/{uid}/{LAUNCHD_LABEL}");
 
     // Try graceful stop first (kickstart -k sends SIGTERM then restarts).
     let result = run_cmd("launchctl", &["kickstart", "-kp", &domain_target]);
@@ -17487,7 +17547,7 @@ fn service_restart_launchd() -> CliResult<()> {
             "launchctl",
             &[
                 "bootout",
-                &format!("gui/{}", get_uid()),
+                &format!("gui/{uid}"),
                 &plist_path.display().to_string(),
             ],
         );
@@ -17497,7 +17557,7 @@ fn service_restart_launchd() -> CliResult<()> {
             "launchctl",
             &[
                 "bootstrap",
-                &format!("gui/{}", get_uid()),
+                &format!("gui/{uid}"),
                 &plist_path.display().to_string(),
             ],
         )?;
@@ -17529,15 +17589,25 @@ fn run_cmd(program: &str, args: &[&str]) -> CliResult<()> {
 }
 
 /// Get the current user's UID (for launchd domain-target).
-fn get_uid() -> u32 {
+fn current_uid() -> CliResult<u32> {
     // Use the `id -u` command to avoid a libc dependency and stay within forbid(unsafe_code).
-    std::process::Command::new("id")
+    let output = std::process::Command::new("id")
         .arg("-u")
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(501) // 501 is the typical first user UID on macOS
+        .map_err(|error| CliError::Other(format!("failed to resolve current uid: {error}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::Other(format!(
+            "failed to resolve current uid: {}",
+            stderr.trim_end()
+        )));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| CliError::Other(format!("id -u returned invalid UTF-8: {error}")))?;
+    stdout
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| CliError::Other(format!("failed to parse current uid: {error}")))
 }
 
 #[cfg(test)]
@@ -17606,6 +17676,30 @@ mod tests {
             cursor = &cursor[next..];
         }
         None
+    }
+
+    #[test]
+    fn build_systemd_exec_start_quotes_paths_with_spaces() {
+        let exec_start =
+            build_systemd_exec_start(Path::new("/tmp/Agent Mail/bin/am"), "127.0.0.1", 8765, true);
+        assert!(exec_start.starts_with("\"/tmp/Agent Mail/bin/am\""));
+        assert!(exec_start.contains(" --host 127.0.0.1 --port 8765 --no-tui --no-auth"));
+    }
+
+    #[test]
+    fn build_launchd_args_xml_escapes_xml_metacharacters() {
+        let args_xml = build_launchd_args_xml(Path::new("/tmp/A&B/am"), "local<host>&", 8765, true);
+        assert!(args_xml.contains("<string>/tmp/A&amp;B/am</string>"));
+        assert!(args_xml.contains("<string>local&lt;host&gt;&amp;</string>"));
+        assert!(args_xml.contains("<string>--no-auth</string>"));
+    }
+
+    #[test]
+    fn xml_escape_text_escapes_all_xml_metacharacters() {
+        assert_eq!(
+            xml_escape_text("<tag attr=\"value\">Tom & 'Jerry'</tag>"),
+            "&lt;tag attr=&quot;value&quot;&gt;Tom &amp; &apos;Jerry&apos;&lt;/tag&gt;"
+        );
     }
 
     #[test]
