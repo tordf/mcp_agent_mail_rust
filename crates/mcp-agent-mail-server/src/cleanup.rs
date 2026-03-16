@@ -814,24 +814,24 @@ fn write_cleanup_artifacts(
             let agent_name = match block_on(async {
                 queries::get_agent_by_id_fresh(cx, pool, row.agent_id).await
             }) {
-                    Outcome::Ok(agent) => agent.name,
-                    Outcome::Err(error) => {
-                        return Err(format!(
-                            "cleanup artifact agent lookup failed for reservation {id}: {error}"
-                        ));
-                    }
-                    Outcome::Cancelled(_) => {
-                        return Err(format!(
-                            "cleanup artifact agent lookup cancelled for reservation {id}"
-                        ));
-                    }
-                    Outcome::Panicked(panic) => {
-                        return Err(format!(
-                            "cleanup artifact agent lookup panicked for reservation {id}: {}",
-                            panic.message()
-                        ));
-                    }
-                };
+                Outcome::Ok(agent) => agent.name,
+                Outcome::Err(error) => {
+                    return Err(format!(
+                        "cleanup artifact agent lookup failed for reservation {id}: {error}"
+                    ));
+                }
+                Outcome::Cancelled(_) => {
+                    return Err(format!(
+                        "cleanup artifact agent lookup cancelled for reservation {id}"
+                    ));
+                }
+                Outcome::Panicked(panic) => {
+                    return Err(format!(
+                        "cleanup artifact agent lookup panicked for reservation {id}: {}",
+                        panic.message()
+                    ));
+                }
+            };
             let released_ts = row.released_ts.ok_or_else(|| {
                 format!("cleanup artifact generation requires released_ts for reservation {id}")
             })?;

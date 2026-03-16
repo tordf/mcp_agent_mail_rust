@@ -380,10 +380,10 @@ mod route_regressions {
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(
-            html.contains(&html_escape_forward_slashes(&format!(
-                "/mail/{}/thread/{root_id}",
-                project.slug
-            ))),
+            html_contains_url(
+                &html,
+                &mail_thread_href(&project.slug, &root_id.to_string())
+            ),
             "{html}"
         );
         assert!(html.contains("Part of a Conversation Thread"));
@@ -447,12 +447,56 @@ mod route_regressions {
             .expect("inbox render should succeed")
             .expect("inbox route should return html");
         assert!(
-            html.contains(&html_escape_forward_slashes(&format!(
-                "/mail/{}/thread/{root_id}",
-                project.slug
-            ))),
+            html_contains_url(
+                &html,
+                &mail_thread_href(&project.slug, &root_id.to_string())
+            ),
             "{html}"
         );
+    }
+
+    #[test]
+    fn render_message_does_not_client_render_raw_markdown_fallback() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("message-no-client-markdown");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-message-no-client-markdown-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+        let message = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            "Sanitized body",
+            "<script>alert('xss')</script>",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+
+        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+            .expect("message render should succeed")
+            .expect("message route should return html");
+        assert!(!html.contains("marked.parse(markdownContent)"), "{html}");
     }
 
     #[test]
@@ -463,6 +507,16 @@ mod route_regressions {
             .expect("unified inbox render should succeed")
             .expect("unified inbox should return html");
         assert!(html.contains("Static export snapshot"));
+    }
+
+    #[test]
+    fn render_unified_inbox_does_not_client_render_raw_markdown_fallback() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("unified-no-client-markdown");
+        let html = render_unified_inbox(&cx, &pool, 10, None, false)
+            .expect("unified inbox render should succeed")
+            .expect("unified inbox should return html");
+        assert!(!html.contains("marked.parse(msg.body_md)"), "{html}");
     }
 
     #[test]
@@ -661,6 +715,11 @@ pub fn mail_thread_href(project_slug: &str, thread_id: &str) -> String {
 #[cfg(test)]
 fn html_escape_forward_slashes(input: &str) -> String {
     input.replace('/', "&#x2f;")
+}
+
+#[cfg(test)]
+fn html_contains_url(html: &str, url: &str) -> bool {
+    html.contains(url) || html.contains(&html_escape_forward_slashes(url))
 }
 
 #[cfg(test)]
@@ -1835,6 +1894,7 @@ struct InboxMessage {
     sender: String,
     importance: String,
     thread_id: String,
+    thread_url: String,
     created: String,
     ack_required: bool,
     acked: bool,
@@ -1880,17 +1940,23 @@ fn render_inbox(
     let mut items = Vec::new();
     for row in inbox.iter().skip(offset).take(limit) {
         let m = &row.message;
+        let thread_id = display_thread_ref_for_message(
+            m.id.unwrap_or(0),
+            m.thread_id.as_deref(),
+            &reply_root_ids,
+        );
         items.push(InboxMessage {
             id: m.id.unwrap_or(0),
             subject: m.subject.clone(),
             body_html: markdown::render_markdown_to_safe_html(&m.body_md),
             sender: row.sender_name.clone(),
             importance: m.importance.clone(),
-            thread_id: display_thread_ref_for_message(
-                m.id.unwrap_or(0),
-                m.thread_id.as_deref(),
-                &reply_root_ids,
-            ),
+            thread_id: thread_id.clone(),
+            thread_url: if thread_id.is_empty() {
+                String::new()
+            } else {
+                mail_thread_href(&p.slug, &thread_id)
+            },
             created: ts_display(m.created_ts),
             ack_required: m.ack_required_bool(),
             acked: row.ack_ts.is_some(),

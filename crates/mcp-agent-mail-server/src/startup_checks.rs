@@ -473,14 +473,12 @@ fn current_executable_hint_path() -> Option<String> {
 }
 
 fn format_listener_pid_hint(hint: &ListenerPidHint) -> String {
-    let ts = hint
-        .created_epoch_secs
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        });
+    let ts = hint.created_epoch_secs.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
     match hint.exe_path.as_deref() {
         Some(exe_path) if !exe_path.trim().is_empty() => {
             format!("{}\n{exe_path}\n{ts}\n", hint.pid)
