@@ -2025,6 +2025,40 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
     }
 }
 
+/// Fetch a single agent by ID, bypassing the read cache.
+///
+/// Cleanup and integrity paths use this when they need authoritative current
+/// database state rather than possibly stale cached rows.
+pub async fn get_agent_by_id_fresh(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let sql = "SELECT id, project_id, name, program, model, task_description, \
+               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               FROM agents WHERE id = ? LIMIT 1";
+    let params = [Value::BigInt(agent_id)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => rows.first().map_or_else(
+            || Outcome::Err(DbError::not_found("Agent", agent_id.to_string())),
+            |row| Outcome::Ok(decode_agent_row_indexed(row)),
+        ),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// List agents for a project
 pub async fn list_agents(
     cx: &Cx,
@@ -3720,63 +3754,63 @@ async fn fetch_inbox_impl(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let id: i64 = match row.get_as(0) {
+                let id: i64 = match row.get_named("id") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let project_id: i64 = match row.get_as(1) {
+                let project_id: i64 = match row.get_named("project_id") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_id: i64 = match row.get_as(2) {
+                let sender_id: i64 = match row.get_named("sender_id") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let thread_id: Option<String> = match row.get_as(3) {
+                let thread_id: Option<String> = match row.get_named("thread_id") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let subject: String = match row.get_as(4) {
+                let subject: String = match row.get_named("subject") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = match row.get_as(5) {
+                let body_md: String = match row.get_named("body_md") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let importance: String = match row.get_as(6) {
+                let importance: String = match row.get_named("importance") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_required: i64 = match row.get_as(7) {
+                let ack_required: i64 = match row.get_named("ack_required") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let created_ts: i64 = match row.get_as(8) {
+                let created_ts: i64 = match row.get_named("created_ts") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let recipients_json: String = match row.get_as(9) {
+                let recipients_json: String = match row.get_named("recipients_json") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let attachments: String = match row.get_as(10) {
+                let attachments: String = match row.get_named("attachments") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_as(11) {
+                let kind: String = match row.get_named("kind") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let sender_name: String = match row.get_as(12) {
+                let sender_name: String = match row.get_named("sender_name") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let read_ts: Option<i64> = match row.get_as(13) {
+                let read_ts: Option<i64> = match row.get_named("read_ts") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let ack_ts: Option<i64> = match row.get_as(14) {
+                let ack_ts: Option<i64> = match row.get_named("ack_ts") {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -5441,6 +5475,8 @@ pub fn release_reservations<'a>(
         // Commit the read transaction first, then delegate writes to the
         // per-id release path which is more stable on FrankenSQLite.
         try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
+        drop(tracked_conn);
+        drop(conn);
         let released_markers =
             match release_reservations_by_ids_matching_expiry(cx, pool, &target_ids, None).await {
                 Outcome::Ok(markers) => markers,
@@ -6776,6 +6812,9 @@ pub async fn release_expired_reservations(
     if ids.is_empty() {
         return Outcome::Ok(ids);
     }
+
+    drop(tracked);
+    drop(conn);
 
     match release_reservations_by_ids_matching_expiry(cx, pool, &ids, Some(now)).await {
         Outcome::Ok(markers) => Outcome::Ok(markers.into_iter().map(|marker| marker.id).collect()),
