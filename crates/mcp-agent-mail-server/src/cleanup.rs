@@ -855,7 +855,7 @@ fn write_cleanup_artifacts(
             config: config.clone(),
             reservations: res_jsons,
         };
-        match mcp_agent_mail_storage::wbq_enqueue(op) {
+        match mcp_agent_mail_storage::wbq_enqueue(op.clone()) {
             mcp_agent_mail_storage::WbqEnqueueResult::Enqueued => {
                 info!(
                     project = %project.slug,
@@ -865,7 +865,17 @@ fn write_cleanup_artifacts(
                 return Ok(());
             }
             mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-                return Err("cleanup archive enqueue failed: queue unavailable".into());
+                mcp_agent_mail_storage::write_op_sync(&op).map_err(|error| {
+                    format!(
+                        "cleanup archive fallback write failed after queue unavailability: {error}"
+                    )
+                })?;
+                info!(
+                    project = %project.slug,
+                    released_count = released_ids.len(),
+                    "cleanup: WBQ unavailable; wrote released reservation archive updates synchronously"
+                );
+                return Ok(());
             }
             mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
                 return Err("cleanup archive enqueue skipped due to critical disk pressure".into());

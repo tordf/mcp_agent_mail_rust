@@ -391,8 +391,7 @@ pub fn write_listener_pid_hint(host: &str, port: u16) -> PathBuf {
     }
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let hint = ListenerPidHint {
         pid: std::process::id(),
         exe_path: current_executable_hint_path(),
@@ -476,8 +475,7 @@ fn format_listener_pid_hint(hint: &ListenerPidHint) -> String {
     let ts = hint.created_epoch_secs.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs())
     });
     match hint.exe_path.as_deref() {
         Some(exe_path) if !exe_path.trim().is_empty() => {
@@ -529,8 +527,7 @@ fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
     if let Some(created) = hint.created_epoch_secs {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         if now.saturating_sub(created) > PID_HINT_MAX_AGE_SECS {
             tracing::debug!(
                 pid = hint.pid,

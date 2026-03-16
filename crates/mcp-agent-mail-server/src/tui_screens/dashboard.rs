@@ -2292,10 +2292,10 @@ const fn event_log_columns_for_width(width: u16) -> usize {
     }
 }
 
-fn render_lines_with_columns<'a>(
+fn render_lines_with_columns(
     frame: &mut Frame<'_>,
     area: Rect,
-    lines: &[Line<'a>],
+    lines: &[Line<'_>],
     min_col_width: u16,
     max_cols: usize,
 ) {
@@ -5548,10 +5548,10 @@ fn compute_heatmap_grid(event_log: &VecDeque<EventEntry>, num_cols: usize) -> He
             * (num_cols as f64 - 1.0)) as usize;
         let col = col.min(num_cols.saturating_sub(1));
         let row = heatmap_kind_index(entry.kind);
-        if let Some(r) = grid.get_mut(row) {
-            if let Some(cell) = r.get_mut(col) {
-                *cell += 1;
-            }
+        if let Some(r) = grid.get_mut(row)
+            && let Some(cell) = r.get_mut(col)
+        {
+            *cell += 1;
         }
     }
     let max_count = grid
