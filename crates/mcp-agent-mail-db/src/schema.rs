@@ -1161,7 +1161,15 @@ pub fn schema_migrations() -> Vec<Migration> {
     migrations.push(Migration::new(
         "v15_add_recipients_json_to_messages".to_string(),
         "add recipients_json column to messages table".to_string(),
-        "ALTER TABLE messages ADD COLUMN recipients_json TEXT NOT NULL DEFAULT '{}'".to_string(),
+        "ALTER TABLE messages ADD COLUMN recipients_json TEXT;\
+         UPDATE messages SET recipients_json = '{}' WHERE recipients_json IS NULL OR recipients_json = '';\
+         CREATE TRIGGER IF NOT EXISTS trg_messages_default_recipients_json \
+         AFTER INSERT ON messages \
+         WHEN NEW.recipients_json IS NULL OR NEW.recipients_json = '' \
+         BEGIN \
+             UPDATE messages SET recipients_json = '{}' WHERE id = NEW.id; \
+         END"
+            .to_string(),
         String::new(),
     ));
 
