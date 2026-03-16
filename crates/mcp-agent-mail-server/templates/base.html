@@ -486,6 +486,7 @@
         background-color: #1e293b;
         color: #f1f5f9;
         font-size: 0.875rem;
+        white-space: pre-line;
         border-radius: 0.5rem;
         box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
       }
@@ -2557,7 +2558,7 @@
               iconBg: 'rgba(99, 102, 241, 0.1)',
               iconColor: 'text-primary-600',
               shortcut: 'G+P',
-              action: () => window.location.href = '/mail',
+              action: () => window.agentMailNavigate('/mail'),
               keywords: 'projects home list'
             },
             {
@@ -2952,7 +2953,7 @@
                 duration: [200, 150],
                 arrow: true,
                 placement: 'top',
-                allowHTML: true,  // Enable HTML in tooltips
+                allowHTML: false,
                 interactive: el.getAttribute('data-tippy-interactive') === 'true',  // Allow hover for complex tooltips
                 maxWidth: el.getAttribute('data-tippy-max-width') || 350
               });
@@ -3129,7 +3130,7 @@
 
         if ((e.key === 'p' || e.key === 'P') && window._lastKeyG) {
           e.preventDefault();
-          window.location.href = '/mail';
+          window.agentMailNavigate('/mail');
           window._lastKeyG = false;
         }
 

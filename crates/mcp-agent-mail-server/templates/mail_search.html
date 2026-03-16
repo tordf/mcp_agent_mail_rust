@@ -316,7 +316,10 @@
                 </span>
               </div>
               {% if deep_link %}
-              <button onclick="navigator.clipboard.writeText(window.location.origin + '{{ deep_link }}')" title="Copy deep link"
+              <button type="button"
+                data-copy-link="{{ deep_link }}"
+                onclick="window.copyToClipboard(window.agentMailAbsoluteUrl(this.dataset.copyLink), 'Link copied!')"
+                title="Copy deep link"
                 class="px-3 py-1.5 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-600 dark:text-slate-400 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5">
                 <i data-lucide="link" class="w-3.5 h-3.5"></i>
                 Copy link
@@ -383,7 +386,7 @@
           {% if next_cursor %}
           <div class="px-6 py-4 border-t border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 flex items-center justify-between">
             <span class="text-sm text-slate-600 dark:text-slate-400">Showing {{ result_count }} results</span>
-            <a href="/mail/{{ project.slug }}/search?q={{ q }}&order={{ order }}&scope={{ scope }}{% if boost %}&boost=1{% endif %}{% for imp in importance %}&imp={{ imp }}{% endfor %}{% if agent %}&agent={{ agent }}{% endif %}{% if thread %}&thread={{ thread }}{% endif %}{% if ack != 'any' %}&ack={{ ack }}{% endif %}{% if direction %}&direction={{ direction }}{% endif %}{% if from_date %}&from_date={{ from_date }}{% endif %}{% if to_date %}&to_date={{ to_date }}{% endif %}&cursor={{ next_cursor }}"
+            <a href="{{ next_page_url }}"
                class="px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2">
               Next page
               <i data-lucide="chevron-right" class="w-4 h-4"></i>
@@ -663,13 +666,13 @@
           ? '<span class="px-1.5 py-0.5 bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300 text-xs font-medium rounded">High</span>'
           : '';
       const threadLink = entry.thread_id
-        ? `<a href="/mail/${projectSlug}/thread/${encodeURIComponent(entry.thread_id)}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors" onclick="event.stopPropagation()"><i data-lucide="message-circle" class="w-3.5 h-3.5"></i><span class="font-mono text-xs">${escapeHtml(entry.thread_id)}</span></a>`
+        ? `<a href="${window.agentMailAppendAuth(`/mail/${projectSlug}/thread/${encodeURIComponent(entry.thread_id)}`)}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors" onclick="event.stopPropagation()"><i data-lucide="message-circle" class="w-3.5 h-3.5"></i><span class="font-mono text-xs">${escapeHtml(entry.thread_id)}</span></a>`
         : '';
       const snippet = entry.body_excerpt
         ? `<div class="text-sm text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/50 rounded-lg p-3 line-clamp-3">${escapeHtml(entry.body_excerpt)}</div>`
         : '';
       return `
-        <a href="/mail/${projectSlug}/message/${entry.id}"
+        <a href="${window.agentMailAppendAuth(`/mail/${projectSlug}/message/${entry.id}`)}"
            class="block p-6 hover:bg-slate-50 dark:hover:bg-slate-900 transition-all duration-200 group">
           <div class="flex items-start justify-between mb-2">
             <h4 class="text-base font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors flex-1 mr-3">${escapeHtml(entry.subject || '(no subject)')}</h4>
@@ -732,7 +735,11 @@
       const params = buildSearchParams();
       const index = await loadSearchIndex();
       const queryString = params.toString();
-      window.history.replaceState(null, '', queryString ? `${window.location.pathname}?${queryString}` : window.location.pathname);
+      window.history.replaceState(
+        null,
+        '',
+        window.agentMailAppendAuth(queryString ? `${window.location.pathname}?${queryString}` : window.location.pathname)
+      );
       const { results, unsupported } = filterResults(index, params);
       renderResults(results, params, unsupported);
     }
@@ -758,7 +765,7 @@
     clearButton?.addEventListener('click', () => {
       form.reset();
       syncReactiveStateFromDom();
-      window.history.replaceState(null, '', window.location.pathname);
+      window.history.replaceState(null, '', window.agentMailAppendAuth(window.location.pathname));
       void runStaticSearch();
     });
 

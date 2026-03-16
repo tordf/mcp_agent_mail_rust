@@ -1158,7 +1158,7 @@ function unifiedInboxManager() {
     handleMessageClick(msg) {
       if (this.viewMode === 'list') {
         // Navigate to dedicated message page in list view
-        window.location.href = `/mail/${msg.project_slug}/message/${msg.id}`;
+        window.agentMailNavigate(`/mail/${msg.project_slug}/message/${msg.id}`);
       } else {
         // Select and display in split view
         this.selectMessage(msg);
@@ -1188,30 +1188,7 @@ function unifiedInboxManager() {
         if (!bodyEl) return;
 
         const serverHtml = typeof msg.body_html === 'string' ? msg.body_html.trim() : '';
-        if (serverHtml.length > 0) {
-          bodyEl.innerHTML = serverHtml;
-        } else if (msg.body_md) {
-          // Fallback path: client-side markdown render when server HTML is unavailable.
-          if (typeof marked !== 'undefined') {
-            try {
-              marked.setOptions({
-                breaks: true,
-                gfm: true,
-                headerIds: true,
-                mangle: false
-              });
-
-              bodyEl.innerHTML = marked.parse(msg.body_md);
-            } catch (error) {
-              console.error('Markdown parsing failed:', error);
-              bodyEl.textContent = msg.body_md;
-            }
-          } else {
-            bodyEl.textContent = msg.body_md;
-          }
-        } else {
-          bodyEl.textContent = '';
-        }
+        bodyEl.innerHTML = serverHtml;
 
         // Highlight code blocks
         if (typeof Prism !== 'undefined') {
@@ -1507,7 +1484,7 @@ function unifiedInboxManager() {
       if (!msg) return;
       const projectSlug = encodeURIComponent(msg.project_slug || '');
       const messageId = encodeURIComponent(String(msg.id));
-      const url = `${window.location.origin}/mail/${projectSlug}/message/${messageId}`;
+      const url = window.agentMailAbsoluteUrl(`/mail/${projectSlug}/message/${messageId}`);
       if (typeof window.copyToClipboard === 'function') {
         window.copyToClipboard(url, 'Message link copied!');
       } else if (navigator.clipboard && navigator.clipboard.writeText) {
