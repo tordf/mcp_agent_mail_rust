@@ -2292,10 +2292,10 @@ const fn event_log_columns_for_width(width: u16) -> usize {
     }
 }
 
-fn render_lines_with_columns(
+fn render_lines_with_columns<'a>(
     frame: &mut Frame<'_>,
     area: Rect,
-    lines: &[Line<'static>],
+    lines: &[Line<'a>],
     min_col_width: u16,
     max_cols: usize,
 ) {
@@ -4826,7 +4826,7 @@ fn render_recent_activity_panel(
         usize::from(column_width).saturating_sub(20usize.saturating_add(kind_width).max(1));
     for entry in filtered.iter().take(list_budget) {
         lines.push(Line::from_spans([
-            Span::styled(entry.timestamp.clone(), crate::tui_theme::text_meta(&tp)),
+            Span::styled(entry.timestamp.as_str(), crate::tui_theme::text_meta(&tp)),
             Span::raw(" "),
             Span::styled(
                 entry.icon.to_string(),
@@ -4834,12 +4834,12 @@ fn render_recent_activity_panel(
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(entry.kind.compact_label(), kind_width).into_owned(),
+                truncate(entry.kind.compact_label(), kind_width),
                 crate::tui_theme::text_meta(&tp),
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&entry.summary, summary_width).into_owned(),
+                truncate(&entry.summary, summary_width),
                 Style::default().fg(tp.text_primary),
             ),
         ]));
@@ -5546,9 +5546,13 @@ fn compute_heatmap_grid(event_log: &VecDeque<EventEntry>, num_cols: usize) -> He
     for entry in event_log {
         let col = ((entry.timestamp_micros - ts_min) as f64 / ts_span as f64
             * (num_cols as f64 - 1.0)) as usize;
-        let col = col.min(num_cols - 1);
+        let col = col.min(num_cols.saturating_sub(1));
         let row = heatmap_kind_index(entry.kind);
-        grid[row][col] += 1;
+        if let Some(r) = grid.get_mut(row) {
+            if let Some(cell) = r.get_mut(col) {
+                *cell += 1;
+            }
+        }
     }
     let max_count = grid
         .iter()

@@ -200,7 +200,7 @@ mod route_regressions {
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
         )));
 
-        outcome_ok(block_on(queries::create_message_with_recipients(
+        let message = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
             &pool,
             project_id,
@@ -213,12 +213,30 @@ mod route_regressions {
             r#"[{"name":"artifact.txt","path":"attachments/demo.txt","content_type":"text/plain","size":"128"}]"#,
             &[(recipient.id.unwrap_or(0), "to")],
         )));
+        let message_id = message.id.unwrap_or(0);
+
+        let fetched_message = outcome_ok(block_on(queries::get_message(&cx, &pool, message_id)));
+
+        let inbox = outcome_ok(block_on(queries::fetch_inbox(
+            &cx,
+            &pool,
+            project_id,
+            recipient.id.unwrap_or(0),
+            false,
+            None,
+            50,
+        )));
+        assert_eq!(fetched_message.attachments, message.attachments);
+        assert_eq!(
+            inbox.first().map(|row| row.message.attachments.as_str()),
+            Some(message.attachments.as_str())
+        );
 
         let html = render_attachments(&cx, &pool, &project.slug)
             .expect("attachments render should succeed")
             .expect("attachments route should return html");
-        assert!(html.contains("artifact.txt"));
-        assert!(html.contains("128"));
+        assert!(html.contains("artifact.txt"), "{html}");
+        assert!(html.contains("128"), "{html}");
     }
 
     #[test]
@@ -361,7 +379,13 @@ mod route_regressions {
         let html = render_message(&cx, &pool, &project.slug, root_id)
             .expect("message render should succeed")
             .expect("message route should return html");
-        assert!(html.contains(&format!("/mail/{}/thread/{root_id}", project.slug)));
+        assert!(
+            html.contains(&html_escape_forward_slashes(&format!(
+                "/mail/{}/thread/{root_id}",
+                project.slug
+            ))),
+            "{html}"
+        );
         assert!(html.contains("Part of a Conversation Thread"));
     }
 
@@ -422,7 +446,13 @@ mod route_regressions {
         let html = render_inbox(&cx, &pool, &project.slug, &recipient.name, 50, 1, false)
             .expect("inbox render should succeed")
             .expect("inbox route should return html");
-        assert!(html.contains(&format!("/mail/{}/thread/{root_id}", project.slug)));
+        assert!(
+            html.contains(&html_escape_forward_slashes(&format!(
+                "/mail/{}/thread/{root_id}",
+                project.slug
+            ))),
+            "{html}"
+        );
     }
 
     #[test]
@@ -626,6 +656,11 @@ pub fn mail_thread_href(project_slug: &str, thread_id: &str) -> String {
         "/mail/{project_slug}/thread/{}",
         percent_encode_path_segment(thread_id)
     )
+}
+
+#[cfg(test)]
+fn html_escape_forward_slashes(input: &str) -> String {
+    input.replace('/', "&#x2f;")
 }
 
 #[cfg(test)]
@@ -1208,7 +1243,10 @@ mod auth_route_hardening_regression_suite {
             .expect("thread route should render html");
 
         assert!(html.contains("Encoded thread subject"));
-        assert!(html.contains("topic/with space+plus"));
+        assert!(
+            html.contains(&html_escape_forward_slashes("topic/with space+plus")),
+            "{html}"
+        );
     }
 
     // -- Method enforcement on known routes --
@@ -3809,7 +3847,7 @@ mod fresh_eyes_regression_tests {
             &cx,
             &pool,
             project_id,
-            "GreenField",
+            "GreenCastle",
             "test",
             "test",
             None,
@@ -3855,13 +3893,13 @@ mod fresh_eyes_regression_tests {
                 .iter()
                 .cloned()
                 .collect::<Vec<String>>(),
-            vec!["BlueLake".to_string(), "GreenField".to_string()]
+            vec!["BlueLake".to_string(), "GreenCastle".to_string()]
         );
         assert_eq!(
             aggregates[0].recipient_read,
             BTreeMap::from([
                 ("BlueLake".to_string(), true),
-                ("GreenField".to_string(), false),
+                ("GreenCastle".to_string(), false),
             ])
         );
         assert!(

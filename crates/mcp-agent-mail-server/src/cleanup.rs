@@ -811,8 +811,9 @@ fn write_cleanup_artifacts(
     for row in target_reservations {
         if let Some(id) = row.id {
             // We need the agent name, which isn't in FileReservationRow, so we look it up
-            let agent_name =
-                match block_on(async { queries::get_agent_by_id(cx, pool, row.agent_id).await }) {
+            let agent_name = match block_on(async {
+                queries::get_agent_by_id_fresh(cx, pool, row.agent_id).await
+            }) {
                     Outcome::Ok(agent) => agent.name,
                     Outcome::Err(error) => {
                         return Err(format!(
@@ -1580,6 +1581,7 @@ mod tests {
             &[mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id)],
         )
         .expect("delete agent");
+        drop(conn);
 
         let config = Config::from_env();
         let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);

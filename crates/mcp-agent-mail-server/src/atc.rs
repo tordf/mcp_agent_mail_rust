@@ -1520,22 +1520,25 @@ impl<'a> TarjanScc<'a> {
 pub fn find_deadlock_cycles(graph: &ProjectConflictGraph) -> Vec<Vec<String>> {
     // Collect all agents that appear in the graph.
     let mut agents: Vec<&str> = Vec::new();
+    let mut index_of: HashMap<&str, usize> = HashMap::new();
+
     for (holder, edges) in &graph.hard_edges {
-        if !agents.contains(&holder.as_str()) {
-            agents.push(holder);
+        if !index_of.contains_key(holder.as_str()) {
+            index_of.insert(holder.as_str(), agents.len());
+            agents.push(holder.as_str());
         }
         for edge in edges {
-            if !agents.contains(&edge.blocked.as_str()) {
-                agents.push(&edge.blocked);
+            if !index_of.contains_key(edge.blocked.as_str()) {
+                index_of.insert(edge.blocked.as_str(), agents.len());
+                agents.push(edge.blocked.as_str());
             }
         }
     }
+
     if agents.len() < 2 {
         return Vec::new();
     }
 
-    // Map agent names to indices for Tarjan's algorithm.
-    let index_of: HashMap<&str, usize> = agents.iter().enumerate().map(|(i, &a)| (a, i)).collect();
     let n = agents.len();
 
     // Build adjacency list.

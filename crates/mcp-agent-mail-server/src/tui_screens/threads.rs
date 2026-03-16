@@ -3306,10 +3306,13 @@ fn render_thread_detail(
 
     let selected_idx = selected_idx.min(tree_rows.len().saturating_sub(1));
     let selected_row = &tree_rows[selected_idx];
-    let selected_message = messages
+    let Some(selected_message) = messages
         .iter()
         .find(|message| message.id == selected_row.message_id)
-        .unwrap_or(&messages[0]);
+        .or_else(|| messages.first())
+    else {
+        return;
+    };
 
     let mut header_lines = Vec::new();
     if let Some(t) = thread {
