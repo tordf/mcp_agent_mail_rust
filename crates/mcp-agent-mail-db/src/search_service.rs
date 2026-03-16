@@ -3789,6 +3789,7 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_sql_plan_search(
     cx: &Cx,
     pool: &DbPool,

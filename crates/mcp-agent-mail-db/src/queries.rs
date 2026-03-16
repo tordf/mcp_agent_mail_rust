@@ -2998,6 +2998,7 @@ async fn create_message_with_recipients_tx(
 /// only messages belonging to that project are returned — preventing
 /// cross-project data leakage.  When `None` (e.g., internal index
 /// rebuilds), all matching messages are returned regardless of project.
+#[allow(clippy::too_many_lines)]
 pub async fn get_messages_details_by_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -5414,84 +5415,86 @@ pub fn release_reservations<'a>(
             return Outcome::Ok(released);
         }
 
-        let conn = match acquire_conn(cx, pool).await {
-            Outcome::Ok(c) => c,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
+        let (reservations, target_ids) = {
+            let conn = match acquire_conn(cx, pool).await {
+                Outcome::Ok(c) => c,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
 
-        let tracked_conn = tracked(&*conn);
-        // Bulk release updates can touch many rows; use IMMEDIATE tx semantics
-        // for deterministic write visibility on FrankenSQLite.
-        try_in_tx!(
-            cx,
-            &tracked_conn,
-            begin_immediate_tx(cx, &tracked_conn).await
-        );
+            let tracked_conn = tracked(&*conn);
+            // Bulk release updates can touch many rows; use IMMEDIATE tx semantics
+            // for deterministic write visibility on FrankenSQLite.
+            try_in_tx!(
+                cx,
+                &tracked_conn,
+                begin_immediate_tx(cx, &tracked_conn).await
+            );
 
-        let mut filter_sql =
-            format!(" WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})");
-        let mut filter_params: Vec<Value> =
-            vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
-        append_release_reservation_filters(
-            &mut filter_sql,
-            &mut filter_params,
-            reservation_ids,
-            paths,
-        );
+            let mut filter_sql = format!(
+                " WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+            );
+            let mut filter_params: Vec<Value> =
+                vec![Value::BigInt(project_id), Value::BigInt(agent_id)];
+            append_release_reservation_filters(
+                &mut filter_sql,
+                &mut filter_params,
+                reservation_ids,
+                paths,
+            );
 
-        let select_sql = format!("{FILE_RESERVATION_SELECT_COLUMNS_SQL}{filter_sql}");
-        let rows_out =
-            map_sql_outcome(traw_query(cx, &tracked_conn, &select_sql, &filter_params).await);
-        let reservations: Vec<FileReservationRow> = match rows_out {
-            Outcome::Ok(rows) => {
-                let mut out = Vec::with_capacity(rows.len());
-                for row in rows {
-                    match decode_file_reservation_row(&row) {
-                        Ok(decoded) => out.push(decoded),
-                        Err(e) => {
-                            rollback_tx(cx, &tracked_conn).await;
-                            return Outcome::Err(e);
+            let select_sql = format!("{FILE_RESERVATION_SELECT_COLUMNS_SQL}{filter_sql}");
+            let rows_out =
+                map_sql_outcome(traw_query(cx, &tracked_conn, &select_sql, &filter_params).await);
+            let reservations: Vec<FileReservationRow> = match rows_out {
+                Outcome::Ok(rows) => {
+                    let mut out = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        match decode_file_reservation_row(&row) {
+                            Ok(decoded) => out.push(decoded),
+                            Err(e) => {
+                                rollback_tx(cx, &tracked_conn).await;
+                                return Outcome::Err(e);
+                            }
                         }
                     }
+                    out
                 }
-                out
-            }
-            Outcome::Err(e) => {
-                rollback_tx(cx, &tracked_conn).await;
-                return Outcome::Err(e);
-            }
-            Outcome::Cancelled(r) => {
-                rollback_tx(cx, &tracked_conn).await;
-                return Outcome::Cancelled(r);
-            }
-            Outcome::Panicked(p) => {
-                rollback_tx(cx, &tracked_conn).await;
-                return Outcome::Panicked(p);
-            }
-        };
+                Outcome::Err(e) => {
+                    rollback_tx(cx, &tracked_conn).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    rollback_tx(cx, &tracked_conn).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    rollback_tx(cx, &tracked_conn).await;
+                    return Outcome::Panicked(p);
+                }
+            };
 
-        if reservations.is_empty() {
+            if reservations.is_empty() {
+                try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
+                return Outcome::Ok(reservations);
+            }
+
+            let target_ids: Vec<i64> = reservations.iter().filter_map(|row| row.id).collect();
+            if target_ids.len() != reservations.len() {
+                rollback_tx(cx, &tracked_conn).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "release_reservations expected {} row ids but found {}",
+                    reservations.len(),
+                    target_ids.len()
+                )));
+            }
+
+            // Commit the read transaction first, then delegate writes to the
+            // per-id release path which is more stable on FrankenSQLite.
             try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
-            return Outcome::Ok(reservations);
-        }
-
-        let target_ids: Vec<i64> = reservations.iter().filter_map(|row| row.id).collect();
-        if target_ids.len() != reservations.len() {
-            rollback_tx(cx, &tracked_conn).await;
-            return Outcome::Err(DbError::Internal(format!(
-                "release_reservations expected {} row ids but found {}",
-                reservations.len(),
-                target_ids.len()
-            )));
-        }
-
-        // Commit the read transaction first, then delegate writes to the
-        // per-id release path which is more stable on FrankenSQLite.
-        try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
-        drop(tracked_conn);
-        drop(conn);
+            (reservations, target_ids)
+        };
         let released_markers =
             match release_reservations_by_ids_matching_expiry(cx, pool, &target_ids, None).await {
                 Outcome::Ok(markers) => markers,
@@ -6797,39 +6800,39 @@ pub async fn release_expired_reservations(
     project_id: i64,
 ) -> Outcome<Vec<i64>, DbError> {
     let now = now_micros();
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    let ids = {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
 
-    let select_sql = format!(
-        "SELECT id FROM file_reservations \
-         WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts <= ?"
-    );
-    let params = [Value::BigInt(project_id), Value::BigInt(now)];
-    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let mut ids = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Ok(id) = row.get_named::<i64>("id") {
-            ids.push(id);
+        let select_sql = format!(
+            "SELECT id FROM file_reservations \
+             WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts <= ?"
+        );
+        let params = [Value::BigInt(project_id), Value::BigInt(now)];
+        let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(id) = row.get_named::<i64>("id") {
+                ids.push(id);
+            }
         }
-    }
+        ids
+    };
 
     if ids.is_empty() {
         return Outcome::Ok(ids);
     }
-
-    drop(tracked);
-    drop(conn);
 
     match release_reservations_by_ids_matching_expiry(cx, pool, &ids, Some(now)).await {
         Outcome::Ok(markers) => Outcome::Ok(markers.into_iter().map(|marker| marker.id).collect()),
