@@ -365,7 +365,9 @@ pub fn create_performance_indexes(snapshot_path: &Path) -> Result<Vec<String>, S
         "fts_messages_ad",
         "fts_messages_au",
     ] {
-        conn.execute_raw(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+        // Use bracket-escaping for the identifier to prevent SQL injection
+        // if this pattern is ever copied to dynamic trigger names.
+        conn.execute_raw(&format!("DROP TRIGGER IF EXISTS [{trigger}]"))
             .map_err(sql_err)?;
     }
 

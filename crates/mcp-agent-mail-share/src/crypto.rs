@@ -340,10 +340,11 @@ pub fn decrypt_with_age(
         }
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ShareError::Io(std::io::Error::other(format!(
-                "age decryption failed: {stderr}"
-            ))));
+            // Do NOT include stderr when a passphrase was involved —
+            // error output could leak passphrase-related diagnostics.
+            return Err(ShareError::Io(std::io::Error::other(
+                "age decryption failed (check passphrase and file integrity)".to_string(),
+            )));
         }
     } else {
         let result = cmd.output()?;

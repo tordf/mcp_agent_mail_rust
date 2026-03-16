@@ -1270,7 +1270,10 @@ fn normalize_path(path: &str, ignorecase: bool) -> String {
     }
     let normalized = parts.join("/");
     if ignorecase {
-        normalized.to_ascii_lowercase()
+        // Use Unicode-aware lowercase (not ASCII-only) so that
+        // non-ASCII path components on case-insensitive filesystems
+        // (macOS HFS+, Windows NTFS) are matched correctly.
+        normalized.to_lowercase()
     } else {
         normalized
     }
