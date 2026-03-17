@@ -195,20 +195,16 @@ fn detect_s3(output_dir: &Path, hints: &mut Vec<HostingHint>) {
 
 /// Walk ancestor directories looking for a specific file/dir.
 fn find_ancestor_path(start: &Path, name: &str) -> Option<std::path::PathBuf> {
-    let mut current = if start.is_file() {
-        start.parent()?.to_path_buf()
+    let search_root = if start.is_file() {
+        start.parent()?
     } else {
-        start.to_path_buf()
+        start
     };
 
-    for _ in 0..10 {
+    for current in search_root.ancestors() {
         let candidate = current.join(name);
         if candidate.exists() {
             return Some(candidate);
-        }
-        match current.parent() {
-            Some(p) if p != current => current = p.to_path_buf(),
-            _ => break,
         }
     }
     None
@@ -435,6 +431,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = find_ancestor_path(dir.path(), "nonexistent.xyz");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_ancestor_path_walks_past_ten_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "").unwrap();
+        let mut nested = dir.path().to_path_buf();
+        for depth in 0..12 {
+            nested.push(format!("level-{depth}"));
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = find_ancestor_path(&nested, "marker.txt");
+        assert_eq!(result, Some(dir.path().join("marker.txt")));
     }
 
     #[test]

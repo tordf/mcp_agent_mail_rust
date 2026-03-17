@@ -471,20 +471,16 @@ fn git_remote_url(dir: &Path) -> Option<String> {
 
 /// Find an ancestor path containing the given name.
 fn find_ancestor_path(start: &Path, name: &str) -> Option<PathBuf> {
-    let mut current = if start.is_file() {
-        start.parent()?.to_path_buf()
+    let search_root = if start.is_file() {
+        start.parent()?
     } else {
-        start.to_path_buf()
+        start
     };
 
-    for _ in 0..10 {
+    for current in search_root.ancestors() {
         let candidate = current.join(name);
         if candidate.exists() {
             return Some(candidate);
-        }
-        match current.parent() {
-            Some(p) if p != current => current = p.to_path_buf(),
-            _ => break,
         }
     }
     None
@@ -646,6 +642,23 @@ mod tests {
 
         let found = find_ancestor_path(&source_file, "wrangler.toml")
             .expect("expected ancestor path from file parent");
+        assert_eq!(found, marker);
+    }
+
+    #[test]
+    fn find_ancestor_path_walks_past_ten_levels() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("wrangler.toml");
+        std::fs::write(&marker, "name = \"demo\"").expect("write marker");
+
+        let mut nested = dir.path().to_path_buf();
+        for depth in 0..12 {
+            nested.push(format!("level-{depth}"));
+        }
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+
+        let found =
+            find_ancestor_path(&nested, "wrangler.toml").expect("expected deep ancestor path");
         assert_eq!(found, marker);
     }
 
