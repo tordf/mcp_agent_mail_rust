@@ -3910,24 +3910,10 @@ mod fresh_eyes_regression_tests {
         let project_id = project.id.expect("project id");
 
         let sender = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project_id,
-            "RedFox",
-            "test",
-            "test",
-            None,
-            None,
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
         )));
         let blue = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project_id,
-            "BlueLake",
-            "test",
-            "test",
-            None,
-            None,
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
         )));
         let green = outcome_ok(block_on(queries::register_agent(
             &cx,
@@ -4132,14 +4118,7 @@ mod fresh_eyes_regression_tests {
         let project_id = project.id.expect("project id");
 
         let sender = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project_id,
-            "RedFox",
-            "test",
-            "test",
-            None,
-            None,
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
         )));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,

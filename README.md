@@ -13,7 +13,7 @@
 
 > "It's like Gmail for your coding agents!"
 
-A mail-like coordination layer for AI coding agents, exposed as an MCP server with 34 tools and 20+ resources, Git-backed archive, SQLite indexing, and an interactive 15-screen TUI operations console. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
+A mail-like coordination layer for AI coding agents, exposed as an MCP server with 36 tools and 33 resources, Git-backed archive, SQLite indexing, an interactive 15-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
 
 **Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
 
@@ -42,7 +42,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Quick Start](#quick-start)
 - [Agent Configuration](#agent-configuration)
 - [Server Modes](#server-modes)
-- [The 34 MCP Tools](#the-34-mcp-tools)
+- [Operator CLI Surface](#operator-cli-surface)
+- [The 36 MCP Tools](#the-36-mcp-tools)
 - [TUI Operations Console](#tui-operations-console)
 - [Robot Mode (`am robot`)](#robot-mode-am-robot)
 - [File Reservations](#file-reservations-for-multi-agent-editing)
@@ -52,12 +53,20 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Deployment Validation](#deployment-validation)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
+- [Core Data Model](#core-data-model)
+- [How the System Works](#how-the-system-works)
+- [Search Architecture](#search-architecture)
+- [Coordination Algorithms and Safety Invariants](#coordination-algorithms-and-safety-invariants)
+- [Consistency and Recovery Model](#consistency-and-recovery-model)
 - [Comparison vs. Alternatives](#comparison-vs-alternatives)
 - [Development](#development)
+- [Performance and Benchmarking](#performance-and-benchmarking)
 - [Mailbox Diagnostics (`am doctor`)](#mailbox-diagnostics-am-doctor)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
 - [FAQ](#faq)
+- [Appendix: Protocol Transcript](#appendix-protocol-transcript)
+- [Appendix: TUI vs. Web vs. Robot](#appendix-tui-vs-web-vs-robot)
 - [Documentation](#documentation)
 - [About Contributions](#about-contributions)
 - [License](#license)
@@ -77,9 +86,11 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Advisory File Reservations** | Agents declare exclusive or shared leases on file globs before editing, preventing conflicts with a pre-commit guard |
 | **Asynchronous Messaging** | Threaded inbox/outbox with subjects, CC/BCC, acknowledgments, and importance levels |
 | **Token-Efficient** | Messages stored in a per-project archive, not in agent context windows |
-| **34 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
-| **11-Screen TUI** | Real-time dashboard, message browser, thread view, agent roster, search, reservations, metrics, health, timeline, projects, and contacts |
-| **Robot Mode** | 16 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
+| **33 MCP Resources** | Read-only inbox, thread, reservation, tooling, identity, and attention views for cheap lookups |
+| **36 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
+| **15-Screen TUI** | Live operator cockpit for messages, threads, agents, search, reservations, metrics, health, analytics, attachments, and archive browsing |
+| **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
+| **Robot Mode** | 17 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
 | **Hybrid Search** | Search V3 via frankensearch with lexical, semantic, and hybrid routing |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
@@ -94,11 +105,11 @@ am
 # That's it. Server starts on 127.0.0.1:8765 with the interactive TUI.
 
 # Agents coordinate through MCP tools:
-#   ensure_project(project_key="/abs/path")
-#   register_agent(project_key, program="claude-code", model="opus-4.6")
-#   file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)
-#   send_message(project_key, from_agent, to_agent, subject="Starting refactor", thread_id="FEAT-123")
-#   fetch_inbox(project_key, agent_name)
+#   ensure_project(human_key="/abs/path")
+#   register_agent(project_key="/abs/path", program="claude-code", model="opus-4.6")
+#   file_reservation_paths(project_key="/abs/path", agent_name="BlueLake", paths=["src/**"], ttl_seconds=3600, exclusive=true)
+#   send_message(project_key="/abs/path", sender_name="BlueLake", to=["GreenCastle"], subject="Starting refactor", body_md="Taking src/**", thread_id="FEAT-123")
+#   fetch_inbox(project_key="/abs/path", agent_name="BlueLake")
 
 # Or use the robot CLI for non-interactive agent workflows:
 am robot status --project /abs/path --agent BlueLake
@@ -167,7 +178,7 @@ Agent Mail was the first open-source agent coordination system that works across
 
 **No "broadcast to all" mode.** Agents are lazy and will default to broadcasting everything to everyone if you let them. That's like your email system at work defaulting to reply-all every time; it spams every agent with mostly irrelevant information and burns precious context.
 
-**Obsessively refined API ergonomics.** Bad MCP documentation and poor agent ergonomics are the silent killers. It takes a huge amount of careful iteration, observation, and refinement to get the balance so tools just work reliably without wasting tokens. Agent Mail's 34 tool definitions have been through hundreds of rounds of real-world tuning.
+**Obsessively refined API ergonomics.** Bad MCP documentation and poor agent ergonomics are the silent killers. It takes a huge amount of careful iteration, observation, and refinement to get the balance so tools just work reliably without wasting tokens. Agent Mail's 36 tool definitions have been through hundreds of rounds of real-world tuning.
 
 **No git worktrees.** Worktrees demolish development velocity and create debt you need to pay later when the agents diverge. Working in one shared space surfaces conflicts immediately so you can deal with them, which is easy when agents can communicate. Instead of isolating agents, Agent Mail coordinates them.
 
@@ -182,7 +193,7 @@ Agent Mail was the first open-source agent coordination system that works across
 - **Prevents conflicts:** Explicit file reservations (leases) for files/globs prevent agents from overwriting each other
 - **Eliminates human liaisons:** Agents send messages directly to each other with threaded conversations, acknowledgments, and priority levels
 - **Keeps communication off the token budget:** Messages stored in per-project Git archive, not consuming agent context windows
-- **Offers quick reads:** `resource://inbox/{Agent}`, `resource://thread/{id}`, and 20+ other MCP resources
+- **Offers quick reads:** `resource://inbox/{Agent}`, `resource://thread/{id}`, and 31 other MCP resources
 - **Provides full audit trails:** Every instruction, lease, message, and attachment is in Git for human review
 - **Scales across repos:** Frontend and backend agents in different repos coordinate through the product bus and contact system
 
@@ -306,7 +317,7 @@ cargo build --release
 # Binaries at target/release/mcp-agent-mail and target/release/am
 ```
 
-Requires Rust nightly (see `rust-toolchain.toml`). Also requires sibling workspace crates: `fastmcp_rust`, `sqlmodel_rust`, `asupersync`, `frankentui`, `beads_rust`, `frankensearch`, `toon_rust`.
+Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect the locally patched sibling projects used by the workspace: `../asupersync`, `../sqlmodel_rust`, `../frankensqlite`, `../frankentui`, and `../frankensearch`. `fastmcp-rust`, `beads_rust`, and `toon` are normal Cargo dependencies, not local path requirements.
 
 ### Platforms
 
@@ -336,35 +347,40 @@ Once the server is running, agents use MCP tools to coordinate:
 
 ```
 # Register identity
-ensure_project(project_key="/abs/path/to/repo")
-register_agent(project_key, program="claude-code", model="opus-4.6")
+ensure_project(human_key="/abs/path/to/repo")
+register_agent(project_key="/abs/path/to/repo", program="claude-code", model="opus-4.6")
 
 # Reserve files before editing
-file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)
+file_reservation_paths(project_key="/abs/path/to/repo", agent_name="GreenCastle", paths=["src/**"], ttl_seconds=3600, exclusive=true)
 
 # Send a message
-send_message(project_key, from_agent="GreenCastle", to_agent="BlueLake",
-             subject="Starting auth refactor", thread_id="FEAT-123", ack_required=true)
+send_message(project_key="/abs/path/to/repo", sender_name="GreenCastle", to=["BlueLake"],
+             subject="Starting auth refactor", body_md="Taking src/auth/**",
+             thread_id="FEAT-123", ack_required=true)
 
 # Check inbox
-fetch_inbox(project_key, agent_name)
-acknowledge_message(project_key, agent_name, message_id)
+fetch_inbox(project_key="/abs/path/to/repo", agent_name="BlueLake")
+acknowledge_message(project_key="/abs/path/to/repo", agent_name="BlueLake", message_id=123)
 ```
 
 ### 3. Use macros for common flows
 
 ```
-# Boot a full session (register + discover inbox + check reservations)
-macro_start_session(project_key, program, model)
+# Boot a full session (ensure project + register agent + reserve files + fetch inbox)
+macro_start_session(human_key="/abs/path/to/repo", program="claude-code", model="opus-4.6")
 
 # Prepare for a thread (fetch context + recent messages)
-macro_prepare_thread(project_key, agent_name, thread_id)
+macro_prepare_thread(project_key="/abs/path/to/repo", thread_id="FEAT-123",
+                     program="claude-code", model="opus-4.6")
 
 # Reserve, work, release cycle
 macro_file_reservation_cycle(project_key, agent_name, paths, ttl_seconds)
 
 # Contact handshake between agents in different projects
-macro_contact_handshake(from_project, from_agent, to_project, to_agent)
+macro_contact_handshake(project_key="/abs/path/to/repo", requester="GreenCastle",
+                        target="BlueLake", to_project="/abs/path/to/other/repo",
+                        auto_accept=true, welcome_subject="Coordination channel",
+                        welcome_body="Use thread FEAT-123 for the cutover")
 ```
 
 ---
@@ -472,14 +488,60 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 
 ---
 
-## The 34 MCP Tools
+## Operator CLI Surface
+
+`am` is more than a launcher. It is the operator surface for runtime control, diagnostics, migration, exports, benchmarking, and agent-facing non-interactive workflows. In non-interactive contexts, bare `am` automatically falls back to robot output instead of trying to launch a blocking TUI.
+
+### Command Families
+
+| Surface | Subcommands / form | What it is for |
+|---------|--------------------|----------------|
+| Runtime | `serve-http`, `serve-stdio`, `service install|status|logs|restart`, `check-inbox` | Start the server, run stdio MCP, manage a background service, or poll inbox state from hooks/editors |
+| Quality gates | `ci`, `lint`, `typecheck`, `bench` | Run the native quality pipeline and capture CLI/perf baselines |
+| E2E and determinism | `e2e list|run|show`, `golden capture|verify|list`, `flake-triage scan|reproduce|detect` | Test transports and workflows, guard CLI output contracts, and triage flaky failures |
+| Share and deploy | `share export|update|preview|verify|decrypt|wizard|static-export`, `share deploy validate|tooling|verify|verify-live` | Build portable mailbox bundles, preview them, and validate live static deployments |
+| Archive and recovery | `archive save|list|restore`, `doctor check|repair|backups|restore|reconstruct|fix` | Snapshot mailbox state, restore it, or repair/rebuild SQLite from the Git archive |
+| Coordination data | `agents ...`, `mail ...`, `contacts ...`, `macros ...`, `file_reservations ...`, `acks ...`, `list-acks` | Operate directly on the same concepts the MCP tools expose |
+| Project and product routing | `projects ...`, `products ...`, `list-projects`, `beads ...` | Manage project identity, cross-project product groupings, and task-tracker views |
+| Platform and setup | `setup run|status`, `config set-port|show-port`, `amctl env`, `tooling ...`, `docs insert-blurbs` | Bootstrap connectors, inspect runtime config, introspect tool schemas/metrics/locks, and stamp docs |
+| Migration and lifecycle | `legacy detect|import|status`, `upgrade`, `migrate`, `self-update`, `am-run`, `guard ...` | Migrate Python installs, perform DB-format upgrades, run slot-aware build commands, and manage guard hooks |
+| Break-glass admin | `clear-and-reset-everything` | Fully reset local state after optional archival. Use sparingly. |
+
+### Family Detail
+
+| Family | Current subcommands / modes |
+|--------|------------------------------|
+| `share` | `export`, `update`, `preview`, `verify`, `decrypt`, `wizard`, `static-export`, `deploy validate`, `deploy tooling`, `deploy verify`, `deploy verify-live` |
+| `archive` | `save`, `list`, `restore` |
+| `guard` | `install`, `uninstall`, `status`, `check` |
+| `file_reservations` | `list`, `active`, `soon`, `reserve`, `renew`, `release`, `conflicts` |
+| `acks` | `pending`, `remind`, `overdue` |
+| `projects` | `mark-identity`, `discovery-init`, `adopt` |
+| `mail` | `status`, `send`, `reply`, `inbox`, `read`, `ack`, `search`, `summarize-thread` |
+| `products` | `ensure`, `link`, `status`, `search`, `inbox`, `summarize-thread` |
+| `doctor` | `check`, `repair`, `backups`, `restore`, `reconstruct`, `fix` |
+| `agents` | `register`, `create`, `list`, `show`, `detect` |
+| `tooling` | `directory`, `schemas`, `metrics`, `metrics-core`, `diagnostics`, `locks`, `decommission-fts` |
+| `macros` | `start-session`, `prepare-thread`, `file-reservation-cycle`, `contact-handshake` |
+| `contacts` | `request`, `respond`, `list`, `policy` |
+| `beads` | `ready`, `list`, `show`, `status` |
+| `setup` | `run`, `status` |
+| `golden` | `capture`, `verify`, `list` |
+| `flake-triage` | `scan`, `reproduce`, `detect` |
+| `robot` | `status`, `inbox`, `timeline`, `overview`, `thread`, `search`, `message`, `navigate`, `reservations`, `metrics`, `health`, `analytics`, `agents`, `contacts`, `projects`, `attachments`, `atc` |
+| `legacy` | `detect`, `import`, `status` |
+| `service` | `install`, `uninstall`, `status`, `logs`, `restart` |
+
+---
+
+## The 36 MCP Tools
 
 ### 9 Clusters
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
-| Infrastructure | 4 | `health_check`, `ensure_project`, `ensure_product`, `products_link` |
-| Identity | 3 | `register_agent`, `create_agent_identity`, `whois` |
+| Infrastructure | 4 | `health_check`, `ensure_project`, `install_precommit_guard`, `uninstall_precommit_guard` |
+| Identity | 5 | `register_agent`, `create_agent_identity`, `whois`, `resolve_pane_identity`, `cleanup_pane_identities` |
 | Messaging | 5 | `send_message`, `reply_message`, `fetch_inbox`, `acknowledge_message`, `mark_message_read` |
 | Contacts | 4 | `request_contact`, `respond_contact`, `list_contacts`, `set_contact_policy` |
 | File Reservations | 4 | `file_reservation_paths`, `renew_file_reservations`, `release_file_reservations`, `force_release_file_reservation` |
@@ -488,17 +550,19 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Product Bus | 5 | `ensure_product`, `products_link`, `search_messages_product`, `fetch_inbox_product`, `summarize_thread_product` |
 | Build Slots | 3 | `acquire_build_slot`, `renew_build_slot`, `release_build_slot` |
 
-### 20+ MCP Resources
+### 33 MCP Resources
 
-Read-only resources for fast lookups without tool calls:
+Read-only resources span environment/config inspection, project and agent discovery, inbox and thread views, reservation views, and tooling diagnostics. They are there so agents can fetch state cheaply without mutating anything.
 
 ```
 resource://inbox/{Agent}?project=<abs-path>&limit=20
 resource://thread/{id}?project=<abs-path>&include_bodies=true
+resource://mailbox/{Agent}?project=<abs-path>
+resource://views/ack-overdue/{Agent}?project=<abs-path>
 resource://agents?project=<abs-path>
-resource://reservations?project=<abs-path>
-resource://metrics
-resource://health
+resource://file_reservations?project=<abs-path>
+resource://tooling/metrics
+resource://config/environment
 ```
 
 ### Macros vs. Granular Tools
@@ -545,7 +609,7 @@ Archive Browser note: use `Enter` to expand/preview, `Tab` to switch tree vs pre
 
 Non-interactive, agent-first CLI surface for TUI-equivalent situational awareness. Use it when you need structured snapshots quickly, especially in automated loops and when tokens matter.
 
-### 16 Subcommands
+### 17 Subcommands
 
 | Command | Purpose | Key flags |
 |---------|---------|-----------|
@@ -565,12 +629,15 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
 | `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
 | `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
+| `am robot atc` | Lightweight ATC availability and requested-subsystem snapshot | `--decisions`, `--liveness`, `--conflicts`, `--summary`, `--limit` |
 
 ### Output Formats
 
 - **`toon`** (default at TTY): Token-efficient, compact, optimized for agent parsing
 - **`json`** (default when piped): Machine-readable envelope with `_meta`, `_alerts`, `_actions`
 - **`md`** (thread/message-focused): Human-readable narrative for deep context
+
+`am robot atc` is intentionally lightweight today. The ATC engine runs inside the server process, so the robot CLI reports availability and intent flags, while the live TUI/System Health surface remains the authoritative UI for current ATC state.
 
 ### Agent Workflow Recipes
 
@@ -624,11 +691,11 @@ sequenceDiagram
     participant S as Agent Mail Server
     participant B as Agent B (BlueLake)
 
-    A->>S: ensure_project("/abs/path")
-    A->>S: register_agent(program="claude-code")
+    A->>S: ensure_project(human_key="/abs/path")
+    A->>S: register_agent(project_key="/abs/path", program="claude-code")
     S-->>A: identity: GreenCastle
 
-    B->>S: register_agent(program="codex-cli")
+    B->>S: register_agent(project_key="/abs/path", program="codex-cli")
     S-->>B: identity: BlueLake
 
     A->>S: file_reservation_paths(["src/auth/**"], exclusive=true)
@@ -640,7 +707,7 @@ sequenceDiagram
     B->>S: file_reservation_paths(["tests/api/**"], exclusive=true)
     S-->>B: reserved ✓
 
-    A->>S: send_message(to=BlueLake, thread="FEAT-123", ack_required=true)
+    A->>S: send_message(to=["BlueLake"], thread_id="FEAT-123", ack_required=true)
     S-->>B: new message in inbox
 
     B->>S: fetch_inbox()
@@ -655,8 +722,8 @@ sequenceDiagram
 
 ### Same Repository
 
-1. **Register identity:** `ensure_project` + `register_agent` using the repo's absolute path as `project_key`
-2. **Reserve files before editing:** `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)`
+1. **Register identity:** `ensure_project(human_key=<abs-path>)` + `register_agent(project_key=<abs-path>, ...)`
+2. **Reserve files before editing:** `file_reservation_paths(project_key, agent_name, paths=["src/**"], ttl_seconds=3600, exclusive=true)`
 3. **Communicate with threads:** `send_message(..., thread_id="FEAT-123")`, check with `fetch_inbox`, acknowledge with `acknowledge_message`
 4. **Quick reads:** `resource://inbox/{Agent}?project=<abs-path>&limit=20`
 
@@ -712,13 +779,19 @@ The server includes a lightweight, server-rendered web UI for humans at `/mail/`
 
 | Route | What You See |
 |-------|-------------|
-| `/mail/` | Unified inbox across all projects, project list, related project suggestions |
-| `/mail/{project}` | Project overview with search, agent roster, quick links to reservations and attachments |
-| `/mail/{project}/inbox/{agent}` | Reverse-chronological inbox for one agent with pagination |
-| `/mail/{project}/message/{id}` | Full message detail with metadata, thread context, and attachments |
+| `/mail/` and `/mail/unified-inbox` | Unified inbox across all projects with importance filtering and related-project context |
+| `/mail/projects` | Project inventory page for browsing into one mailbox at a time |
+| `/mail/{project}` | Project overview with search entry point, agent roster, and quick links |
+| `/mail/{project}/inbox/{agent}` | Reverse-chronological inbox for one agent with pagination and mark-read actions |
+| `/mail/{project}/message/{id}` | Full message detail with metadata, recipients, thread preview, and attachments |
+| `/mail/{project}/thread/{thread_id}` | Full thread rendering with chronological conversation context |
 | `/mail/{project}/search?q=...` | Search V3-powered query route with field filters (`subject:foo`, `body:"multi word"`) |
 | `/mail/{project}/file_reservations` | Active and historical file reservations |
-| `/mail/{project}/attachments` | Messages with attachments |
+| `/mail/{project}/attachments` | Messages with attachments and provenance |
+| `/mail/{project}/overseer/compose` | Human compose form for pushing high-priority instructions to agents |
+| `/mail/api/unified-inbox` | JSON feed backing the unified inbox |
+| `/mail/api/projects/{project}/agents` | JSON roster for one project |
+| `/mail/archive/*` | Archive browser and time-travel routes |
 
 Auth: set `HTTP_BEARER_TOKEN` for production. For local dev, set `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` to browse without headers.
 
@@ -797,21 +870,28 @@ For operations guidance and troubleshooting, see [docs/OPERATOR_RUNBOOK.md](docs
 Cargo workspace with strict dependency layering:
 
 ```text
-MCP Client (agent) ──── stdio/HTTP ────► mcp-agent-mail-server
-                                              │
-                                    ┌─────────┼─────────┐
-                                    ▼         ▼         ▼
-                               34 Tools   20+ Resources  TUI
-                                    │         │
-                              mcp-agent-mail-tools
-                                    │
-                         ┌──────────┼──────────┐
-                         ▼          ▼          ▼
-                    mcp-agent-mail-db   mcp-agent-mail-storage
-                    (SQLite index)      (Git archive)
-                         │
-                    mcp-agent-mail-core
-                    (config, models, errors, metrics)
+MCP Client / Operator / Browser
+   │           │           │
+   ├─ stdio ───┤           │
+   ├─ HTTP  ───┼───────────┤
+   ▼           ▼           ▼
+             mcp-agent-mail-server
+                     │
+        ┌────────────┼────────────┬─────────────┐
+        ▼            ▼            ▼             ▼
+   36 MCP Tools  33 Resources   TUI         Web UI
+        │            │            │             │
+        └────────────┴──────┬─────┴─────────────┘
+                            ▼
+                    mcp-agent-mail-tools
+                            │
+                 ┌──────────┼──────────┬──────────────┐
+                 ▼          ▼          ▼              ▼
+          mcp-agent-mail-db storage  search-core   share/export
+           (SQLite index)  (Git)     (query path)  (bundles/static)
+                 │
+           mcp-agent-mail-core
+      (config, models, errors, metrics)
 ```
 
 ### Workspace Structure
@@ -826,7 +906,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-search-core/         # Pluggable search traits
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 34 MCP tool implementations (9 clusters)
+│   ├── mcp-agent-mail-tools/               # 36 MCP tool implementations (9 clusters)
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (15 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode
@@ -866,10 +946,90 @@ mcp_agent_mail_rust/
 - **Async git commit coalescer** (write-behind queue) to avoid commit storms
 - **i64 microseconds** for all timestamps (no `chrono::NaiveDateTime` in storage layer)
 - **Search V3 via frankensearch** with lexical/semantic/hybrid routing and unified diagnostics
-- **Conformance testing** against the Python reference implementation (23 tools, 23+ resources)
+- **Conformance testing** against the Python reference implementation plus Rust-native extensions
 - **Advisory file reservations** with symmetric fnmatch, archive reading, and rename handling
 - **`#![forbid(unsafe_code)]`** across all crates
 - **asupersync exclusively** for all async operations (no Tokio, reqwest, hyper, or axum)
+
+---
+
+## Core Data Model
+
+| Type | Role |
+|------|------|
+| `Project` | Stable identity for one codebase, keyed by absolute path and slug |
+| `Product` | Cross-project grouping for search, inbox aggregation, and routing |
+| `Agent` | Registered worker identity with name, program, model, policy, and task metadata |
+| `Message` | Canonical envelope for subject, body, importance, thread, attachments, and recipients |
+| `Recipient` | Delivery metadata for `to`/`cc`/`bcc`, read state, and acknowledgement state |
+| `Thread` | Logical conversation identifier spanning replies and summaries |
+| `FileReservation` | Advisory lease over file paths/globs with TTL, exclusivity, and reason |
+| `BuildSlot` | Named lease used to serialize build-heavy work on a shared checkout |
+| `ToolMetrics` | Per-tool latency, error, and call-count telemetry used by TUI, CLI, and diagnostics |
+
+The important boundary is this: Git stores the durable human-auditable artifacts, while SQLite stores the queryable operational state. Every surface in the project is built around that split.
+
+---
+
+## How the System Works
+
+### Write Path
+
+1. An MCP tool call, CLI command, web overseer action, or guard hook enters the runtime.
+2. Inputs are normalized and validated against project identity, agent names, and policy constraints.
+3. The SQLite layer performs the indexed mutation: insert/update rows, enforce invariants, and emit IDs/timestamps.
+4. The storage layer writes canonical Markdown/JSON artifacts into the per-project archive.
+5. The commit coalescer batches archive updates so bursts of activity do not become commit storms.
+6. Metrics and event streams are updated so TUI, robot, and web surfaces all observe the same fresh state.
+
+### Read Path
+
+1. A resource read, robot command, TUI view, or web request asks for mailbox or tooling state.
+2. The server resolves scope: project, agent, product, thread, search query, or tooling view.
+3. For direct state, SQLite answers immediately. For search, Search V3 plans the query and executes the appropriate lexical, semantic, or hybrid route.
+4. The result is rendered as MCP JSON, robot `toon`/`json`/`md`, TUI widgets, or HTML under `/mail/`.
+
+This is why the project feels consistent across surfaces: they are not separate products. They are separate renderers over the same DB + archive + metrics pipeline.
+
+---
+
+## Search Architecture
+
+Search V3 is not an afterthought bolted onto mailbox rows. It is a dedicated query path with shared planning and diagnostics:
+
+- Queries are normalized, classified, and routed through a unified search service.
+- Lexical, semantic, and hybrid modes share the same top-level contract and diagnostics surface.
+- Candidate budgeting and fusion keep broad natural-language queries from exploding while preserving exact-match strength for identifiers and short phrases.
+- The same search path serves MCP tools, `am mail search`, `am robot search`, TUI search, and web UI search routes.
+- Legacy SQLite FTS artifacts still exist for migration hygiene and cleanup, but the current search architecture is the Search V3 path, not ad-hoc direct SQL fallback.
+
+The dedicated `mcp-agent-mail-search-core` crate exists specifically so search planning and backends can evolve without entangling the rest of the mailbox stack.
+
+---
+
+## Coordination Algorithms and Safety Invariants
+
+- **Explicit recipients only.** `send_message` keeps a `broadcast` field for schema compatibility, but `broadcast=true` is intentionally rejected so agents cannot spam every other agent by default.
+- **Project isolation first.** Agent names are only meaningful inside a project unless a contact link or product bus path explicitly bridges them.
+- **Symmetric reservation matching.** File reservation conflicts use symmetric glob overlap checks, so `src/**` conflicts with `src/lib.rs` in either direction.
+- **TTL instead of forever-locks.** Reservations and build slots expire, which makes the system robust to crashed or vanished agents.
+- **Wrong-surface denial.** MCP-only and CLI-only commands fail deterministically when invoked through the wrong entrypoint, reducing automation footguns.
+- **Idempotent session bootstrapping.** `ensure_project`, `register_agent`, and the session macros are designed so agents can safely retry startup without creating duplicate identity state.
+- **Contact approval as policy, not convention.** Cross-project messaging is gated by explicit contact workflows and per-agent contact policies.
+
+These are the design rules that let many agents share one checkout without immediately degenerating into chaos.
+
+---
+
+## Consistency and Recovery Model
+
+- **Git is the artifact ledger.** Canonical messages, inbox/outbox copies, reservation files, and agent profiles are all written as files under per-project archives.
+- **SQLite is the acceleration layer.** It makes inbox fetches, searches, summaries, views, and robot/TUI/web queries fast.
+- **Repair is not reconstruct.** `am doctor repair` is the in-place hygiene path. `am doctor reconstruct` is the archive-first rebuild path when SQLite is no longer trustworthy.
+- **Backups are first-class.** `archive save`, doctor backups, and restore flows all exist because operational recovery is part of the product, not a manual afterthought.
+- **Stale lock cleanup is expected.** Guard hooks, archive lock management, and doctor checks assume agents crash and processes die unexpectedly.
+
+The practical upshot is simple: if the fast layer gets sick, the durable layer can rebuild it.
 
 ---
 
@@ -948,8 +1108,8 @@ Verification checklist:
 | Crate | Purpose |
 |-------|---------|
 | `asupersync` | Structured async runtime (channels, sync, regions, HTTP, testing) |
-| `fastmcp_rust` | MCP protocol implementation (JSON-RPC, stdio, HTTP transport) |
-| `sqlmodel_rust` | SQLite ORM (schema, queries, migrations, pool) |
+| `fastmcp-rust` / `fastmcp` | MCP protocol implementation (JSON-RPC, stdio, HTTP transport) |
+| `sqlmodel_rust` / `sqlmodel` | SQLite ORM (schema, queries, migrations, pool) |
 | `frankentui` | TUI rendering (widgets, themes, accessibility, markdown, syntax highlighting) |
 | `frankensearch` | Hybrid search engine (lexical + semantic, two-tier fusion, reranking) |
 | `beads_rust` | Issue tracking integration |
@@ -957,9 +1117,86 @@ Verification checklist:
 
 ---
 
+## Performance and Benchmarking
+
+The repository carries both stress tests and reproducible benchmark baselines. The two serve different purposes:
+
+- **Stress suites** answer “does the system stay correct under ugly concurrency?”
+- **Bench suites** answer “how fast is the operator and mailbox path right now?”
+
+### Native `am bench`
+
+The native CLI benchmark runner is built around four categories in `crates/mcp-agent-mail-cli/src/bench.rs`:
+
+| Category | Built-in cases | What it measures |
+|----------|----------------|------------------|
+| Startup | `help` | Pure CLI startup and argument parsing |
+| Analysis | `lint`, `typecheck` | Cost of native quality commands |
+| Stub encoder | `stub_encode_1k`, `stub_encode_10k`, `stub_encode_100k` | Compact encoding subprocess path |
+| Operational | `mail_inbox`, `mail_send`, `mail_search`, `mail_threads`, `doctor_check`, `message_count`, `agents_list` | Real mailbox/operator workflows over a seeded DB |
+
+### Checked-In Baselines
+
+These numbers come from [`benches/BUDGETS.md`](benches/BUDGETS.md), which records dated benchmark baselines and budgets.
+
+#### CLI Operational Baselines (`am bench --quick`, 2026-02-09)
+
+| Command | Baseline mean | Budget |
+|---------|---------------|--------|
+| `am --help` | 4.2ms | < 10ms |
+| `am mail inbox` | 11.5ms | < 25ms |
+| `am mail inbox --include-bodies` | 11.7ms | < 25ms |
+| `am mail send` | 27.1ms | < 50ms |
+| `am doctor check` | 5.8ms | < 15ms |
+| `am list-projects` | 6.2ms | < 15ms |
+| `am lint` | 457ms | < 1000ms |
+| `am typecheck` | 399ms | < 800ms |
+
+#### Search V3 Tantivy Lexical Baselines (2026-02-18)
+
+| Corpus size | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 |
+|-------------|--------------|--------------|--------------|------------|
+| 1,000 messages | ~382µs | ~531µs | ~706µs | < 1.5ms |
+| 5,000 messages | ~622µs | ~800µs | ~1.1ms | < 5ms |
+| 15,000 messages | ~679µs | ~805µs | ~1.0ms | < 15ms |
+
+Index build throughput baseline from the same file is 7.5K docs/sec at 1K, 36K docs/sec at 5K, and 90K docs/sec at 15K, with roughly 89-107 bytes/doc of disk overhead.
+
+#### Archive Write Baselines (2026-02-08)
+
+| Operation | Baseline p50 | Baseline p95 | Budget p95 | Notes |
+|-----------|--------------|--------------|------------|-------|
+| Single message, no attachments | ~17.2ms | ~21.3ms | < 25ms | Healthy write path |
+| Single message, inline attachment | ~22.0ms | ~26.0ms | < 25ms | Slightly over budget |
+| Single message, file attachment | ~20.4ms | ~25.2ms | < 25ms | Marginal |
+| Batch 100 messages | ~930ms | ~1076ms | < 250ms | Still materially over budget |
+
+That last row matters. The README should not pretend every path is already perfect: the project measures what is fast, what is acceptable, and what still needs work.
+
+### Reproduction Commands
+
+```bash
+# Native CLI benchmark catalog
+am bench --list
+am bench --quick
+
+# Archive write path
+cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write
+
+# Search V3 lexical path
+cargo bench -p mcp-agent-mail-db --bench search_v3_bench
+
+# Load / soak validation
+cargo test -p mcp-agent-mail-db --test sustained_load -- --ignored --nocapture
+```
+
+Hardware, kernel, and build profile matter. Treat these as checked-in reference baselines, not universal promises.
+
+---
+
 ## Mailbox Diagnostics (`am doctor`)
 
-Over time, mailbox state can drift: stale locks from crashed processes, unresponsive local servers, MCP config skew, archive/SQLite divergence, orphaned rows, FTS index desync, or outright database corruption. The `doctor` command group detects these issues, explains what it found, and can now automatically apply the common fixes.
+Over time, mailbox state can drift: stale locks from crashed processes, unresponsive local servers, MCP config skew, archive/SQLite divergence, orphaned rows, legacy FTS/search-side schema drift, or outright database corruption. The `doctor` command group detects these issues, explains what it found, and can now automatically apply the common fixes.
 
 ```bash
 # Run diagnostics (fast, non-destructive)
@@ -993,10 +1230,10 @@ What `check` inspects:
 | Database file sanity | Missing/zero-byte files, malformed relative paths, corruption signatures, reopen probe failures |
 | Archive vs DB parity | Cases where Git-backed canonical mail artifacts are ahead of SQLite and a reconstruct is safer than repair |
 | Database integrity | `PRAGMA integrity_check`, foreign-key violations, orphaned recipient rows, missing core tables |
-| Search/index state | FTS table presence and rebuildability |
+| Search/index state | Legacy FTS artifact presence, rebuildability, and search-side schema hygiene |
 | Storage/runtime hygiene | Stale archive locks, WAL mode, expired reservations, writable storage root |
 
-`am doctor repair` is the in-place path: it creates a backup, cleans orphaned rows, rebuilds FTS, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
+`am doctor repair` is the in-place path: it creates a backup, cleans orphaned rows, rebuilds legacy FTS artifacts if they still exist, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
 
 ---
 
@@ -1004,7 +1241,7 @@ What `check` inspects:
 
 | Problem | Fix |
 |---------|-----|
-| `"from_agent not registered"` | Always `register_agent` in the correct `project_key` first |
+| `"sender or recipients not registered"` | Register the sender and verify all recipient names are registered in the target `project_key` |
 | `"FILE_RESERVATION_CONFLICT"` | Adjust patterns, wait for TTL expiry, or use non-exclusive reservation |
 | Auth errors with JWT | Include bearer token with matching `kid` in the request header |
 | Port 8765 already in use | `am serve-http --port 9000` or stop the existing server |
@@ -1018,7 +1255,7 @@ What `check` inspects:
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Local workspace dependencies.** Building from source requires sibling directories for `fastmcp_rust`, `sqlmodel_rust`, `asupersync`, `frankentui`, `frankensearch`, `beads_rust`, and `toon_rust`.
+- **Local patched dependencies.** Building from source expects local sibling checkouts for `asupersync`, `sqlmodel_rust`, `frankensqlite`, `frankentui`, and `frankensearch`.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
@@ -1050,6 +1287,162 @@ A: Use the Beads issue ID (e.g., `br-123`) as the Mail `thread_id`. Beads owns t
 
 ---
 
+## Appendix: Protocol Transcript
+
+This is what a realistic agent-to-agent coordination flow looks like on the wire. The point is not that agents memorize JSON-RPC; the point is that the system is explicit, auditable, and deterministic.
+
+### 1. Boot a session
+
+```json
+{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"macro_start_session","arguments":{
+  "human_key":"/data/projects/acme-api",
+  "program":"codex-cli",
+  "model":"gpt-5",
+  "agent_name":"BlueLake",
+  "task_description":"Auth refactor",
+  "file_reservation_paths":["src/auth/**"],
+  "file_reservation_reason":"br-123",
+  "inbox_limit":10
+}}}
+```
+
+Representative response shape:
+
+```json
+{
+  "project":{"slug":"data-projects-acme-api","human_key":"/data/projects/acme-api"},
+  "agent":{"name":"BlueLake","program":"codex-cli","model":"gpt-5"},
+  "file_reservations":{"granted":[{"path_pattern":"src/auth/**","exclusive":true}]},
+  "inbox":[]
+}
+```
+
+### 2. Notify another agent
+
+```json
+{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"send_message","arguments":{
+  "project_key":"/data/projects/acme-api",
+  "sender_name":"BlueLake",
+  "to":["GreenCastle"],
+  "subject":"[br-123] Starting auth refactor",
+  "body_md":"I have `src/auth/**` reserved. Please keep your edits in `src/http/**` for now.",
+  "thread_id":"br-123",
+  "ack_required":true,
+  "importance":"high"
+}}}
+```
+
+### 3. Peer fetches inbox and acknowledges
+
+```json
+{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"fetch_inbox","arguments":{
+  "project_key":"/data/projects/acme-api",
+  "agent_name":"GreenCastle",
+  "limit":20,
+  "include_bodies":true
+}}}
+```
+
+```json
+{"jsonrpc":"2.0","id":"4","method":"tools/call","params":{"name":"acknowledge_message","arguments":{
+  "project_key":"/data/projects/acme-api",
+  "agent_name":"GreenCastle",
+  "message_id":1482
+}}}
+```
+
+### 4. Reply in-thread
+
+```json
+{"jsonrpc":"2.0","id":"5","method":"tools/call","params":{"name":"reply_message","arguments":{
+  "project_key":"/data/projects/acme-api",
+  "message_id":1482,
+  "sender_name":"GreenCastle",
+  "body_md":"Understood. I am staying in `src/http/**`. Ping me before changing token parsing."
+}}}
+```
+
+### 5. Release the reservation when done
+
+```json
+{"jsonrpc":"2.0","id":"6","method":"tools/call","params":{"name":"release_file_reservations","arguments":{
+  "project_key":"/data/projects/acme-api",
+  "agent_name":"BlueLake",
+  "paths":["src/auth/**"]
+}}}
+```
+
+One deliberate non-feature is worth calling out here: `broadcast=true` on `send_message` is intentionally rejected. The system wants explicit routing, not default spam.
+
+---
+
+## Appendix: TUI vs. Web vs. Robot
+
+The project exposes the same underlying state through three different surfaces. They are optimized for different operators, not different data.
+
+| Surface | Best for | Output style |
+|---------|----------|--------------|
+| TUI | Live human operations and triage | Dense interactive cockpit |
+| Web UI | Browser-based review and overseer intervention | Server-rendered HTML routes under `/mail/` |
+| Robot CLI | Agent loops, hooks, and machine-readable snapshots | `toon`, `json`, and `md` |
+
+### Representative TUI Shape
+
+```text
+┌ Dashboard ───────────────────────────────────────────────────────────────┐
+│ unread: 12   urgent: 2   ack_overdue: 1   reservations: 5              │
+│ top threads: br-123, br-140, infra-cutover                             │
+│ anomalies: 2 acks overdue | 1 reservation expiring < 15m               │
+├ Screens ────────────────────────────────────────────────────────────────┤
+│ 1 Dashboard  2 Messages  3 Threads  4 Agents  5 Search  6 Reservations │
+│ 7 Tool Metrics  8 System Health  9 Timeline  0 Projects                │
+│ ! Contacts  @ Explorer  # Analytics  $ Attachments  % Archive Browser  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### Representative Web Shape
+
+```text
+/mail/
+  Unified Inbox
+  Filter: importance=high
+  Project: acme-api
+
+  [high][ack required] #1482  [br-123] Starting auth refactor
+  From: BlueLake   To: GreenCastle   Thread: br-123
+  Quick links: thread | attachments | project overview | reservations
+```
+
+### Representative Robot Shape
+
+```json
+{
+  "_meta": {
+    "command": "robot status",
+    "format": "json",
+    "project": "acme-api",
+    "agent": "BlueLake",
+    "version": "1.0"
+  },
+  "_alerts": [
+    {
+      "severity": "warn",
+      "summary": "2 acks overdue",
+      "action": "am robot inbox --ack-overdue"
+    }
+  ],
+  "_actions": [
+    "am robot reservations --conflicts"
+  ],
+  "health": { "status": "ok" },
+  "inbox_summary": { "total": 12, "urgent": 2, "ack_overdue": 1 }
+}
+```
+
+The reason the three surfaces coexist is pragmatic. Humans need a cockpit and a browser view. Agents need compact, deterministic snapshots. All three ride on the same mailbox state.
+
+---
+
 ## Ready-Made Blurb for Your AGENTS.md
 
 Add this to your project's `AGENTS.md` or `CLAUDE.md` to help agents use Agent Mail effectively:
@@ -1068,10 +1461,10 @@ Why it's useful
 - Offers quick reads (resource://inbox/..., resource://thread/...) and macros that bundle common flows.
 
 How to use effectively
-1) Register an identity: call ensure_project, then register_agent using this repo's
-   absolute path as project_key.
+1) Register an identity: call ensure_project with this repo's absolute path as
+   `human_key`, then call register_agent using that same absolute path as `project_key`.
 2) Reserve files before you edit: file_reservation_paths(project_key, agent_name,
-   ["src/**"], ttl_seconds=3600, exclusive=true)
+   paths=["src/**"], ttl_seconds=3600, exclusive=true)
 3) Communicate with threads: use send_message(..., thread_id="FEAT-123"); check inbox
    with fetch_inbox and acknowledge with acknowledge_message.
 4) Quick reads: resource://inbox/{Agent}?project=<abs-path>&limit=20
@@ -1083,7 +1476,7 @@ Macros vs granular tools
   fetch_inbox, acknowledge_message.
 
 Common pitfalls
-- "from_agent not registered": always register_agent in the correct project_key first.
+- "sender or recipients not registered": register the sender first and verify recipient names in the correct project_key.
 - "FILE_RESERVATION_CONFLICT": adjust patterns, wait for expiry, or use non-exclusive.
 ```
 
@@ -1096,9 +1489,14 @@ Common pitfalls
 | [OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md) | Deployment, troubleshooting, diagnostics |
 | [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | Dev setup, debugging, testing |
 | [MIGRATION_GUIDE.md](docs/MIGRATION_GUIDE.md) | Python to Rust migration |
+| [DUAL_MODE_ROLLOUT_PLAYBOOK.md](docs/DUAL_MODE_ROLLOUT_PLAYBOOK.md) | Operational rollout notes for the dual-mode interface |
 | [RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md](docs/RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md) | `am legacy` / `am upgrade` migration operations |
 | [RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) | Pre-release validation |
 | [ROLLOUT_PLAYBOOK.md](docs/ROLLOUT_PLAYBOOK.md) | Staged rollout strategy |
+| [SPEC-search-v3-query-contract.md](docs/SPEC-search-v3-query-contract.md) | Query grammar, filters, and Search V3 contract |
+| [SPEC-web-ui-parity-contract.md](docs/SPEC-web-ui-parity-contract.md) | Web UI parity and route contract |
+| [SPEC-verify-live-contract.md](docs/SPEC-verify-live-contract.md) | Static bundle live-verification rules |
+| [TUI_V2_CONTRACT.md](docs/TUI_V2_CONTRACT.md) | TUI surface contract and parity expectations |
 | [TEMPLATE_OLD_REPO_RUST_CUTOVER_PR_CHECKLIST.md](docs/TEMPLATE_OLD_REPO_RUST_CUTOVER_PR_CHECKLIST.md) | Canonical old-repo cutover PR checklist |
 | [TEMPLATE_OLD_REPO_RUST_CUTOVER_RELEASE_NOTES.md](docs/TEMPLATE_OLD_REPO_RUST_CUTOVER_RELEASE_NOTES.md) | Release-notes template for Rust cutover |
 | [ADR-001](docs/ADR-001-dual-mode-invariants.md) | Dual-mode interface design |

@@ -827,8 +827,11 @@ fn run_fixtures_against_rust_server_router() {
             content.trim_start().starts_with("---json"),
             "message {msg_rel} must start with ---json frontmatter marker"
         );
-        let fm = parse_frontmatter(&content).expect("message {msg_rel} has no valid ---json frontmatter");
-        let fm_obj = fm.as_object().unwrap_or_else(|| panic!("{msg_rel} frontmatter is not a JSON object"));
+        let fm = parse_frontmatter(&content)
+            .expect("message {msg_rel} has no valid ---json frontmatter");
+        let fm_obj = fm
+            .as_object()
+            .unwrap_or_else(|| panic!("{msg_rel} frontmatter is not a JSON object"));
 
         for field in &required_fm_fields {
             assert!(

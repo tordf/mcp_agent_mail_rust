@@ -3050,8 +3050,10 @@ mod tests {
 
         // Create a healthy DB as a backup.
         let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)").unwrap();
-        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')").unwrap();
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
+            .unwrap();
         drop(conn);
         let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
         let _ = std::fs::remove_file(format!("{}-shm", primary.display()));

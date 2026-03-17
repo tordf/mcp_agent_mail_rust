@@ -1195,7 +1195,11 @@ mod tests {
         let bridge = setup_bridge_with_docs();
         let query = PlannerQuery::messages("", 1);
         let results = bridge.search(&query);
-        assert_eq!(results.len(), 2, "Empty query with project filter should return all project documents");
+        assert_eq!(
+            results.len(),
+            2,
+            "Empty query with project filter should return all project documents"
+        );
     }
 
     #[test]

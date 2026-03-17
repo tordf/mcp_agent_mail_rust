@@ -18999,9 +18999,13 @@ command = "mcp-agent-mail"
             .unwrap_or_else(|err| err.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CwdGuard::chdir(dir.path());
-        
+
         // Skip this test if 'am' is not in PATH, as handle_bench relies on invoking the CLI binary.
-        if std::process::Command::new("am").arg("--version").output().is_err() {
+        if std::process::Command::new("am")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             println!("Skipping handle_bench test because 'am' binary is not in PATH");
             return;
         }

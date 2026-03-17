@@ -147,7 +147,16 @@ const MODEL_PRIORITY: &[(&str, &str)] = &[
 const DEFAULT_MODEL: &str = "gpt-5.4";
 
 /// Aliases that trigger dynamic model selection.
-const AUTO_ALIASES: &[&str] = &["best", "auto", "gpt-5.4", "gpt5.4", "gpt-5-mini", "gpt-5m", "gpt-4o", "gpt4o"];
+const AUTO_ALIASES: &[&str] = &[
+    "best",
+    "auto",
+    "gpt-5.4",
+    "gpt5.4",
+    "gpt-5-mini",
+    "gpt-5m",
+    "gpt-4o",
+    "gpt4o",
+];
 
 /// Choose the best available model based on set API keys.
 ///
@@ -620,7 +629,9 @@ const ACTION_KEYWORDS: &[&str] = &["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"]
 
 fn contains_action_keyword(text: &str) -> bool {
     let upper = text.to_ascii_uppercase();
-    ACTION_KEYWORDS.iter().any(|keyword| upper.contains(keyword))
+    ACTION_KEYWORDS
+        .iter()
+        .any(|keyword| upper.contains(keyword))
 }
 
 fn normalize_action_point(text: &str) -> Option<String> {
@@ -1126,7 +1137,10 @@ mod tests {
 
     #[test]
     fn resolve_alias_passthrough() {
-        assert_eq!(resolve_model_alias("some-custom-model-id"), "some-custom-model-id");
+        assert_eq!(
+            resolve_model_alias("some-custom-model-id"),
+            "some-custom-model-id"
+        );
         assert_eq!(
             resolve_model_alias("claude-3-opus-20240229"),
             "claude-3-opus-20240229"
@@ -1183,8 +1197,7 @@ mod tests {
         env.insert("GOOGLE_API_KEY".to_string(), "test-google".to_string());
         drop(env);
 
-        let (_, _, openai_model) =
-            resolve_api_endpoint("openai/gpt-4o").expect("openai endpoint");
+        let (_, _, openai_model) = resolve_api_endpoint("openai/gpt-4o").expect("openai endpoint");
         assert_eq!(openai_model, "gpt-4o");
 
         let (_, _, anthropic_model) =
@@ -1321,11 +1334,7 @@ mod tests {
                 .key_points
                 .contains(&"TODO: deploy to staging".to_string())
         );
-        assert!(
-            merged
-                .key_points
-                .contains(&"TODO: update docs".to_string())
-        );
+        assert!(merged.key_points.contains(&"TODO: update docs".to_string()));
     }
 
     #[test]
