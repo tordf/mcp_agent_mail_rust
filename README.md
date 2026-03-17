@@ -776,9 +776,46 @@ curl -sS -X POST 'http://127.0.0.1:8765/mail/ws-input' \
 
 ---
 
+## Web Dashboard
+
+The server also exposes a browser TUI mirror at `/web-dashboard`.
+
+This is distinct from the server-rendered `/mail/*` web UI:
+
+- `/web-dashboard` mirrors the live terminal TUI into a browser canvas when a live TUI is active
+- `/web-dashboard/state` serves the browser dashboard state contract
+- `/web-dashboard/input` forwards browser keyboard input back to the live TUI
+
+### Runtime Modes
+
+The dashboard is intentionally explicit about which mode it is in:
+
+- `live`: the terminal TUI is active and browser mirroring is working
+- `warming`: the terminal TUI exists, but the first browser frame has not been captured yet
+- `inactive`: no live terminal TUI is attached, so the page falls back to passive server telemetry instead of pretending the mirror is available
+
+In `inactive` mode, the page remains useful: it shows passive request/event telemetry and links back into the main `/mail` web UI.
+
+### Browser Auth
+
+For browser access with bearer auth enabled, use the same query-token pattern as the `/mail` UI:
+
+```bash
+http://127.0.0.1:8765/web-dashboard?token=<HTTP_BEARER_TOKEN>
+```
+
+When loaded that way, the page automatically reuses the token for background polling and input POSTs. Unauthorized HTML requests to `/web-dashboard` return a remediation page; unauthorized JSON requests to `/web-dashboard/state` and `/web-dashboard/input` return JSON `401` responses.
+
+### Notes
+
+- Headless runs such as `mcp-agent-mail serve --no-tui` do not provide a live terminal mirror, so `/web-dashboard` will stay in `inactive` mode.
+- Polling requests for `/web-dashboard/state` are suppressed from the TUI event stream to avoid self-generated telemetry noise.
+
+---
+
 ## Web UI
 
-The server includes a lightweight, server-rendered web UI for humans at `/mail/`. Agents should continue using MCP tools and resources; the web UI is for human review and oversight.
+The server includes a lightweight, server-rendered web UI for humans at `/mail/`. Agents should continue using MCP tools and resources; the web UI is for human review and oversight. Use `/mail/*` for mailbox/task oversight and `/web-dashboard` for terminal-mirror situational awareness.
 
 ### Routes
 
