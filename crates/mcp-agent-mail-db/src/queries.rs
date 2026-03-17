@@ -22,9 +22,9 @@ use sqlmodel::prelude::*;
 use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
 use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
 use sqlmodel_query::{raw_execute, raw_query};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 fn cache_scope_for_pool(pool: &DbPool) -> String {
     pool.sqlite_identity_key()
@@ -5290,6 +5290,173 @@ pub async fn rebuild_all_inbox_stats(cx: &Cx, pool: &DbPool) -> Outcome<(), DbEr
 // FileReservation Queries
 // =============================================================================
 
+struct ReservationConflictIndex {
+    exact_by_path: BTreeMap<String, Vec<Arc<CompiledPattern>>>,
+    globs_by_prefix: BTreeMap<String, Vec<Arc<CompiledPattern>>>,
+    root_globs: Vec<Arc<CompiledPattern>>,
+}
+
+impl ReservationConflictIndex {
+    fn build(patterns: impl IntoIterator<Item = String>) -> Self {
+        let mut exact_by_path = BTreeMap::new();
+        let mut globs_by_prefix = BTreeMap::new();
+        let mut root_globs = Vec::new();
+
+        for raw_pattern in patterns {
+            let compiled = CompiledPattern::cached(&raw_pattern);
+            if !compiled.is_glob() {
+                exact_by_path
+                    .entry(compiled.normalized().to_owned())
+                    .or_insert_with(Vec::new)
+                    .push(compiled);
+            } else if let Some(prefix) = compiled.first_literal_segment() {
+                globs_by_prefix
+                    .entry(prefix.to_owned())
+                    .or_insert_with(Vec::new)
+                    .push(compiled);
+            } else {
+                root_globs.push(compiled);
+            }
+        }
+
+        Self {
+            exact_by_path,
+            globs_by_prefix,
+            root_globs,
+        }
+    }
+
+    fn first_conflict<'a>(&'a self, request_pat: &CompiledPattern) -> Option<&'a CompiledPattern> {
+        let req_norm = request_pat.normalized();
+        let req_prefix = request_pat.first_literal_segment();
+
+        let found = if request_pat.is_glob() {
+            self.first_glob_request_conflict(request_pat, req_prefix)
+        } else {
+            self.first_exact_request_conflict(request_pat, req_norm, req_prefix)
+        };
+
+        found.or_else(|| {
+            self.root_globs
+                .iter()
+                .find(|res_pat| res_pat.overlaps(request_pat))
+                .map(Arc::as_ref)
+        })
+    }
+
+    fn first_exact_request_conflict<'a>(
+        &'a self,
+        request_pat: &CompiledPattern,
+        req_norm: &str,
+        req_prefix: Option<&str>,
+    ) -> Option<&'a CompiledPattern> {
+        if let Some(exact) = self
+            .exact_by_path
+            .get(req_norm)
+            .and_then(|entries| entries.first())
+        {
+            return Some(exact.as_ref());
+        }
+
+        for slash_idx in req_norm.match_indices('/').map(|(idx, _)| idx) {
+            let ancestor = &req_norm[..slash_idx];
+            if let Some(exact) = self
+                .exact_by_path
+                .get(ancestor)
+                .and_then(|entries| entries.first())
+            {
+                return Some(exact.as_ref());
+            }
+        }
+
+        if let Some(descendant_prefix) = reservation_descendant_prefix(req_norm) {
+            for (path, entries) in self.exact_by_path.range(descendant_prefix.clone()..) {
+                if !path.starts_with(&descendant_prefix) {
+                    break;
+                }
+                if let Some(exact) = entries.first() {
+                    return Some(exact.as_ref());
+                }
+            }
+        }
+
+        if let Some(prefix) = req_prefix {
+            return self
+                .globs_by_prefix
+                .get(prefix)
+                .and_then(|entries| entries.iter().find(|pat| pat.overlaps(request_pat)))
+                .map(Arc::as_ref);
+        }
+
+        self.globs_by_prefix
+            .values()
+            .flat_map(|entries| entries.iter())
+            .find(|pat| pat.overlaps(request_pat))
+            .map(Arc::as_ref)
+    }
+
+    fn first_glob_request_conflict<'a>(
+        &'a self,
+        request_pat: &CompiledPattern,
+        req_prefix: Option<&str>,
+    ) -> Option<&'a CompiledPattern> {
+        if let Some(prefix) = req_prefix {
+            if let Some(exact) = self.exact_by_path.get(prefix).and_then(|entries| {
+                entries.iter().find(|exact_pat| {
+                    request_pat.matches(exact_pat.normalized()) || exact_pat.overlaps(request_pat)
+                })
+            }) {
+                return Some(exact.as_ref());
+            }
+
+            if let Some(descendant_prefix) = reservation_descendant_prefix(prefix) {
+                for (path, entries) in self.exact_by_path.range(descendant_prefix.clone()..) {
+                    if !path.starts_with(&descendant_prefix) {
+                        break;
+                    }
+                    if let Some(exact) = entries.iter().find(|exact_pat| {
+                        request_pat.matches(exact_pat.normalized())
+                            || exact_pat.overlaps(request_pat)
+                    }) {
+                        return Some(exact.as_ref());
+                    }
+                }
+            }
+
+            return self
+                .globs_by_prefix
+                .get(prefix)
+                .and_then(|entries| entries.iter().find(|pat| pat.overlaps(request_pat)))
+                .map(Arc::as_ref);
+        }
+
+        if let Some(exact) = self
+            .exact_by_path
+            .values()
+            .flat_map(|entries| entries.iter())
+            .find(|exact_pat| {
+                request_pat.matches(exact_pat.normalized()) || exact_pat.overlaps(request_pat)
+            })
+        {
+            return Some(exact.as_ref());
+        }
+
+        self.globs_by_prefix
+            .values()
+            .flat_map(|entries| entries.iter())
+            .find(|pat| pat.overlaps(request_pat))
+            .map(Arc::as_ref)
+    }
+}
+
+fn reservation_descendant_prefix(norm: &str) -> Option<String> {
+    if norm.is_empty() {
+        None
+    } else {
+        Some(format!("{norm}/"))
+    }
+}
+
 /// Create file reservations
 #[allow(clippy::too_many_arguments)]
 pub async fn create_file_reservations(
@@ -5342,24 +5509,21 @@ pub async fn create_file_reservations(
         map_sql_outcome(traw_query(cx, &tracked, &conflict_sql, &conflict_params).await)
     );
 
-    let mut active_patterns = Vec::with_capacity(active_rows.len());
-    for row in active_rows {
-        if let Ok(pat) = row.get_named::<String>("path_pattern") {
-            active_patterns.push(CompiledPattern::new(&pat));
-        }
-    }
+    let active_index = ReservationConflictIndex::build(
+        active_rows
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("path_pattern").ok()),
+    );
 
     for path in paths {
-        let req_pat = CompiledPattern::new(path);
-        for active_pat in &active_patterns {
-            if req_pat.overlaps(active_pat) {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::ResourceBusy(format!(
-                    "Reservation conflict: '{}' overlaps with active exclusive reservation '{}'",
-                    path,
-                    active_pat.normalized()
-                )));
-            }
+        let req_pat = CompiledPattern::cached(path);
+        if let Some(active_pat) = active_index.first_conflict(req_pat.as_ref()) {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::ResourceBusy(format!(
+                "Reservation conflict: '{}' overlaps with active exclusive reservation '{}'",
+                path,
+                active_pat.normalized()
+            )));
         }
     }
 
@@ -9132,6 +9296,182 @@ mod tests {
                     .into_result()
                     .expect("release exact id set");
             assert_eq!(released_ids, vec![second_id]);
+        });
+    }
+
+    #[test]
+    fn create_file_reservations_rejects_exact_request_that_hits_existing_glob() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("reservation_conflict_glob_to_exact.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-reservation-conflict-glob-to-exact-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register holder");
+            let holder_id = holder.id.expect("holder id");
+
+            let requester = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedHarbor",
+                "codex-cli",
+                "gpt-5",
+                Some("requester"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register requester");
+            let requester_id = requester.id.expect("requester id");
+
+            create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/**"],
+                3600,
+                true,
+                "holder",
+            )
+            .await
+            .into_result()
+            .expect("create holder reservation");
+
+            let err = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                requester_id,
+                &["src/main.rs"],
+                3600,
+                true,
+                "requester",
+            )
+            .await
+            .expect_err("exact request should conflict");
+
+            match err {
+                DbError::ResourceBusy(message) => {
+                    assert!(message.contains("src/main.rs"));
+                    assert!(message.contains("src/**"));
+                }
+                other => panic!("expected ResourceBusy, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn create_file_reservations_rejects_glob_request_that_hits_existing_exact_path() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("reservation_conflict_exact_to_glob.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-reservation-conflict-exact-to-glob-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register holder");
+            let holder_id = holder.id.expect("holder id");
+
+            let requester = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedHarbor",
+                "codex-cli",
+                "gpt-5",
+                Some("requester"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register requester");
+            let requester_id = requester.id.expect("requester id");
+
+            create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/main.rs"],
+                3600,
+                true,
+                "holder",
+            )
+            .await
+            .into_result()
+            .expect("create holder reservation");
+
+            let err = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                requester_id,
+                &["src/**"],
+                3600,
+                true,
+                "requester",
+            )
+            .await
+            .expect_err("glob request should conflict");
+
+            match err {
+                DbError::ResourceBusy(message) => {
+                    assert!(message.contains("src/**"));
+                    assert!(message.contains("src/main.rs"));
+                }
+                other => panic!("expected ResourceBusy, got {other:?}"),
+            }
         });
     }
 
