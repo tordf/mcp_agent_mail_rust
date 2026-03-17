@@ -1709,6 +1709,13 @@ struct ScheduledAgentReview {
     agent: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingLivenessFeedback {
+    action: LivenessAction,
+    expected_loss: f64,
+    issued_at_micros: i64,
+}
+
 /// Infer a reasonable inter-activity prior from program name.
 #[must_use]
 pub fn program_prior_interval_secs(program: &str) -> f64 {
@@ -1749,6 +1756,168 @@ pub struct ProjectConflictGraph {
     pub hard_edges: HashMap<String, Vec<HardEdge>>,
     /// Generation counter for incremental computation.
     pub generation: u64,
+}
+
+impl ProjectConflictGraph {
+    fn patterns_overlap(left: &str, right: &str) -> bool {
+        let left = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(left);
+        let right = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(right);
+        left.overlaps(&right)
+    }
+
+    fn is_wildcard_path_marker(path: &str) -> bool {
+        matches!(path, "<all-active>" | "<unknown>")
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    fn record_blocking_conflict(
+        &mut self,
+        holder: &str,
+        blocked: &str,
+        requested_path: &str,
+        holder_path_pattern: &str,
+        since: i64,
+    ) -> bool {
+        if holder.is_empty() || blocked.is_empty() || holder == blocked {
+            return false;
+        }
+
+        let edges = self.hard_edges.entry(holder.to_string()).or_default();
+        if let Some(edge) = edges.iter_mut().find(|edge| edge.blocked == blocked) {
+            let mut changed = false;
+            for pattern in [requested_path, holder_path_pattern] {
+                if !pattern.is_empty()
+                    && !edge
+                        .contested_patterns
+                        .iter()
+                        .any(|existing| existing == pattern)
+                {
+                    edge.contested_patterns.push(pattern.to_string());
+                    changed = true;
+                }
+            }
+            if since > 0 && (edge.since == 0 || since < edge.since) {
+                edge.since = since;
+                changed = true;
+            }
+            if changed {
+                edge.contested_patterns.sort();
+                edge.contested_patterns.dedup();
+                self.bump_generation();
+            }
+            return changed;
+        }
+
+        let mut contested_patterns = Vec::new();
+        for pattern in [requested_path, holder_path_pattern] {
+            if !pattern.is_empty() {
+                contested_patterns.push(pattern.to_string());
+            }
+        }
+        contested_patterns.sort();
+        contested_patterns.dedup();
+        edges.push(HardEdge {
+            holder: holder.to_string(),
+            blocked: blocked.to_string(),
+            contested_patterns,
+            since,
+        });
+        self.bump_generation();
+        true
+    }
+
+    fn clear_blocked_conflicts_for_grant(
+        &mut self,
+        blocked: &str,
+        granted_paths: &[String],
+    ) -> usize {
+        if blocked.is_empty() {
+            return 0;
+        }
+        let clear_all = granted_paths
+            .iter()
+            .any(|path| Self::is_wildcard_path_marker(path));
+        let mut removed = 0_usize;
+        self.hard_edges.retain(|_, edges| {
+            edges.retain_mut(|edge| {
+                if edge.blocked != blocked {
+                    return true;
+                }
+                if clear_all {
+                    removed = removed.saturating_add(1);
+                    return false;
+                }
+                let before = edge.contested_patterns.len();
+                edge.contested_patterns.retain(|pattern| {
+                    !granted_paths
+                        .iter()
+                        .any(|granted| Self::patterns_overlap(pattern, granted))
+                });
+                removed =
+                    removed.saturating_add(before.saturating_sub(edge.contested_patterns.len()));
+                !edge.contested_patterns.is_empty()
+            });
+            !edges.is_empty()
+        });
+        if removed > 0 {
+            self.bump_generation();
+        }
+        removed
+    }
+
+    fn clear_holder_conflicts_for_release(
+        &mut self,
+        holder: &str,
+        released_paths: &[String],
+    ) -> usize {
+        let Some(edges) = self.hard_edges.get_mut(holder) else {
+            return 0;
+        };
+        let clear_all = released_paths
+            .iter()
+            .any(|path| Self::is_wildcard_path_marker(path));
+        let mut removed = 0_usize;
+        edges.retain_mut(|edge| {
+            if clear_all {
+                removed = removed.saturating_add(edge.contested_patterns.len().max(1));
+                return false;
+            }
+            let before = edge.contested_patterns.len();
+            edge.contested_patterns.retain(|pattern| {
+                !released_paths
+                    .iter()
+                    .any(|released| Self::patterns_overlap(pattern, released))
+            });
+            removed = removed.saturating_add(before.saturating_sub(edge.contested_patterns.len()));
+            !edge.contested_patterns.is_empty()
+        });
+        let remove_holder = edges.is_empty();
+        if remove_holder {
+            let _ = edges;
+            self.hard_edges.remove(holder);
+        }
+        if removed > 0 {
+            self.bump_generation();
+        }
+        removed
+    }
+
+    fn prune_stale_edges(&mut self, cutoff_micros: i64) -> usize {
+        let mut removed = 0_usize;
+        self.hard_edges.retain(|_, edges| {
+            let before = edges.len();
+            edges.retain(|edge| edge.since == 0 || edge.since >= cutoff_micros);
+            removed = removed.saturating_add(before.saturating_sub(edges.len()));
+            !edges.is_empty()
+        });
+        if removed > 0 {
+            self.bump_generation();
+        }
+        removed
+    }
 }
 
 struct TarjanScc<'a> {
@@ -3632,6 +3801,10 @@ pub struct AtcEngine {
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
     /// Projects whose conflict state has changed since the last cached render.
     dirty_projects: HashSet<String>,
+    /// Monotone communication/session synthesis for operator summaries.
+    session_summary: SessionSummary,
+    /// Cross-thread participation graph for communication-aware coordination.
+    thread_participation: ThreadParticipationGraph,
     /// Cached deadlock SCCs by project.
     deadlock_cache: HashMap<String, DeadlockCacheEntry>,
     /// Total number of currently cached deadlock cycles across all projects.
@@ -3673,6 +3846,8 @@ pub struct AtcEngine {
     /// Last processed event sequence number (incremental computation).
     #[allow(dead_code)]
     last_event_seq: u64,
+    /// Outstanding liveness decisions awaiting eventual ground-truth feedback.
+    pending_liveness_feedback: HashMap<String, PendingLivenessFeedback>,
     /// Engine tick count.
     tick_count: u64,
 }
@@ -3757,6 +3932,8 @@ impl AtcEngine {
             dirty_agents: HashSet::new(),
             conflict_graphs: HashMap::new(),
             dirty_projects: HashSet::new(),
+            session_summary: SessionSummary::default(),
+            thread_participation: ThreadParticipationGraph::default(),
             deadlock_cache: HashMap::new(),
             deadlock_cycle_total: 0,
             deadlock_cache_hits: 0,
@@ -3780,6 +3957,7 @@ impl AtcEngine {
             last_budget_telemetry: AtcBudgetTelemetry::default(),
             last_policy_telemetry: AtcPolicyTelemetry::default(),
             last_event_seq: 0,
+            pending_liveness_feedback: HashMap::new(),
             tick_count: 0,
         }
     }
@@ -3858,6 +4036,297 @@ impl AtcEngine {
         self.agents
             .get(agent)
             .and_then(|entry| entry.project_key.clone())
+    }
+
+    fn conflict_edge_ttl_micros(&self) -> i64 {
+        self.config
+            .advisory_cooldown_micros
+            .max(self.config.probe_interval_micros.saturating_mul(4))
+            .max(60_000_000)
+    }
+
+    fn note_message_sent(
+        &mut self,
+        from: &str,
+        to: &[String],
+        thread_id: Option<&str>,
+        timestamp_micros: i64,
+    ) {
+        self.session_summary.absorb(&SynthesisEvent::MessageSent {
+            from: from.to_string(),
+            to: to.to_vec(),
+            thread_id: thread_id.map(str::to_string),
+            timestamp_micros,
+        });
+        if let Some(thread_id) =
+            thread_id.filter(|thread_id| !thread_id.is_empty() && *thread_id != "unthreaded")
+        {
+            self.thread_participation
+                .record_participation(from, thread_id);
+            for recipient in to {
+                self.thread_participation
+                    .record_participation(recipient, thread_id);
+            }
+        }
+    }
+
+    fn note_message_received(
+        &mut self,
+        agent: &str,
+        thread_id: Option<&str>,
+        timestamp_micros: i64,
+    ) {
+        self.session_summary
+            .absorb(&SynthesisEvent::MessageReceived {
+                agent: agent.to_string(),
+                timestamp_micros,
+            });
+        if let Some(thread_id) =
+            thread_id.filter(|thread_id| !thread_id.is_empty() && *thread_id != "unthreaded")
+        {
+            self.thread_participation
+                .record_participation(agent, thread_id);
+        }
+    }
+
+    fn note_reservation_granted(
+        &mut self,
+        agent: &str,
+        paths: &[String],
+        exclusive: bool,
+        project: &str,
+        timestamp_micros: i64,
+    ) {
+        self.session_summary
+            .absorb(&SynthesisEvent::ReservationGranted {
+                agent: agent.to_string(),
+                timestamp_micros,
+            });
+        if !exclusive || paths.is_empty() {
+            return;
+        }
+        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
+        if cleared > 0 {
+            self.dirty_projects.insert(project.to_string());
+            self.session_summary
+                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
+        }
+    }
+
+    fn note_reservation_released(
+        &mut self,
+        agent: &str,
+        paths: &[String],
+        project: &str,
+        timestamp_micros: i64,
+    ) {
+        self.session_summary
+            .absorb(&SynthesisEvent::ReservationReleased {
+                agent: agent.to_string(),
+                timestamp_micros,
+            });
+        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
+        if cleared > 0 {
+            self.dirty_projects.insert(project.to_string());
+            self.session_summary
+                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
+        }
+    }
+
+    fn note_reservation_conflicts(
+        &mut self,
+        requester: &str,
+        project: &str,
+        conflicts: &[(String, String, String)],
+        timestamp_micros: i64,
+    ) {
+        if requester.is_empty() || conflicts.is_empty() {
+            return;
+        }
+        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let mut added = false;
+        for (holder, requested_path, holder_path_pattern) in conflicts {
+            added |= graph.record_blocking_conflict(
+                holder,
+                requester,
+                requested_path,
+                holder_path_pattern,
+                timestamp_micros,
+            );
+        }
+        if added {
+            self.dirty_projects.insert(project.to_string());
+            self.session_summary
+                .absorb(&SynthesisEvent::ConflictDetected { timestamp_micros });
+        }
+    }
+
+    fn note_atc_intervention(&mut self, timestamp_micros: i64) {
+        self.session_summary
+            .absorb(&SynthesisEvent::AtcIntervention { timestamp_micros });
+    }
+
+    fn record_pending_liveness_feedback(
+        &mut self,
+        agent: &str,
+        action: LivenessAction,
+        expected_loss: f64,
+        issued_at_micros: i64,
+    ) {
+        if action == LivenessAction::DeclareAlive {
+            return;
+        }
+        self.pending_liveness_feedback.insert(
+            agent.to_string(),
+            PendingLivenessFeedback {
+                action,
+                expected_loss,
+                issued_at_micros,
+            },
+        );
+    }
+
+    fn apply_liveness_feedback(
+        &mut self,
+        agent: &str,
+        action: LivenessAction,
+        true_state: LivenessState,
+        predicted_loss: f64,
+        actual_loss: f64,
+        correct: bool,
+        timestamp_micros: i64,
+    ) {
+        self.eprocess
+            .update(correct, AtcSubsystem::Liveness, Some(agent));
+        self.cusum.update(!correct, timestamp_micros);
+
+        let ep_snapshot = self.eprocess.clone();
+        let cusum_snapshot = self.cusum.clone();
+        if self
+            .calibration
+            .update(&ep_snapshot, &cusum_snapshot, correct, timestamp_micros)
+        {
+            self.mark_agents_dirty();
+        }
+
+        if let Some(conformal_lock) = ATC_CONFORMAL.get()
+            && let Ok(mut conformal) = conformal_lock.lock()
+        {
+            conformal.observe(AtcSubsystem::Liveness, predicted_loss, actual_loss);
+        }
+
+        if let Some(thresholds_lock) = ATC_THRESHOLDS.get()
+            && let Ok(mut thresholds) = thresholds_lock.lock()
+            && let Some(adaptive) = thresholds.get_mut(agent)
+        {
+            adaptive.record_outcome(correct);
+        }
+
+        if let Some(tuner_lock) = ATC_LIVENESS_TUNER.get()
+            && let Ok(mut tuner) = tuner_lock.lock()
+        {
+            let regret = (predicted_loss - actual_loss).abs();
+            tuner.record_outcome(action, true_state, regret);
+            if tuner.maybe_update(&mut self.liveness_core) {
+                self.propagate_liveness_policy();
+            }
+        }
+
+        let silence = self
+            .agents
+            .get(agent)
+            .map_or(0, |entry| entry.rhythm.silence_duration(timestamp_micros));
+        if let Some(survival_lock) = ATC_SURVIVAL.get()
+            && let Ok(mut survival) = survival_lock.lock()
+        {
+            let estimator = survival
+                .entry("all".to_string())
+                .or_insert_with(|| KaplanMeierEstimator::new(1000));
+            estimator.observe(silence, true_state != LivenessState::Alive);
+        }
+    }
+
+    fn resolve_pending_feedback_on_activity(&mut self, agent: &str, timestamp_micros: i64) {
+        let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
+            return;
+        };
+        let (actual_loss, correct) = match pending.action {
+            LivenessAction::ReleaseReservations => (100.0, false),
+            LivenessAction::Suspect => (2.0, true),
+            LivenessAction::DeclareAlive => (0.0, true),
+        };
+        self.apply_liveness_feedback(
+            agent,
+            pending.action,
+            LivenessState::Alive,
+            pending.expected_loss,
+            actual_loss,
+            correct,
+            timestamp_micros,
+        );
+    }
+
+    fn resolve_stale_liveness_feedback(&mut self, now_micros: i64) {
+        let feedback_window_micros = self.config.probe_interval_micros.max(60_000_000);
+        let expired_agents: Vec<String> = self
+            .pending_liveness_feedback
+            .iter()
+            .filter_map(|(agent, pending)| {
+                (now_micros.saturating_sub(pending.issued_at_micros) >= feedback_window_micros)
+                    .then_some(agent.clone())
+            })
+            .collect();
+        for agent in expired_agents {
+            let Some(pending) = self.pending_liveness_feedback.remove(&agent) else {
+                continue;
+            };
+            let true_state = self
+                .agents
+                .get(&agent)
+                .map_or(LivenessState::Dead, |entry| entry.state);
+            let (actual_loss, correct) = match pending.action {
+                LivenessAction::ReleaseReservations => match true_state {
+                    LivenessState::Dead => (1.0, true),
+                    LivenessState::Flaky => (20.0, false),
+                    LivenessState::Alive => (100.0, false),
+                },
+                LivenessAction::Suspect => match true_state {
+                    LivenessState::Alive => (8.0, false),
+                    LivenessState::Flaky => (2.0, true),
+                    LivenessState::Dead => (6.0, true),
+                },
+                LivenessAction::DeclareAlive => (0.0, true),
+            };
+            self.apply_liveness_feedback(
+                &agent,
+                pending.action,
+                true_state,
+                pending.expected_loss,
+                actual_loss,
+                correct,
+                now_micros,
+            );
+        }
+    }
+
+    fn prune_stale_conflicts(&mut self, now_micros: i64) {
+        let cutoff = now_micros.saturating_sub(self.conflict_edge_ttl_micros());
+        let dirty_projects: Vec<String> = self.conflict_graphs.keys().cloned().collect();
+        for project in dirty_projects {
+            let removed = self
+                .conflict_graphs
+                .get_mut(&project)
+                .map_or(0, |graph| graph.prune_stale_edges(cutoff));
+            if removed > 0 {
+                self.dirty_projects.insert(project);
+                self.session_summary
+                    .absorb(&SynthesisEvent::ConflictResolved {
+                        timestamp_micros: now_micros,
+                    });
+            }
+        }
     }
 
     fn current_release_guard_reason(&self) -> Option<String> {
@@ -4184,6 +4653,7 @@ impl AtcEngine {
         if agent == ATC_AGENT_NAME {
             return;
         }
+        self.resolve_pending_feedback_on_activity(agent, timestamp_micros);
         let mut resurrected = false;
         if let Some(entry) = self.agents.get_mut(agent) {
             if let Some(project_key) = project_key.map(str::trim).filter(|value| !value.is_empty())
@@ -4379,6 +4849,7 @@ impl AtcEngine {
                 evaluation
                     .decision_metadata
                     .insert(subject.clone(), LivenessDecisionMetadata { decision_id });
+                self.record_pending_liveness_feedback(&subject, action, incumbent_loss, now_micros);
             }
 
             if let Some(action) = action_to_emit {
@@ -4535,6 +5006,8 @@ impl AtcEngine {
     fn run_tick(&mut self, now_micros: i64) -> AtcTickReport {
         let total_started = Instant::now();
         self.tick_count = self.tick_count.saturating_add(1);
+        self.resolve_stale_liveness_feedback(now_micros);
+        self.prune_stale_conflicts(now_micros);
 
         let decision_fallback_reason = self.current_release_guard_reason();
         let decision_fallback_active = decision_fallback_reason.is_some();
@@ -7875,6 +8348,122 @@ pub fn atc_observe_activity_with_project(
         return;
     }
     e.observe_activity(agent, project_key, timestamp_micros);
+}
+
+#[derive(Debug, Clone)]
+pub struct AtcConflictObservation {
+    pub holder: String,
+    pub requested_path: String,
+    pub holder_path_pattern: String,
+}
+
+pub fn atc_note_message_sent(
+    from: &str,
+    to: &[String],
+    thread_id: Option<&str>,
+    timestamp_micros: i64,
+) {
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    e.note_message_sent(from, to, thread_id, timestamp_micros);
+}
+
+pub fn atc_note_message_received(agent: &str, thread_id: Option<&str>, timestamp_micros: i64) {
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    e.note_message_received(agent, thread_id, timestamp_micros);
+}
+
+pub fn atc_note_reservation_granted(
+    agent: &str,
+    paths: &[String],
+    exclusive: bool,
+    project: &str,
+    timestamp_micros: i64,
+) {
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    e.note_reservation_granted(agent, paths, exclusive, project, timestamp_micros);
+}
+
+pub fn atc_note_reservation_released(
+    agent: &str,
+    paths: &[String],
+    project: &str,
+    timestamp_micros: i64,
+) {
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    e.note_reservation_released(agent, paths, project, timestamp_micros);
+}
+
+pub fn atc_note_reservation_conflicts(
+    requester: &str,
+    project: &str,
+    conflicts: &[AtcConflictObservation],
+    timestamp_micros: i64,
+) {
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    let conflicts: Vec<(String, String, String)> = conflicts
+        .iter()
+        .map(|conflict| {
+            (
+                conflict.holder.clone(),
+                conflict.requested_path.clone(),
+                conflict.holder_path_pattern.clone(),
+            )
+        })
+        .collect();
+    e.note_reservation_conflicts(requester, project, &conflicts, timestamp_micros);
+}
+
+pub fn atc_note_intervention(timestamp_micros: i64) {
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    e.note_atc_intervention(timestamp_micros);
 }
 
 /// Actionable outputs from an ATC tick.
