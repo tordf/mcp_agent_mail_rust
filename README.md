@@ -172,17 +172,17 @@ No human relay needed. Agents negotiate file ownership, flag breaking changes in
 
 Modern projects often run multiple coding agents at once (backend, frontend, scripts, infra). Without a shared coordination fabric, agents overwrite each other's edits, miss critical context from parallel workstreams, and require humans to relay messages across tools and teams.
 
-Agent Mail was the first open-source agent coordination system that works across providers (Claude Code, Codex CLI, Gemini CLI, etc.), available since October 2025. You're going to hear about a lot of agent communication systems because it's such an obviously good idea, but Agent Mail sidesteps all the footguns that a naive implementation falls prey to. Combined with [Beads](https://github.com/Dicklesworthstone/beads_rust) and [bv](https://github.com/Dicklesworthstone/beads_viewer), it unlocks truly insane productivity gains.
+Agent Mail has been available since October 2025 and was designed around real multi-agent coding workloads across providers such as Claude Code, Codex CLI, and Gemini CLI. The adjacent [Beads](https://github.com/Dicklesworthstone/beads_rust) and [bv](https://github.com/Dicklesworthstone/beads_viewer) tools make it more useful as a full coordination stack: Beads tracks work, bv helps pick the right next work, and Agent Mail carries the coordination traffic.
 
 ### The Footguns Agent Mail Avoids
 
-**No "broadcast to all" mode.** Agents are lazy and will default to broadcasting everything to everyone if you let them. That's like your email system at work defaulting to reply-all every time; it spams every agent with mostly irrelevant information and burns precious context.
+**No "broadcast to all" mode.** Given the option, many agents will overuse broadcast-style messaging. That is the equivalent of default reply-all in email: lots of irrelevant noise and wasted context.
 
-**Obsessively refined API ergonomics.** Bad MCP documentation and poor agent ergonomics are the silent killers. It takes a huge amount of careful iteration, observation, and refinement to get the balance so tools just work reliably without wasting tokens. Agent Mail's 36 tool definitions have been through hundreds of rounds of real-world tuning.
+**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 36 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
 
-**No git worktrees.** Worktrees demolish development velocity and create debt you need to pay later when the agents diverge. Working in one shared space surfaces conflicts immediately so you can deal with them, which is easy when agents can communicate. Instead of isolating agents, Agent Mail coordinates them.
+**No git worktrees.** Worktrees can slow development velocity and create reconciliation debt when agents diverge. Agent Mail takes the opposite approach: keep agents in one shared space, surface conflicts quickly, and give them tools to coordinate through them.
 
-**Advisory file reservations instead of hard locks.** There's a much better way to prevent conflicts than worktrees: agents call dibs temporarily on files while they're working on them, but it's not rigorously enforced, and reservations expire. Agents can observe if reserved files haven't been touched recently and reclaim them. You want a system that's robust to agents suddenly dying or getting their memory wiped, because that happens all the time. Hard locks would deadlock.
+**Advisory file reservations instead of hard locks.** For this problem, advisory reservations fit better than hard locks. Agents can temporarily claim files while they work, reservations expire automatically, and stale claims can be reclaimed. That makes the system robust to crashed or reset agents; hard locks would not.
 
 **Semi-persistent identity.** An identity that can last for the duration of a discrete task (for the purpose of coordination), but one that can also vanish without a trace and not break things. You don't want ringleader agents whose death takes down the whole system. Agent Mail identities are memorable (e.g., `GreenCastle`), but ephemeral by design.
 
@@ -191,9 +191,9 @@ Agent Mail was the first open-source agent coordination system that works across
 ### What Agent Mail Gives You
 
 - **Prevents conflicts:** Explicit file reservations (leases) for files/globs prevent agents from overwriting each other
-- **Eliminates human liaisons:** Agents send messages directly to each other with threaded conversations, acknowledgments, and priority levels
+- **Reduces human relay work:** Agents send messages directly to each other with threaded conversations, acknowledgments, and priority levels
 - **Keeps communication off the token budget:** Messages stored in per-project Git archive, not consuming agent context windows
-- **Offers quick reads:** `resource://inbox/{Agent}`, `resource://thread/{id}`, and 31 other MCP resources
+- **Offers quick reads:** `resource://inbox/{Agent}?project=<abs-path>`, `resource://thread/{id}?project=<abs-path>`, and 31 other MCP resources
 - **Provides full audit trails:** Every instruction, lease, message, and attachment is in Git for human review
 - **Scales across repos:** Frontend and backend agents in different repos coordinate through the product bus and contact system
 
@@ -207,7 +207,7 @@ Agent Mail was the first open-source agent coordination system that works across
 
 ### Productivity Math
 
-One disciplined hour of AI coding agents often produces 10-20 "human hours" of work because the agents reason and type at machine speed. Agent Mail multiplies that: you invest 1-2 hours of human supervision, but dozens of agent-hours execute in parallel with clear audit trails and conflict-avoidance baked in. A single developer running Agent Mail + Beads + bv can ship what would normally take a team of engineers weeks.
+Parallel agent work changes the economics of supervision. One human operator can spend an hour steering several agents while those agents produce many hours of implementation work in parallel. The exact multiplier depends on the task and on how disciplined the workflow is, but the point is straightforward: coordination overhead matters, and Agent Mail is built to keep that overhead low.
 
 ---
 
@@ -345,6 +345,8 @@ Auto-detects all installed coding agents (Claude Code, Codex CLI, Gemini CLI, et
 
 Once the server is running, agents use MCP tools to coordinate:
 
+Terminology note: `ensure_project` takes a `human_key`, which must be the absolute repo path. Most follow-on tools take `project_key`, which can be that same absolute path or the project's computed slug.
+
 ```
 # Register identity
 ensure_project(human_key="/abs/path/to/repo")
@@ -374,7 +376,8 @@ macro_prepare_thread(project_key="/abs/path/to/repo", thread_id="FEAT-123",
                      program="claude-code", model="opus-4.6")
 
 # Reserve, work, release cycle
-macro_file_reservation_cycle(project_key, agent_name, paths, ttl_seconds)
+macro_file_reservation_cycle(project_key="/abs/path/to/repo", agent_name="GreenCastle",
+                             paths=["src/auth/**"], ttl_seconds=3600, auto_release=true)
 
 # Contact handshake between agents in different projects
 macro_contact_handshake(project_key="/abs/path/to/repo", requester="GreenCastle",
@@ -559,11 +562,13 @@ resource://inbox/{Agent}?project=<abs-path>&limit=20
 resource://thread/{id}?project=<abs-path>&include_bodies=true
 resource://mailbox/{Agent}?project=<abs-path>
 resource://views/ack-overdue/{Agent}?project=<abs-path>
-resource://agents?project=<abs-path>
-resource://file_reservations?project=<abs-path>
+resource://agents/<project-slug>
+resource://file_reservations/<project-slug>?active_only=true
 resource://tooling/metrics
 resource://config/environment
 ```
+
+`resource://agents/...` and `resource://file_reservations/...` take the project in the path segment. Inbox, mailbox, thread, and message resources put the agent or thread in the path and the project in the query string.
 
 ### Macros vs. Granular Tools
 
@@ -665,7 +670,7 @@ am robot reservations --project /abs/path --agent AgentName --conflicts --expiri
 Before editing, agents reserve file paths to avoid conflicts:
 
 ```
-file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)
+file_reservation_paths(project_key, agent_name, paths=["src/**"], ttl_seconds=3600, exclusive=true)
 ```
 
 The pre-commit guard (`mcp-agent-mail-guard`) installs as a Git hook and blocks commits that touch files reserved by other agents. Reservations are advisory, TTL-based, and support glob patterns.
@@ -698,25 +703,25 @@ sequenceDiagram
     B->>S: register_agent(project_key="/abs/path", program="codex-cli")
     S-->>B: identity: BlueLake
 
-    A->>S: file_reservation_paths(["src/auth/**"], exclusive=true)
+    A->>S: file_reservation_paths(project_key="/abs/path", agent_name="GreenCastle", paths=["src/auth/**"], exclusive=true)
     S-->>A: reserved ✓
 
-    B->>S: file_reservation_paths(["src/auth/**"], exclusive=true)
+    B->>S: file_reservation_paths(project_key="/abs/path", agent_name="BlueLake", paths=["src/auth/**"], exclusive=true)
     S-->>B: CONFLICT — reserved by GreenCastle
 
-    B->>S: file_reservation_paths(["tests/api/**"], exclusive=true)
+    B->>S: file_reservation_paths(project_key="/abs/path", agent_name="BlueLake", paths=["tests/api/**"], exclusive=true)
     S-->>B: reserved ✓
 
-    A->>S: send_message(to=["BlueLake"], thread_id="FEAT-123", ack_required=true)
+    A->>S: send_message(project_key="/abs/path", sender_name="GreenCastle", to=["BlueLake"], thread_id="FEAT-123", ack_required=true)
     S-->>B: new message in inbox
 
-    B->>S: fetch_inbox()
+    B->>S: fetch_inbox(project_key="/abs/path", agent_name="BlueLake")
     S-->>B: [message from GreenCastle]
 
-    B->>S: acknowledge_message(message_id)
+    B->>S: acknowledge_message(project_key="/abs/path", agent_name="BlueLake", message_id=1482)
     S-->>A: ack received ✓
 
-    A->>S: release_file_reservations(["src/auth/**"])
+    A->>S: release_file_reservations(project_key="/abs/path", agent_name="GreenCastle", paths=["src/auth/**"])
     S-->>A: released ✓
 ```
 
@@ -806,7 +811,7 @@ Overseer messages:
 - Bypass normal contact policies so you can always reach any agent
 - Include a preamble instructing agents to pause current work, handle the request, then resume
 
-Agents see overseer messages in their normal inbox via `fetch_inbox` or `resource://inbox/{name}`. They can reply in-thread like any other message. Everything is stored identically to agent-to-agent messages (Git + SQLite), fully auditable.
+Agents see overseer messages in their normal inbox via `fetch_inbox` or `resource://inbox/{name}?project=<abs-path>`. They can reply in-thread like any other message. Everything is stored identically to agent-to-agent messages (Git + SQLite), fully auditable.
 
 ---
 
@@ -989,7 +994,7 @@ The important boundary is this: Git stores the durable human-auditable artifacts
 3. For direct state, SQLite answers immediately. For search, Search V3 plans the query and executes the appropriate lexical, semantic, or hybrid route.
 4. The result is rendered as MCP JSON, robot `toon`/`json`/`md`, TUI widgets, or HTML under `/mail/`.
 
-This is why the project feels consistent across surfaces: they are not separate products. They are separate renderers over the same DB + archive + metrics pipeline.
+That consistency comes from a shared DB + archive + metrics pipeline. The TUI, web UI, robot CLI, and MCP resources are separate renderers over the same underlying state.
 
 ---
 
@@ -1029,7 +1034,7 @@ These are the design rules that let many agents share one checkout without immed
 - **Backups are first-class.** `archive save`, doctor backups, and restore flows all exist because operational recovery is part of the product, not a manual afterthought.
 - **Stale lock cleanup is expected.** Guard hooks, archive lock management, and doctor checks assume agents crash and processes die unexpectedly.
 
-The practical upshot is simple: if the fast layer gets sick, the durable layer can rebuild it.
+If the fast layer gets sick, the durable layer can rebuild it.
 
 ---
 
@@ -1171,7 +1176,7 @@ Index build throughput baseline from the same file is 7.5K docs/sec at 1K, 36K d
 | Single message, file attachment | ~20.4ms | ~25.2ms | < 25ms | Marginal |
 | Batch 100 messages | ~930ms | ~1076ms | < 250ms | Still materially over budget |
 
-That last row matters. The README should not pretend every path is already perfect: the project measures what is fast, what is acceptable, and what still needs work.
+The batch-write path is still above budget. This section is here to show both the fast paths and the remaining bottlenecks.
 
 ### Reproduction Commands
 
@@ -1289,7 +1294,7 @@ A: Use the Beads issue ID (e.g., `br-123`) as the Mail `thread_id`. Beads owns t
 
 ## Appendix: Protocol Transcript
 
-This is what a realistic agent-to-agent coordination flow looks like on the wire. The point is not that agents memorize JSON-RPC; the point is that the system is explicit, auditable, and deterministic.
+This is what a realistic agent-to-agent coordination flow looks like on the wire. Agents do not need to memorize JSON-RPC; the value of this appendix is that it shows the explicit, auditable contract the system exposes.
 
 ### 1. Boot a session
 
@@ -1372,7 +1377,7 @@ Representative response shape:
 }}}
 ```
 
-One deliberate non-feature is worth calling out here: `broadcast=true` on `send_message` is intentionally rejected. The system wants explicit routing, not default spam.
+One deliberate non-feature: `broadcast=true` on `send_message` is intentionally rejected. The system wants explicit routing, not default spam.
 
 ---
 
@@ -1458,7 +1463,7 @@ What it is
 Why it's useful
 - Prevents agents from stepping on each other with explicit file reservations (leases).
 - Keeps communication out of your token budget by storing messages in a per-project archive.
-- Offers quick reads (resource://inbox/..., resource://thread/...) and macros that bundle common flows.
+- Offers quick reads (`resource://inbox/{Agent}?project=<abs-path>`, `resource://thread/{id}?project=<abs-path>`) and macros that bundle common flows.
 
 How to use effectively
 1) Register an identity: call ensure_project with this repo's absolute path as
