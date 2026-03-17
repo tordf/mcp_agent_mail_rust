@@ -486,6 +486,86 @@ impl SystemHealthScreen {
                 hint_style,
             ),
         ]));
+        let next_due = snap
+            .atc
+            .kernel
+            .next_due_micros
+            .map_or_else(|| "--".to_string(), format_diag_timestamp_micros);
+        lines.push(Line::from_spans([
+            Span::styled("Executor:  ", label_style),
+            Span::styled(
+                format!(
+                    "mode={}  pending={}  overhead={}us",
+                    snap.atc.executor_mode,
+                    snap.atc.executor_pending_effects,
+                    snap.atc.outer_loop_overhead_micros
+                ),
+                value_style,
+            ),
+            Span::styled(format!("  next_due={next_due}"), hint_style),
+        ]));
+        lines.push(Line::from_spans([
+            Span::styled("Kernel:    ", label_style),
+            Span::styled(
+                format!(
+                    "scheduled={}  kernel_pending={}  lock_wait={}us  debt={}us",
+                    snap.atc.kernel.scheduled_agents,
+                    snap.atc.kernel.pending_effects,
+                    snap.atc.kernel.lock_wait_micros,
+                    snap.atc.budget.budget_debt_micros
+                ),
+                value_style,
+            ),
+            Span::styled(
+                format!("  decision_mode={}", snap.atc.policy.decision_mode),
+                hint_style,
+            ),
+        ]));
+        lines.push(Line::from_spans([
+            Span::styled("Artifacts: ", label_style),
+            Span::styled(
+                format!(
+                    "bundle={}  incumbent={}",
+                    snap.atc.policy.bundle_id, snap.atc.policy.incumbent_policy_id
+                ),
+                value_style,
+            ),
+            Span::styled(
+                format!(
+                    "  shadow={}  disagreements={}",
+                    snap.atc.policy.shadow_enabled, snap.atc.policy.shadow_disagreements
+                ),
+                hint_style,
+            ),
+        ]));
+        if let Some(decision) = snap.atc.recent_decisions.first() {
+            lines.push(Line::from_spans([
+                Span::styled("Decision:  ", label_style),
+                Span::styled(
+                    format!(
+                        "{} {} -> {} ({})",
+                        decision.subject,
+                        decision.decision_class,
+                        decision.action,
+                        decision.claim_id
+                    ),
+                    value_style,
+                ),
+            ]));
+        }
+        if let Some(execution) = snap.atc.recent_executions.last() {
+            lines.push(Line::from_spans([
+                Span::styled("Execution: ", label_style),
+                Span::styled(
+                    format!(
+                        "{} {} [{}]",
+                        execution.agent, execution.kind, execution.status
+                    ),
+                    value_style,
+                ),
+                Span::styled(format!("  effect={}", execution.effect_id), hint_style),
+            ]));
+        }
         let degraded_agents: Vec<&crate::AtcOperatorAgentSnapshot> = snap
             .atc
             .tracked_agents
@@ -1712,6 +1792,36 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
         });
     }
 
+    if out.atc.budget.budget_debt_micros > 0 {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-budget-debt",
+            detail: format!(
+                "ATC budget debt is {}us with executor backlog {}",
+                out.atc.budget.budget_debt_micros, out.atc.executor_pending_effects
+            ),
+            remediation: Some(
+                "Reduce ATC work per tick or clear the executor backlog before widening automation."
+                    .into(),
+            ),
+        });
+    }
+
+    if out.atc.executor_pending_effects > 0 {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-executor-backlog",
+            detail: format!(
+                "ATC executor has {} pending effect(s) in {} mode",
+                out.atc.executor_pending_effects, out.atc.executor_mode
+            ),
+            remediation: Some(
+                "Inspect ATC recent executions and downstream tool health before enabling broader effect execution."
+                    .into(),
+            ),
+        });
+    }
+
     if out.atc.policy.shadow_enabled && out.atc.policy.shadow_disagreements > 0 {
         out.lines.push(ProbeLine {
             level: Level::Warn,
@@ -1724,6 +1834,27 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
                 "Review the live policy and shadow candidate before promoting any ATC policy changes.".into(),
             ),
         });
+    }
+
+    if let Some(execution) = out.atc.recent_executions.last() {
+        let failed = matches!(
+            execution.status.as_str(),
+            "missing_project" | "executor_unavailable"
+        ) || execution.status.starts_with("failed:");
+        if failed {
+            out.lines.push(ProbeLine {
+                level: Level::Fail,
+                name: "atc-executor",
+                detail: format!(
+                    "ATC effect execution failed for {} {} ({})",
+                    execution.agent, execution.kind, execution.status
+                ),
+                remediation: Some(
+                    "Inspect project registration, executor mode, and downstream tool errors before trusting live ATC effects."
+                        .into(),
+                ),
+            });
+        }
     }
 
     for agent in out
@@ -2845,8 +2976,26 @@ mod tests {
                 last_tick_duration_micros: 120,
                 last_tick_budget_micros: 60,
                 last_tick_budget_exceeded: true,
+                executor_mode: "live".to_string(),
+                executor_pending_effects: 2,
+                recent_executions: vec![crate::AtcOperatorExecutionSnapshot {
+                    timestamp_micros: 1_500_000,
+                    effect_id: "atc-effect-1".to_string(),
+                    claim_id: "atc-claim-1".to_string(),
+                    evidence_id: "atc-evidence-1".to_string(),
+                    trace_id: "atc-trace-1".to_string(),
+                    kind: "send_advisory".to_string(),
+                    category: "liveness".to_string(),
+                    agent: "BetaAgent".to_string(),
+                    project_key: Some("/tmp/project".to_string()),
+                    policy_id: Some("liveness-incumbent-r1".to_string()),
+                    execution_mode: "live".to_string(),
+                    status: "failed:executor".to_string(),
+                    message: Some("operator send failed".to_string()),
+                }],
                 budget: crate::atc::AtcBudgetTelemetry {
                     mode: "pressure".to_string(),
+                    budget_debt_micros: 44,
                     ..Default::default()
                 },
                 policy: crate::atc::AtcPolicyTelemetry {
@@ -2857,6 +3006,7 @@ mod tests {
                     shadow_regret_avg: 0.3,
                     fallback_active: true,
                     fallback_reason: Some("budget_pressure".to_string()),
+                    ..Default::default()
                 },
                 tracked_agents: vec![
                     crate::AtcOperatorAgentSnapshot {
@@ -2883,6 +3033,13 @@ mod tests {
         assert!(out.lines.iter().any(|line| line.name == "atc-fallback"));
         assert!(out.lines.iter().any(|line| line.name == "atc-deadlocks"));
         assert!(out.lines.iter().any(|line| line.name == "atc-budget"));
+        assert!(out.lines.iter().any(|line| line.name == "atc-budget-debt"));
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line.name == "atc-executor-backlog")
+        );
+        assert!(out.lines.iter().any(|line| line.name == "atc-executor"));
         assert!(out.lines.iter().any(|line| line.name == "atc-shadow"));
         assert!(
             out.lines

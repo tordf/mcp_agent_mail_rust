@@ -62,6 +62,18 @@ fn floor_f64_to_u64(value: f64) -> u64 {
     }
 }
 
+fn stable_fnv1a64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Decision Core (Track 1)
 // ──────────────────────────────────────────────────────────────────────
@@ -509,7 +521,7 @@ pub fn default_load_core() -> DecisionCore<LoadState, LoadAction> {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Which ATC subsystem produced a decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AtcSubsystem {
     Liveness,
     Conflict,
@@ -530,17 +542,34 @@ impl fmt::Display for AtcSubsystem {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AtcLossTableEntry {
+    pub action: String,
+    pub expected_loss: f64,
+}
+
 /// A single auditable decision record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AtcDecisionRecord {
     /// Unique decision ID (monotonically increasing).
     pub id: u64,
+    /// Stable artifact-graph claim identifier.
+    pub claim_id: String,
+    /// Stable artifact-graph evidence identifier.
+    pub evidence_id: String,
+    /// Stable artifact-graph trace identifier.
+    pub trace_id: String,
     /// Timestamp of the decision (microseconds since epoch).
     pub timestamp_micros: i64,
     /// Which subsystem made the decision.
     pub subsystem: AtcSubsystem,
+    /// Fine-grained decision class within the subsystem.
+    pub decision_class: String,
     /// The entity the decision concerns (agent name or thread ID).
     pub subject: String,
+    /// Policy artifact that was active when the decision was made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
     /// Posterior belief at decision time.
     pub posterior: Vec<(String, f64)>,
     /// Action chosen.
@@ -549,12 +578,17 @@ pub struct AtcDecisionRecord {
     pub expected_loss: f64,
     /// Expected loss of the next-best alternative.
     pub runner_up_loss: f64,
+    /// Expected-loss table for the visible candidate actions.
+    pub loss_table: Vec<AtcLossTableEntry>,
     /// Key evidence that drove this decision.
     pub evidence_summary: String,
     /// Whether the calibration guard was healthy at decision time.
     pub calibration_healthy: bool,
     /// Whether safe mode was active.
     pub safe_mode_active: bool,
+    /// Explicit fallback reason when deterministic conservative mode was active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 impl AtcDecisionRecord {
@@ -604,6 +638,7 @@ pub struct EvidenceLedger {
 /// Avoids the 11-argument `record()` method that clippy rightly rejects.
 pub struct DecisionBuilder<'a, S: AtcState, A: AtcAction> {
     pub subsystem: AtcSubsystem,
+    pub decision_class: &'a str,
     pub subject: &'a str,
     pub core: &'a DecisionCore<S, A>,
     pub action: A,
@@ -612,10 +647,66 @@ pub struct DecisionBuilder<'a, S: AtcState, A: AtcAction> {
     pub evidence_summary: &'a str,
     pub calibration_healthy: bool,
     pub safe_mode_active: bool,
+    pub policy_id: Option<&'a str>,
+    pub fallback_reason: Option<&'a str>,
+    pub timestamp_micros: i64,
+}
+
+pub struct EventDecisionBuilder<'a> {
+    pub subsystem: AtcSubsystem,
+    pub decision_class: &'a str,
+    pub subject: &'a str,
+    pub policy_id: Option<&'a str>,
+    pub posterior: Vec<(String, f64)>,
+    pub action: &'a str,
+    pub expected_loss: f64,
+    pub runner_up_loss: f64,
+    pub loss_table: Vec<AtcLossTableEntry>,
+    pub evidence_summary: &'a str,
+    pub calibration_healthy: bool,
+    pub safe_mode_active: bool,
+    pub fallback_reason: Option<&'a str>,
     pub timestamp_micros: i64,
 }
 
 impl EvidenceLedger {
+    fn make_trace_id(
+        id: u64,
+        subsystem: AtcSubsystem,
+        decision_class: &str,
+        subject: &str,
+        action: &str,
+        policy_id: Option<&str>,
+    ) -> String {
+        let mut seed = format!("{id}:{subsystem}:{decision_class}:{subject}:{action}");
+        if let Some(policy_id) = policy_id {
+            seed.push(':');
+            seed.push_str(policy_id);
+        }
+        format!("atc-trace-{:016x}", stable_fnv1a64(seed.as_bytes()))
+    }
+
+    fn loss_table_for_core<S: AtcState, A: AtcAction>(
+        core: &DecisionCore<S, A>,
+    ) -> Vec<AtcLossTableEntry> {
+        let mut losses: Vec<AtcLossTableEntry> = core
+            .actions
+            .iter()
+            .copied()
+            .map(|action| AtcLossTableEntry {
+                action: format!("{action:?}"),
+                expected_loss: core.expected_loss_for(action),
+            })
+            .collect();
+        losses.sort_by(|left, right| {
+            left.expected_loss
+                .partial_cmp(&right.expected_loss)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.action.cmp(&right.action))
+        });
+        losses
+    }
+
     /// Create a new ledger with the given capacity.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
@@ -633,19 +724,78 @@ impl EvidenceLedger {
     ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
+        let action = format!("{:?}", builder.action);
+        let policy_id = builder.policy_id.map(ToOwned::to_owned);
+        let trace_id = Self::make_trace_id(
+            id,
+            builder.subsystem,
+            builder.decision_class,
+            builder.subject,
+            &action,
+            builder.policy_id,
+        );
 
         let record = AtcDecisionRecord {
             id,
+            claim_id: format!("atc-claim-{id}"),
+            evidence_id: format!("atc-evidence-{id}"),
+            trace_id,
             timestamp_micros: builder.timestamp_micros,
             subsystem: builder.subsystem,
+            decision_class: builder.decision_class.to_string(),
             subject: builder.subject.to_string(),
+            policy_id,
             posterior: builder.core.posterior_summary(),
-            action: format!("{:?}", builder.action),
+            action,
             expected_loss: builder.expected_loss,
             runner_up_loss: builder.runner_up_loss,
+            loss_table: Self::loss_table_for_core(builder.core),
             evidence_summary: builder.evidence_summary.to_string(),
             calibration_healthy: builder.calibration_healthy,
             safe_mode_active: builder.safe_mode_active,
+            fallback_reason: builder.fallback_reason.map(ToOwned::to_owned),
+        };
+
+        if self.records.len() >= self.capacity {
+            self.records.pop_front();
+        }
+        self.records.push_back(record);
+
+        id
+    }
+
+    /// Record a deterministic event-style decision that is not backed by a single `DecisionCore`.
+    pub fn record_event(&mut self, builder: &EventDecisionBuilder<'_>) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let trace_id = Self::make_trace_id(
+            id,
+            builder.subsystem,
+            builder.decision_class,
+            builder.subject,
+            builder.action,
+            builder.policy_id,
+        );
+
+        let record = AtcDecisionRecord {
+            id,
+            claim_id: format!("atc-claim-{id}"),
+            evidence_id: format!("atc-evidence-{id}"),
+            trace_id,
+            timestamp_micros: builder.timestamp_micros,
+            subsystem: builder.subsystem,
+            decision_class: builder.decision_class.to_string(),
+            subject: builder.subject.to_string(),
+            policy_id: builder.policy_id.map(ToOwned::to_owned),
+            posterior: builder.posterior.clone(),
+            action: builder.action.to_string(),
+            expected_loss: builder.expected_loss,
+            runner_up_loss: builder.runner_up_loss,
+            loss_table: builder.loss_table.clone(),
+            evidence_summary: builder.evidence_summary.to_string(),
+            calibration_healthy: builder.calibration_healthy,
+            safe_mode_active: builder.safe_mode_active,
+            fallback_reason: builder.fallback_reason.map(ToOwned::to_owned),
         };
 
         if self.records.len() >= self.capacity {
@@ -858,6 +1008,7 @@ mod tests {
     ) -> DecisionBuilder<'a, LivenessState, LivenessAction> {
         DecisionBuilder {
             subsystem: AtcSubsystem::Liveness,
+            decision_class: "test",
             subject,
             core,
             action: LivenessAction::DeclareAlive,
@@ -866,6 +1017,8 @@ mod tests {
             evidence_summary: "test",
             calibration_healthy: true,
             safe_mode_active: false,
+            policy_id: None,
+            fallback_reason: None,
             timestamp_micros: ts,
         }
     }
@@ -876,6 +1029,7 @@ mod tests {
         let core = default_liveness_core();
         let id = ledger.record(&DecisionBuilder {
             subsystem: AtcSubsystem::Liveness,
+            decision_class: "test",
             subject: "TestAgent",
             core: &core,
             action: LivenessAction::DeclareAlive,
@@ -884,6 +1038,8 @@ mod tests {
             evidence_summary: "agent sent message 3s ago",
             calibration_healthy: true,
             safe_mode_active: false,
+            policy_id: Some("policy-test"),
+            fallback_reason: None,
             timestamp_micros: 1_000_000,
         });
         assert_eq!(id, 1);
@@ -930,9 +1086,14 @@ mod tests {
     fn decision_record_formats_readable_message() {
         let record = AtcDecisionRecord {
             id: 42,
+            claim_id: "atc-claim-42".to_string(),
+            evidence_id: "atc-evidence-42".to_string(),
+            trace_id: "atc-trace-42".to_string(),
             timestamp_micros: 1_000_000,
             subsystem: AtcSubsystem::Liveness,
+            decision_class: "liveness_transition".to_string(),
             subject: "BlueFox".to_string(),
+            policy_id: Some("policy-test".to_string()),
             posterior: vec![
                 ("Alive".to_string(), 0.12),
                 ("Flaky".to_string(), 0.41),
@@ -941,9 +1102,14 @@ mod tests {
             action: "Suspect".to_string(),
             expected_loss: 3.2,
             runner_up_loss: 18.1,
+            loss_table: vec![AtcLossTableEntry {
+                action: "Suspect".to_string(),
+                expected_loss: 3.2,
+            }],
             evidence_summary: "no activity for 847s".to_string(),
             calibration_healthy: true,
             safe_mode_active: false,
+            fallback_reason: None,
         };
 
         let msg = record.format_message();
@@ -961,16 +1127,23 @@ mod tests {
     fn decision_record_shows_safe_mode() {
         let record = AtcDecisionRecord {
             id: 1,
+            claim_id: "atc-claim-1".to_string(),
+            evidence_id: "atc-evidence-1".to_string(),
+            trace_id: "atc-trace-1".to_string(),
             timestamp_micros: 0,
             subsystem: AtcSubsystem::Calibration,
+            decision_class: "safe_mode".to_string(),
             subject: "system".to_string(),
+            policy_id: None,
             posterior: vec![],
             action: "SafeMode".to_string(),
             expected_loss: 0.0,
             runner_up_loss: 0.0,
+            loss_table: Vec::new(),
             evidence_summary: "coverage dropped".to_string(),
             calibration_healthy: false,
             safe_mode_active: true,
+            fallback_reason: Some("calibration_safe_mode".to_string()),
         };
 
         let msg = record.format_message();
@@ -1299,16 +1472,23 @@ mod tests {
     fn format_message_with_empty_posterior() {
         let record = AtcDecisionRecord {
             id: 1,
+            claim_id: "atc-claim-1".to_string(),
+            evidence_id: "atc-evidence-1".to_string(),
+            trace_id: "atc-trace-1".to_string(),
             timestamp_micros: 1_000_000,
             subsystem: AtcSubsystem::Liveness,
+            decision_class: "test".to_string(),
             subject: "EmptyAgent".to_string(),
+            policy_id: None,
             posterior: vec![], // empty posterior
             action: "DeclareAlive".to_string(),
             expected_loss: 0.5,
             runner_up_loss: 3.0,
+            loss_table: Vec::new(),
             evidence_summary: "no evidence".to_string(),
             calibration_healthy: true,
             safe_mode_active: false,
+            fallback_reason: None,
         };
 
         let msg = record.format_message();
@@ -1332,16 +1512,23 @@ mod tests {
 
         let record = AtcDecisionRecord {
             id: 99,
+            claim_id: "atc-claim-99".to_string(),
+            evidence_id: "atc-evidence-99".to_string(),
+            trace_id: "atc-trace-99".to_string(),
             timestamp_micros: 5_000_000,
             subsystem: AtcSubsystem::Conflict,
+            decision_class: "test".to_string(),
             subject: "BigAgent".to_string(),
+            policy_id: None,
             posterior,
             action: "Ignore".to_string(),
             expected_loss: 2.5,
             runner_up_loss: 4.0,
+            loss_table: Vec::new(),
             evidence_summary: "lots of states".to_string(),
             calibration_healthy: true,
             safe_mode_active: false,
+            fallback_reason: None,
         };
 
         let msg = record.format_message();
@@ -1492,6 +1679,8 @@ impl AgentRhythm {
 pub struct AgentLivenessEntry {
     /// Agent name.
     pub name: String,
+    /// Project key used to route advisories/effects back into Agent Mail.
+    pub project_key: Option<String>,
     /// Agent program (used for hierarchical priors and cohort updates).
     pub program: String,
     /// Current state.
@@ -2789,6 +2978,8 @@ impl CalibrationGuard {
 pub struct AtcConfig {
     /// Master switch.
     pub enabled: bool,
+    /// Optional JSON policy bundle path for policy-as-data execution.
+    pub policy_bundle_path: Option<String>,
     /// Health probe interval (microseconds).
     pub probe_interval_micros: i64,
     /// Minimum interval between advisories to the same agent (microseconds).
@@ -2815,6 +3006,7 @@ impl Default for AtcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            policy_bundle_path: None,
             probe_interval_micros: 120 * 1_000_000,
             advisory_cooldown_micros: 300 * 1_000_000,
             summary_interval_micros: 300 * 1_000_000,
@@ -2863,8 +3055,11 @@ pub struct AtcStageTimings {
 pub struct AtcKernelTelemetry {
     pub due_agents: usize,
     pub scheduled_agents: usize,
+    pub next_due_micros: Option<i64>,
     pub dirty_agents: usize,
     pub dirty_projects: usize,
+    pub pending_effects: usize,
+    pub lock_wait_micros: u64,
     pub deadlock_cache_hits: u64,
     pub deadlock_cache_misses: u64,
     pub deadlock_cache_hit_rate: f64,
@@ -2877,24 +3072,33 @@ pub struct AtcBudgetTelemetry {
     pub probe_budget_micros: u64,
     pub estimated_probe_cost_micros: u64,
     pub max_probes_this_tick: usize,
+    pub budget_debt_micros: u64,
     pub utilization_ratio: f64,
     pub slow_window_utilization: f64,
+    pub kernel_total_micros: u64,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AtcPolicyTelemetry {
+    pub bundle_id: String,
+    pub bundle_hash: String,
     pub incumbent_policy_id: String,
+    pub incumbent_artifact_hash: String,
     pub candidate_policy_id: Option<String>,
+    pub candidate_artifact_hash: Option<String>,
     pub shadow_enabled: bool,
     pub shadow_disagreements: u64,
     pub shadow_regret_avg: f64,
+    pub decision_mode: String,
     pub fallback_active: bool,
     pub fallback_reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AtcLivenessPolicyArtifact {
+    schema_version: u32,
     policy_id: String,
+    artifact_hash: String,
     suspicion_k: f64,
     max_probes_per_tick: usize,
     probe_recency_decay_secs: f64,
@@ -2905,7 +3109,60 @@ struct AtcLivenessPolicyArtifact {
     losses: [[f64; 3]; 3],
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AtcLivenessPolicyBundle {
+    schema_version: u32,
+    bundle_id: String,
+    bundle_hash: String,
+    incumbent: AtcLivenessPolicyArtifact,
+    candidate: Option<AtcLivenessPolicyArtifact>,
+}
+
 impl AtcLivenessPolicyArtifact {
+    fn compute_artifact_hash(&self) -> String {
+        let serialized = format!(
+            "{}|{}|{:.6}|{}|{:.6}|{:.6}|{:.6}|{:.6}|{}|{:?}",
+            self.schema_version,
+            self.policy_id,
+            self.suspicion_k,
+            self.max_probes_per_tick,
+            self.probe_recency_decay_secs,
+            self.probe_gain_floor,
+            self.probe_budget_fraction,
+            self.conservative_probe_budget_fraction,
+            self.release_guard_enabled,
+            self.losses,
+        );
+        format!("{:016x}", stable_fnv1a64(serialized.as_bytes()))
+    }
+
+    fn finalize(mut self) -> Self {
+        self.artifact_hash = self.compute_artifact_hash();
+        self
+    }
+
+    fn apply_to_core(&self, core: &mut DecisionCore<LivenessState, LivenessAction>) {
+        for (action_idx, action) in [
+            LivenessAction::DeclareAlive,
+            LivenessAction::Suspect,
+            LivenessAction::ReleaseReservations,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (state_idx, state) in [
+                LivenessState::Alive,
+                LivenessState::Flaky,
+                LivenessState::Dead,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                core.set_loss_entry(action, state, self.losses[action_idx][state_idx]);
+            }
+        }
+    }
+
     #[must_use]
     fn from_core(
         policy_id: String,
@@ -2933,7 +3190,9 @@ impl AtcLivenessPolicyArtifact {
             }
         }
         Self {
+            schema_version: 1,
             policy_id,
+            artifact_hash: String::new(),
             suspicion_k: base_k,
             max_probes_per_tick: 3,
             probe_recency_decay_secs: 60.0,
@@ -2943,6 +3202,7 @@ impl AtcLivenessPolicyArtifact {
             release_guard_enabled: true,
             losses,
         }
+        .finalize()
     }
 
     #[must_use]
@@ -2958,7 +3218,7 @@ impl AtcLivenessPolicyArtifact {
         candidate.losses[2][0] *= 1.15;
         candidate.losses[2][1] *= 1.35;
         candidate.losses[1][2] *= 0.9;
-        candidate
+        candidate.finalize()
     }
 
     #[must_use]
@@ -3026,6 +3286,71 @@ impl AtcLivenessPolicyArtifact {
             }
         }
         (best_action, best_loss, runner_up)
+    }
+}
+
+impl AtcLivenessPolicyBundle {
+    fn load_from_path(path: &std::path::Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|error| format!("read bundle '{}': {error}", path.display()))?;
+        let bundle: Self = serde_json::from_str(&raw)
+            .map_err(|error| format!("parse bundle '{}': {error}", path.display()))?;
+        bundle
+            .validate()
+            .map_err(|error| format!("validate bundle '{}': {error}", path.display()))?;
+        Ok(bundle)
+    }
+
+    fn compute_bundle_hash(&self) -> String {
+        let serialized = format!(
+            "{}|{}|{}|{}|{}",
+            self.schema_version,
+            self.bundle_id,
+            self.incumbent.artifact_hash,
+            self.candidate
+                .as_ref()
+                .map_or("-", |candidate| candidate.artifact_hash.as_str()),
+            self.incumbent.policy_id,
+        );
+        format!("{:016x}", stable_fnv1a64(serialized.as_bytes()))
+    }
+
+    fn finalize(mut self) -> Self {
+        self.bundle_hash = self.compute_bundle_hash();
+        self
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version == 0 || self.bundle_id.is_empty() {
+            return Err("invalid_policy_bundle_metadata");
+        }
+        if self.incumbent.compute_artifact_hash() != self.incumbent.artifact_hash {
+            return Err("invalid_incumbent_policy_hash");
+        }
+        if let Some(candidate) = self.candidate.as_ref()
+            && candidate.compute_artifact_hash() != candidate.artifact_hash
+        {
+            return Err("invalid_candidate_policy_hash");
+        }
+        if self.compute_bundle_hash() != self.bundle_hash {
+            return Err("invalid_policy_bundle_hash");
+        }
+        Ok(())
+    }
+
+    fn from_live_policies(
+        incumbent: &AtcLivenessPolicyArtifact,
+        candidate: Option<&AtcLivenessPolicyArtifact>,
+        revision: u64,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            bundle_id: format!("atc-liveness-bundle-r{revision}"),
+            bundle_hash: String::new(),
+            incumbent: incumbent.clone(),
+            candidate: candidate.cloned(),
+        }
+        .finalize()
     }
 }
 
@@ -3111,6 +3436,7 @@ impl AtcCostModel {
 struct AtcSlowControllerState {
     mode: AtcBudgetMode,
     probe_limit: usize,
+    budget_debt_micros: f64,
     window_tick_count: u64,
     window_total_utilization: f64,
     window_budget_exceeded: u64,
@@ -3122,6 +3448,7 @@ impl Default for AtcSlowControllerState {
         Self {
             mode: AtcBudgetMode::Nominal,
             probe_limit: 3,
+            budget_debt_micros: 0.0,
             window_tick_count: 0,
             window_total_utilization: 0.0,
             window_budget_exceeded: 0,
@@ -3133,10 +3460,20 @@ impl Default for AtcSlowControllerState {
 impl AtcSlowControllerState {
     fn note_tick(
         &mut self,
+        total_micros: u64,
+        tick_budget_micros: u64,
         utilization_ratio: f64,
         budget_exceeded: bool,
         baseline_probe_limit: usize,
     ) {
+        let debt_delta = i64::try_from(total_micros).unwrap_or(i64::MAX)
+            - i64::try_from(tick_budget_micros).unwrap_or(i64::MAX);
+        let next_debt = self.budget_debt_micros + nonnegative_i64_to_f64(debt_delta);
+        self.budget_debt_micros = if debt_delta < 0 {
+            (self.budget_debt_micros - nonnegative_i64_to_f64(-debt_delta)).max(0.0)
+        } else {
+            next_debt
+        };
         self.window_tick_count = self.window_tick_count.saturating_add(1);
         self.window_total_utilization += utilization_ratio;
         if budget_exceeded {
@@ -3148,10 +3485,11 @@ impl AtcSlowControllerState {
 
         let average_utilization =
             self.window_total_utilization / u64_to_f64(self.window_tick_count);
-        if self.window_budget_exceeded > 0 || average_utilization > 0.9 {
+        let debt_ratio = self.budget_debt_micros / u64_to_f64(tick_budget_micros.max(1));
+        if self.window_budget_exceeded > 0 || average_utilization > 0.9 || debt_ratio > 1.5 {
             self.mode = AtcBudgetMode::Conservative;
             self.probe_limit = self.probe_limit.saturating_sub(1).max(1);
-        } else if average_utilization > 0.75 {
+        } else if average_utilization > 0.75 || debt_ratio > 0.5 {
             self.mode = AtcBudgetMode::Pressure;
             self.probe_limit = self.probe_limit.min(baseline_probe_limit.max(1));
         } else {
@@ -3171,6 +3509,11 @@ impl AtcSlowControllerState {
         } else {
             self.window_total_utilization / u64_to_f64(self.window_tick_count)
         }
+    }
+
+    #[must_use]
+    fn budget_debt_micros(&self) -> u64 {
+        floor_f64_to_u64(self.budget_debt_micros)
     }
 }
 
@@ -3235,9 +3578,30 @@ impl AtcShadowPolicyState {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AtcEffectPlan {
+    pub effect_id: String,
+    pub claim_id: String,
+    pub evidence_id: String,
+    pub trace_id: String,
+    pub timestamp_micros: i64,
+    pub kind: String,
+    pub category: String,
+    pub agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_loss: Option<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AtcTickReport {
     pub actions: Vec<AtcTickAction>,
+    pub effects: Vec<AtcEffectPlan>,
     pub summary: AtcSummarySnapshot,
 }
 
@@ -3256,6 +3620,10 @@ pub struct AtcEngine {
     conflict_core: DecisionCore<ConflictState, ConflictAction>,
     /// Per-agent liveness tracking.
     agents: HashMap<String, AgentLivenessEntry>,
+    /// Cached deterministic agent ordering for summary rendering.
+    sorted_agent_names: Vec<String>,
+    /// Whether the cached agent ordering must be rebuilt.
+    agent_order_dirty: bool,
     /// Incremental liveness review schedule.
     liveness_schedule: BinaryHeap<Reverse<ScheduledAgentReview>>,
     /// Agents that must be reevaluated immediately due to policy changes.
@@ -3290,6 +3658,8 @@ pub struct AtcEngine {
     incumbent_policy: AtcLivenessPolicyArtifact,
     /// Shadow-mode candidate policy.
     shadow_policy: AtcShadowPolicyState,
+    /// Deterministic policy bundle used for replay and validation.
+    policy_bundle: AtcLivenessPolicyBundle,
     /// Monotonic policy revision for operator visibility.
     policy_revision: u64,
     /// Most recent stage timings emitted by the kernel.
@@ -3311,6 +3681,12 @@ pub struct AtcEngine {
 struct LivenessEvaluation {
     due_agents: usize,
     actions: Vec<(String, LivenessAction)>,
+    decision_metadata: HashMap<String, LivenessDecisionMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct LivenessDecisionMetadata {
+    decision_id: u64,
 }
 
 impl AtcEngine {
@@ -3332,18 +3708,42 @@ impl AtcEngine {
         let cusum = CusumDetector::new(0.15, config.cusum_threshold, config.cusum_delta);
         let regret = RegretTracker::new(100);
         let ledger = EvidenceLedger::new(config.ledger_capacity);
-        let liveness_core = default_liveness_core();
-        let incumbent_policy = AtcLivenessPolicyArtifact::from_core(
+        let mut liveness_core = default_liveness_core();
+        let mut incumbent_policy = AtcLivenessPolicyArtifact::from_core(
             "liveness-incumbent-r1".to_string(),
             &liveness_core,
             config.suspicion_k,
         );
-        let shadow_policy = AtcShadowPolicyState {
+        let mut shadow_policy = AtcShadowPolicyState {
             candidate: Some(AtcLivenessPolicyArtifact::candidate_from_incumbent(
                 &incumbent_policy,
             )),
             ..AtcShadowPolicyState::default()
         };
+        let mut policy_bundle = AtcLivenessPolicyBundle::from_live_policies(
+            &incumbent_policy,
+            shadow_policy.candidate.as_ref(),
+            1,
+        );
+        let policy_revision = 1;
+        if let Some(path) = config.policy_bundle_path.as_deref() {
+            match AtcLivenessPolicyBundle::load_from_path(std::path::Path::new(path)) {
+                Ok(bundle) => {
+                    bundle.incumbent.apply_to_core(&mut liveness_core);
+                    incumbent_policy = bundle.incumbent.clone();
+                    shadow_policy = AtcShadowPolicyState {
+                        candidate: bundle.candidate.clone(),
+                        ..AtcShadowPolicyState::default()
+                    };
+                    policy_bundle = bundle;
+                    tracing::info!(path, bundle = %policy_bundle.bundle_id, "loaded ATC policy bundle from disk");
+                }
+                Err(error) => {
+                    tracing::warn!(path, %error, "failed to load ATC policy bundle; using in-process defaults");
+                }
+            }
+        }
+        debug_assert!(policy_bundle.validate().is_ok());
 
         Self {
             config,
@@ -3351,6 +3751,8 @@ impl AtcEngine {
             liveness_core,
             conflict_core: default_conflict_core(),
             agents: HashMap::new(),
+            sorted_agent_names: Vec::new(),
+            agent_order_dirty: false,
             liveness_schedule: BinaryHeap::new(),
             dirty_agents: HashSet::new(),
             conflict_graphs: HashMap::new(),
@@ -3371,7 +3773,8 @@ impl AtcEngine {
             },
             incumbent_policy,
             shadow_policy,
-            policy_revision: 1,
+            policy_bundle,
+            policy_revision,
             last_stage_timings: AtcStageTimings::default(),
             last_kernel_telemetry: AtcKernelTelemetry::default(),
             last_budget_telemetry: AtcBudgetTelemetry::default(),
@@ -3451,8 +3854,16 @@ impl AtcEngine {
         self.agents.keys().map(String::as_str).collect()
     }
 
+    fn agent_project_key(&self, agent: &str) -> Option<String> {
+        self.agents
+            .get(agent)
+            .and_then(|entry| entry.project_key.clone())
+    }
+
     fn current_release_guard_reason(&self) -> Option<String> {
-        if self.calibration.is_safe_mode() {
+        if self.policy_bundle.validate().is_err() {
+            Some("policy_bundle_invalid".to_string())
+        } else if self.calibration.is_safe_mode() {
             Some("calibration_safe_mode".to_string())
         } else if self.slow_controller.mode == AtcBudgetMode::Conservative {
             Some("budget_pressure".to_string())
@@ -3463,6 +3874,19 @@ impl AtcEngine {
 
     fn mark_agents_dirty(&mut self) {
         self.dirty_agents.extend(self.agents.keys().cloned());
+    }
+
+    fn mark_agent_order_dirty(&mut self) {
+        self.agent_order_dirty = true;
+    }
+
+    fn sorted_agent_names(&mut self) -> &[String] {
+        if self.agent_order_dirty {
+            self.sorted_agent_names = self.agents.keys().cloned().collect();
+            self.sorted_agent_names.sort();
+            self.agent_order_dirty = false;
+        }
+        &self.sorted_agent_names
     }
 
     fn refresh_incumbent_policy_from_core(&mut self) {
@@ -3479,6 +3903,11 @@ impl AtcEngine {
             .slow_controller
             .probe_limit
             .min(self.incumbent_policy.max_probes_per_tick.max(1));
+        self.policy_bundle = AtcLivenessPolicyBundle::from_live_policies(
+            &self.incumbent_policy,
+            self.shadow_policy.candidate.as_ref(),
+            self.policy_revision,
+        );
         self.mark_agents_dirty();
     }
 
@@ -3532,16 +3961,8 @@ impl AtcEngine {
         self.liveness_schedule = rebuilt;
     }
 
-    fn effective_threshold_for_agent(
-        &self,
-        agent_name: &str,
-        base_k: f64,
-        thresholds: Option<&HashMap<String, AdaptiveThreshold>>,
-        fallback_active: bool,
-    ) -> f64 {
-        let adaptive_k = thresholds
-            .and_then(|items| items.get(agent_name))
-            .map_or(base_k, AdaptiveThreshold::effective_k);
+    fn effective_threshold(base_k: f64, adaptive_k: Option<f64>, fallback_active: bool) -> f64 {
+        let adaptive_k = adaptive_k.unwrap_or(base_k);
         if fallback_active {
             adaptive_k.max(base_k + 0.5)
         } else {
@@ -3576,22 +3997,10 @@ impl AtcEngine {
         next_review
     }
 
-    fn reschedule_agent(
-        &mut self,
-        agent: &str,
-        now_micros: i64,
-        thresholds: Option<&HashMap<String, AdaptiveThreshold>>,
-        fallback_active: bool,
-    ) {
+    fn reschedule_agent(&mut self, agent: &str, now_micros: i64, incumbent_k: f64) {
         let Some(entry) = self.agents.get(agent) else {
             return;
         };
-        let incumbent_k = self.effective_threshold_for_agent(
-            agent,
-            self.incumbent_policy.suspicion_k,
-            thresholds,
-            fallback_active,
-        );
         let incumbent_review = self.next_review_time_for_policy(entry, incumbent_k, now_micros);
         let candidate_review = self
             .shadow_policy
@@ -3631,6 +4040,31 @@ impl AtcEngine {
         due
     }
 
+    fn next_scheduled_review_micros(&mut self) -> Option<i64> {
+        while let Some(Reverse(next)) = self.liveness_schedule.peek().cloned() {
+            let Some(entry) = self.agents.get(&next.agent) else {
+                self.liveness_schedule.pop();
+                continue;
+            };
+            let stale_version = entry.schedule_version != next.schedule_version;
+            let stale_review_time = entry.next_review_micros != next.review_at_micros;
+            if stale_version || stale_review_time {
+                self.liveness_schedule.pop();
+                continue;
+            }
+            return Some(next.review_at_micros);
+        }
+        None
+    }
+
+    fn normalize_deadlock_cycles(mut cycles: Vec<Vec<String>>) -> Vec<Vec<String>> {
+        for cycle in &mut cycles {
+            cycle.sort();
+        }
+        cycles.sort();
+        cycles
+    }
+
     fn update_deadlock_cache_for_project(&mut self, project: &str) {
         let Some(graph) = self.conflict_graphs.get(project) else {
             self.deadlock_cache.remove(project);
@@ -3642,7 +4076,7 @@ impl AtcEngine {
             .is_none_or(|cached| cached.generation != graph.generation);
         if should_recompute {
             self.deadlock_cache_misses = self.deadlock_cache_misses.saturating_add(1);
-            let cycles = find_deadlock_cycles(graph);
+            let cycles = Self::normalize_deadlock_cycles(find_deadlock_cycles(graph));
             self.deadlock_cache.insert(
                 project.to_string(),
                 DeadlockCacheEntry {
@@ -3684,14 +4118,21 @@ impl AtcEngine {
     }
 
     /// Register a new agent for liveness tracking.
-    pub fn register_agent(&mut self, name: &str, program: &str) {
+    pub fn register_agent(&mut self, name: &str, program: &str, project_key: Option<&str>) {
         if name == ATC_AGENT_NAME {
             return; // self-exclusion
         }
+        let project_key = project_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
         match self.agents.entry(name.to_string()) {
             std::collections::hash_map::Entry::Occupied(mut occupied) => {
                 let entry = occupied.get_mut();
                 let program_changed = entry.program != program;
+                if project_key.is_some() {
+                    entry.project_key = project_key.clone();
+                }
                 entry.program = program.to_string();
                 if program_changed {
                     let seeded = Self::seeded_rhythm(program);
@@ -3706,6 +4147,7 @@ impl AtcEngine {
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 vacant.insert(AgentLivenessEntry {
                     name: name.to_string(),
+                    project_key,
                     program: program.to_string(),
                     state: LivenessState::Alive,
                     rhythm: Self::seeded_rhythm(program),
@@ -3716,27 +4158,38 @@ impl AtcEngine {
                     schedule_version: 0,
                     next_review_micros: i64::MAX,
                 });
+                self.mark_agent_order_dirty();
             }
         }
-        let thresholds_snapshot = ATC_THRESHOLDS
-            .get()
-            .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
         let fallback_active = self.current_release_guard_reason().is_some();
+        let incumbent_k = Self::effective_threshold(
+            self.incumbent_policy.suspicion_k,
+            current_adaptive_threshold_k(name),
+            fallback_active,
+        );
         self.reschedule_agent(
             name,
             mcp_agent_mail_core::timestamps::now_micros(),
-            thresholds_snapshot.as_ref(),
-            fallback_active,
+            incumbent_k,
         );
     }
 
     /// Process an agent activity signal (message, reservation, commit).
-    pub fn observe_activity(&mut self, agent: &str, timestamp_micros: i64) {
+    pub fn observe_activity(
+        &mut self,
+        agent: &str,
+        project_key: Option<&str>,
+        timestamp_micros: i64,
+    ) {
         if agent == ATC_AGENT_NAME {
             return;
         }
         let mut resurrected = false;
         if let Some(entry) = self.agents.get_mut(agent) {
+            if let Some(project_key) = project_key.map(str::trim).filter(|value| !value.is_empty())
+            {
+                entry.project_key = Some(project_key.to_string());
+            }
             entry.rhythm.observe(timestamp_micros);
             // Any activity resets to Alive (resurrection)
             if entry.state != LivenessState::Alive {
@@ -3747,16 +4200,13 @@ impl AtcEngine {
                 resurrected = true;
             }
         }
-        let thresholds_snapshot = ATC_THRESHOLDS
-            .get()
-            .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
         let fallback_active = self.current_release_guard_reason().is_some();
-        self.reschedule_agent(
-            agent,
-            timestamp_micros,
-            thresholds_snapshot.as_ref(),
+        let incumbent_k = Self::effective_threshold(
+            self.incumbent_policy.suspicion_k,
+            current_adaptive_threshold_k(agent),
             fallback_active,
         );
+        self.reschedule_agent(agent, timestamp_micros, incumbent_k);
         if resurrected {
             self.dirty_agents.insert(agent.to_string());
         }
@@ -3768,10 +4218,8 @@ impl AtcEngine {
     /// `(agent_name, recommended_action)` pairs that require intervention.
     #[must_use]
     fn evaluate_liveness(&mut self, now_micros: i64) -> LivenessEvaluation {
-        let thresholds_snapshot = ATC_THRESHOLDS
-            .get()
-            .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
-        let fallback_active = self.current_release_guard_reason().is_some();
+        let fallback_reason = self.current_release_guard_reason();
+        let fallback_active = fallback_reason.is_some();
         let incumbent_policy = self.incumbent_policy.clone();
         let candidate_policy = self.shadow_policy.candidate.clone();
         let due_agents = self.pop_due_agents(now_micros);
@@ -3781,10 +4229,9 @@ impl AtcEngine {
         };
 
         for agent_name in due_agents {
-            let incumbent_k = self.effective_threshold_for_agent(
-                &agent_name,
+            let incumbent_k = Self::effective_threshold(
                 incumbent_policy.suspicion_k,
-                thresholds_snapshot.as_ref(),
+                current_adaptive_threshold_k(&agent_name),
                 fallback_active,
             );
             let candidate_k = candidate_policy
@@ -3914,8 +4361,9 @@ impl AtcEngine {
                 let Some(entry) = self.agents.get(&agent_name) else {
                     continue;
                 };
-                self.ledger.record(&DecisionBuilder {
+                let decision_id = self.ledger.record(&DecisionBuilder {
                     subsystem: AtcSubsystem::Liveness,
+                    decision_class: "liveness_transition",
                     subject: &subject,
                     core: &entry.core,
                     action,
@@ -3924,20 +4372,20 @@ impl AtcEngine {
                     evidence_summary: &evidence_summary,
                     calibration_healthy: !fallback_active,
                     safe_mode_active: fallback_active,
+                    policy_id: Some(&incumbent_policy.policy_id),
+                    fallback_reason: fallback_reason.as_deref(),
                     timestamp_micros: now_micros,
                 });
+                evaluation
+                    .decision_metadata
+                    .insert(subject.clone(), LivenessDecisionMetadata { decision_id });
             }
 
             if let Some(action) = action_to_emit {
                 evaluation.actions.push(action);
             }
 
-            self.reschedule_agent(
-                &agent_name,
-                now_micros,
-                thresholds_snapshot.as_ref(),
-                fallback_active,
-            );
+            self.reschedule_agent(&agent_name, now_micros, incumbent_k);
         }
 
         evaluation
@@ -3962,6 +4410,7 @@ impl AtcEngine {
                 results.push((project.clone(), cached.cycles.clone()));
             }
         }
+        results.sort_by(|left, right| left.0.cmp(&right.0));
         results
     }
 
@@ -3979,7 +4428,7 @@ impl AtcEngine {
     }
 
     fn build_summary_snapshot_with(
-        &self,
+        &mut self,
         now_micros: i64,
         stage_timings: &AtcStageTimings,
         kernel: &AtcKernelTelemetry,
@@ -3987,7 +4436,11 @@ impl AtcEngine {
         policy: &AtcPolicyTelemetry,
     ) -> AtcSummarySnapshot {
         let mut agent_states = Vec::with_capacity(self.agents.len());
-        for (name, entry) in &self.agents {
+        let agent_names: Vec<String> = self.sorted_agent_names().to_vec();
+        for name in agent_names {
+            let Some(entry) = self.agents.get(&name) else {
+                continue;
+            };
             agent_states.push(AgentStateSnapshot {
                 name: name.clone(),
                 state: entry.state,
@@ -3995,7 +4448,6 @@ impl AtcEngine {
                 posterior_alive: entry.core.posterior_probability(LivenessState::Alive),
             });
         }
-        agent_states.sort_by(|left, right| left.name.cmp(&right.name));
 
         AtcSummarySnapshot {
             enabled: self.enabled(),
@@ -4006,6 +4458,7 @@ impl AtcEngine {
             eprocess_value: self.eprocess().e_value(),
             regret_avg: self.regret().average_regret(),
             decisions_total: self.ledger().latest_id(),
+            recent_decisions: self.ledger().recent(16).cloned().collect(),
             stage_timings: stage_timings.clone(),
             kernel: kernel.clone(),
             budget: budget.clone(),
@@ -4013,34 +4466,132 @@ impl AtcEngine {
         }
     }
 
+    fn effect_plan_from_record(
+        &self,
+        record: &AtcDecisionRecord,
+        timestamp_micros: i64,
+        kind: &str,
+        category: &str,
+        agent: String,
+        project_key: Option<String>,
+        message: Option<String>,
+    ) -> AtcEffectPlan {
+        let mut effect_seed = format!("{}:{kind}:{category}:{agent}", record.trace_id,);
+        if let Some(project_key) = project_key.as_deref() {
+            effect_seed.push(':');
+            effect_seed.push_str(project_key);
+        }
+        if let Some(policy_id) = record.policy_id.as_deref() {
+            effect_seed.push(':');
+            effect_seed.push_str(policy_id);
+        }
+        if let Some(message) = message.as_deref() {
+            effect_seed.push(':');
+            effect_seed.push_str(message);
+        }
+        AtcEffectPlan {
+            effect_id: format!("atc-effect-{:016x}", stable_fnv1a64(effect_seed.as_bytes())),
+            claim_id: record.claim_id.clone(),
+            evidence_id: record.evidence_id.clone(),
+            trace_id: record.trace_id.clone(),
+            timestamp_micros,
+            kind: kind.to_string(),
+            category: category.to_string(),
+            agent,
+            project_key,
+            policy_id: record.policy_id.clone(),
+            message,
+            expected_loss: record
+                .loss_table
+                .iter()
+                .find_map(|entry| (entry.action == record.action).then_some(entry.expected_loss)),
+        }
+    }
+
+    fn effect_plan_for_decision_id(
+        &self,
+        decision_id: u64,
+        timestamp_micros: i64,
+        kind: &str,
+        category: &str,
+        agent: String,
+        project_key: Option<String>,
+        message: Option<String>,
+    ) -> Option<AtcEffectPlan> {
+        self.ledger.get(decision_id).map(|record| {
+            self.effect_plan_from_record(
+                record,
+                timestamp_micros,
+                kind,
+                category,
+                agent,
+                project_key,
+                message,
+            )
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn run_tick(&mut self, now_micros: i64) -> AtcTickReport {
         let total_started = Instant::now();
         self.tick_count = self.tick_count.saturating_add(1);
 
-        let fallback_reason = self.current_release_guard_reason();
-        let mode = self.budget_mode();
+        let decision_fallback_reason = self.current_release_guard_reason();
+        let decision_fallback_active = decision_fallback_reason.is_some();
+        let decision_mode = self.budget_mode();
         let candidate_policy = self.shadow_policy.candidate.clone();
-        let thresholds_snapshot = ATC_THRESHOLDS
-            .get()
-            .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
 
         let mut actions = Vec::new();
+        let mut effects = Vec::new();
         let mut timings = AtcStageTimings::default();
 
         let liveness_started = Instant::now();
         let liveness = self.evaluate_liveness(now_micros);
         timings.liveness_micros = elapsed_micros(liveness_started);
         for (agent_name, action) in &liveness.actions {
+            let decision_id = liveness
+                .decision_metadata
+                .get(agent_name)
+                .map(|metadata| metadata.decision_id);
             match *action {
-                LivenessAction::Suspect => actions.push(AtcTickAction::SendAdvisory {
-                    agent: agent_name.clone(),
-                    message: format!("[ATC] Agent {agent_name} appears unresponsive. Monitoring."),
-                }),
+                LivenessAction::Suspect => {
+                    let message =
+                        format!("[ATC] Agent {agent_name} appears unresponsive. Monitoring.");
+                    actions.push(AtcTickAction::SendAdvisory {
+                        agent: agent_name.clone(),
+                        message: message.clone(),
+                    });
+                    if let Some(decision_id) = decision_id
+                        && let Some(effect) = self.effect_plan_for_decision_id(
+                            decision_id,
+                            now_micros,
+                            "send_advisory",
+                            "liveness",
+                            agent_name.clone(),
+                            self.agent_project_key(agent_name),
+                            Some(message),
+                        )
+                    {
+                        effects.push(effect);
+                    }
+                }
                 LivenessAction::ReleaseReservations => {
                     actions.push(AtcTickAction::ReleaseReservations {
                         agent: agent_name.clone(),
                     });
+                    if let Some(decision_id) = decision_id
+                        && let Some(effect) = self.effect_plan_for_decision_id(
+                            decision_id,
+                            now_micros,
+                            "release_reservations_requested",
+                            "liveness",
+                            agent_name.clone(),
+                            self.agent_project_key(agent_name),
+                            None,
+                        )
+                    {
+                        effects.push(effect);
+                    }
                 }
                 LivenessAction::DeclareAlive => {}
             }
@@ -4051,13 +4602,43 @@ impl AtcEngine {
         timings.deadlock_micros = elapsed_micros(deadlock_started);
         for (project, cycles) in &deadlocks {
             for cycle in cycles {
+                let subject = cycle.join(" → ");
+                let evidence_summary =
+                    format!("deterministic deadlock cycle in {project}: {subject}");
+                let decision_id = self.ledger.record_event(&EventDecisionBuilder {
+                    subsystem: AtcSubsystem::Conflict,
+                    decision_class: "deadlock_cycle",
+                    subject: &subject,
+                    policy_id: None,
+                    posterior: Vec::new(),
+                    action: "AdvisoryMessage",
+                    expected_loss: 0.0,
+                    runner_up_loss: 0.0,
+                    loss_table: Vec::new(),
+                    evidence_summary: &evidence_summary,
+                    calibration_healthy: !decision_fallback_active,
+                    safe_mode_active: decision_fallback_active,
+                    fallback_reason: decision_fallback_reason.as_deref(),
+                    timestamp_micros: now_micros,
+                });
+                let message = format!(
+                    "[ATC] Deadlock detected in {project}: {subject}. Consider releasing reservations."
+                );
                 actions.push(AtcTickAction::SendAdvisory {
                     agent: cycle[0].clone(),
-                    message: format!(
-                        "[ATC] Deadlock detected in {project}: {}. Consider releasing reservations.",
-                        cycle.join(" → ")
-                    ),
+                    message: message.clone(),
                 });
+                if let Some(effect) = self.effect_plan_for_decision_id(
+                    decision_id,
+                    now_micros,
+                    "send_advisory",
+                    "conflict",
+                    cycle[0].clone(),
+                    Some(project.clone()),
+                    Some(message),
+                ) {
+                    effects.push(effect);
+                }
             }
         }
 
@@ -4078,20 +4659,28 @@ impl AtcEngine {
             .tick_budget_micros
             .saturating_sub(projected_non_probe_micros);
         let probe_budget_micros = floor_f64_to_u64(
-            u64_to_f64(available_budget_micros) * self.incumbent_policy.probe_budget_fraction(mode),
+            u64_to_f64(available_budget_micros)
+                * self.incumbent_policy.probe_budget_fraction(decision_mode),
         )
         .min(self.config.tick_budget_micros);
+        let debt_based_probe_limit =
+            if self.slow_controller.budget_debt_micros() > self.config.tick_budget_micros {
+                1
+            } else {
+                usize::MAX
+            };
         let effective_probe_limit = self
             .slow_controller
             .probe_limit
-            .min(self.incumbent_policy.max_probes(mode));
+            .min(self.incumbent_policy.max_probes(decision_mode))
+            .min(debt_based_probe_limit);
 
         let probe_started = Instant::now();
         let incumbent_probe_candidates = budgeted_probe_schedule(
             &self.agents,
             &excluded_agents,
             &self.incumbent_policy,
-            mode,
+            decision_mode,
             effective_probe_limit,
             probe_budget_micros,
             estimated_probe_cost_micros,
@@ -4103,14 +4692,15 @@ impl AtcEngine {
             .collect();
         if let Some(candidate) = candidate_policy.as_ref() {
             let candidate_probe_budget_micros = floor_f64_to_u64(
-                u64_to_f64(available_budget_micros) * candidate.probe_budget_fraction(mode),
+                u64_to_f64(available_budget_micros)
+                    * candidate.probe_budget_fraction(decision_mode),
             )
             .min(self.config.tick_budget_micros);
             let candidate_probe_agents: Vec<String> = budgeted_probe_schedule(
                 &self.agents,
                 &excluded_agents,
                 candidate,
-                mode,
+                decision_mode,
                 effective_probe_limit,
                 candidate_probe_budget_micros,
                 estimated_probe_cost_micros,
@@ -4128,15 +4718,62 @@ impl AtcEngine {
             if let Some(entry) = self.agents.get_mut(&candidate.agent) {
                 entry.probe_sent_at = now_micros;
             }
-            self.reschedule_agent(
-                &candidate.agent,
-                now_micros,
-                thresholds_snapshot.as_ref(),
-                fallback_reason.is_some(),
+            let incumbent_k = Self::effective_threshold(
+                self.incumbent_policy.suspicion_k,
+                current_adaptive_threshold_k(&candidate.agent),
+                decision_fallback_active,
             );
-            actions.push(AtcTickAction::ProbeAgent {
-                agent: candidate.agent,
+            self.reschedule_agent(&candidate.agent, now_micros, incumbent_k);
+            let posterior = self
+                .agents
+                .get(&candidate.agent)
+                .map_or_else(Vec::new, |entry| entry.core.posterior_summary());
+            let evidence_summary = format!(
+                "selected for probing with gain_per_micro {:.4} in {} mode",
+                candidate.gain_per_micro,
+                decision_mode.as_str()
+            );
+            let probe_loss = 1.0 / candidate.gain_per_micro.max(1e-6);
+            let decision_id = self.ledger.record_event(&EventDecisionBuilder {
+                subsystem: AtcSubsystem::Synthesis,
+                decision_class: "probe_schedule",
+                subject: &candidate.agent,
+                policy_id: Some(&self.incumbent_policy.policy_id),
+                posterior,
+                action: "ProbeAgent",
+                expected_loss: probe_loss,
+                runner_up_loss: probe_loss + 1.0,
+                loss_table: vec![
+                    AtcLossTableEntry {
+                        action: "ProbeAgent".to_string(),
+                        expected_loss: probe_loss,
+                    },
+                    AtcLossTableEntry {
+                        action: "DeferProbe".to_string(),
+                        expected_loss: probe_loss + 1.0,
+                    },
+                ],
+                evidence_summary: &evidence_summary,
+                calibration_healthy: !decision_fallback_active,
+                safe_mode_active: decision_fallback_active,
+                fallback_reason: decision_fallback_reason.as_deref(),
+                timestamp_micros: now_micros,
             });
+            actions.push(AtcTickAction::ProbeAgent {
+                agent: candidate.agent.clone(),
+            });
+            let probe_project_key = self.agent_project_key(&candidate.agent);
+            if let Some(effect) = self.effect_plan_for_decision_id(
+                decision_id,
+                now_micros,
+                "probe_agent",
+                "probe",
+                candidate.agent,
+                probe_project_key,
+                None,
+            ) {
+                effects.push(effect);
+            }
         }
 
         let gating_started = Instant::now();
@@ -4152,6 +4789,16 @@ impl AtcEngine {
                 }
                 _ => true,
             });
+            effects.retain(|effect| {
+                if effect.kind == "release_reservations_requested" {
+                    withheld_releases.push(effect.agent.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            withheld_releases.sort();
+            withheld_releases.dedup();
         }
 
         for agent_name in withheld_releases {
@@ -4163,13 +4810,63 @@ impl AtcEngine {
                     entry.suspect_since = now_micros;
                 }
             }
-            self.reschedule_agent(&agent_name, now_micros, thresholds_snapshot.as_ref(), true);
+            let incumbent_k = Self::effective_threshold(
+                self.incumbent_policy.suspicion_k,
+                current_adaptive_threshold_k(&agent_name),
+                true,
+            );
+            self.reschedule_agent(&agent_name, now_micros, incumbent_k);
+            let posterior = self
+                .agents
+                .get(&agent_name)
+                .map_or_else(Vec::new, |entry| entry.core.posterior_summary());
+            let evidence_summary =
+                "conformal uncertainty forced deterministic withholding of release".to_string();
+            let decision_id = self.ledger.record_event(&EventDecisionBuilder {
+                subsystem: AtcSubsystem::Calibration,
+                decision_class: "withheld_release",
+                subject: &agent_name,
+                policy_id: Some(&self.incumbent_policy.policy_id),
+                posterior,
+                action: "WithholdRelease",
+                expected_loss: 0.0,
+                runner_up_loss: self
+                    .incumbent_policy
+                    .expected_loss(LivenessAction::ReleaseReservations, &[]),
+                loss_table: vec![
+                    AtcLossTableEntry {
+                        action: "WithholdRelease".to_string(),
+                        expected_loss: 0.0,
+                    },
+                    AtcLossTableEntry {
+                        action: "ReleaseReservations".to_string(),
+                        expected_loss: 1.0,
+                    },
+                ],
+                evidence_summary: &evidence_summary,
+                calibration_healthy: false,
+                safe_mode_active: true,
+                fallback_reason: Some("conformal_uncertainty"),
+                timestamp_micros: now_micros,
+            });
+            let message = format!(
+                "[ATC] Agent {agent_name} appears unresponsive. Automated reservation release withheld under high uncertainty."
+            );
             actions.push(AtcTickAction::SendAdvisory {
                 agent: agent_name.clone(),
-                message: format!(
-                    "[ATC] Agent {agent_name} appears unresponsive. Automated reservation release withheld under high uncertainty."
-                ),
+                message: message.clone(),
             });
+            if let Some(effect) = self.effect_plan_for_decision_id(
+                decision_id,
+                now_micros,
+                "send_advisory",
+                "calibration",
+                agent_name.clone(),
+                self.agent_project_key(&agent_name),
+                Some(message),
+            ) {
+                effects.push(effect);
+            }
         }
 
         let release_targets: Vec<String> = actions
@@ -4180,12 +4877,27 @@ impl AtcEngine {
             })
             .collect();
         for agent_name in release_targets {
+            let message = format!(
+                "[ATC] Agent {agent_name} declared dead. Automated reservation release requested."
+            );
+            let project_key = self.agent_project_key(&agent_name);
             actions.push(AtcTickAction::SendAdvisory {
                 agent: agent_name.clone(),
-                message: format!(
-                    "[ATC] Agent {agent_name} declared dead. Automated reservation release requested."
-                ),
+                message: message.clone(),
             });
+            if let Some(metadata) = liveness.decision_metadata.get(&agent_name)
+                && let Some(effect) = self.effect_plan_for_decision_id(
+                    metadata.decision_id,
+                    now_micros,
+                    "send_advisory",
+                    "liveness",
+                    agent_name,
+                    project_key,
+                    Some(message),
+                )
+            {
+                effects.push(effect);
+            }
         }
         timings.gating_micros = elapsed_micros(gating_started);
 
@@ -4201,17 +4913,26 @@ impl AtcEngine {
         let utilization_ratio = u64_to_f64(pre_summary_total_micros)
             / u64_to_f64(self.config.tick_budget_micros.max(1));
         self.slow_controller.note_tick(
+            pre_summary_total_micros,
+            self.config.tick_budget_micros,
             utilization_ratio,
             budget_exceeded,
             self.incumbent_policy.max_probes_per_tick,
         );
         timings.slow_control_micros = elapsed_micros(slow_started);
 
+        let reported_mode = self.budget_mode();
+        let reported_fallback_reason = self.current_release_guard_reason();
+        let next_due_micros = self.next_scheduled_review_micros();
+
         let kernel = AtcKernelTelemetry {
             due_agents: liveness.due_agents,
             scheduled_agents: self.scheduled_agent_count(),
+            next_due_micros,
             dirty_agents: self.dirty_agents.len(),
             dirty_projects: self.dirty_projects.len(),
+            pending_effects: effects.len(),
+            lock_wait_micros: 0,
             deadlock_cache_hits: self.deadlock_cache_hits,
             deadlock_cache_misses: self.deadlock_cache_misses,
             deadlock_cache_hit_rate: if self.deadlock_cache_hits + self.deadlock_cache_misses == 0 {
@@ -4222,27 +4943,36 @@ impl AtcEngine {
             },
         };
         let budget = AtcBudgetTelemetry {
-            mode: mode.as_str().to_string(),
+            mode: reported_mode.as_str().to_string(),
             tick_budget_micros: self.config.tick_budget_micros,
             probe_budget_micros,
             estimated_probe_cost_micros,
             max_probes_this_tick: self
                 .slow_controller
                 .probe_limit
-                .min(self.incumbent_policy.max_probes(mode)),
+                .min(self.incumbent_policy.max_probes(reported_mode)),
+            budget_debt_micros: self.slow_controller.budget_debt_micros(),
             utilization_ratio,
             slow_window_utilization: self.slow_controller.average_window_utilization(),
+            kernel_total_micros: pre_summary_total_micros,
         };
         let policy = AtcPolicyTelemetry {
+            bundle_id: self.policy_bundle.bundle_id.clone(),
+            bundle_hash: self.policy_bundle.bundle_hash.clone(),
             incumbent_policy_id: self.incumbent_policy.policy_id.clone(),
+            incumbent_artifact_hash: self.incumbent_policy.artifact_hash.clone(),
             candidate_policy_id: candidate_policy
                 .as_ref()
                 .map(|candidate| candidate.policy_id.clone()),
+            candidate_artifact_hash: candidate_policy
+                .as_ref()
+                .map(|candidate| candidate.artifact_hash.clone()),
             shadow_enabled: candidate_policy.is_some(),
             shadow_disagreements: self.shadow_policy.disagreements,
             shadow_regret_avg: self.shadow_policy.average_regret(),
-            fallback_active: fallback_reason.is_some(),
-            fallback_reason,
+            decision_mode: decision_mode.as_str().to_string(),
+            fallback_active: reported_fallback_reason.is_some(),
+            fallback_reason: reported_fallback_reason,
         };
 
         let summary_started = Instant::now();
@@ -4261,7 +4991,11 @@ impl AtcEngine {
         self.cost_model
             .update(&self.last_stage_timings, incumbent_probe_agents.len());
 
-        AtcTickReport { actions, summary }
+        AtcTickReport {
+            actions,
+            effects,
+            summary,
+        }
     }
 }
 
@@ -4382,7 +5116,7 @@ mod engine_tests {
     #[test]
     fn engine_registers_agent() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("BlueFox", "claude-code");
+        engine.register_agent("BlueFox", "claude-code", None);
         assert!(engine.agent_liveness("BlueFox").is_some());
         assert_eq!(engine.agent_liveness("BlueFox"), Some(LivenessState::Alive));
     }
@@ -4390,15 +5124,15 @@ mod engine_tests {
     #[test]
     fn engine_excludes_atc_from_registration() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent(ATC_AGENT_NAME, "mcp-agent-mail");
+        engine.register_agent(ATC_AGENT_NAME, "mcp-agent-mail", None);
         assert!(engine.agent_liveness(ATC_AGENT_NAME).is_none());
     }
 
     #[test]
     fn engine_excludes_atc_from_activity() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("BlueFox", "claude-code");
-        engine.observe_activity(ATC_AGENT_NAME, 1_000_000);
+        engine.register_agent("BlueFox", "claude-code", None);
+        engine.observe_activity(ATC_AGENT_NAME, None, 1_000_000);
         // ATC activity should be silently ignored
         assert!(engine.agent_liveness(ATC_AGENT_NAME).is_none());
     }
@@ -4406,25 +5140,25 @@ mod engine_tests {
     #[test]
     fn activity_resets_to_alive() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("BlueFox", "claude-code");
+        engine.register_agent("BlueFox", "claude-code", None);
 
         // Manually set to Flaky
         engine.agents.get_mut("BlueFox").unwrap().state = LivenessState::Flaky;
         assert_eq!(engine.agent_liveness("BlueFox"), Some(LivenessState::Flaky));
 
         // Activity resets to Alive
-        engine.observe_activity("BlueFox", 1_000_000);
+        engine.observe_activity("BlueFox", None, 1_000_000);
         assert_eq!(engine.agent_liveness("BlueFox"), Some(LivenessState::Alive));
     }
 
     #[test]
     fn evaluate_liveness_detects_silent_agent() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("BlueFox", "claude-code");
+        engine.register_agent("BlueFox", "claude-code", None);
 
         // Establish a rhythm (60s intervals, 10 observations)
         for i in 0..10 {
-            engine.observe_activity("BlueFox", i * 60_000_000);
+            engine.observe_activity("BlueFox", None, i * 60_000_000);
         }
 
         // 5 minutes of silence (5× the 60s avg).  The posterior update is
@@ -4458,11 +5192,11 @@ mod engine_tests {
     #[test]
     fn evaluate_liveness_ignores_active_agent() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("BlueFox", "claude-code");
+        engine.register_agent("BlueFox", "claude-code", None);
 
         // Agent is active right now
         for i in 0..10 {
-            engine.observe_activity("BlueFox", i * 60_000_000);
+            engine.observe_activity("BlueFox", None, i * 60_000_000);
         }
         let now = 9 * 60_000_000 + 30_000_000; // only 30s since last activity
         let evaluation = engine.evaluate_liveness(now);
@@ -4475,12 +5209,12 @@ mod engine_tests {
     #[test]
     fn safe_mode_blocks_release() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("BlueFox", "claude-code");
+        engine.register_agent("BlueFox", "claude-code", None);
         engine.set_safe_mode(true, 0);
 
         // Establish rhythm then go very silent
         for i in 0..10 {
-            engine.observe_activity("BlueFox", i * 60_000_000);
+            engine.observe_activity("BlueFox", None, i * 60_000_000);
         }
         // Force posterior toward Dead
         let entry = engine.agents.get_mut("BlueFox").unwrap();
@@ -4572,11 +5306,11 @@ mod engine_tests {
     #[test]
     fn ledger_records_liveness_decisions() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("BlueFox", "claude-code");
+        engine.register_agent("BlueFox", "claude-code", None);
 
         // Establish rhythm then go silent
         for i in 0..10 {
-            engine.observe_activity("BlueFox", i * 60_000_000);
+            engine.observe_activity("BlueFox", None, i * 60_000_000);
         }
         let now = 9 * 60_000_000 + 300_000_000;
         let _actions = engine.evaluate_liveness(now);
@@ -4594,7 +5328,7 @@ mod engine_tests {
     #[test]
     fn dead_agent_resurrection_via_observe_activity() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("Phoenix", "claude-code");
+        engine.register_agent("Phoenix", "claude-code", None);
 
         // Manually set to Dead
         if let Some(entry) = engine.agents.get_mut("Phoenix") {
@@ -4609,7 +5343,7 @@ mod engine_tests {
         );
 
         // observe_activity should resurrect from Dead → Alive
-        engine.observe_activity("Phoenix", 2_000_000);
+        engine.observe_activity("Phoenix", None, 2_000_000);
 
         assert_eq!(
             engine.agent_liveness("Phoenix"),
@@ -4629,11 +5363,11 @@ mod engine_tests {
     #[test]
     fn evaluate_liveness_skips_dead_agents() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("Zombie", "claude-code");
+        engine.register_agent("Zombie", "claude-code", None);
 
         // Establish rhythm then set to Dead
         for i in 0..10 {
-            engine.observe_activity("Zombie", i * 60_000_000);
+            engine.observe_activity("Zombie", None, i * 60_000_000);
         }
         if let Some(entry) = engine.agents.get_mut("Zombie") {
             entry.state = LivenessState::Dead;
@@ -4661,7 +5395,7 @@ mod engine_tests {
         let agents_before = engine.tracked_agents().len();
 
         // Call observe_activity for an agent that was never registered
-        engine.observe_activity("GhostAgent", 1_000_000);
+        engine.observe_activity("GhostAgent", None, 1_000_000);
 
         // Should not panic, should not create a new entry
         assert_eq!(
@@ -5541,6 +6275,7 @@ mod predictive_tests {
         // Uncertain agent (uniform posterior)
         let mut uncertain = AgentLivenessEntry {
             name: "Uncertain".to_string(),
+            project_key: None,
             program: "claude-code".to_string(),
             state: LivenessState::Alive,
             rhythm: AgentRhythm::new(60.0),
@@ -5565,6 +6300,7 @@ mod predictive_tests {
         // Confident agent (strong alive posterior — default)
         let confident = AgentLivenessEntry {
             name: "Confident".to_string(),
+            project_key: None,
             program: "claude-code".to_string(),
             state: LivenessState::Alive,
             rhythm: AgentRhythm::new(60.0),
@@ -5592,6 +6328,7 @@ mod predictive_tests {
             ATC_AGENT_NAME.to_string(),
             AgentLivenessEntry {
                 name: ATC_AGENT_NAME.to_string(),
+                project_key: None,
                 program: "mcp-agent-mail".to_string(),
                 state: LivenessState::Alive,
                 rhythm: AgentRhythm::new(60.0),
@@ -6102,6 +6839,7 @@ mod edge_case_tests {
             let subject = format!("Agent{i}");
             ledger.record(&DecisionBuilder {
                 subsystem: AtcSubsystem::Liveness,
+                decision_class: "test",
                 subject: &subject,
                 core: &core,
                 action: LivenessAction::DeclareAlive,
@@ -6110,6 +6848,8 @@ mod edge_case_tests {
                 evidence_summary: "test",
                 calibration_healthy: true,
                 safe_mode_active: false,
+                policy_id: None,
+                fallback_reason: None,
                 timestamp_micros: i,
             });
         }
@@ -6127,16 +6867,23 @@ mod edge_case_tests {
     fn format_message_with_empty_posterior() {
         let record = AtcDecisionRecord {
             id: 1,
+            claim_id: "atc-claim-1".to_string(),
+            evidence_id: "atc-evidence-1".to_string(),
+            trace_id: "atc-trace-1".to_string(),
             timestamp_micros: 0,
             subsystem: AtcSubsystem::Liveness,
+            decision_class: "test".to_string(),
             subject: "Test".to_string(),
+            policy_id: None,
             posterior: vec![],
             action: "Test".to_string(),
             expected_loss: 0.0,
             runner_up_loss: 0.0,
+            loss_table: Vec::new(),
             evidence_summary: "test".to_string(),
             calibration_healthy: true,
             safe_mode_active: false,
+            fallback_reason: None,
         };
         let msg = record.format_message();
         assert!(
@@ -6153,6 +6900,7 @@ mod edge_case_tests {
             let subject = format!("Agent{i}");
             ledger.record(&DecisionBuilder {
                 subsystem: AtcSubsystem::Liveness,
+                decision_class: "test",
                 subject: &subject,
                 core: &core,
                 action: LivenessAction::DeclareAlive,
@@ -6161,6 +6909,8 @@ mod edge_case_tests {
                 evidence_summary: "test",
                 calibration_healthy: true,
                 safe_mode_active: false,
+                policy_id: None,
+                fallback_reason: None,
                 timestamp_micros: i,
             });
         }
@@ -6200,11 +6950,11 @@ mod edge_case_tests {
     #[test]
     fn evaluate_liveness_skips_dead_agent() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("DeadAgent", "claude-code");
+        engine.register_agent("DeadAgent", "claude-code", None);
         // Force to Dead
         engine.agents.get_mut("DeadAgent").unwrap().state = LivenessState::Dead;
         for i in 0..10 {
-            engine.observe_activity("DeadAgent", i * 60_000_000);
+            engine.observe_activity("DeadAgent", None, i * 60_000_000);
         }
         // Reset to Dead again (observe_activity resurrects)
         engine.agents.get_mut("DeadAgent").unwrap().state = LivenessState::Dead;
@@ -6224,7 +6974,7 @@ mod edge_case_tests {
     fn observe_activity_unregistered_agent_ignored() {
         let mut engine = AtcEngine::new_for_testing();
         // Don't register "Ghost" — just observe activity
-        engine.observe_activity("Ghost", 1_000_000);
+        engine.observe_activity("Ghost", None, 1_000_000);
         assert!(
             engine.agent_liveness("Ghost").is_none(),
             "unregistered agent should not be auto-created"
@@ -6789,7 +7539,12 @@ pub fn submodular_probe_schedule<S: BuildHasher>(
     }
 
     let mut candidates: Vec<(String, f64)> = Vec::with_capacity(max_probes);
-    for (name, entry) in agents {
+    let mut agent_names: Vec<&String> = agents.keys().collect();
+    agent_names.sort();
+    for name in agent_names {
+        let Some(entry) = agents.get(name) else {
+            continue;
+        };
         if name.as_str() == ATC_AGENT_NAME || entry.state == LivenessState::Dead {
             continue;
         }
@@ -6806,7 +7561,16 @@ pub fn submodular_probe_schedule<S: BuildHasher>(
         if gain <= 0.001 {
             continue;
         }
-        let insert_at = candidates.partition_point(|(_, existing_gain)| *existing_gain >= gain);
+        let insert_at = candidates.partition_point(|(existing_name, existing_gain)| {
+            match existing_gain
+                .partial_cmp(&gain)
+                .unwrap_or(std::cmp::Ordering::Equal)
+            {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => existing_name.as_str() <= name.as_str(),
+                std::cmp::Ordering::Less => false,
+            }
+        });
         if insert_at >= max_probes {
             continue;
         }
@@ -6886,14 +7650,6 @@ fn budgeted_probe_schedule<S: BuildHasher>(
             gain_per_micro: estimated_gain / u64_to_f64(probe_cost),
         });
     }
-
-    candidates.sort_by(|left, right| {
-        right
-            .gain_per_micro
-            .partial_cmp(&left.gain_per_micro)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.agent.cmp(&right.agent))
-    });
     candidates
 }
 
@@ -6982,12 +7738,27 @@ static ATC_SURVIVAL: OnceLock<Mutex<HashMap<String, KaplanMeierEstimator>>> = On
 static ATC_LIVENESS_TUNER: OnceLock<Mutex<LossMatrixTuner<LivenessAction, LivenessState>>> =
     OnceLock::new();
 
+fn current_adaptive_threshold_k(agent_name: &str) -> Option<f64> {
+    ATC_THRESHOLDS
+        .get()
+        .and_then(|lock| lock.lock().ok())
+        .and_then(|thresholds| {
+            thresholds
+                .get(agent_name)
+                .map(AdaptiveThreshold::effective_k)
+        })
+}
+
 impl AtcEngine {
     /// Build an `AtcConfig` from the core `Config` env vars.
     #[must_use]
     pub fn config_from_env(config: &mcp_agent_mail_core::Config) -> AtcConfig {
         AtcConfig {
             enabled: config.atc_enabled,
+            policy_bundle_path: std::env::var("AM_ATC_POLICY_BUNDLE_PATH")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             probe_interval_micros: i64::try_from(config.atc_probe_interval_secs)
                 .unwrap_or(120)
                 .saturating_mul(1_000_000),
@@ -7057,21 +7828,27 @@ pub fn atc_enabled() -> bool {
 
 /// Record an agent registration in the ATC.
 pub fn atc_register_agent(name: &str, program: &str) {
-    if !atc_enabled() {
+    atc_register_agent_with_project(name, program, None);
+}
+
+/// Record an agent registration in the ATC with optional project routing metadata.
+pub fn atc_register_agent_with_project(name: &str, program: &str, project_key: Option<&str>) {
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
         return;
     }
-    if let Some(engine) = ATC_ENGINE.get()
-        && let Ok(mut e) = engine.lock()
-    {
-        e.register_agent(name, program);
-    }
+    let base_k = e.config.suspicion_k;
+    e.register_agent(name, program, project_key);
+    drop(e);
+
     if let Some(thresholds) = ATC_THRESHOLDS.get()
         && let Ok(mut t) = thresholds.lock()
     {
-        let base_k = ATC_ENGINE
-            .get()
-            .and_then(|m| m.lock().ok())
-            .map_or(3.0, |e| e.config.suspicion_k);
         t.entry(name.to_string())
             .or_insert_with(|| AdaptiveThreshold::new(base_k));
     }
@@ -7079,14 +7856,25 @@ pub fn atc_register_agent(name: &str, program: &str) {
 
 /// Record agent activity (tool call, message, etc.) in the ATC.
 pub fn atc_observe_activity(agent: &str, timestamp_micros: i64) {
-    if !atc_enabled() {
+    atc_observe_activity_with_project(agent, None, timestamp_micros);
+}
+
+/// Record agent activity (tool call, message, etc.) in the ATC with optional project metadata.
+pub fn atc_observe_activity_with_project(
+    agent: &str,
+    project_key: Option<&str>,
+    timestamp_micros: i64,
+) {
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
         return;
     }
-    if let Some(engine) = ATC_ENGINE.get()
-        && let Ok(mut e) = engine.lock()
-    {
-        e.observe_activity(agent, timestamp_micros);
-    }
+    e.observe_activity(agent, project_key, timestamp_micros);
 }
 
 /// Actionable outputs from an ATC tick.
@@ -7106,12 +7894,17 @@ pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
 /// Run one ATC tick and return both actions and the fully-populated summary snapshot.
 #[must_use]
 pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
+    let lock_started = Instant::now();
     let engine_lock = ATC_ENGINE.get()?;
     let mut engine = engine_lock.lock().ok()?;
+    let lock_wait_micros = elapsed_micros(lock_started);
     if !engine.enabled() {
         return None;
     }
-    Some(engine.run_tick(now_micros))
+    let mut report = engine.run_tick(now_micros);
+    report.summary.kernel.lock_wait_micros = lock_wait_micros;
+    engine.last_kernel_telemetry.lock_wait_micros = lock_wait_micros;
+    Some(report)
 }
 
 /// Record the outcome of an ATC decision for calibration feedback.
@@ -7220,13 +8013,17 @@ pub fn atc_record_outcome(
 #[must_use]
 pub fn atc_summary() -> Option<AtcSummarySnapshot> {
     let engine_lock = ATC_ENGINE.get()?;
-    let engine = engine_lock.lock().ok()?;
+    let mut engine = engine_lock.lock().ok()?;
+    let timings = engine.last_stage_timings.clone();
+    let kernel = engine.last_kernel_telemetry.clone();
+    let budget = engine.last_budget_telemetry.clone();
+    let policy = engine.last_policy_telemetry.clone();
     Some(engine.build_summary_snapshot_with(
         mcp_agent_mail_core::timestamps::now_micros(),
-        &engine.last_stage_timings,
-        &engine.last_kernel_telemetry,
-        &engine.last_budget_telemetry,
-        &engine.last_policy_telemetry,
+        &timings,
+        &kernel,
+        &budget,
+        &policy,
     ))
 }
 
@@ -7240,6 +8037,7 @@ pub struct AtcSummarySnapshot {
     pub eprocess_value: f64,
     pub regret_avg: f64,
     pub decisions_total: u64,
+    pub recent_decisions: Vec<AtcDecisionRecord>,
     pub stage_timings: AtcStageTimings,
     pub kernel: AtcKernelTelemetry,
     pub budget: AtcBudgetTelemetry,
@@ -7340,7 +8138,7 @@ mod alien_enhancement_tests {
     #[test]
     fn tuned_liveness_policy_propagates_to_existing_and_new_agents() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("Existing", "claude-code");
+        engine.register_agent("Existing", "claude-code", None);
 
         let original_loss = engine
             .agents
@@ -7373,7 +8171,7 @@ mod alien_enhancement_tests {
             "existing agent should receive tuned policy: existing={existing_loss}, tuned={tuned_loss}"
         );
 
-        engine.register_agent("NewAgent", "claude-code");
+        engine.register_agent("NewAgent", "claude-code", None);
         let new_loss = engine
             .agents
             .get("NewAgent")
@@ -7437,8 +8235,8 @@ mod alien_enhancement_tests {
     #[test]
     fn engine_population_snapshot_uses_agent_programs() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("Claude", "claude-code");
-        engine.register_agent("Codex", "codex-cli");
+        engine.register_agent("Claude", "claude-code", None);
+        engine.register_agent("Codex", "codex-cli", None);
 
         let claude = engine.agents.get_mut("Claude").expect("claude entry");
         for i in 1..=10 {
@@ -7527,6 +8325,7 @@ mod alien_enhancement_tests {
                 name.clone(),
                 AgentLivenessEntry {
                     name,
+                    project_key: None,
                     program: "claude-code".to_string(),
                     state: LivenessState::Alive,
                     rhythm: AgentRhythm::new(60.0),
@@ -7558,6 +8357,7 @@ mod alien_enhancement_tests {
             "DeadProbe".to_string(),
             AgentLivenessEntry {
                 name: "DeadProbe".to_string(),
+                project_key: None,
                 program: "claude-code".to_string(),
                 state: LivenessState::Dead,
                 rhythm: AgentRhythm::new(60.0),
@@ -7573,6 +8373,7 @@ mod alien_enhancement_tests {
             "LiveProbe".to_string(),
             AgentLivenessEntry {
                 name: "LiveProbe".to_string(),
+                project_key: None,
                 program: "claude-code".to_string(),
                 state: LivenessState::Alive,
                 rhythm: AgentRhythm::new(60.0),
@@ -7819,9 +8620,9 @@ mod alien_enhancement_tests {
             let mut engine = engine_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            engine.register_agent("ReleaseNoProbe", "claude-code");
+            engine.register_agent("ReleaseNoProbe", "claude-code", None);
             for i in 0..10 {
-                engine.observe_activity("ReleaseNoProbe", i * 60_000_000);
+                engine.observe_activity("ReleaseNoProbe", None, i * 60_000_000);
             }
             let entry = engine.agents.get_mut("ReleaseNoProbe").expect("agent");
             for _ in 0..30 {
@@ -7864,9 +8665,9 @@ mod alien_enhancement_tests {
             let mut engine = engine_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            engine.register_agent("ConformalTick", "claude-code");
+            engine.register_agent("ConformalTick", "claude-code", None);
             for i in 0..10 {
-                engine.observe_activity("ConformalTick", i * 60_000_000);
+                engine.observe_activity("ConformalTick", None, i * 60_000_000);
             }
             let entry = engine.agents.get_mut("ConformalTick").expect("agent");
             for _ in 0..30 {
@@ -7978,6 +8779,7 @@ mod alien_enhancement_tests {
         for name in ["Alpha", "Beta", "Gamma"] {
             let mut entry = AgentLivenessEntry {
                 name: name.to_string(),
+                project_key: None,
                 program: "claude-code".to_string(),
                 state: LivenessState::Alive,
                 rhythm: AgentRhythm::new(60.0),
@@ -8029,6 +8831,7 @@ mod alien_enhancement_tests {
         for name in ["Alpha", "Beta", "Gamma"] {
             let mut entry = AgentLivenessEntry {
                 name: name.to_string(),
+                project_key: None,
                 program: "claude-code".to_string(),
                 state: LivenessState::Alive,
                 rhythm: AgentRhythm::new(60.0),
@@ -8093,7 +8896,7 @@ mod alien_enhancement_tests {
     #[test]
     fn schedule_compaction_discards_stale_heap_entries() {
         let mut engine = AtcEngine::new_for_testing();
-        engine.register_agent("HeapAgent", "claude-code");
+        engine.register_agent("HeapAgent", "claude-code", None);
 
         for tick in 1..=65 {
             engine.schedule_entry_for_push("HeapAgent", tick);
@@ -8105,6 +8908,43 @@ mod alien_enhancement_tests {
             "compaction should keep only the latest schedule entry per agent"
         );
         assert_eq!(engine.scheduled_agent_count(), 1);
+    }
+
+    #[test]
+    fn observe_activity_reschedules_with_single_agent_adaptive_threshold() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Adaptive", "claude-code", None);
+
+        let thresholds_lock = ATC_THRESHOLDS.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut thresholds = thresholds_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let adaptive = thresholds
+                .entry("Adaptive".to_string())
+                .or_insert_with(|| AdaptiveThreshold::new(engine.config.suspicion_k));
+            for _ in 0..8 {
+                adaptive.record_outcome(true);
+            }
+        }
+
+        let observed_at = 60_000_000;
+        engine.observe_activity("Adaptive", None, observed_at);
+
+        let expected_k = AtcEngine::effective_threshold(
+            engine.incumbent_policy.suspicion_k,
+            current_adaptive_threshold_k("Adaptive"),
+            false,
+        );
+        let entry = engine.agents.get("Adaptive").expect("adaptive agent");
+        let expected_review = engine.next_review_time_for_policy(entry, expected_k, observed_at);
+        assert_eq!(entry.next_review_micros, expected_review);
     }
 
     #[test]
@@ -8130,5 +8970,122 @@ mod alien_enhancement_tests {
                 >= report.summary.stage_timings.liveness_micros
         );
         assert!(report.summary.kernel.scheduled_agents >= report.summary.tracked_agents.len());
+    }
+
+    #[test]
+    fn effect_plan_carries_registered_project_key() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("ProjectAgent", "claude-code", Some("/tmp/project-agent"));
+
+        let core = default_liveness_core();
+        let decision_id = engine.ledger.record(&DecisionBuilder {
+            subsystem: AtcSubsystem::Liveness,
+            decision_class: "liveness_transition",
+            subject: "ProjectAgent",
+            core: &core,
+            action: LivenessAction::Suspect,
+            expected_loss: 1.0,
+            runner_up_loss: 2.0,
+            evidence_summary: "silence threshold exceeded",
+            calibration_healthy: true,
+            safe_mode_active: false,
+            policy_id: Some("policy-test"),
+            fallback_reason: None,
+            timestamp_micros: 1_000_000,
+        });
+
+        let effect = engine
+            .effect_plan_for_decision_id(
+                decision_id,
+                1_000_000,
+                "send_advisory",
+                "liveness",
+                "ProjectAgent".to_string(),
+                engine.agent_project_key("ProjectAgent"),
+                Some("project-aware advisory".to_string()),
+            )
+            .expect("effect plan");
+
+        assert_eq!(effect.project_key.as_deref(), Some("/tmp/project-agent"));
+    }
+
+    #[test]
+    fn effect_ids_are_unique_per_effect_variant() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("EffectAgent", "claude-code", Some("/tmp/effect-agent"));
+
+        let core = default_liveness_core();
+        let decision_id = engine.ledger.record(&DecisionBuilder {
+            subsystem: AtcSubsystem::Liveness,
+            decision_class: "liveness_transition",
+            subject: "EffectAgent",
+            core: &core,
+            action: LivenessAction::ReleaseReservations,
+            expected_loss: 0.5,
+            runner_up_loss: 1.5,
+            evidence_summary: "posterior dead state crossed release threshold",
+            calibration_healthy: true,
+            safe_mode_active: false,
+            policy_id: Some("policy-test"),
+            fallback_reason: None,
+            timestamp_micros: 1_000_000,
+        });
+
+        let release = engine
+            .effect_plan_for_decision_id(
+                decision_id,
+                1_000_000,
+                "release_reservations_requested",
+                "liveness",
+                "EffectAgent".to_string(),
+                engine.agent_project_key("EffectAgent"),
+                None,
+            )
+            .expect("release effect");
+        let advisory = engine
+            .effect_plan_for_decision_id(
+                decision_id,
+                1_000_000,
+                "send_advisory",
+                "liveness",
+                "EffectAgent".to_string(),
+                engine.agent_project_key("EffectAgent"),
+                Some("release requested".to_string()),
+            )
+            .expect("advisory effect");
+
+        assert_ne!(release.effect_id, advisory.effect_id);
+    }
+
+    #[test]
+    fn engine_loads_policy_bundle_from_disk() {
+        let incumbent = AtcLivenessPolicyArtifact::from_core(
+            "liveness-incumbent-r99".to_string(),
+            &default_liveness_core(),
+            4.25,
+        );
+        let bundle = AtcLivenessPolicyBundle::from_live_policies(
+            &incumbent,
+            Some(&AtcLivenessPolicyArtifact::candidate_from_incumbent(
+                &incumbent,
+            )),
+            99,
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle_path = dir.path().join("atc-policy-bundle.json");
+        std::fs::write(
+            &bundle_path,
+            serde_json::to_vec_pretty(&bundle).expect("serialize bundle"),
+        )
+        .expect("write bundle");
+
+        let engine = AtcEngine::new(AtcConfig {
+            policy_bundle_path: Some(bundle_path.display().to_string()),
+            ..AtcConfig::default()
+        });
+
+        assert_eq!(engine.policy_bundle.bundle_hash, bundle.bundle_hash);
+        assert_eq!(engine.incumbent_policy.policy_id, "liveness-incumbent-r99");
+        assert!((engine.incumbent_policy.suspicion_k - 4.25).abs() < f64::EPSILON);
     }
 }

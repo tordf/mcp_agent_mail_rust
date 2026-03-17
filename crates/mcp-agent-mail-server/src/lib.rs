@@ -2959,6 +2959,7 @@ fn set_tui_state_handle(state: Option<Arc<tui_bridge::TuiSharedState>>) {
 }
 
 const ATC_OPERATOR_ACTION_CAPACITY: usize = 64;
+const ATC_OPERATOR_EXECUTION_CAPACITY: usize = 64;
 const ATC_OPERATOR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const ATC_OPERATOR_MIN_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -2974,10 +2975,15 @@ pub(crate) struct AtcOperatorSnapshot {
     pub(crate) regret_avg: f64,
     pub(crate) decisions_total: u64,
     pub(crate) recent_actions: Vec<AtcOperatorActionSnapshot>,
+    pub(crate) recent_decisions: Vec<atc::AtcDecisionRecord>,
+    pub(crate) recent_executions: Vec<AtcOperatorExecutionSnapshot>,
     pub(crate) last_tick_micros: i64,
     pub(crate) last_tick_duration_micros: u64,
     pub(crate) last_tick_budget_micros: u64,
     pub(crate) last_tick_budget_exceeded: bool,
+    pub(crate) outer_loop_overhead_micros: u64,
+    pub(crate) executor_mode: String,
+    pub(crate) executor_pending_effects: usize,
     pub(crate) stage_timings: atc::AtcStageTimings,
     pub(crate) kernel: atc::AtcKernelTelemetry,
     pub(crate) budget: atc::AtcBudgetTelemetry,
@@ -3024,6 +3030,70 @@ pub(crate) struct AtcOperatorActionSnapshot {
     pub(crate) message: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct AtcOperatorExecutionSnapshot {
+    pub(crate) timestamp_micros: i64,
+    pub(crate) effect_id: String,
+    pub(crate) claim_id: String,
+    pub(crate) evidence_id: String,
+    pub(crate) trace_id: String,
+    pub(crate) kind: String,
+    pub(crate) category: String,
+    pub(crate) agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) project_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) policy_id: Option<String>,
+    pub(crate) execution_mode: String,
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtcExecutorMode {
+    Shadow,
+    DryRun,
+    Canary,
+    Live,
+}
+
+impl AtcExecutorMode {
+    fn from_env() -> Self {
+        match std::env::var("AM_ATC_EXECUTOR_MODE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("dry-run" | "dry_run" | "dryrun") => Self::DryRun,
+            Some("canary") => Self::Canary,
+            Some("live") => Self::Live,
+            _ => Self::Shadow,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::DryRun => "dry_run",
+            Self::Canary => "canary",
+            Self::Live => "live",
+        }
+    }
+
+    const fn requires_runtime(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    const fn executes_advisories(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    const fn executes_releases(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
 impl AtcOperatorActionSnapshot {
     fn console_line(&self) -> String {
         match self.message.as_deref() {
@@ -3061,43 +3131,204 @@ fn atc_liveness_state_label(state: atc::LivenessState) -> &'static str {
     }
 }
 
-fn atc_tick_action_snapshot(
-    now_micros: i64,
-    action: atc::AtcTickAction,
-) -> AtcOperatorActionSnapshot {
-    match action {
-        atc::AtcTickAction::SendAdvisory { agent, message } => {
-            let category = if message.contains("Deadlock detected") {
-                "conflict"
-            } else {
-                "liveness"
-            };
-            let message = if message.contains("Reservations released.") {
-                message.replace("Reservations released.", "Reservation release recommended.")
-            } else {
-                message
-            };
-            AtcOperatorActionSnapshot {
-                timestamp_micros: now_micros,
-                kind: "send_advisory".to_string(),
-                category: category.to_string(),
-                agent,
-                message: Some(message),
-            }
-        }
-        atc::AtcTickAction::ReleaseReservations { agent } => AtcOperatorActionSnapshot {
-            timestamp_micros: now_micros,
-            kind: "release_reservations_requested".to_string(),
-            category: "liveness".to_string(),
-            agent,
-            message: Some("ATC recommends releasing this agent's reservations.".to_string()),
+fn atc_effect_semantic_key(effect: &atc::AtcEffectPlan) -> String {
+    let project_key = effect.project_key.as_deref().unwrap_or("-");
+    effect.message.as_deref().map_or_else(
+        || {
+            format!(
+                "{}:{}:{}:{}",
+                effect.kind, effect.category, project_key, effect.agent
+            )
         },
-        atc::AtcTickAction::ProbeAgent { agent } => AtcOperatorActionSnapshot {
-            timestamp_micros: now_micros,
-            kind: "probe_agent".to_string(),
-            category: "probe".to_string(),
-            agent,
-            message: None,
+        |message| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                effect.kind, effect.category, project_key, effect.agent, message
+            )
+        },
+    )
+}
+
+fn atc_execution_snapshot(
+    now_micros: i64,
+    effect: &atc::AtcEffectPlan,
+    execution_mode: &str,
+    status: &str,
+) -> AtcOperatorExecutionSnapshot {
+    AtcOperatorExecutionSnapshot {
+        timestamp_micros: now_micros,
+        effect_id: effect.effect_id.clone(),
+        claim_id: effect.claim_id.clone(),
+        evidence_id: effect.evidence_id.clone(),
+        trace_id: effect.trace_id.clone(),
+        kind: effect.kind.clone(),
+        category: effect.category.clone(),
+        agent: effect.agent.clone(),
+        project_key: effect.project_key.clone(),
+        policy_id: effect.policy_id.clone(),
+        execution_mode: execution_mode.to_string(),
+        status: status.to_string(),
+        message: effect.message.clone(),
+    }
+}
+
+fn atc_action_snapshot_from_execution(
+    execution: &AtcOperatorExecutionSnapshot,
+) -> AtcOperatorActionSnapshot {
+    AtcOperatorActionSnapshot {
+        timestamp_micros: execution.timestamp_micros,
+        kind: execution.kind.clone(),
+        category: execution.category.clone(),
+        agent: execution.agent.clone(),
+        message: execution.message.clone(),
+    }
+}
+
+fn atc_effect_subject(effect: &atc::AtcEffectPlan) -> String {
+    match effect.kind.as_str() {
+        "send_advisory" => format!("[ATC] {} advisory for {}", effect.category, effect.agent),
+        "release_reservations_requested" => format!("[ATC] release request for {}", effect.agent),
+        "probe_agent" => format!("[ATC] probe intent for {}", effect.agent),
+        _ => format!("[ATC] {} for {}", effect.kind, effect.agent),
+    }
+}
+
+fn atc_effect_body(effect: &atc::AtcEffectPlan) -> String {
+    let headline = effect
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("ATC generated effect '{}'.", effect.kind));
+    let expected_loss = effect
+        .expected_loss
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    format!(
+        "{headline}\n\ntrace_id: {}\nclaim_id: {}\nevidence_id: {}\neffect_id: {}\nexpected_loss: {}\nmode: automated-atc",
+        effect.trace_id, effect.claim_id, effect.evidence_id, effect.effect_id, expected_loss
+    )
+}
+
+fn ensure_atc_executor_identity(
+    runtime: &Runtime,
+    ensured_projects: &mut HashSet<String>,
+    project_key: &str,
+) -> Result<(), String> {
+    if ensured_projects.contains(project_key) {
+        return Ok(());
+    }
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let ctx = McpContext::new(cx, 1);
+    runtime
+        .block_on(async {
+            mcp_agent_mail_tools::identity::register_agent(
+                &ctx,
+                project_key.to_string(),
+                "mcp-agent-mail".to_string(),
+                "atc-executor".to_string(),
+                Some(atc::ATC_AGENT_NAME.to_string()),
+                Some("ATC automated control plane".to_string()),
+                None,
+            )
+            .await
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())?;
+    ensured_projects.insert(project_key.to_string());
+    Ok(())
+}
+
+fn execute_atc_advisory_effect(
+    runtime: &Runtime,
+    ensured_projects: &mut HashSet<String>,
+    effect: &atc::AtcEffectPlan,
+    project_key: &str,
+) -> Result<(), String> {
+    ensure_atc_executor_identity(runtime, ensured_projects, project_key)?;
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let ctx = McpContext::new(cx, 1);
+    runtime
+        .block_on(async {
+            mcp_agent_mail_tools::messaging::send_message(
+                &ctx,
+                project_key.to_string(),
+                atc::ATC_AGENT_NAME.to_string(),
+                vec![effect.agent.clone()],
+                atc_effect_subject(effect),
+                atc_effect_body(effect),
+                None,
+                None,
+                None,
+                None,
+                Some("normal".to_string()),
+                Some(false),
+                Some(effect.trace_id.clone()),
+                None,
+                Some(false),
+                Some(false),
+            )
+            .await
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn execute_atc_release_effect(
+    runtime: &Runtime,
+    effect: &atc::AtcEffectPlan,
+    project_key: &str,
+) -> Result<(), String> {
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let ctx = McpContext::new(cx, 1);
+    runtime
+        .block_on(async {
+            mcp_agent_mail_tools::reservations::release_file_reservations(
+                &ctx,
+                project_key.to_string(),
+                effect.agent.clone(),
+                None,
+                None,
+            )
+            .await
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn execute_atc_effect(
+    runtime: Option<&Runtime>,
+    executor_mode: AtcExecutorMode,
+    ensured_projects: &mut HashSet<String>,
+    effect: &atc::AtcEffectPlan,
+) -> String {
+    match executor_mode {
+        AtcExecutorMode::Shadow => "shadowed".to_string(),
+        AtcExecutorMode::DryRun => "dry_run".to_string(),
+        AtcExecutorMode::Canary | AtcExecutorMode::Live => match effect.kind.as_str() {
+            "send_advisory" if executor_mode.executes_advisories() => {
+                let Some(project_key) = effect.project_key.as_deref() else {
+                    return "missing_project".to_string();
+                };
+                let Some(runtime) = runtime else {
+                    return "executor_unavailable".to_string();
+                };
+                execute_atc_advisory_effect(runtime, ensured_projects, effect, project_key)
+                    .map(|_| "executed".to_string())
+                    .unwrap_or_else(|error| format!("failed:{error}"))
+            }
+            "release_reservations_requested" if executor_mode.executes_releases() => {
+                let Some(project_key) = effect.project_key.as_deref() else {
+                    return "missing_project".to_string();
+                };
+                let Some(runtime) = runtime else {
+                    return "executor_unavailable".to_string();
+                };
+                execute_atc_release_effect(runtime, effect, project_key)
+                    .map(|_| "executed".to_string())
+                    .unwrap_or_else(|error| format!("failed:{error}"))
+            }
+            "release_reservations_requested" => "shadowed_release".to_string(),
+            "probe_agent" => "probe_intent".to_string(),
+            _ => "shadowed".to_string(),
         },
     }
 }
@@ -3105,10 +3336,14 @@ fn atc_tick_action_snapshot(
 fn build_atc_operator_snapshot(
     summary: Option<atc::AtcSummarySnapshot>,
     recent_actions: &VecDeque<AtcOperatorActionSnapshot>,
+    recent_executions: &VecDeque<AtcOperatorExecutionSnapshot>,
     last_tick_micros: i64,
     last_tick_duration_micros: u64,
     last_tick_budget_micros: u64,
     last_tick_budget_exceeded: bool,
+    outer_loop_overhead_micros: u64,
+    executor_mode: &str,
+    executor_pending_effects: usize,
     note: Option<String>,
 ) -> AtcOperatorSnapshot {
     if let Some(summary) = summary {
@@ -3132,10 +3367,15 @@ fn build_atc_operator_snapshot(
             regret_avg: summary.regret_avg,
             decisions_total: summary.decisions_total,
             recent_actions: recent_actions.iter().cloned().collect(),
+            recent_decisions: summary.recent_decisions,
+            recent_executions: recent_executions.iter().cloned().collect(),
             last_tick_micros,
             last_tick_duration_micros,
             last_tick_budget_micros,
             last_tick_budget_exceeded,
+            outer_loop_overhead_micros,
+            executor_mode: executor_mode.to_string(),
+            executor_pending_effects,
             stage_timings: summary.stage_timings,
             kernel: summary.kernel,
             budget: summary.budget,
@@ -3148,10 +3388,14 @@ fn build_atc_operator_snapshot(
         enabled: true,
         source: "warming_up".to_string(),
         recent_actions: recent_actions.iter().cloned().collect(),
+        recent_executions: recent_executions.iter().cloned().collect(),
         last_tick_micros,
         last_tick_duration_micros,
         last_tick_budget_micros,
         last_tick_budget_exceeded,
+        outer_loop_overhead_micros,
+        executor_mode: executor_mode.to_string(),
+        executor_pending_effects,
         note,
         ..AtcOperatorSnapshot::default()
     }
@@ -3165,6 +3409,7 @@ fn set_atc_operator_snapshot(snapshot: AtcOperatorSnapshot) {
     *lock_mutex(&ATC_OPERATOR_SNAPSHOT) = snapshot;
 }
 
+#[allow(dead_code)]
 fn atc_action_cooldown_key(snapshot: &AtcOperatorActionSnapshot) -> String {
     snapshot.message.as_deref().map_or_else(
         || format!("{}:{}:{}", snapshot.kind, snapshot.category, snapshot.agent),
@@ -3192,6 +3437,22 @@ fn wait_for_atc_operator_interval(stop: &AtomicBool, duration: Duration) -> bool
     false
 }
 
+fn atc_operator_wait_duration(
+    snapshot: &AtcOperatorSnapshot,
+    now_micros: i64,
+    max_interval: Duration,
+) -> Duration {
+    if snapshot.executor_pending_effects > 0 {
+        return ATC_OPERATOR_MIN_TICK_INTERVAL;
+    }
+    let Some(next_due_micros) = snapshot.kernel.next_due_micros else {
+        return max_interval;
+    };
+    let micros_until_due = next_due_micros.saturating_sub(now_micros).max(0);
+    let wait = Duration::from_micros(u64::try_from(micros_until_due).unwrap_or(u64::MAX));
+    wait.min(max_interval)
+}
+
 fn maybe_emit_atc_summary_log(state: &tui_bridge::TuiSharedState, snapshot: &AtcOperatorSnapshot) {
     let suspect_count = snapshot
         .tracked_agents
@@ -3199,14 +3460,15 @@ fn maybe_emit_atc_summary_log(state: &tui_bridge::TuiSharedState, snapshot: &Atc
         .filter(|agent| agent.state != "alive")
         .count();
     state.push_console_log(format!(
-        "[ATC] tick={} decisions={} deadlocks={} suspect_agents={} safe_mode={} mode={} policy={} e={:.2} regret={:.2}",
+        "[ATC] tick={} decisions={} deadlocks={} suspect_agents={} safe_mode={} mode={} pending={} bundle={} e={:.2} regret={:.2}",
         snapshot.tick_count,
         snapshot.decisions_total,
         snapshot.deadlock_cycles,
         suspect_count,
         snapshot.safe_mode,
         snapshot.budget.mode,
-        snapshot.policy.incumbent_policy_id,
+        snapshot.executor_pending_effects,
+        snapshot.policy.bundle_id,
         snapshot.eprocess_value,
         snapshot.regret_avg
     ));
@@ -3220,53 +3482,94 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     .max(ATC_OPERATOR_MIN_TICK_INTERVAL);
     let advisory_cooldown_micros = atc_config.advisory_cooldown_micros.max(0);
     let summary_interval_micros = atc_config.summary_interval_micros.max(1);
+    let executor_mode = AtcExecutorMode::from_env();
+    let executor_runtime = executor_mode
+        .requires_runtime()
+        .then(|| RuntimeBuilder::current_thread().build())
+        .transpose()
+        .ok()
+        .flatten();
 
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
+    let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
     let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
     let mut last_summary_log_micros = 0_i64;
+    let mut pending_effects: VecDeque<atc::AtcEffectPlan> = VecDeque::new();
+    let mut pending_effect_keys: HashSet<String> = HashSet::new();
+    let mut executor_registered_projects: HashSet<String> = HashSet::new();
 
     set_atc_operator_snapshot(AtcOperatorSnapshot::warming_up(true));
 
     while !stop.load(Ordering::Relaxed) {
         let now_micros = mcp_agent_mail_core::timestamps::now_micros();
         let started_at = Instant::now();
-        let report = atc::atc_tick_report(now_micros);
-        let tick_duration_micros =
-            u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX)))
-                .unwrap_or(u64::MAX);
-        let actions = report
-            .as_ref()
-            .map_or_else(Vec::new, |report| report.actions.clone());
-        let live_summary = report.map(|report| report.summary);
+        let (live_summary, new_effects) = match atc::atc_tick_report(now_micros) {
+            Some(report) => (Some(report.summary), report.effects),
+            None => (None, Vec::new()),
+        };
         let tick_budget_micros = live_summary
             .as_ref()
             .map_or(atc_config.tick_budget_micros, |summary| {
                 summary.budget.tick_budget_micros
             });
-        let tick_budget_exceeded = tick_duration_micros > tick_budget_micros;
+
+        for effect in new_effects {
+            let effect_key = atc_effect_semantic_key(&effect);
+            if pending_effect_keys.insert(effect_key) {
+                pending_effects.push_back(effect);
+            }
+        }
 
         let mut visible_actions = Vec::new();
-        for action in actions {
-            let snapshot = atc_tick_action_snapshot(now_micros, action);
-            let cooldown_key = atc_action_cooldown_key(&snapshot);
-            let suppressed = last_action_by_key
+        let mut executed_this_tick = 0_usize;
+        while executed_this_tick < ATC_OPERATOR_ACTION_CAPACITY {
+            let Some(effect) = pending_effects.front() else {
+                break;
+            };
+            let cooldown_key = atc_effect_semantic_key(effect);
+            let throttled = last_action_by_key
                 .get(&cooldown_key)
                 .copied()
                 .is_some_and(|last| {
                     advisory_cooldown_micros > 0
                         && now_micros.saturating_sub(last) < advisory_cooldown_micros
                 });
-            if suppressed {
-                continue;
+            if throttled {
+                break;
             }
+            let Some(effect) = pending_effects.pop_front() else {
+                continue;
+            };
+            pending_effect_keys.remove(&cooldown_key);
             last_action_by_key.insert(cooldown_key, now_micros);
-            visible_actions.push(snapshot.clone());
+            let status = execute_atc_effect(
+                executor_runtime.as_ref(),
+                executor_mode,
+                &mut executor_registered_projects,
+                &effect,
+            );
+            let execution =
+                atc_execution_snapshot(now_micros, &effect, executor_mode.as_str(), &status);
+            if recent_executions.len() >= ATC_OPERATOR_EXECUTION_CAPACITY {
+                let _ = recent_executions.pop_front();
+            }
+            recent_executions.push_back(execution.clone());
+            let action_snapshot = atc_action_snapshot_from_execution(&execution);
+            visible_actions.push(action_snapshot.clone());
             if recent_actions.len() >= ATC_OPERATOR_ACTION_CAPACITY {
                 let _ = recent_actions.pop_front();
             }
-            recent_actions.push_back(snapshot);
+            recent_actions.push_back(action_snapshot);
+            executed_this_tick = executed_this_tick.saturating_add(1);
         }
 
+        let tick_duration_micros =
+            u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX)))
+                .unwrap_or(u64::MAX);
+        let tick_budget_exceeded = tick_duration_micros > tick_budget_micros;
+        let outer_loop_overhead_micros = live_summary.as_ref().map_or(0, |summary| {
+            tick_duration_micros.saturating_sub(summary.budget.kernel_total_micros)
+        });
         let note = tick_budget_exceeded.then(|| {
             format!(
                 "ATC tick exceeded budget: {}us > {}us",
@@ -3276,10 +3579,14 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         let snapshot = build_atc_operator_snapshot(
             live_summary,
             &recent_actions,
+            &recent_executions,
             now_micros,
             tick_duration_micros,
             tick_budget_micros,
             tick_budget_exceeded,
+            outer_loop_overhead_micros,
+            executor_mode.as_str(),
+            pending_effects.len(),
             note.clone(),
         );
         set_atc_operator_snapshot(snapshot.clone());
@@ -3302,7 +3609,15 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             );
         }
 
-        if !wait_for_atc_operator_interval(stop.as_ref(), tick_interval) {
+        let wait_duration = {
+            let duration = atc_operator_wait_duration(&snapshot, now_micros, tick_interval);
+            if duration.is_zero() {
+                Duration::from_millis(1)
+            } else {
+                duration
+            }
+        };
+        if !wait_for_atc_operator_interval(stop.as_ref(), wait_duration) {
             break;
         }
     }
@@ -6843,7 +7158,11 @@ to skip auth for local requests.</p>
 
                 // Record agent activity in the ATC engine for liveness tracking.
                 if let Some(ref agent) = agent_hint {
-                    atc::atc_observe_activity(agent, mcp_agent_mail_core::timestamps::now_micros());
+                    atc::atc_observe_activity_with_project(
+                        agent,
+                        project_hint.as_deref(),
+                        mcp_agent_mail_core::timestamps::now_micros(),
+                    );
                 }
 
                 // Register agent in ATC on successful register_agent / macro_start_session.
@@ -6852,7 +7171,7 @@ to skip auth for local requests.</p>
                 {
                     let program =
                         extract_arg_str(call_arguments.as_ref(), &["program"]).unwrap_or_default();
-                    atc::atc_register_agent(agent, &program);
+                    atc::atc_register_agent_with_project(agent, &program, project_hint.as_deref());
                 }
 
                 // Emit tool-call-end panel
@@ -19935,5 +20254,63 @@ mod tests {
                 .await
                 .expect("retry helper instance should stop cleanly");
         });
+    }
+
+    #[test]
+    fn atc_effect_semantic_key_is_project_scoped() {
+        let left = atc::AtcEffectPlan {
+            effect_id: "atc-effect-left".to_string(),
+            claim_id: "atc-claim-left".to_string(),
+            evidence_id: "atc-evidence-left".to_string(),
+            trace_id: "atc-trace-left".to_string(),
+            timestamp_micros: 1_000_000,
+            kind: "send_advisory".to_string(),
+            category: "liveness".to_string(),
+            agent: "AgentAlpha".to_string(),
+            project_key: Some("/tmp/project-a".to_string()),
+            policy_id: Some("policy-a".to_string()),
+            message: Some("same message".to_string()),
+            expected_loss: Some(0.2),
+        };
+        let mut right = left.clone();
+        right.project_key = Some("/tmp/project-b".to_string());
+
+        assert_ne!(
+            atc_effect_semantic_key(&left),
+            atc_effect_semantic_key(&right)
+        );
+    }
+
+    #[test]
+    fn atc_operator_wait_duration_uses_next_due_deadline() {
+        let snapshot = AtcOperatorSnapshot {
+            enabled: true,
+            source: "live".to_string(),
+            kernel: atc::AtcKernelTelemetry {
+                next_due_micros: Some(1_250_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let wait = atc_operator_wait_duration(&snapshot, 1_000_000, Duration::from_secs(5));
+        assert_eq!(wait, Duration::from_micros(250_000));
+    }
+
+    #[test]
+    fn atc_operator_wait_duration_prioritizes_executor_backlog() {
+        let snapshot = AtcOperatorSnapshot {
+            enabled: true,
+            source: "live".to_string(),
+            executor_pending_effects: 3,
+            kernel: atc::AtcKernelTelemetry {
+                next_due_micros: Some(5_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let wait = atc_operator_wait_duration(&snapshot, 1_000_000, Duration::from_secs(5));
+        assert_eq!(wait, ATC_OPERATOR_MIN_TICK_INTERVAL);
     }
 }
