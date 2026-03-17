@@ -602,15 +602,9 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
         .wait_with_output()
         .map_err(|e| EncoderError::OsError(format!("TOON encoder failed: {e}")))?;
 
-    // Join stdin thread to catch write errors
-    if let Err(e) = stdin_thread
+    let write_result = stdin_thread
         .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stdin writer thread panicked")))
-    {
-        return Err(EncoderError::OsError(format!(
-            "TOON encoder stdin write failed: {e}"
-        )));
-    }
+        .unwrap_or_else(|_| Err(std::io::Error::other("stdin writer thread panicked")));
 
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
@@ -619,6 +613,12 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
             code,
             stderr: truncate_str(&stderr, 2000),
         });
+    }
+
+    if let Err(e) = write_result {
+        return Err(EncoderError::OsError(format!(
+            "TOON encoder stdin write failed: {e}"
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

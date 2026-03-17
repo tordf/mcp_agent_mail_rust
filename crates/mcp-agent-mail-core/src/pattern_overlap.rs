@@ -224,17 +224,10 @@ impl CompiledPattern {
             return true;
         }
 
-        // An empty pattern (normalized from "/" or ".") represents the root directory.
-        // Reserving the root directory overlaps with everything in the workspace.
-        if self.norm.is_empty() || other.norm.is_empty() {
+        if is_directory_prefix(&self.norm, &other.norm)
+            || is_directory_prefix(&other.norm, &self.norm)
+        {
             return true;
-        }
-
-        // Distinct exact literals overlap only when one is a slash-boundary
-        // directory prefix of the other.
-        if !self.is_glob && !other.is_glob {
-            return is_directory_prefix(&self.norm, &other.norm)
-                || is_directory_prefix(&other.norm, &self.norm);
         }
 
         // 1. Check subset/containment (existing logic)
