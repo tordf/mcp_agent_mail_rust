@@ -466,6 +466,27 @@ impl SystemHealthScreen {
                 hint_style,
             ),
         ]));
+        lines.push(Line::from_spans([
+            Span::styled("Control:   ", label_style),
+            Span::styled(
+                format!(
+                    "mode={}  due={}  probes={}  cache_hit={:.0}%",
+                    snap.atc.budget.mode,
+                    snap.atc.kernel.due_agents,
+                    snap.atc.budget.max_probes_this_tick,
+                    snap.atc.kernel.deadlock_cache_hit_rate * 100.0
+                ),
+                value_style,
+            ),
+            Span::styled(
+                format!(
+                    "  policy={}  fallback={}",
+                    snap.atc.policy.incumbent_policy_id,
+                    snap.atc.policy.fallback_active
+                ),
+                hint_style,
+            ),
+        ]));
         let degraded_agents: Vec<&crate::AtcOperatorAgentSnapshot> = snap
             .atc
             .tracked_agents
@@ -1646,6 +1667,24 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
         });
     }
 
+    if out.atc.policy.fallback_active {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-fallback",
+            detail: format!(
+                "ATC deterministic fallback mode is active ({})",
+                out.atc
+                    .policy
+                    .fallback_reason
+                    .clone()
+                    .unwrap_or_else(|| "unspecified".to_string())
+            ),
+            remediation: Some(
+                "Inspect ATC budget pressure and calibration telemetry before trusting automation breadth.".into(),
+            ),
+        });
+    }
+
     if out.atc.deadlock_cycles > 0 {
         out.lines.push(ProbeLine {
             level: Level::Fail,
@@ -1670,6 +1709,20 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             ),
             remediation: Some(
                 "Profile the ATC hot path before increasing the tick interval or budget.".into(),
+            ),
+        });
+    }
+
+    if out.atc.policy.shadow_enabled && out.atc.policy.shadow_disagreements > 0 {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-shadow",
+            detail: format!(
+                "ATC shadow policy diverged {} time(s) with avg regret {:.2}",
+                out.atc.policy.shadow_disagreements, out.atc.policy.shadow_regret_avg
+            ),
+            remediation: Some(
+                "Review the live policy and shadow candidate before promoting any ATC policy changes.".into(),
             ),
         });
     }
@@ -2793,6 +2846,19 @@ mod tests {
                 last_tick_duration_micros: 120,
                 last_tick_budget_micros: 60,
                 last_tick_budget_exceeded: true,
+                budget: crate::atc::AtcBudgetTelemetry {
+                    mode: "pressure".to_string(),
+                    ..Default::default()
+                },
+                policy: crate::atc::AtcPolicyTelemetry {
+                    incumbent_policy_id: "liveness-incumbent-r1".to_string(),
+                    candidate_policy_id: Some("liveness-shadow-cautious-v1".to_string()),
+                    shadow_enabled: true,
+                    shadow_disagreements: 2,
+                    shadow_regret_avg: 0.3,
+                    fallback_active: true,
+                    fallback_reason: Some("budget_pressure".to_string()),
+                },
                 tracked_agents: vec![
                     crate::AtcOperatorAgentSnapshot {
                         name: "AlphaAgent".to_string(),
@@ -2815,8 +2881,10 @@ mod tests {
         add_atc_findings(&mut out);
 
         assert!(out.lines.iter().any(|line| line.name == "atc-safe-mode"));
+        assert!(out.lines.iter().any(|line| line.name == "atc-fallback"));
         assert!(out.lines.iter().any(|line| line.name == "atc-deadlocks"));
         assert!(out.lines.iter().any(|line| line.name == "atc-budget"));
+        assert!(out.lines.iter().any(|line| line.name == "atc-shadow"));
         assert!(
             out.lines
                 .iter()

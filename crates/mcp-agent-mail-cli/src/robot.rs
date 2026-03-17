@@ -992,7 +992,61 @@ struct AtcRobotSnapshot {
     last_tick_budget_micros: u64,
     last_tick_budget_exceeded: bool,
     #[serde(default)]
+    stage_timings: AtcRobotStageTimings,
+    #[serde(default)]
+    kernel: AtcRobotKernel,
+    #[serde(default)]
+    budget: AtcRobotBudget,
+    #[serde(default)]
+    policy: AtcRobotPolicy,
+    #[serde(default)]
     note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotStageTimings {
+    liveness_micros: u64,
+    deadlock_micros: u64,
+    probe_micros: u64,
+    gating_micros: u64,
+    slow_control_micros: u64,
+    summary_micros: u64,
+    total_micros: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotKernel {
+    due_agents: usize,
+    scheduled_agents: usize,
+    dirty_agents: usize,
+    dirty_projects: usize,
+    deadlock_cache_hits: u64,
+    deadlock_cache_misses: u64,
+    deadlock_cache_hit_rate: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotBudget {
+    mode: String,
+    tick_budget_micros: u64,
+    probe_budget_micros: u64,
+    estimated_probe_cost_micros: u64,
+    max_probes_this_tick: usize,
+    utilization_ratio: f64,
+    slow_window_utilization: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotPolicy {
+    incumbent_policy_id: String,
+    #[serde(default)]
+    candidate_policy_id: Option<String>,
+    shadow_enabled: bool,
+    shadow_disagreements: u64,
+    shadow_regret_avg: f64,
+    fallback_active: bool,
+    #[serde(default)]
+    fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1029,6 +1083,32 @@ struct AtcSummaryData {
     last_tick_duration_micros: u64,
     last_tick_budget_micros: u64,
     last_tick_budget_exceeded: bool,
+    budget_mode: String,
+    probe_budget_micros: u64,
+    estimated_probe_cost_micros: u64,
+    max_probes_this_tick: usize,
+    tick_utilization_ratio: f64,
+    slow_window_utilization: f64,
+    incumbent_policy_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_policy_id: Option<String>,
+    shadow_enabled: bool,
+    shadow_disagreements: u64,
+    shadow_regret_avg: f64,
+    fallback_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<String>,
+    due_agents: usize,
+    scheduled_agents: usize,
+    deadlock_cache_hits: u64,
+    deadlock_cache_misses: u64,
+    deadlock_cache_hit_rate: f64,
+    liveness_stage_micros: u64,
+    deadlock_stage_micros: u64,
+    probe_stage_micros: u64,
+    gating_stage_micros: u64,
+    slow_control_micros: u64,
+    summary_stage_micros: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -4953,6 +5033,30 @@ fn atc_summary_data(snapshot: &AtcRobotSnapshot) -> AtcSummaryData {
         last_tick_duration_micros: snapshot.last_tick_duration_micros,
         last_tick_budget_micros: snapshot.last_tick_budget_micros,
         last_tick_budget_exceeded: snapshot.last_tick_budget_exceeded,
+        budget_mode: snapshot.budget.mode.clone(),
+        probe_budget_micros: snapshot.budget.probe_budget_micros,
+        estimated_probe_cost_micros: snapshot.budget.estimated_probe_cost_micros,
+        max_probes_this_tick: snapshot.budget.max_probes_this_tick,
+        tick_utilization_ratio: snapshot.budget.utilization_ratio,
+        slow_window_utilization: snapshot.budget.slow_window_utilization,
+        incumbent_policy_id: snapshot.policy.incumbent_policy_id.clone(),
+        candidate_policy_id: snapshot.policy.candidate_policy_id.clone(),
+        shadow_enabled: snapshot.policy.shadow_enabled,
+        shadow_disagreements: snapshot.policy.shadow_disagreements,
+        shadow_regret_avg: snapshot.policy.shadow_regret_avg,
+        fallback_active: snapshot.policy.fallback_active,
+        fallback_reason: snapshot.policy.fallback_reason.clone(),
+        due_agents: snapshot.kernel.due_agents,
+        scheduled_agents: snapshot.kernel.scheduled_agents,
+        deadlock_cache_hits: snapshot.kernel.deadlock_cache_hits,
+        deadlock_cache_misses: snapshot.kernel.deadlock_cache_misses,
+        deadlock_cache_hit_rate: snapshot.kernel.deadlock_cache_hit_rate,
+        liveness_stage_micros: snapshot.stage_timings.liveness_micros,
+        deadlock_stage_micros: snapshot.stage_timings.deadlock_micros,
+        probe_stage_micros: snapshot.stage_timings.probe_micros,
+        gating_stage_micros: snapshot.stage_timings.gating_micros,
+        slow_control_micros: snapshot.stage_timings.slow_control_micros,
+        summary_stage_micros: snapshot.stage_timings.summary_micros,
     }
 }
 
@@ -6520,6 +6624,20 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     Some("Profile the ATC hot path before relaxing tick cadence".to_string()),
                 );
             }
+            if env
+                .data
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.fallback_active)
+            {
+                let detail = env
+                    .data
+                    .summary
+                    .as_ref()
+                    .and_then(|summary| summary.fallback_reason.clone())
+                    .unwrap_or_else(|| "deterministic conservative fallback active".to_string());
+                env = env.with_alert("warn", "ATC fallback mode active", Some(detail));
+            }
             format_output(&env, format)?
         }
     };
@@ -6605,6 +6723,42 @@ mod tests {
             last_tick_duration_micros: 80,
             last_tick_budget_micros: 60,
             last_tick_budget_exceeded: true,
+            stage_timings: AtcRobotStageTimings {
+                liveness_micros: 10,
+                deadlock_micros: 12,
+                probe_micros: 18,
+                gating_micros: 8,
+                slow_control_micros: 6,
+                summary_micros: 5,
+                total_micros: 59,
+            },
+            kernel: AtcRobotKernel {
+                due_agents: 1,
+                scheduled_agents: 2,
+                dirty_agents: 0,
+                dirty_projects: 0,
+                deadlock_cache_hits: 9,
+                deadlock_cache_misses: 1,
+                deadlock_cache_hit_rate: 0.9,
+            },
+            budget: AtcRobotBudget {
+                mode: "pressure".to_string(),
+                tick_budget_micros: 60,
+                probe_budget_micros: 20,
+                estimated_probe_cost_micros: 10,
+                max_probes_this_tick: 2,
+                utilization_ratio: 1.33,
+                slow_window_utilization: 0.82,
+            },
+            policy: AtcRobotPolicy {
+                incumbent_policy_id: "liveness-incumbent-r7".to_string(),
+                candidate_policy_id: Some("liveness-shadow-cautious-v1".to_string()),
+                shadow_enabled: true,
+                shadow_disagreements: 3,
+                shadow_regret_avg: 0.4,
+                fallback_active: true,
+                fallback_reason: Some("budget_pressure".to_string()),
+            },
             note: Some("live snapshot".to_string()),
         }
     }

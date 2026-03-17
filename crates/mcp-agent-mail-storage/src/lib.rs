@@ -3506,6 +3506,21 @@ fn repo_cache_insert(root: &Path) {
 
 static DIR_CACHE: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
+#[derive(Clone, Debug)]
+struct CanonicalPathCacheEntry {
+    canonical: PathBuf,
+    validated_at: Instant,
+}
+
+const CANONICAL_PATH_CACHE_MAX_ENTRIES: usize = 2048;
+#[cfg(test)]
+const CANONICAL_PATH_CACHE_FRESHNESS: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const CANONICAL_PATH_CACHE_FRESHNESS: Duration = Duration::from_secs(2);
+
+static CANONICAL_PATH_CACHE: LazyLock<Mutex<HashMap<PathBuf, CanonicalPathCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Create parent directories for `path`, skipping `create_dir_all` when the
 /// parent has already been seen. This eliminates redundant `stat`/`access`
 /// syscalls in the hot message-write path.
@@ -3530,6 +3545,53 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
         cache.insert(dir.to_path_buf());
     }
     Ok(())
+}
+
+/// Canonicalize an absolute path with a short-lived process-local cache.
+///
+/// This targets hot repeated root/base-directory lookups while preserving the
+/// original syscall-backed behavior for relative and one-off paths. Only paths
+/// that are already canonical are cached, so symlinked or otherwise rewritten
+/// inputs still revalidate through the filesystem each time.
+fn canonicalize_path_cached(path: &Path) -> std::io::Result<PathBuf> {
+    if !path.is_absolute() {
+        return path.canonicalize();
+    }
+
+    {
+        let mut cache = CANONICAL_PATH_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cache.get(path).cloned() {
+            if entry.validated_at.elapsed() <= CANONICAL_PATH_CACHE_FRESHNESS {
+                return Ok(entry.canonical);
+            }
+            cache.remove(path);
+        }
+    }
+
+    let canonical = path.canonicalize()?;
+    if canonical != path {
+        return Ok(canonical);
+    }
+
+    let mut cache = CANONICAL_PATH_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !cache.contains_key(path)
+        && cache.len() >= CANONICAL_PATH_CACHE_MAX_ENTRIES
+        && let Some(victim) = cache.keys().next().cloned()
+    {
+        cache.remove(&victim);
+    }
+    cache.insert(
+        path.to_path_buf(),
+        CanonicalPathCacheEntry {
+            canonical: canonical.clone(),
+            validated_at: Instant::now(),
+        },
+    );
+    Ok(canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -3565,12 +3627,10 @@ pub fn open_archive(config: &Config, slug: &str) -> Result<Option<ProjectArchive
         return Ok(None);
     }
 
-    let canonical_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.clone());
-    let canonical_repo_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.clone());
+    let canonical_root =
+        canonicalize_path_cached(&project_root).unwrap_or_else(|_| project_root.clone());
+    let canonical_repo_root =
+        canonicalize_path_cached(&repo_root).unwrap_or_else(|_| repo_root.clone());
 
     Ok(Some(ProjectArchive {
         slug: slug.to_string(),
@@ -3594,12 +3654,10 @@ pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
     let project_root = repo_root.join("projects").join(slug);
     ensure_dir(&project_root)?;
 
-    let canonical_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.clone());
-    let canonical_repo_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.clone());
+    let canonical_root =
+        canonicalize_path_cached(&project_root).unwrap_or_else(|_| project_root.clone());
+    let canonical_repo_root =
+        canonicalize_path_cached(&repo_root).unwrap_or_else(|_| repo_root.clone());
     Ok(ProjectArchive {
         slug: slug.to_string(),
         root: project_root.clone(),
@@ -4776,7 +4834,7 @@ pub fn process_attachments(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let canonical_base = base_dir.canonicalize().map_err(|e| {
+    let canonical_base = canonicalize_path_cached(base_dir).map_err(|e| {
         StorageError::InvalidPath(format!(
             "Attachment base directory does not exist or is not accessible: {} ({e})",
             base_dir.display()
@@ -4840,7 +4898,7 @@ pub fn process_markdown_images(
 ) -> Result<(String, Vec<AttachmentMeta>, Vec<String>)> {
     let re = image_pattern_re();
 
-    let canonical_base = match base_dir.canonicalize() {
+    let canonical_base = match canonicalize_path_cached(base_dir) {
         Ok(b) => b,
         Err(_) => return Ok((body_md.to_string(), Vec::new(), Vec::new())),
     };
@@ -4956,7 +5014,7 @@ pub fn markdown_has_processable_local_images(
     base_dir: &Path,
     body_md: &str,
 ) -> bool {
-    let canonical_base = match base_dir.canonicalize() {
+    let canonical_base = match canonicalize_path_cached(base_dir) {
         Ok(b) => b,
         Err(_) => return false,
     };
@@ -4981,7 +5039,7 @@ pub fn resolve_attachment_source_path(
     config: &Config,
     raw_path: &str,
 ) -> Result<PathBuf> {
-    let base = base_dir.canonicalize().map_err(|e| {
+    let base = canonicalize_path_cached(base_dir).map_err(|e| {
         StorageError::InvalidPath(format!(
             "Attachment base directory does not exist or is not accessible: {} ({e})",
             base_dir.display()
@@ -7229,6 +7287,16 @@ mod tests {
         assert_eq!(archive.slug, "test-project");
         assert!(archive.root.exists());
         assert!(archive.root.ends_with("projects/test-project"));
+    }
+
+    #[test]
+    fn canonicalize_path_cached_reuses_absolute_path_result() {
+        let tmp = TempDir::new().unwrap();
+        let canonical = canonicalize_path_cached(tmp.path()).unwrap();
+        assert_eq!(canonical, tmp.path().canonicalize().unwrap());
+
+        let cached = canonicalize_path_cached(tmp.path()).unwrap();
+        assert_eq!(cached, canonical);
     }
 
     #[test]
