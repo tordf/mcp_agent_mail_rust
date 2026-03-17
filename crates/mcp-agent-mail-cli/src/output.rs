@@ -9,8 +9,9 @@
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
-#[allow(unused_imports)]
-use std::io::IsTerminal;
+use std::collections::BTreeMap;
+use std::io::{IsTerminal, Write};
+use unicode_width::UnicodeWidthStr;
 
 // ── Output format enum ────────────────────────────────────────────────────
 
@@ -145,14 +146,14 @@ impl CliTable {
             .enumerate()
             .map(|(i, h)| {
                 let min = self.min_widths.get(i).copied().unwrap_or(0);
-                h.chars().count().max(min)
+                h.width().max(min)
             })
             .collect();
 
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < ncols {
-                    widths[i] = widths[i].max(cell.chars().count());
+                    widths[i] = widths[i].max(cell.width());
                 }
             }
         }
@@ -214,7 +215,9 @@ impl CliTable {
                 // Last column: no padding
                 parts.push(cell.to_string());
             } else {
-                parts.push(format!("{:<width$}", cell, width = *width));
+                let cell_width = cell.width();
+                let pad = width.saturating_sub(cell_width);
+                parts.push(format!("{}{}", cell, " ".repeat(pad)));
             }
         }
         parts.join("  ")
@@ -1095,7 +1098,9 @@ mod tests {
         };
 
         let output = with_capture(|| {
-            json_or_table(true, &data, || {});
+            json_or_table(true, &data, || {
+                panic!("table render should not be called");
+            });
         });
 
         let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
