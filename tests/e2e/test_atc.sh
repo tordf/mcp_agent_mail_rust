@@ -53,10 +53,10 @@ else
     e2e_fail "am robot atc --format json: invalid JSON output"
 fi
 
-if echo "$OUTPUT" | grep -q '"enabled"'; then
-    e2e_pass "JSON output contains 'enabled' field"
+if echo "$OUTPUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "enabled" in d and "source" in d' 2>/dev/null; then
+    e2e_pass "JSON output contains ATC status fields"
 else
-    e2e_fail "JSON output missing 'enabled' field"
+    e2e_fail "JSON output missing ATC status fields"
 fi
 
 e2e_section "Phase 0: ATC type system"
@@ -171,25 +171,25 @@ e2e_log "Waiting for ATC liveness detection cycle..."
 sleep 8
 
 # Check if ATC generated any decisions by querying the robot CLI
-ATC_STATUS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" am robot atc --format json 2>/dev/null || true)
+ATC_STATUS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --format json 2>/dev/null || true)
 e2e_save_artifact "phase2_atc_status.json" "$ATC_STATUS"
 if [ -z "$ATC_STATUS" ]; then
     e2e_fail "ATC status query returned empty output"
-elif echo "$ATC_STATUS" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-    e2e_pass "ATC status is valid JSON after agent activity"
+elif echo "$ATC_STATUS" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["source"] == "live"; assert "summary" in d' 2>/dev/null; then
+    e2e_pass "ATC status is live and includes summary data after agent activity"
 else
-    e2e_fail "ATC status is not valid JSON: $(echo "$ATC_STATUS" | head -c 200)"
+    e2e_fail "ATC status is not live summary JSON: $(echo "$ATC_STATUS" | head -c 200)"
 fi
 
 # Check for liveness data
-ATC_LIVENESS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" am robot atc --liveness --format json 2>/dev/null || true)
+ATC_LIVENESS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --liveness --format json 2>/dev/null || true)
 e2e_save_artifact "phase2_atc_liveness.json" "$ATC_LIVENESS"
 if [ -z "$ATC_LIVENESS" ]; then
     e2e_fail "ATC liveness query returned empty output"
-elif echo "$ATC_LIVENESS" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-    e2e_pass "ATC liveness report is valid JSON"
+elif echo "$ATC_LIVENESS" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["source"] == "live"; assert "liveness" in d and len(d["liveness"]) > 0' 2>/dev/null; then
+    e2e_pass "ATC liveness report is live and includes tracked agents"
 else
-    e2e_fail "ATC liveness report is not valid JSON: $(echo "$ATC_LIVENESS" | head -c 200)"
+    e2e_fail "ATC liveness report is not live liveness JSON: $(echo "$ATC_LIVENESS" | head -c 200)"
 fi
 
 # ── Phase 3: Robot CLI integration with live server ──────────────────
@@ -197,25 +197,25 @@ fi
 e2e_section "Phase 3: Robot CLI with live DB"
 
 # Decisions report
-ATC_DECISIONS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" am robot atc --decisions --format json 2>/dev/null || true)
+ATC_DECISIONS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --decisions --format json 2>/dev/null || true)
 e2e_save_artifact "phase3_atc_decisions.json" "$ATC_DECISIONS"
 if [ -z "$ATC_DECISIONS" ]; then
     e2e_fail "ATC decisions query returned empty output"
-elif echo "$ATC_DECISIONS" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-    e2e_pass "am robot atc --decisions --format json returns valid JSON"
+elif echo "$ATC_DECISIONS" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["source"] == "live"; assert "decisions" in d' 2>/dev/null; then
+    e2e_pass "am robot atc --decisions returns live decision data"
 else
-    e2e_fail "ATC decisions is not valid JSON: $(echo "$ATC_DECISIONS" | head -c 200)"
+    e2e_fail "ATC decisions is not live decision JSON: $(echo "$ATC_DECISIONS" | head -c 200)"
 fi
 
 # Summary report
-ATC_SUMMARY=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" am robot atc --summary --format json 2>/dev/null || true)
+ATC_SUMMARY=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --summary --format json 2>/dev/null || true)
 e2e_save_artifact "phase3_atc_summary.json" "$ATC_SUMMARY"
 if [ -z "$ATC_SUMMARY" ]; then
     e2e_fail "ATC summary query returned empty output"
-elif echo "$ATC_SUMMARY" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-    e2e_pass "am robot atc --summary --format json returns valid JSON"
+elif echo "$ATC_SUMMARY" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["source"] == "live"; assert "summary" in d' 2>/dev/null; then
+    e2e_pass "am robot atc --summary returns live ATC summary"
 else
-    e2e_fail "ATC summary is not valid JSON: $(echo "$ATC_SUMMARY" | head -c 200)"
+    e2e_fail "ATC summary is not live summary JSON: $(echo "$ATC_SUMMARY" | head -c 200)"
 fi
 
 # ── Phase 4: Cleanup ─────────────────────────────────────────────────
