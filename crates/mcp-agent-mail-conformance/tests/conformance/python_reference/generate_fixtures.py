@@ -354,7 +354,10 @@ async def _read_resource_json(mcp: Any, uri: str) -> Any:
     text = getattr(item, "content", None)
     if not isinstance(text, str):
         raise RuntimeError(f"resource returned non-text content: {uri}")
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"resource returned invalid JSON for {uri}: {e}")
 
 
 async def _generate() -> dict[str, Any]:
