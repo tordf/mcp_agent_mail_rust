@@ -2295,11 +2295,9 @@ fn parse_dotenv_value(raw: &str) -> String {
 }
 
 fn strip_inline_comment(value: &str) -> &str {
-    let bytes = value.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
-            return value[..i].trim_end();
-        }
+    if let Some(comment) = extract_inline_comment(value) {
+        let comment_start = value.len() - comment.len();
+        return value[..comment_start].trim_end();
     }
     value
 }

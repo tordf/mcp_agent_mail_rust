@@ -135,28 +135,31 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
     let mut table_has_rows_cache: HashMap<&'static str, Option<bool>> = HashMap::new();
 
     for &(table, column, _nullable) in TIMESTAMP_COLUMNS {
+        let table_has_rows = table_has_rows_cache.entry(table).or_insert_with(|| {
+            let row_probe_sql = format!("SELECT 1 AS present FROM {table} LIMIT 1");
+            conn.query_sync(&row_probe_sql, &[])
+                .ok()
+                .map(|rows| !rows.is_empty())
+        });
+        
+        let has_rows = table_has_rows.unwrap_or(false);
+        if !has_rows {
+            continue; // Table doesn't exist or is empty
+        }
+        saw_nonempty_table = true;
+
         // Query the typeof() of the first non-NULL value in the column.
         let sql =
             format!("SELECT typeof({column}) AS t FROM {table} WHERE {column} IS NOT NULL LIMIT 1");
         let Ok(rows) = conn.query_sync(&sql, &[]) else {
-            let table_has_rows = table_has_rows_cache.entry(table).or_insert_with(|| {
-                let row_probe_sql = format!("SELECT 1 AS present FROM {table} LIMIT 1");
-                conn.query_sync(&row_probe_sql, &[])
-                    .ok()
-                    .map(|rows| !rows.is_empty())
-            });
-            if let Some(has_rows) = table_has_rows.as_ref().copied() {
-                saw_nonempty_table |= has_rows;
-                saw_incompatible_timestamp_schema |= has_rows;
-            }
-            continue; // Table might not exist or column renamed
+            saw_incompatible_timestamp_schema = true;
+            continue; // Column might be renamed or missing
         };
 
         if rows.is_empty() {
-            continue; // Table is empty, skip
+            saw_incompatible_timestamp_schema = true;
+            continue; // Column exists but all values are NULL, or frankensqlite bug
         }
-
-        saw_nonempty_table = true;
 
         let type_str: String = rows[0].get_named("t").unwrap_or_default();
         match type_str.as_str() {

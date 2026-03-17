@@ -1931,7 +1931,6 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
         None,
         None,
     );
-    req_id += 1;
     let read_result = result.expect("projects query read should succeed");
     let json = decode_json_from_resource_contents(&params.uri, &read_result.contents)
         .expect("projects query response should decode");

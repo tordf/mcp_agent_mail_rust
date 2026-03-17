@@ -3027,13 +3027,7 @@ pub async fn fetch_inbox(
     // the fetch.
     for msg in &messages {
         if let Err(e) = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::mark_message_read(
-                ctx.cx(),
-                &pool,
-                agent_id,
-                msg.id,
-            )
-            .await,
+            mcp_agent_mail_db::queries::mark_message_read(ctx.cx(), &pool, agent_id, msg.id).await,
         ) {
             tracing::warn!(
                 message_id = msg.id,
