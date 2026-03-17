@@ -608,23 +608,22 @@ pub struct InvalidationEvent {
 /// Cache invalidator for coordinating invalidation across caches.
 pub struct CacheInvalidator<T> {
     cache: Arc<QueryCache<T>>,
-    events: RwLock<Vec<InvalidationEvent>>,
+    events: RwLock<VecDeque<InvalidationEvent>>,
     max_events: usize,
 }
 
 impl<T: Clone> CacheInvalidator<T> {
-    /// Create a new invalidator for a cache.
+    /// Create a new cache invalidator.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // RwLock::new is not const
     pub fn new(cache: Arc<QueryCache<T>>, max_events: usize) -> Self {
         Self {
             cache,
-            events: RwLock::new(Vec::new()),
+            events: RwLock::new(VecDeque::new()),
             max_events,
         }
     }
 
-    /// Invalidate cache due to a trigger.
+    /// Invalidate the cache and record the event.
     pub fn invalidate(&self, trigger: InvalidationTrigger) {
         let entries_before = self.cache.metrics().current_entries;
         self.cache.invalidate_all();
@@ -638,10 +637,10 @@ impl<T: Clone> CacheInvalidator<T> {
         };
 
         if let Ok(mut events) = self.events.write() {
-            events.push(event);
+            events.push_back(event);
             // Keep only recent events
             if events.len() > self.max_events {
-                events.remove(0);
+                events.pop_front();
             }
         }
     }
@@ -649,7 +648,10 @@ impl<T: Clone> CacheInvalidator<T> {
     /// Get recent invalidation events.
     #[must_use]
     pub fn recent_events(&self) -> Vec<InvalidationEvent> {
-        self.events.read().map(|e| e.clone()).unwrap_or_default()
+        self.events
+            .read()
+            .map(|e| e.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Get the underlying cache.

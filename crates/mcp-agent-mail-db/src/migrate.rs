@@ -292,11 +292,13 @@ fn strip_timezone_suffix(s: &str) -> &str {
     let s = s.strip_suffix('Z').unwrap_or(s);
     // Strip "+HH:MM" or "-HH:MM" offset at end
     if s.len() >= 6 && s.is_char_boundary(s.len() - 6) {
-        let tail = &s[s.len() - 6..];
-        if (tail.starts_with('+') || tail.starts_with('-'))
-            && tail[1..3].chars().all(|c| c.is_ascii_digit())
-            && tail.as_bytes()[3] == b':'
-            && tail[4..6].chars().all(|c| c.is_ascii_digit())
+        let tail = s[s.len() - 6..].as_bytes();
+        if (tail[0] == b'+' || tail[0] == b'-')
+            && tail[1].is_ascii_digit()
+            && tail[2].is_ascii_digit()
+            && tail[3] == b':'
+            && tail[4].is_ascii_digit()
+            && tail[5].is_ascii_digit()
         {
             return &s[..s.len() - 6];
         }
@@ -908,6 +910,21 @@ mod tests {
         let m1 = parse("2026-02-24 15:30:00").unwrap();
         let m2 = parse("2026-02-24T15:30:00").unwrap();
         assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn parse_integer_string() {
+        assert_eq!(try_parse_timestamp_micros("1234567890"), Some(1234567890));
+    }
+
+    #[test]
+    fn parse_iso_dates_handles_malformed_safely() {
+        let mut s = String::from("12345");
+        s.push('+');
+        s.push('\u{20AC}'); // 3 bytes
+        s.push('X');
+        s.push('Y');
+        assert_eq!(try_parse_timestamp_micros(&s), None); // Must not panic on char boundary
     }
 
     // ── strip_timezone_suffix tests ────────────────────────────────────

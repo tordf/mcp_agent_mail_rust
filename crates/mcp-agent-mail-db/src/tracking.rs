@@ -319,8 +319,8 @@ pub struct SlowQueryEntry {
 /// Both are rare in production since 99.9%+ of queries target known tables
 /// and few queries exceed the slow-query threshold.
 #[derive(Debug, Default)]
-struct TrackerAux {
-    slow_queries: Vec<SlowQueryEntry>,
+struct QueryTrackerAux {
+    slow_queries: VecDeque<SlowQueryEntry>,
     unknown_tables: std::collections::HashMap<String, u64>,
 }
 
@@ -338,7 +338,7 @@ pub struct QueryTracker {
     /// Lock-free per-table counters indexed by `TableId`.
     per_table: [AtomicU64; TableId::COUNT],
     /// Mutex-protected auxiliary state (slow queries + unknown table counts).
-    aux: OrderedMutex<TrackerAux>,
+    aux: OrderedMutex<QueryTrackerAux>,
 }
 
 /// Helper to create a zeroed `AtomicU64` array.
@@ -363,7 +363,7 @@ impl QueryTracker {
             slow_enabled: AtomicBool::new(true),
             slow_threshold_us: AtomicU64::new(250_000), // 250ms default
             per_table: new_atomic_array(),
-            aux: OrderedMutex::new(LockLevel::DbQueryTrackerInner, TrackerAux::default()),
+            aux: OrderedMutex::new(LockLevel::DbQueryTrackerInner, QueryTrackerAux::default()),
         }
     }
 
@@ -437,9 +437,9 @@ impl QueryTracker {
             }
             if is_slow {
                 if aux.slow_queries.len() >= SLOW_QUERY_LIMIT {
-                    aux.slow_queries.remove(0);
+                    aux.slow_queries.pop_front();
                 }
-                aux.slow_queries.push(SlowQueryEntry {
+                aux.slow_queries.push_back(SlowQueryEntry {
                     table: name,
                     duration_ms: round_ms(duration_us),
                 });
@@ -450,9 +450,9 @@ impl QueryTracker {
             if is_slow {
                 let mut aux = self.aux.lock();
                 if aux.slow_queries.len() >= SLOW_QUERY_LIMIT {
-                    aux.slow_queries.remove(0);
+                    aux.slow_queries.pop_front();
                 }
-                aux.slow_queries.push(SlowQueryEntry {
+                aux.slow_queries.push_back(SlowQueryEntry {
                     table: Some(table_id.as_str().to_string()),
                     duration_ms: round_ms(duration_us),
                 });
@@ -460,42 +460,36 @@ impl QueryTracker {
         }
     }
 
-    /// Get a snapshot of current metrics.
+    /// Snapshot the current metrics.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn snapshot(&self) -> QueryTrackerSnapshot {
-        // Build per_table HashMap from atomic array (known tables)
         let mut per_table = std::collections::HashMap::new();
-        for i in 0..TableId::COUNT {
-            let count = self.per_table[i].load(Ordering::Relaxed);
-            if count > 0 {
-                let id = TableId::from_index(i);
-                // Don't include "unknown" bucket in the per_table map
-                if id != TableId::Unknown {
-                    per_table.insert(id.as_str().to_string(), count);
-                }
+        for (idx, count) in self.per_table.iter().enumerate() {
+            let c = count.load(Ordering::Relaxed);
+            if c > 0 {
+                let name = TableId::from_index(idx)
+                    .unwrap_or(TableId::Unknown)
+                    .as_str();
+                per_table.insert(name.to_string(), c);
             }
         }
 
-        let slow_query_ms = if self.slow_enabled.load(Ordering::Acquire) {
-            Some(self.slow_threshold_us.load(Ordering::Relaxed) as f64 / 1000.0)
-        } else {
-            None
-        };
-
-        // Merge unknown table counts and grab slow queries
         let aux = self.aux.lock();
-        for (table, &count) in &aux.unknown_tables {
-            *per_table.entry(table.clone()).or_insert(0) += count;
+        for (name, c) in &aux.unknown_tables {
+            *per_table.entry(name.clone()).or_insert(0) += *c;
         }
-        let slow_queries = aux.slow_queries.clone();
+        let slow_queries: Vec<_> = aux.slow_queries.iter().cloned().collect();
         drop(aux);
 
         QueryTrackerSnapshot {
             total: self.total.load(Ordering::Relaxed),
             total_time_ms: round_ms(self.total_time_us.load(Ordering::Relaxed)),
             per_table,
-            slow_query_ms,
+            slow_query_ms: if self.slow_enabled.load(Ordering::Acquire) {
+                Some(self.slow_threshold_us.load(Ordering::Relaxed) as f64 / 1000.0)
+            } else {
+                None
+            },
             slow_queries,
         }
     }
@@ -654,7 +648,7 @@ fn extract_table(sql: &str) -> Option<String> {
 }
 
 /// Round microseconds to milliseconds with 2 decimal places.
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn round_ms(us: u64) -> f64 {
     let ms = us as f64 / 1000.0;
     (ms * 100.0).round() / 100.0

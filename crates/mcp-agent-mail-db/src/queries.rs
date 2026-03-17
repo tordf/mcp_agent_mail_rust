@@ -2588,38 +2588,41 @@ where
             });
         }
 
-        // Use RETURNING to map inserted IDs deterministically to this chunk without race windows.
-        query.push_str(" RETURNING id");
-        let id_rows = try_in_tx!(
+        // Insert without RETURNING (frankensqlite compatibility).
+        try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &query, &params).await)
+            map_sql_outcome(traw_execute(cx, &tracked, &query, &params).await)
         );
 
+        // Retrieve the inserted IDs via a deterministic query keyed on the
+        // exact (project_id, created_ts, path_pattern) tuples we just inserted.
+        // Within this IMMEDIATE transaction no concurrent inserts can interleave.
         let start_idx = created_rows.len() - chunk.len();
-        if id_rows.len() != chunk.len() {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(format!(
-                "file reservation insert returned {} ids for {} rows",
-                id_rows.len(),
-                chunk.len()
-            )));
-        }
-
-        for (j, row) in id_rows.iter().enumerate() {
-            let Some(id) = row_first_i64(row) else {
+        for (j, (agent_id, path, _, _, _)) in chunk.iter().enumerate() {
+            let id_sql = "SELECT id FROM file_reservations \
+                          WHERE project_id = ? AND agent_id = ? AND path_pattern = ? AND created_ts = ? \
+                          ORDER BY id DESC LIMIT 1";
+            let id_params = [
+                Value::BigInt(project_id),
+                Value::BigInt(*agent_id),
+                Value::Text(path.clone()),
+                Value::BigInt(now),
+            ];
+            let id_rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, id_sql, &id_params).await)
+            );
+            let Some(id) = id_rows.first().and_then(row_first_i64) else {
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Err(DbError::Internal(
-                    "file reservation insert RETURNING id yielded non-integer id".to_string(),
+                    "file reservation insert: could not retrieve inserted row id".to_string(),
                 ));
             };
-            let Some(cr) = created_rows.get_mut(start_idx + j) else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(
-                    "file reservation insert ID mapping overflowed result buffer".to_string(),
-                ));
-            };
-            cr.id = Some(id);
+            if let Some(cr) = created_rows.get_mut(start_idx + j) {
+                cr.id = Some(id);
+            }
         }
     }
 
@@ -5963,10 +5966,11 @@ async fn release_reservations_by_ids_with_expiry_constraint(
     let mut released = Vec::with_capacity(ids.len());
 
     // Build the eligibility check: active reservation not already released.
+    // ACTIVE_RESERVATION_PREDICATE already includes the release-ledger
+    // exclusion, so no additional NOT IN clause is needed.
     let mut check_sql = format!(
         "SELECT 1 FROM file_reservations \
-         WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) \
-         AND id NOT IN (SELECT reservation_id FROM file_reservation_releases)"
+         WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
     );
     match expiry_constraint {
         ReleaseReservationExpiryConstraint::Any => {}

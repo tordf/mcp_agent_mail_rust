@@ -1182,4 +1182,26 @@ mod tests {
             cache.len()
         );
     }
+
+    #[test]
+    fn test_ghost_eviction_duplicate_seq_bug() {
+        let mut cache = S3FifoCache::new(5);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("a", 3);
+        cache.remove(&"a");
+        cache.insert("a", 4);
+        cache.insert("c", 5);
+        for i in 0..10 {
+            let key = format!("k{}", i);
+            cache.insert(key.clone(), i);
+            cache.insert(format!("dummy{}", i), i);
+        }
+        cache.insert("a", 6);
+        assert_eq!(
+            cache.small.len(),
+            1,
+            "If a went to small, ghost was forgotten!"
+        );
+    }
 }
