@@ -3081,12 +3081,13 @@ fn commit_paths_lockfree(
     for path in rel_paths {
         let path = validate_repo_relative_path("lockfree commit path", path)?;
         let full = workdir.join(path);
-        if full.exists() {
-            let blob_oid = repo.blob_path(&full)?;
-            updates.push((path.to_string(), Some(blob_oid)));
-        } else {
-            // File does not exist, so we record a deletion (None OID)
-            updates.push((path.to_string(), None));
+        match repo.blob_path(&full) {
+            Ok(blob_oid) => updates.push((path.to_string(), Some(blob_oid))),
+            Err(err) if err.code() == git2::ErrorCode::NotFound => {
+                // Missing files are deletions/moves from the archive's point of view.
+                updates.push((path.to_string(), None));
+            }
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -6719,6 +6720,7 @@ fn commit_paths(
     }
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
+    let _workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
 
     let mut index = repo.index()?;
     reset_index_to_head(repo, &mut index)?;
@@ -6728,18 +6730,22 @@ fn commit_paths(
         let path = validate_repo_relative_path("commit path", path)?;
         // git2 expects forward-slash paths on all platforms
         let p = Path::new(path);
-        let full = repo.workdir().ok_or(StorageError::NotInitialized)?.join(p);
 
-        if full.exists() {
-            index.add_path(p)?;
-        } else {
-            // File doesn't exist on disk, remove it from the index (deletion/move)
-            // Ignore error if the path wasn't in the index to begin with (idempotency)
-            if let Err(e) = index.remove_path(p) {
-                // Ignore "path not in index" errors, but propagate others
-                if e.code() != git2::ErrorCode::NotFound {
-                    return Err(e.into());
+        match index.add_path(p) {
+            Ok(()) => {}
+            Err(err) if err.code() == git2::ErrorCode::NotFound => {
+                // File doesn't exist on disk, remove it from the index (deletion/move).
+                // Ignore "path not in index" errors, but propagate others.
+                if let Err(remove_err) = index.remove_path(p)
+                    && remove_err.code() != git2::ErrorCode::NotFound
+                {
+                    return Err(remove_err.into());
                 }
+            }
+            Err(err) => {
+                // `add_path` already performed the existence/readability check.
+                // Keep richer errors for non-NotFound failures.
+                return Err(err.into());
             }
         }
         any_added = true;
@@ -11026,6 +11032,46 @@ mod tests {
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         let tree = head.tree().unwrap();
         assert!(tree.get_path(Path::new(&rel)).is_ok());
+    }
+
+    #[test]
+    fn lockfree_commit_missing_file_records_deletion() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "lockfree-delete").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+
+        let file_path = archive.root.join("agents/TestAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, r#"{"name":"TestAgent"}"#).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+
+        commit_paths_lockfree(&repo, &config, "lockfree add", &[rel.as_str()]).unwrap();
+        fs::remove_file(&file_path).unwrap();
+        commit_paths_lockfree(&repo, &config, "lockfree delete", &[rel.as_str()]).unwrap();
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(head.tree().unwrap().get_path(Path::new(&rel)).is_err());
+    }
+
+    #[test]
+    fn commit_paths_missing_file_records_deletion() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "index-delete").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+
+        let file_path = archive.root.join("agents/TestAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, r#"{"name":"TestAgent"}"#).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+
+        commit_paths(&repo, &config, "index add", &[rel.as_str()]).unwrap();
+        fs::remove_file(&file_path).unwrap();
+        commit_paths(&repo, &config, "index delete", &[rel.as_str()]).unwrap();
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(head.tree().unwrap().get_path(Path::new(&rel)).is_err());
     }
 
     #[test]

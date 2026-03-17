@@ -3178,7 +3178,7 @@ impl AtcSlowControllerState {
 struct AtcShadowPolicyState {
     candidate: Option<AtcLivenessPolicyArtifact>,
     disagreements: u64,
-    evaluations: u64,
+    regret_samples: u64,
     total_estimated_regret: f64,
     recent_estimated_regret: VecDeque<f64>,
 }
@@ -3188,7 +3188,7 @@ impl Default for AtcShadowPolicyState {
         Self {
             candidate: None,
             disagreements: 0,
-            evaluations: 0,
+            regret_samples: 0,
             total_estimated_regret: 0.0,
             recent_estimated_regret: VecDeque::with_capacity(64),
         }
@@ -3203,7 +3203,7 @@ impl AtcShadowPolicyState {
         incumbent_loss: f64,
         candidate_loss: f64,
     ) {
-        self.evaluations = self.evaluations.saturating_add(1);
+        self.regret_samples = self.regret_samples.saturating_add(1);
         if incumbent_action != candidate_action {
             self.disagreements = self.disagreements.saturating_add(1);
         }
@@ -3220,7 +3220,6 @@ impl AtcShadowPolicyState {
         incumbent_agents: &[String],
         candidate_agents: &[String],
     ) {
-        self.evaluations = self.evaluations.saturating_add(1);
         if incumbent_agents != candidate_agents {
             self.disagreements = self.disagreements.saturating_add(1);
         }
@@ -3228,10 +3227,10 @@ impl AtcShadowPolicyState {
 
     #[must_use]
     fn average_regret(&self) -> f64 {
-        if self.evaluations == 0 {
+        if self.regret_samples == 0 {
             0.0
         } else {
-            self.total_estimated_regret / u64_to_f64(self.evaluations)
+            self.total_estimated_regret / u64_to_f64(self.regret_samples)
         }
     }
 }
@@ -3484,18 +3483,53 @@ impl AtcEngine {
     }
 
     fn schedule_entry_for_push(&mut self, agent: &str, review_at_micros: i64) {
-        let Some(entry) = self.agents.get_mut(agent) else {
-            return;
+        let scheduled = {
+            let Some(entry) = self.agents.get_mut(agent) else {
+                return;
+            };
+            entry.schedule_version = entry.schedule_version.saturating_add(1);
+            entry.next_review_micros = review_at_micros;
+            let schedule_version = entry.schedule_version;
+            (review_at_micros < i64::MAX).then(|| {
+                Reverse(ScheduledAgentReview {
+                    review_at_micros,
+                    schedule_version,
+                    agent: agent.to_string(),
+                })
+            })
         };
-        entry.schedule_version = entry.schedule_version.saturating_add(1);
-        entry.next_review_micros = review_at_micros;
-        if review_at_micros < i64::MAX {
-            self.liveness_schedule.push(Reverse(ScheduledAgentReview {
-                review_at_micros,
+        if let Some(item) = scheduled {
+            self.liveness_schedule.push(item);
+            self.compact_liveness_schedule_if_needed();
+        }
+    }
+
+    fn scheduled_agent_count(&self) -> usize {
+        self.agents
+            .values()
+            .filter(|entry| entry.next_review_micros < i64::MAX)
+            .count()
+    }
+
+    fn compact_liveness_schedule_if_needed(&mut self) {
+        let live_scheduled = self.scheduled_agent_count();
+        let max_heap_entries = live_scheduled.saturating_mul(4).max(64);
+        if self.liveness_schedule.len() <= max_heap_entries {
+            return;
+        }
+
+        let mut rebuilt = BinaryHeap::new();
+        for entry in self.agents.values() {
+            if entry.next_review_micros >= i64::MAX {
+                continue;
+            }
+            rebuilt.push(Reverse(ScheduledAgentReview {
+                review_at_micros: entry.next_review_micros,
                 schedule_version: entry.schedule_version,
-                agent: agent.to_string(),
+                agent: entry.name.clone(),
             }));
         }
+        self.liveness_schedule = rebuilt;
     }
 
     fn effective_threshold_for_agent(
@@ -3580,9 +3614,9 @@ impl AtcEngine {
             let Some(entry) = self.agents.get(&next.agent) else {
                 continue;
             };
-            if entry.schedule_version != next.schedule_version
-                || entry.next_review_micros != next.review_at_micros
-            {
+            let stale_version = entry.schedule_version != next.schedule_version;
+            let stale_review_time = entry.next_review_micros != next.review_at_micros;
+            if stale_version || stale_review_time {
                 continue;
             }
             if seen.insert(next.agent.clone()) {
@@ -3730,10 +3764,10 @@ impl AtcEngine {
 
     /// Evaluate liveness for all tracked agents.
     ///
-    /// Returns a list of `(agent_name, recommended_action)` tuples for agents
-    /// that need intervention.
+    /// Returns the number of due agents that were inspected together with any
+    /// `(agent_name, recommended_action)` pairs that require intervention.
     #[must_use]
-    pub fn evaluate_liveness(&mut self, now_micros: i64) -> LivenessEvaluation {
+    fn evaluate_liveness(&mut self, now_micros: i64) -> LivenessEvaluation {
         let thresholds_snapshot = ATC_THRESHOLDS
             .get()
             .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
@@ -4047,6 +4081,10 @@ impl AtcEngine {
             u64_to_f64(available_budget_micros) * self.incumbent_policy.probe_budget_fraction(mode),
         )
         .min(self.config.tick_budget_micros);
+        let effective_probe_limit = self
+            .slow_controller
+            .probe_limit
+            .min(self.incumbent_policy.max_probes(mode));
 
         let probe_started = Instant::now();
         let incumbent_probe_candidates = budgeted_probe_schedule(
@@ -4054,6 +4092,7 @@ impl AtcEngine {
             &excluded_agents,
             &self.incumbent_policy,
             mode,
+            effective_probe_limit,
             probe_budget_micros,
             estimated_probe_cost_micros,
             now_micros,
@@ -4072,6 +4111,7 @@ impl AtcEngine {
                 &excluded_agents,
                 candidate,
                 mode,
+                effective_probe_limit,
                 candidate_probe_budget_micros,
                 estimated_probe_cost_micros,
                 now_micros,
@@ -4169,7 +4209,7 @@ impl AtcEngine {
 
         let kernel = AtcKernelTelemetry {
             due_agents: liveness.due_agents,
-            scheduled_agents: self.liveness_schedule.len(),
+            scheduled_agents: self.scheduled_agent_count(),
             dirty_agents: self.dirty_agents.len(),
             dirty_projects: self.dirty_projects.len(),
             deadlock_cache_hits: self.deadlock_cache_hits,
@@ -4392,11 +4432,11 @@ mod engine_tests {
         // the strong alive prior.  Simulate multiple tick evaluations.
         let base = 9 * 60_000_000;
         let mut any_action = false;
-        let mut last_actions = Vec::new();
+        let mut last_evaluation = LivenessEvaluation::default();
         for tick in 1..=10 {
             let now = base + tick * 30_000_000; // every 30s
-            last_actions = engine.evaluate_liveness(now);
-            if !last_actions.is_empty() {
+            last_evaluation = engine.evaluate_liveness(now);
+            if !last_evaluation.actions.is_empty() {
                 any_action = true;
                 break;
             }
@@ -4407,7 +4447,7 @@ mod engine_tests {
         );
 
         // Verify the action targets BlueFox
-        let (agent, action) = &last_actions[0];
+        let (agent, action) = &last_evaluation.actions[0];
         assert_eq!(agent, "BlueFox");
         assert!(
             *action == LivenessAction::Suspect || *action == LivenessAction::ReleaseReservations,
@@ -4425,9 +4465,9 @@ mod engine_tests {
             engine.observe_activity("BlueFox", i * 60_000_000);
         }
         let now = 9 * 60_000_000 + 30_000_000; // only 30s since last activity
-        let actions = engine.evaluate_liveness(now);
+        let evaluation = engine.evaluate_liveness(now);
         assert!(
-            actions.is_empty(),
+            evaluation.actions.is_empty(),
             "active agent should not trigger any action"
         );
     }
@@ -4453,7 +4493,7 @@ mod engine_tests {
         }
 
         let now = 9 * 60_000_000 + 600_000_000; // 10 min silence
-        let actions = engine.evaluate_liveness(now);
+        let evaluation = engine.evaluate_liveness(now);
 
         // In safe mode, even if the core recommends Release, the state
         // transition is downgraded to Flaky (Suspect), never Dead.
@@ -4464,21 +4504,25 @@ mod engine_tests {
             "safe mode should prevent Dead state, got {state:?}"
         );
         assert!(
-            actions
+            evaluation
+                .actions
                 .iter()
                 .any(|(agent, action)| agent == "BlueFox" && *action == LivenessAction::Suspect),
             "safe mode should downgrade release actions to Suspect"
         );
         assert!(
-            !actions.iter().any(|(agent, action)| agent == "BlueFox"
-                && *action == LivenessAction::ReleaseReservations),
+            !evaluation
+                .actions
+                .iter()
+                .any(|(agent, action)| agent == "BlueFox"
+                    && *action == LivenessAction::ReleaseReservations),
             "safe mode should not emit release actions"
         );
     }
 
     #[test]
     fn detect_deadlocks_empty_graphs() {
-        let engine = AtcEngine::new_for_testing();
+        let mut engine = AtcEngine::new_for_testing();
         assert!(engine.detect_deadlocks().is_empty());
     }
 
@@ -4597,10 +4641,11 @@ mod engine_tests {
 
         // Long silence — but Dead agents should be skipped
         let now = 9 * 60_000_000 + 600_000_000; // 10 min silence
-        let actions = engine.evaluate_liveness(now);
+        let evaluation = engine.evaluate_liveness(now);
 
         // No actions should be generated for Dead agents
-        let zombie_actions: Vec<_> = actions
+        let zombie_actions: Vec<_> = evaluation
+            .actions
             .iter()
             .filter(|(name, _)| name == "Zombie")
             .collect();
@@ -6165,9 +6210,12 @@ mod edge_case_tests {
         engine.agents.get_mut("DeadAgent").unwrap().state = LivenessState::Dead;
 
         let now = 9 * 60_000_000 + 600_000_000;
-        let actions = engine.evaluate_liveness(now);
+        let evaluation = engine.evaluate_liveness(now);
         assert!(
-            !actions.iter().any(|(name, _)| name == "DeadAgent"),
+            !evaluation
+                .actions
+                .iter()
+                .any(|(name, _)| name == "DeadAgent"),
             "should skip Dead agents"
         );
     }
@@ -6796,6 +6844,7 @@ fn budgeted_probe_schedule<S: BuildHasher>(
     excluded_agents: &HashSet<String>,
     policy: &AtcLivenessPolicyArtifact,
     mode: AtcBudgetMode,
+    hard_probe_limit: usize,
     max_budget_micros: u64,
     estimated_probe_cost_micros: u64,
     now_micros: i64,
@@ -6804,7 +6853,7 @@ fn budgeted_probe_schedule<S: BuildHasher>(
         return Vec::new();
     }
 
-    let max_probes = policy.max_probes(mode);
+    let max_probes = policy.max_probes(mode).min(hard_probe_limit);
     if max_probes == 0 {
         return Vec::new();
     }
@@ -7696,12 +7745,12 @@ mod alien_enhancement_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let disabled_config = mcp_agent_mail_core::Config {
-            atc_enabled: false,
+        let seeded_config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
             atc_probe_interval_secs: 7,
             ..Default::default()
         };
-        init_global_atc(&disabled_config);
+        init_global_atc(&seeded_config);
         atc_register_agent("StickyAgent", "claude-code");
         atc_observe_activity("StickyAgent", 1_000_000);
 
@@ -7711,8 +7760,8 @@ mod alien_enhancement_tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(
-                !engine.enabled(),
-                "ATC config should refresh disabled state"
+                engine.enabled(),
+                "seed config should allow tracked agents before reinit"
             );
             assert_eq!(engine.config.probe_interval_micros, 7_000_000);
             assert!(
@@ -7962,6 +8011,7 @@ mod alien_enhancement_tests {
             &excluded,
             &policy,
             AtcBudgetMode::Nominal,
+            3,
             10,
             10,
             1_000_000,
@@ -7971,6 +8021,90 @@ mod alien_enhancement_tests {
             selected[0].agent, "Alpha",
             "excluded agents must be skipped"
         );
+    }
+
+    #[test]
+    fn budgeted_probe_schedule_respects_slow_controller_limit() {
+        let mut agents = HashMap::new();
+        for name in ["Alpha", "Beta", "Gamma"] {
+            let mut entry = AgentLivenessEntry {
+                name: name.to_string(),
+                program: "claude-code".to_string(),
+                state: LivenessState::Alive,
+                rhythm: AgentRhythm::new(60.0),
+                suspect_since: 0,
+                probe_sent_at: 0,
+                sprt_log_lr: 0.0,
+                core: default_liveness_core(),
+                schedule_version: 0,
+                next_review_micros: i64::MAX,
+            };
+            for _ in 0..20 {
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, 0.3),
+                    (LivenessState::Flaky, 0.9),
+                    (LivenessState::Dead, 0.9),
+                ]);
+            }
+            agents.insert(name.to_string(), entry);
+        }
+
+        let policy = AtcLivenessPolicyArtifact::from_core(
+            "probe-test".to_string(),
+            &default_liveness_core(),
+            3.0,
+        );
+
+        let selected = budgeted_probe_schedule(
+            &agents,
+            &HashSet::new(),
+            &policy,
+            AtcBudgetMode::Nominal,
+            1,
+            1_000_000,
+            10,
+            1_000_000,
+        );
+        assert_eq!(
+            selected.len(),
+            1,
+            "slow controller probe limit should cap probe selection"
+        );
+    }
+
+    #[test]
+    fn shadow_policy_probe_disagreement_does_not_dilute_regret_average() {
+        let mut shadow = AtcShadowPolicyState::default();
+        shadow.record_decision_pair(
+            LivenessAction::DeclareAlive,
+            LivenessAction::Suspect,
+            10.0,
+            2.0,
+        );
+        assert!((shadow.average_regret() - 8.0).abs() < f64::EPSILON);
+
+        shadow.record_probe_disagreement(&["Alpha".to_string()], &["Beta".to_string()]);
+        assert!(
+            (shadow.average_regret() - 8.0).abs() < f64::EPSILON,
+            "probe disagreements should not dilute regret averages"
+        );
+    }
+
+    #[test]
+    fn schedule_compaction_discards_stale_heap_entries() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("HeapAgent", "claude-code");
+
+        for tick in 1..=65 {
+            engine.schedule_entry_for_push("HeapAgent", tick);
+        }
+
+        assert_eq!(
+            engine.liveness_schedule.len(),
+            1,
+            "compaction should keep only the latest schedule entry per agent"
+        );
+        assert_eq!(engine.scheduled_agent_count(), 1);
     }
 
     #[test]

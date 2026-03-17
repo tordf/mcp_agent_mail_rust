@@ -1607,88 +1607,92 @@ pub async fn register_agent(
                     )
                 );
 
-                // FrankenSQLite's `changes()` always returns 0, so we cannot rely
-                // on the UPDATE return value to decide whether the row exists.
-                // Use an explicit SELECT existence check instead.
-                let exists_sql = "SELECT 1 FROM agents \
-                                  WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                                  LIMIT 1";
-                let exists_params = [Value::BigInt(project_id), Value::Text(name_s.clone())];
-                let exists_rows = try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(traw_query(cx, &tracked, exists_sql, &exists_params).await)
-                );
-
-                let mut inserted_new = false;
-                if exists_rows.is_empty() {
-                    let insert_sql = "INSERT INTO agents \
-                        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                    let attach_pol = attachments_policy
-                        .map_or_else(|| "auto".to_string(), std::string::ToString::to_string);
-                    let insert_params = [
-                        Value::BigInt(project_id),
-                        Value::Text(name_s),
-                        Value::Text(program_s),
-                        Value::Text(model_s),
-                        Value::Text(insert_task_desc),
-                        Value::BigInt(now),
-                        Value::BigInt(now),
-                        Value::Text(attach_pol),
-                        Value::Text("auto".to_string()),
-                    ];
-                    match map_sql_outcome(
-                        traw_execute(cx, &tracked, insert_sql, &insert_params).await,
-                    ) {
-                        Outcome::Ok(_) => {
-                            inserted_new = true;
-                        }
-                        Outcome::Err(e) if is_agent_unique_violation(&e) => {
-                            // Concurrent insert race: row now exists, so apply normalize update.
-                            let mut retry_params = normalize_base_params;
-                            retry_params.push(Value::BigInt(project_id));
-                            retry_params.push(Value::Text(name.to_string()));
-                            let _retried_rows = try_in_tx!(
-                                cx,
-                                &tracked,
-                                map_sql_outcome(
-                                    traw_execute(cx, &tracked, &normalize_sql, &retry_params).await
-                                )
-                            );
-                        }
-                        Outcome::Err(e) => {
-                            rollback_tx(cx, &tracked).await;
-                            return Outcome::Err(e);
-                        }
-                        Outcome::Cancelled(r) => {
-                            rollback_tx(cx, &tracked).await;
-                            return Outcome::Cancelled(r);
-                        }
-                        Outcome::Panicked(p) => {
-                            rollback_tx(cx, &tracked).await;
-                            return Outcome::Panicked(p);
-                        }
-                    }
-                }
-
                 let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                                  inception_ts, last_active_ts, attachments_policy, contact_policy \
                                  FROM agents \
                                  WHERE project_id = ? AND name = ? COLLATE NOCASE \
                                  ORDER BY id ASC \
                                  LIMIT 1";
-                let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-                let rows = try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
-                );
-                let Some(fresh) = rows.first().map(decode_agent_row_indexed) else {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(DbError::Internal(format!(
-                        "agent upsert succeeded but re-select failed for {project_id}:{name}"
-                    )));
+
+                let mut inserted_new = false;
+                let fresh = {
+                    let fetch_params = [Value::BigInt(project_id), Value::Text(name_s.clone())];
+                    let existing_rows = try_in_tx!(
+                        cx,
+                        &tracked,
+                        map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+                    );
+
+                    if let Some(existing) = existing_rows.first().map(decode_agent_row_indexed) {
+                        existing
+                    } else {
+                    let insert_sql = "INSERT INTO agents \
+                        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                        let attach_pol = attachments_policy.map_or_else(
+                            || "auto".to_string(),
+                            std::string::ToString::to_string,
+                        );
+                        let insert_params = [
+                            Value::BigInt(project_id),
+                            Value::Text(name_s.clone()),
+                            Value::Text(program_s),
+                            Value::Text(model_s),
+                            Value::Text(insert_task_desc),
+                            Value::BigInt(now),
+                            Value::BigInt(now),
+                            Value::Text(attach_pol),
+                            Value::Text("auto".to_string()),
+                        ];
+                        match map_sql_outcome(
+                            traw_execute(cx, &tracked, insert_sql, &insert_params).await,
+                        ) {
+                            Outcome::Ok(_) => {
+                                inserted_new = true;
+                            }
+                            Outcome::Err(e) if is_agent_unique_violation(&e) => {
+                                // Concurrent insert race: row now exists, so apply normalize update.
+                                let mut retry_params = normalize_base_params;
+                                retry_params.push(Value::BigInt(project_id));
+                                retry_params.push(Value::Text(name.to_string()));
+                                let _retried_rows = try_in_tx!(
+                                    cx,
+                                    &tracked,
+                                    map_sql_outcome(
+                                        traw_execute(cx, &tracked, &normalize_sql, &retry_params)
+                                            .await
+                                    )
+                                );
+                            }
+                            Outcome::Err(e) => {
+                                rollback_tx(cx, &tracked).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                rollback_tx(cx, &tracked).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                rollback_tx(cx, &tracked).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+
+                        let fetch_params =
+                            [Value::BigInt(project_id), Value::Text(name.to_string())];
+                        let rows = try_in_tx!(
+                            cx,
+                            &tracked,
+                            map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+                        );
+                        let Some(fresh) = rows.first().map(decode_agent_row_indexed) else {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(DbError::Internal(format!(
+                                "agent upsert succeeded but re-select failed for {project_id}:{name}"
+                            )));
+                        };
+                        fresh
+                    }
                 };
 
                 try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
@@ -9375,10 +9379,11 @@ mod tests {
                 "requester",
             )
             .await
+            .into_result()
             .expect_err("exact request should conflict");
 
             match err {
-                DbError::ResourceBusy(message) => {
+                asupersync::OutcomeError::Err(DbError::ResourceBusy(message)) => {
                     assert!(message.contains("src/main.rs"));
                     assert!(message.contains("src/**"));
                 }
@@ -9463,10 +9468,11 @@ mod tests {
                 "requester",
             )
             .await
+            .into_result()
             .expect_err("glob request should conflict");
 
             match err {
-                DbError::ResourceBusy(message) => {
+                asupersync::OutcomeError::Err(DbError::ResourceBusy(message)) => {
                     assert!(message.contains("src/**"));
                     assert!(message.contains("src/main.rs"));
                 }
