@@ -627,11 +627,29 @@ fn extract_brace_json(text: &str) -> Option<Value> {
 /// Action keywords used to identify heuristic `key_points` worth preserving.
 const ACTION_KEYWORDS: &[&str] = &["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"];
 
-fn contains_action_keyword(text: &str) -> bool {
-    let upper = text.to_ascii_uppercase();
-    ACTION_KEYWORDS
-        .iter()
-        .any(|keyword| upper.contains(keyword))
+fn action_keyword_suffix_allowed(suffix: Option<u8>) -> bool {
+    suffix.is_none_or(|byte| {
+        byte.is_ascii_whitespace() || matches!(byte, b':' | b',' | b';' | b')' | b']')
+    })
+}
+
+pub(crate) fn contains_any_action_keyword(text: &str, keywords: &[&str]) -> bool {
+    let bytes = text.as_bytes();
+    keywords.iter().any(|keyword| {
+        let keyword_bytes = keyword.as_bytes();
+        bytes
+            .windows(keyword_bytes.len())
+            .enumerate()
+            .any(|(idx, window)| {
+                window.eq_ignore_ascii_case(keyword_bytes)
+                    && (idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric())
+                    && action_keyword_suffix_allowed(bytes.get(idx + keyword_bytes.len()).copied())
+            })
+    })
+}
+
+pub(crate) fn contains_action_keyword(text: &str) -> bool {
+    contains_any_action_keyword(text, ACTION_KEYWORDS)
 }
 
 fn normalize_action_point(text: &str) -> Option<String> {
@@ -1354,6 +1372,16 @@ mod tests {
         // (caller should detect None from parse_json_safely and skip merge)
         assert_eq!(heuristic.key_points, vec!["BLOCKED: waiting on infra"]);
         assert_eq!(heuristic.action_items, vec!["BLOCKED: waiting on infra"]);
+    }
+
+    #[test]
+    fn contains_action_keyword_ignores_substring_matches() {
+        assert!(contains_action_keyword("TODO: deploy to staging"));
+        assert!(contains_action_keyword("blocked on review"));
+        assert!(!contains_action_keyword("The deploy is unblocked now"));
+        assert!(!contains_action_keyword("Next.js route is green"));
+        assert!(!contains_action_keyword("Next-generation feature is live"));
+        assert!(!contains_action_keyword("This is actionable follow-up"));
     }
 
     #[test]

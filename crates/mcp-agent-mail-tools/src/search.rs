@@ -183,12 +183,19 @@ fn is_ordered_prefix(s: &str) -> bool {
 }
 
 fn parse_thread_ids(thread_id: &str) -> Vec<String> {
-    thread_id
+    let mut parsed = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in thread_id
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect()
+    {
+        let thread_id = candidate.to_string();
+        if seen.insert(thread_id.clone()) {
+            parsed.push(thread_id);
+        }
+    }
+    parsed
 }
 
 fn explain_facet_value<'a>(
@@ -297,8 +304,6 @@ pub(crate) fn summarize_messages(
     let mut done_actions: i64 = 0;
     let mut mentions: HashMap<String, i64> = HashMap::with_capacity(8);
     let mut code_references: HashSet<String> = HashSet::with_capacity(8);
-    let keywords = ["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"];
-
     let mut seen_points: HashSet<String> = HashSet::with_capacity(16);
     let mut seen_actions: HashSet<String> = HashSet::with_capacity(16);
 
@@ -381,22 +386,9 @@ pub(crate) fn summarize_messages(
                 }
             }
 
-            let mut has_keyword = false;
-            let mut is_open_action = false;
-            let stripped_bytes = stripped.as_bytes();
-            for &k in &keywords {
-                let k_bytes = k.as_bytes();
-                if stripped_bytes
-                    .windows(k_bytes.len())
-                    .any(|w| w.eq_ignore_ascii_case(k_bytes))
-                {
-                    has_keyword = true;
-                    if k == "FIXME" || k == "TODO" || k == "ACTION" {
-                        is_open_action = true;
-                        break; // No need to check others if we already know it's an open action
-                    }
-                }
-            }
+            let has_keyword = llm::contains_action_keyword(stripped);
+            let is_open_action =
+                llm::contains_any_action_keyword(stripped, &["FIXME", "TODO", "ACTION"]);
 
             if has_keyword && seen_actions.insert(stripped.to_string()) {
                 if is_open_action {
@@ -1254,6 +1246,12 @@ mod tests {
         assert!(parsed.is_empty());
     }
 
+    #[test]
+    fn parse_thread_ids_deduplicates_preserving_order() {
+        let parsed = parse_thread_ids("br-2, br-1, br-2, br-3, br-1");
+        assert_eq!(parsed, vec!["br-2", "br-1", "br-3"]);
+    }
+
     fn make_msg(from: &str, body: &str) -> ThreadMessageRow {
         ThreadMessageRow {
             id: 1,
@@ -1624,6 +1622,17 @@ mod tests {
         let rows = vec![make_msg("Alice", "todo handle this\nblocked on review")];
         let summary = summarize_messages(&rows);
         assert_eq!(summary.action_items.len(), 2);
+    }
+
+    #[test]
+    fn summarize_keyword_substrings_do_not_count_as_actions() {
+        let rows = vec![make_msg(
+            "Alice",
+            "The deploy is unblocked now\nNext.js route is green\nThis is actionable follow-up",
+        )];
+        let summary = summarize_messages(&rows);
+        assert!(summary.action_items.is_empty());
+        assert_eq!(summary.open_actions, 0);
     }
 
     // -----------------------------------------------------------------------

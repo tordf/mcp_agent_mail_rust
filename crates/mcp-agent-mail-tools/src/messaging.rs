@@ -586,18 +586,23 @@ fn validate_message_size_limits(
     // Per-attachment size (check file paths if provided)
     let mut total_size = subject.len().saturating_add(body_md.len());
     if let Some(paths) = attachment_paths {
+        let canonical_attachment_base =
+            attachment_base_dir.map(|base_dir| base_dir.canonicalize().ok());
         for path in paths {
-            let metadata = if let Some(base_dir) = attachment_base_dir {
-                // When a project base dir is provided, only size-check resolved
-                // paths accepted by attachment path policy. Invalid paths are
-                // deferred to downstream attachment validation.
-                match mcp_agent_mail_storage::resolve_attachment_source_path(base_dir, config, path)
-                {
-                    Ok(resolved) => std::fs::metadata(resolved),
-                    Err(_) => continue,
+            let metadata = match canonical_attachment_base.as_ref() {
+                Some(Some(base_dir)) => {
+                    // When a project base dir is provided, only size-check resolved
+                    // paths accepted by attachment path policy. Invalid paths are
+                    // deferred to downstream attachment validation.
+                    match mcp_agent_mail_storage::resolve_attachment_source_path_from_canonical_base(
+                        base_dir, config, path,
+                    ) {
+                        Ok(resolved) => std::fs::metadata(resolved),
+                        Err(_) => continue,
+                    }
                 }
-            } else {
-                std::fs::metadata(path)
+                Some(None) => continue,
+                None => std::fs::metadata(path),
             };
             if let Ok(meta) = metadata {
                 if !meta.is_file() {
@@ -1099,10 +1104,24 @@ fn process_message_attachments(
     {
         match mcp_agent_mail_storage::ensure_archive(config, project_slug) {
             Ok(archive) => {
+                let canonical_base = base_dir.canonicalize().ok();
                 for path in paths {
-                    let resolved = mcp_agent_mail_storage::resolve_attachment_source_path(
-                        base_dir, config, path,
-                    )
+                    let resolved = match canonical_base.as_ref() {
+                        Some(base_dir) => {
+                            mcp_agent_mail_storage::resolve_attachment_source_path_from_canonical_base(
+                                base_dir,
+                                config,
+                                path,
+                            )
+                        }
+                        None => {
+                            mcp_agent_mail_storage::resolve_attachment_source_path(
+                                base_dir,
+                                config,
+                                path,
+                            )
+                        }
+                    }
                     .map_err(|e| {
                         legacy_tool_error(
                             "INVALID_ARGUMENT",
@@ -4487,6 +4506,21 @@ mod tests {
         // attachment resolution, not by this size pre-check.
         let result =
             validate_message_size_limits(&cfg, "", "", Some(&paths), Some(project_dir.path()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn size_limits_skip_attachment_checks_when_project_base_dir_is_missing() {
+        let cfg = config_with_limits(0, 10, 0, 0);
+        let missing_project_dir = tempfile::tempdir().unwrap();
+        let missing_base = missing_project_dir.path().join("missing");
+
+        let external_dir = tempfile::tempdir().unwrap();
+        let external_file = external_dir.path().join("big.txt");
+        std::fs::write(&external_file, "x".repeat(20)).unwrap();
+
+        let paths = vec![external_file.to_string_lossy().to_string()];
+        let result = validate_message_size_limits(&cfg, "", "", Some(&paths), Some(&missing_base));
         assert!(result.is_ok());
     }
 

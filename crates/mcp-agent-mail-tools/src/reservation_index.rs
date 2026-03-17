@@ -1,24 +1,25 @@
 //! Prefix-partitioned index for file reservation conflict detection.
 //!
 //! Replaces the O(M*N) brute-force nested loop in `file_reservation_paths`
-//! with an indexed structure that groups reservations by their first path
-//! segment, enabling O(M * (`K_seg` + `K_root`)) lookups where `K_seg` is
-//! the count of reservations sharing the request path's prefix and `K_root`
-//! is the (typically small) set of root-level glob patterns.
+//! with an indexed structure that narrows exact-path checks to exact,
+//! ancestor, and descendant range lookups while still grouping glob
+//! reservations by their first literal path segment.
 //!
 //! # Partitioning Strategy
 //!
 //! Active exclusive reservations are classified into three buckets:
 //!
-//! 1. **Exact paths** (no glob metacharacters): stored in a `HashMap<String, …>`
-//!    keyed by normalized path, grouped by first segment for prefix-scoped scans.
+//! 1. **Exact paths** (no glob metacharacters): stored in a `BTreeMap<String, …>`
+//!    keyed by normalized path so exact/ancestor lookups are O(log N) and
+//!    descendant scans use a tight prefix range instead of scanning every
+//!    reservation under the same first segment.
 //! 2. **Prefixed globs** (e.g. `src/**/*.rs`): grouped by first literal segment.
 //! 3. **Root globs** (e.g. `*.rs`, `**`): must be checked against every request.
 //!
 //! For each requested path, only the relevant prefix group + root globs are
 //! examined, skipping all reservations under unrelated directory subtrees.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use std::sync::Arc;
@@ -34,9 +35,9 @@ pub(crate) struct ReservationRef {
 
 /// Indexed collection of active exclusive reservations for fast conflict detection.
 pub(crate) struct ReservationIndex {
-    /// Exact-path reservations grouped by first path segment.
-    /// Each entry is `(normalized_path, ref)`.
-    exact_by_prefix: HashMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>>,
+    /// Exact-path reservations keyed by normalized path.
+    /// Each value contains one or more reservations on the same path.
+    exact_by_path: BTreeMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>>,
 
     /// Glob reservations grouped by first literal path segment.
     globs_by_prefix: HashMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>>,
@@ -49,8 +50,8 @@ pub(crate) struct ReservationIndex {
 impl ReservationIndex {
     /// Build an index from an iterator of `(raw_pattern, reservation_ref)` pairs.
     pub fn build(reservations: impl Iterator<Item = (String, ReservationRef)>) -> Self {
-        let mut exact_by_prefix: HashMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>> =
-            HashMap::new();
+        let mut exact_by_path: BTreeMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>> =
+            BTreeMap::new();
         let mut globs_by_prefix: HashMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>> =
             HashMap::new();
         let mut root_globs: Vec<(Arc<CompiledPattern>, ReservationRef)> = Vec::new();
@@ -59,12 +60,8 @@ impl ReservationIndex {
             let compiled = CompiledPattern::cached(&raw_pattern);
 
             if !compiled.is_glob() {
-                // Exact path: group by first segment for prefix-scoped scans.
-                let prefix = first_segment(compiled.normalized())
-                    .unwrap_or("")
-                    .to_owned();
-                exact_by_prefix
-                    .entry(prefix)
+                exact_by_path
+                    .entry(compiled.normalized().to_owned())
                     .or_default()
                     .push((compiled, rref));
             } else if let Some(prefix) = compiled.first_literal_segment() {
@@ -80,7 +77,7 @@ impl ReservationIndex {
         }
 
         Self {
-            exact_by_prefix,
+            exact_by_path,
             globs_by_prefix,
             root_globs,
         }
@@ -125,26 +122,33 @@ impl ReservationIndex {
         req_prefix: Option<&str>,
         conflicts: &mut Vec<&'a ReservationRef>,
     ) {
-        if let Some(prefix) = req_prefix {
-            // Check exact reservations: only same-prefix group.
-            // We use patterns_overlap to handle directory prefix overlaps (e.g. `src` vs `src/main.rs`).
-            if let Some(entries) = self.exact_by_prefix.get(prefix) {
-                for (exact_pat, rref) in entries {
-                    if exact_pat.normalized() == req_norm || exact_pat.overlaps(request_pat) {
-                        conflicts.push(rref);
-                    }
-                }
+        if let Some(entries) = self.exact_by_path.get(req_norm) {
+            for (_, rref) in entries {
+                conflicts.push(rref);
             }
-            // Also check exact entries with empty prefix (root-level exact paths).
-            if let Some(entries) = self.exact_by_prefix.get("") {
-                for (exact_pat, rref) in entries {
-                    if exact_pat.normalized() == req_norm || exact_pat.overlaps(request_pat) {
-                        conflicts.push(rref);
-                    }
-                }
-            }
+        }
 
-            // Check glob reservations in the same prefix group.
+        for slash_idx in req_norm.match_indices('/').map(|(idx, _)| idx) {
+            let ancestor = &req_norm[..slash_idx];
+            if let Some(entries) = self.exact_by_path.get(ancestor) {
+                for (_, rref) in entries {
+                    conflicts.push(rref);
+                }
+            }
+        }
+
+        if let Some(descendant_prefix) = descendant_prefix(req_norm) {
+            for (path, entries) in self.exact_by_path.range(descendant_prefix.clone()..) {
+                if !path.starts_with(&descendant_prefix) {
+                    break;
+                }
+                for (_, rref) in entries {
+                    conflicts.push(rref);
+                }
+            }
+        }
+
+        if let Some(prefix) = req_prefix {
             if let Some(entries) = self.globs_by_prefix.get(prefix) {
                 for (res_pat, rref) in entries {
                     if res_pat.overlaps(request_pat) {
@@ -153,14 +157,6 @@ impl ReservationIndex {
                 }
             }
         } else {
-            // Root exact request (no prefix): must check ALL groups because it acts as a directory prefix for everything.
-            for entries in self.exact_by_prefix.values() {
-                for (exact_pat, rref) in entries {
-                    if exact_pat.normalized() == req_norm || exact_pat.overlaps(request_pat) {
-                        conflicts.push(rref);
-                    }
-                }
-            }
             for entries in self.globs_by_prefix.values() {
                 for (res_pat, rref) in entries {
                     if res_pat.overlaps(request_pat) {
@@ -182,21 +178,10 @@ impl ReservationIndex {
         conflicts: &mut Vec<&'a ReservationRef>,
     ) {
         if let Some(prefix) = req_prefix {
-            // Scoped scan: only check entries sharing this prefix.
-
-            // Check exact entries: request glob might match exact paths or overlap with exact directory prefixes.
-            if let Some(entries) = self.exact_by_prefix.get(prefix) {
-                for (exact_pat, rref) in entries {
-                    // One-directional match, or fallback to patterns_overlap for directory prefix cases
-                    if request_pat.matches(exact_pat.normalized())
-                        || exact_pat.overlaps(request_pat)
-                    {
-                        conflicts.push(rref);
-                    }
-                }
-            }
-            // Also check exact entries with empty prefix (root-level exact paths or root directory itself).
-            if let Some(entries) = self.exact_by_prefix.get("") {
+            // Scoped scan: only check the exact anchor (`src`) and its
+            // descendants (`src/...`) instead of every exact entry sharing the
+            // first path segment.
+            if let Some(entries) = self.exact_by_path.get(prefix) {
                 for (exact_pat, rref) in entries {
                     if request_pat.matches(exact_pat.normalized())
                         || exact_pat.overlaps(request_pat)
@@ -206,7 +191,21 @@ impl ReservationIndex {
                 }
             }
 
-            // Check glob entries in same prefix group.
+            if let Some(descendant_prefix) = descendant_prefix(prefix) {
+                for (path, entries) in self.exact_by_path.range(descendant_prefix.clone()..) {
+                    if !path.starts_with(&descendant_prefix) {
+                        break;
+                    }
+                    for (exact_pat, rref) in entries {
+                        if request_pat.matches(exact_pat.normalized())
+                            || exact_pat.overlaps(request_pat)
+                        {
+                            conflicts.push(rref);
+                        }
+                    }
+                }
+            }
+
             if let Some(entries) = self.globs_by_prefix.get(prefix) {
                 for (res_pat, rref) in entries {
                     if res_pat.overlaps(request_pat) {
@@ -216,7 +215,7 @@ impl ReservationIndex {
             }
         } else {
             // Root glob request (no prefix): must check ALL groups.
-            for entries in self.exact_by_prefix.values() {
+            for entries in self.exact_by_path.values() {
                 for (exact_pat, rref) in entries {
                     if request_pat.matches(exact_pat.normalized())
                         || exact_pat.overlaps(request_pat)
@@ -236,10 +235,12 @@ impl ReservationIndex {
     }
 }
 
-/// Extract the first path segment from a normalized path.
-fn first_segment(norm: &str) -> Option<&str> {
-    let seg = norm.split('/').next().unwrap_or("");
-    if seg.is_empty() { None } else { Some(seg) }
+fn descendant_prefix(norm: &str) -> Option<String> {
+    if norm.is_empty() {
+        None
+    } else {
+        Some(format!("{norm}/"))
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +405,28 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_exact_path_conflicts_with_descendant_request() {
+        let idx = ReservationIndex::build(vec![("src".to_string(), make_ref(1))].into_iter());
+        let req = CompiledPattern::new("src/main.rs");
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].agent_id, 1);
+    }
+
+    #[test]
+    fn exact_directory_request_conflicts_with_descendant_exact_path() {
+        let idx = ReservationIndex::build(
+            vec![("src/main/generated.rs".to_string(), make_ref(1))].into_iter(),
+        );
+        let req = CompiledPattern::new("src/main");
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].agent_id, 1);
+    }
+
+    #[test]
     fn star_glob_matches_root_files() {
         let idx = ReservationIndex::build(vec![("*.toml".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("Cargo.toml");
@@ -463,10 +486,16 @@ mod tests {
     }
 
     #[test]
-    fn first_segment_helper() {
-        assert_eq!(first_segment("src/main.rs"), Some("src"));
-        assert_eq!(first_segment("Cargo.toml"), Some("Cargo.toml"));
-        assert_eq!(first_segment(""), None);
+    fn descendant_prefix_helper() {
+        assert_eq!(
+            descendant_prefix("src/main.rs").as_deref(),
+            Some("src/main.rs/")
+        );
+        assert_eq!(
+            descendant_prefix("Cargo.toml").as_deref(),
+            Some("Cargo.toml/")
+        );
+        assert_eq!(descendant_prefix("").as_deref(), None);
     }
 
     #[test]
