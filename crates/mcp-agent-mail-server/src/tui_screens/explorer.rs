@@ -1494,9 +1494,6 @@ impl MailScreen for MailExplorerScreen {
         outer_block.render(area, frame);
         let area = inner;
 
-        // Sync list state with cursor before rendering
-        self.sync_list_state();
-
         // Layout: header (3-4h) + body
         let header_h: u16 = if area.height >= 6 { 4 } else { 3 };
         let body_h = area.height.saturating_sub(header_h);
@@ -1757,14 +1754,21 @@ fn sort_entries(entries: &mut [DisplayEntry], mode: SortMode) {
             });
         }
         SortMode::AgentAlpha => {
-            // Pre-compute lowercased agent name to avoid to_lowercase() per comparison.
-            entries.sort_by_cached_key(|e| {
-                let agent = if e.direction == Direction::Inbound {
-                    &e.sender_name
+            entries.sort_by(|a, b| {
+                let agent_a = if a.direction == Direction::Inbound {
+                    &a.sender_name
                 } else {
-                    &e.to_agents
+                    &a.to_agents
                 };
-                (agent.to_lowercase(), std::cmp::Reverse(e.created_ts))
+                let agent_b = if b.direction == Direction::Inbound {
+                    &b.sender_name
+                } else {
+                    &b.to_agents
+                };
+                match crate::tui_screens::cmp_ci(agent_a, agent_b) {
+                    std::cmp::Ordering::Equal => b.created_ts.cmp(&a.created_ts), // reverse timestamp fallback
+                    other => other,
+                }
             });
         }
     }

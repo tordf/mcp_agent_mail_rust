@@ -429,6 +429,11 @@ impl AttachmentExplorerScreen {
     fn rebuild_display(&mut self) {
         let filter = &self.text_filter;
         let media = self.media_filter;
+        let lower_filter = if filter.is_empty() {
+            String::new()
+        } else {
+            filter.to_lowercase()
+        };
 
         self.display_indices = self
             .entries
@@ -438,13 +443,12 @@ impl AttachmentExplorerScreen {
                 if !media.matches(&e.media_type) {
                     return false;
                 }
-                if !filter.is_empty() {
-                    let lower = filter.to_lowercase();
-                    let matches = crate::tui_screens::contains_ci(&e.media_type, &lower)
-                        || crate::tui_screens::contains_ci(&e.sender_name, &lower)
-                        || crate::tui_screens::contains_ci(&e.subject, &lower)
-                        || crate::tui_screens::contains_ci(&e.project_slug, &lower)
-                        || crate::tui_screens::contains_ci(&e.sha1, &lower);
+                if !lower_filter.is_empty() {
+                    let matches = crate::tui_screens::contains_ci(&e.media_type, &lower_filter)
+                        || crate::tui_screens::contains_ci(&e.sender_name, &lower_filter)
+                        || crate::tui_screens::contains_ci(&e.subject, &lower_filter)
+                        || crate::tui_screens::contains_ci(&e.project_slug, &lower_filter)
+                        || crate::tui_screens::contains_ci(&e.sha1, &lower_filter);
                     if !matches {
                         return false;
                     }
@@ -1449,7 +1453,7 @@ mod tests {
 
         let kb_entry = AttachmentEntry {
             bytes: 2048,
-            ..entry.clone()
+            ..entry
         };
         assert_eq!(kb_entry.size_display(), "2.0 KB");
 

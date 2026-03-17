@@ -370,13 +370,15 @@ impl ArchiveBrowserScreen {
         }
         self.archive_root = Some(archive_path.clone());
 
+        let filter_lower = self.filter.to_lowercase();
+
         // Build flattened visible tree
         let mut entries = Vec::new();
         Self::scan_directory_with_state(
             &archive_path,
             &archive_path,
             0,
-            &self.filter,
+            &filter_lower,
             &expanded_paths,
             &mut entries,
         );
@@ -511,7 +513,7 @@ impl ArchiveBrowserScreen {
             // Re-scan to rebuild visible entries with expansion state
             if let Some(root) = &self.archive_root {
                 let root = root.clone();
-                let filter = self.filter.clone();
+                let filter_lower = self.filter.to_lowercase();
                 // Preserve expansion states
                 let expanded_paths: HashSet<PathBuf> = self
                     .entries
@@ -526,7 +528,7 @@ impl ArchiveBrowserScreen {
                     &root,
                     &root,
                     0,
-                    &filter,
+                    &filter_lower,
                     &expanded_paths,
                     &mut final_entries,
                 );
@@ -548,7 +550,7 @@ impl ArchiveBrowserScreen {
         root: &Path,
         dir: &Path,
         depth: usize,
-        filter: &str,
+        filter_lower: &str,
         expanded_state: &HashSet<PathBuf>,
         entries: &mut Vec<ArchiveEntry>,
     ) {
@@ -556,7 +558,6 @@ impl ArchiveBrowserScreen {
             return;
         };
 
-        let filter_lc = filter.to_lowercase();
         let mut items: Vec<(bool, String, PathBuf, u64)> = Vec::new();
         for entry in read_dir.flatten() {
             let path = entry.path();
@@ -573,14 +574,13 @@ impl ArchiveBrowserScreen {
             let size = if is_dir {
                 0
             } else {
-                entry.metadata().map_or(0, |metadata| metadata.len())
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
             };
 
-            if !filter_lc.is_empty()
-                && !is_dir
-                && !crate::tui_screens::contains_ci(&name, &filter_lc)
-            {
-                continue;
+            if !filter_lower.is_empty() {
+                if !crate::tui_screens::contains_ci(&name, filter_lower) {
+                    continue;
+                }
             }
 
             items.push((is_dir, name, path, size));
@@ -617,7 +617,7 @@ impl ArchiveBrowserScreen {
                     root,
                     &path,
                     depth + 1,
-                    filter,
+                    filter_lower,
                     expanded_state,
                     entries,
                 );

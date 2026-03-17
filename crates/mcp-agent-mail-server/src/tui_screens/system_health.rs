@@ -107,6 +107,24 @@ fn format_http_status(status: u16) -> String {
     }
 }
 
+fn derive_web_dashboard_url(web_ui_url: &str) -> Option<String> {
+    let trimmed = web_ui_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let split_idx = trimmed.rfind("/mail")?;
+    let suffix = &trimmed[split_idx + "/mail".len()..];
+    if !(suffix.is_empty() || suffix.starts_with('?') || suffix.starts_with('#')) {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        &trimmed[..split_idx],
+        "/web-dashboard",
+        suffix
+    ))
+}
+
 fn screen_diag_level(diag: &ScreenDiagnosticSnapshot) -> Level {
     let active_user_filter = query_params_explain_empty_state(&diag.query_params);
     if diag.raw_count > 0 && diag.rendered_count == 0 && !active_user_filter {
@@ -351,9 +369,15 @@ impl SystemHealthScreen {
             Span::styled(snap.endpoint.clone(), value_style),
         ]));
         lines.push(Line::from_spans([
-            Span::styled("Web UI:    ", label_style),
+            Span::styled("Mail UI:   ", label_style),
             Span::styled(snap.web_ui_url.clone(), value_style),
         ]));
+        if let Some(web_dashboard_url) = derive_web_dashboard_url(&snap.web_ui_url) {
+            lines.push(Line::from_spans([
+                Span::styled("Dashboard: ", label_style),
+                Span::styled(web_dashboard_url, accent_style),
+            ]));
+        }
         if let Some(ref url) = snap.remote_url {
             let remote_style = crate::tui_theme::text_accent(&tp).bold();
             lines.push(Line::from_spans([
@@ -363,7 +387,7 @@ impl SystemHealthScreen {
             lines.push(Line::from_spans([
                 Span::styled("           ", label_style),
                 Span::styled(
-                    "(Tailscale — click to open web app from remote machine)".to_string(),
+                    "(Tailscale - remote MCP/API URL for agents and CLI clients)".to_string(),
                     hint_style,
                 ),
             ]));
@@ -722,9 +746,9 @@ impl SystemHealthScreen {
             Span::styled("v", action_key_style),
             Span::styled(" Dashboard  ", hint_style),
             Span::styled("o", action_key_style),
-            Span::styled(" Open URL  ", hint_style),
+            Span::styled(" Open Mail UI  ", hint_style),
             Span::styled("y", action_key_style),
-            Span::styled(" Copy URL", hint_style),
+            Span::styled(" Copy Mail UI", hint_style),
         ]));
 
         let block = Block::default()
@@ -1428,7 +1452,9 @@ impl MailScreen for SystemHealthScreen {
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("Server status, connection pool, WAL/cache diagnostics. Use o=open URL, y=copy URL.")
+        Some(
+            "Server status, connection pool, WAL/cache diagnostics. Use o=open Mail UI, y=copy Mail UI.",
+        )
     }
 
     fn title(&self) -> &'static str {
@@ -1616,8 +1642,8 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
     let cfg = state.config_snapshot();
     let env_cfg = Config::from_env();
 
-    // Show the MCP endpoint URL rather than the non-functional `/mail` web
-    // UI path so the remote URL is actually usable by agents.
+    // Show the MCP endpoint URL rather than a browser surface so the remote
+    // URL remains directly usable by agents and CLI tooling.
     let remote_url = tailscale_ip.map(|ip| {
         let path = env_cfg.http_path.trim_end_matches('/');
         format!("http://{ip}:{}{path}/", env_cfg.http_port)
@@ -2271,6 +2297,13 @@ mod tests {
         assert_eq!(parsed.host, "::1");
         assert_eq!(parsed.port, 8766);
         assert_eq!(parsed.path, "/mcp/");
+    }
+
+    #[test]
+    fn derive_web_dashboard_url_preserves_token_and_fragment() {
+        let url = derive_web_dashboard_url("https://example.test/mail?token=abc123#ctx")
+            .expect("dashboard url");
+        assert_eq!(url, "https://example.test/web-dashboard?token=abc123#ctx");
     }
 
     #[test]
@@ -3310,12 +3343,12 @@ mod tests {
 
         let text = buffer_to_text(&frame.buffer);
         assert!(
-            text.contains("Open URL"),
-            "expected footer to include Open URL shortcut, got:\n{text}"
+            text.contains("Open Mail UI"),
+            "expected footer to include Open Mail UI shortcut, got:\n{text}"
         );
         assert!(
-            text.contains("Copy URL"),
-            "expected footer to include Copy URL shortcut, got:\n{text}"
+            text.contains("Copy Mail UI"),
+            "expected footer to include Copy Mail UI shortcut, got:\n{text}"
         );
     }
 

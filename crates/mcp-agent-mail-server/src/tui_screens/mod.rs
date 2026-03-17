@@ -52,8 +52,8 @@ pub fn contains_ci(text: &str, query_lower: &str) -> bool {
     }
     if query_lower.is_ascii() {
         let q_bytes = query_lower.as_bytes();
-        let q_first = q_bytes[0]; // query_lower is already lowercase
-        let q_first_upper = q_first.to_ascii_uppercase();
+        let q_first_lower = q_bytes[0].to_ascii_lowercase();
+        let q_first_upper = q_bytes[0].to_ascii_uppercase();
 
         let t_bytes = text.as_bytes();
         if t_bytes.len() < q_bytes.len() {
@@ -63,7 +63,7 @@ pub fn contains_ci(text: &str, query_lower: &str) -> bool {
         let max_idx = t_bytes.len() - q_bytes.len();
         for i in 0..=max_idx {
             let b = t_bytes[i];
-            if b == q_first || b == q_first_upper {
+            if b == q_first_lower || b == q_first_upper {
                 if t_bytes[i..i + q_bytes.len()].eq_ignore_ascii_case(q_bytes) {
                     return true;
                 }
@@ -71,7 +71,7 @@ pub fn contains_ci(text: &str, query_lower: &str) -> bool {
         }
         false
     } else {
-        text.to_lowercase().contains(query_lower)
+        text.to_lowercase().contains(&query_lower.to_lowercase())
     }
 }
 
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn category_labels_are_non_empty() {
+    fn category_labels_are_nonempty() {
         for &cat in ScreenCategory::ALL {
             assert!(!cat.label().is_empty());
             assert!(!cat.short_label().is_empty());

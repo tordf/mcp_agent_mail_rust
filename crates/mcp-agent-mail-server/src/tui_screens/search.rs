@@ -969,18 +969,14 @@ fn clamp_to_char_boundary(s: &str, mut idx: usize) -> usize {
     idx
 }
 
-fn extract_snippet(text: &str, terms: &[QueryTerm], max_chars: usize) -> String {
+fn extract_snippet(text: &str, needles: &[String], max_chars: usize) -> String {
     let mut best_pos: Option<usize> = None;
     let mut best_len: usize = 0;
 
-    if !terms.is_empty() {
+    if !needles.is_empty() {
         let hay = text.to_ascii_lowercase();
-        for term in terms.iter().filter(|t| !t.negated) {
-            if term.text.len() < 2 {
-                continue;
-            }
-            let needle = term.text.to_ascii_lowercase();
-            if let Some(pos) = hay.find(&needle)
+        for needle in needles {
+            if let Some(pos) = hay.find(needle.as_str())
                 && (best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX))
             {
                 best_pos = Some(pos);
@@ -3677,18 +3673,22 @@ fn map_unified_results(
     results: Vec<mcp_agent_mail_db::search_planner::SearchResult>,
     highlight_terms: &[QueryTerm],
 ) -> Vec<ResultEntry> {
+    let highlight_needles = build_highlight_needles(highlight_terms);
     results
         .into_iter()
-        .map(|result| map_unified_result(result, highlight_terms))
+        .map(|result| map_unified_result(result, highlight_terms, &highlight_needles))
         .collect()
 }
 
 fn map_unified_result(
     result: mcp_agent_mail_db::search_planner::SearchResult,
     highlight_terms: &[QueryTerm],
+    highlight_needles: &[String],
 ) -> ResultEntry {
     match result.doc_kind {
-        DocKind::Message | DocKind::Thread => map_unified_message_result(result, highlight_terms),
+        DocKind::Message | DocKind::Thread => {
+            map_unified_message_result(result, highlight_terms, highlight_needles)
+        }
         DocKind::Agent => ResultEntry {
             id: result.id,
             doc_kind: DocKind::Agent,
@@ -3736,6 +3736,7 @@ fn map_unified_result(
 fn map_unified_message_result(
     result: mcp_agent_mail_db::search_planner::SearchResult,
     highlight_terms: &[QueryTerm],
+    highlight_needles: &[String],
 ) -> ResultEntry {
     let subject_text = collapse_whitespace(&result.title);
     let has_highlight_terms = highlight_terms
@@ -3748,12 +3749,12 @@ fn map_unified_message_result(
     };
     let body_lines = markdown_to_searchable_lines_with_caps(&result.body, line_cap, char_cap);
     let subject_match_count = if has_highlight_terms {
-        count_term_matches(&subject_text, highlight_terms)
+        count_term_matches(&subject_text, highlight_needles)
     } else {
         0
     };
     let body_match_count = if has_highlight_terms {
-        count_term_matches_in_lines(&body_lines, highlight_terms)
+        count_term_matches_in_lines(&body_lines, highlight_needles)
     } else {
         0
     };
@@ -3771,12 +3772,12 @@ fn map_unified_message_result(
     let mut preview = if !has_highlight_terms {
         truncate_str(&body_preview_source, 120)
     } else if body_match_count > 0 {
-        extract_context_snippet_from_lines(&body_lines, highlight_terms, MAX_SNIPPET_CHARS)
+        extract_context_snippet_from_lines(&body_lines, highlight_needles, MAX_SNIPPET_CHARS)
     } else if subject_match_count > 0 {
-        let subject_snippet = extract_snippet(&subject_text, highlight_terms, MAX_SNIPPET_CHARS);
+        let subject_snippet = extract_snippet(&subject_text, highlight_needles, MAX_SNIPPET_CHARS);
         format!("subject: {subject_snippet}")
     } else {
-        extract_snippet(&body_preview_source, highlight_terms, MAX_SNIPPET_CHARS)
+        extract_snippet(&body_preview_source, highlight_needles, MAX_SNIPPET_CHARS)
     };
     if preview.is_empty() {
         preview = truncate_str(&subject_text, 120);
@@ -3814,6 +3815,7 @@ fn query_message_rows(
     params: &[Value],
     highlight_terms: &[QueryTerm],
 ) -> Result<Vec<ResultEntry>, String> {
+    let highlight_needles = build_highlight_needles(highlight_terms);
     conn.query_sync(sql, params)
         .map_err(|e| e.to_string())
         .map(|rows| {
@@ -3835,12 +3837,12 @@ fn query_message_rows(
                     let body_lines =
                         markdown_to_searchable_lines_with_caps(&body_md, line_cap, char_cap);
                     let subject_match_count = if has_highlight_terms {
-                        count_term_matches(&subject_text, highlight_terms)
+                        count_term_matches(&subject_text, &highlight_needles)
                     } else {
                         0
                     };
                     let body_match_count = if has_highlight_terms {
-                        count_term_matches_in_lines(&body_lines, highlight_terms)
+                        count_term_matches_in_lines(&body_lines, &highlight_needles)
                     } else {
                         0
                     };
@@ -3861,15 +3863,15 @@ fn query_message_rows(
                     } else if body_match_count > 0 {
                         extract_context_snippet_from_lines(
                             &body_lines,
-                            highlight_terms,
+                            &highlight_needles,
                             MAX_SNIPPET_CHARS,
                         )
                     } else if subject_match_count > 0 {
                         let subject_snippet =
-                            extract_snippet(&subject_text, highlight_terms, MAX_SNIPPET_CHARS);
+                            extract_snippet(&subject_text, &highlight_needles, MAX_SNIPPET_CHARS);
                         format!("subject: {subject_snippet}")
                     } else {
-                        extract_snippet(&body_preview_source, highlight_terms, MAX_SNIPPET_CHARS)
+                        extract_snippet(&body_preview_source, &highlight_needles, MAX_SNIPPET_CHARS)
                     };
                     if preview.is_empty() {
                         preview = truncate_str(&subject_text, 120);
@@ -4105,23 +4107,39 @@ fn markdown_to_searchable_lines_with_caps(
     lines
 }
 
-fn count_term_matches_in_lines(lines: &[SearchableLine], terms: &[QueryTerm]) -> usize {
+fn count_term_matches_in_lines(lines: &[SearchableLine], needles: &[String]) -> usize {
+    if needles.is_empty() {
+        return 0;
+    }
     lines
         .iter()
-        .map(|line| count_term_matches(&line.text, terms))
+        .map(|line| {
+            let hay = line.text.to_ascii_lowercase();
+            let mut total = 0usize;
+            for needle in needles {
+                let mut offset = 0usize;
+                while offset < hay.len() {
+                    let Some(pos) = hay[offset..].find(needle.as_str()) else {
+                        break;
+                    };
+                    total = total.saturating_add(1);
+                    offset = offset.saturating_add(pos.saturating_add(needle.len().max(1)));
+                }
+            }
+            total
+        })
         .sum()
 }
 
 fn extract_context_snippet_from_lines(
     lines: &[SearchableLine],
-    terms: &[QueryTerm],
+    needles: &[String],
     max_chars: usize,
 ) -> String {
     if lines.is_empty() {
         return String::new();
     }
 
-    let needles = build_highlight_needles(terms);
     let match_line_idx = if needles.is_empty() {
         None
     } else {
@@ -4131,7 +4149,18 @@ fn extract_context_snippet_from_lines(
             let hay = line.text.to_ascii_lowercase();
             let score = needles
                 .iter()
-                .map(|needle| hay.matches(needle).count())
+                .map(|needle| {
+                    let mut count = 0usize;
+                    let mut offset = 0usize;
+                    while offset < hay.len() {
+                        let Some(pos) = hay[offset..].find(needle.as_str()) else {
+                            break;
+                        };
+                        count += 1;
+                        offset = offset.saturating_add(pos.saturating_add(needle.len().max(1)));
+                    }
+                    count
+                })
                 .sum::<usize>();
             if score > best_score || (score > 0 && score == best_score) {
                 best_score = score;
@@ -4176,23 +4205,16 @@ fn extract_context_snippet_from_lines(
     truncate_str(snippet.trim(), max_chars)
 }
 
-fn count_term_matches(text: &str, terms: &[QueryTerm]) -> usize {
-    if text.is_empty() || terms.is_empty() {
+fn count_term_matches(text: &str, needles: &[String]) -> usize {
+    if text.is_empty() || needles.is_empty() {
         return 0;
     }
     let hay = text.to_ascii_lowercase();
     let mut total = 0usize;
-    for term in terms.iter().filter(|term| !term.negated) {
-        if term.text.len() < 2 {
-            continue;
-        }
-        let needle = term.text.to_ascii_lowercase();
-        if needle.is_empty() {
-            continue;
-        }
+    for needle in needles {
         let mut offset = 0usize;
         while offset < hay.len() {
-            let Some(pos) = hay[offset..].find(&needle) else {
+            let Some(pos) = hay[offset..].find(needle.as_str()) else {
                 break;
             };
             total = total.saturating_add(1);
