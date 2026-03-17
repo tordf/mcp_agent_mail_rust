@@ -2273,8 +2273,8 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
         "mark_message_read should decrement unread_count to zero"
     );
     assert_eq!(
-        after_mark_read.ack_pending_count, 1,
-        "mark_message_read should not change ack_pending_count"
+        after_mark_read.ack_pending_count, 0,
+        "mark_message_read should auto-ack ack_required messages (read = ack)"
     );
     assert_ne!(
         after_mark_read.unread_count, stale_before_mark_read.unread_count,
@@ -2290,6 +2290,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
     };
     put_cached_inbox_stats(&pool, &stale_before_ack);
 
+    // acknowledge_message is now idempotent — auto-ack already set ack_ts.
     let _ack_ts = acknowledge_message(&pool, receiver_id, first_msg);
     let after_ack = get_inbox_stats(&pool, receiver_id);
     assert_eq!(
@@ -2302,7 +2303,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
     );
     assert_eq!(
         after_ack.ack_pending_count, 0,
-        "acknowledge_message should decrement ack_pending_count to zero"
+        "ack_pending should remain zero (already auto-acked on read)"
     );
     assert_ne!(
         after_ack.ack_pending_count, stale_before_ack.ack_pending_count,

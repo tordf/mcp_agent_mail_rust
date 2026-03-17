@@ -134,8 +134,9 @@ CREATE TABLE IF NOT EXISTS agent_links (
     expires_ts INTEGER,
     UNIQUE(a_project_id, a_agent_id, b_project_id, b_agent_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_links_pair_unique
-    ON agent_links(a_project_id, a_agent_id, b_project_id, b_agent_id);
+-- Note: the UNIQUE table constraint above already creates an implicit unique
+-- index on (a_project_id, a_agent_id, b_project_id, b_agent_id); no separate
+-- CREATE UNIQUE INDEX is needed.
 CREATE INDEX IF NOT EXISTS idx_agent_links_a_project ON agent_links(a_project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_b_project ON agent_links(b_project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_status ON agent_links(status);
@@ -888,22 +889,21 @@ pub fn schema_migrations() -> Vec<Migration> {
 
     // Backfill agent/project identity indexes from existing rows.
     migrations.push(Migration::new(
-	        "v7_backfill_fts_agents".to_string(),
-	        "backfill fts_agents from agents".to_string(),
-	        "INSERT OR REPLACE INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
-	         SELECT id, id, project_id, name, task_description, program, model FROM agents"
-	        .to_string(),
-	        String::new(),
-	    ));
+        "v7_backfill_fts_agents".to_string(),
+        "backfill fts_agents from agents".to_string(),
+        "INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+         SELECT id, id, project_id, name, task_description, program, model FROM agents"
+        .to_string(),
+        String::new(),
+    ));
     migrations.push(Migration::new(
         "v7_backfill_fts_projects".to_string(),
         "backfill fts_projects from projects".to_string(),
-        "INSERT OR REPLACE INTO fts_projects(rowid, project_id, slug, human_key) \
-	         SELECT id, id, slug, human_key FROM projects"
+        "INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
+         SELECT id, id, slug, human_key FROM projects"
             .to_string(),
         String::new(),
     ));
-
     // ── v8: Search recipes and query history ──────────────────────
     migrations.extend(crate::search_recipes::recipe_migrations());
 

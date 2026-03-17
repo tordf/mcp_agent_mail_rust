@@ -155,17 +155,18 @@ where
                 Node::Small {
                     value: v,
                     freq,
-                    seq: n_seq,
+                    seq: _n_seq,
                 }
                 | Node::Main {
                     value: v,
                     freq,
-                    seq: n_seq,
+                    seq: _n_seq,
                 } => {
                     *v = value;
                     *freq = (*freq + 1).min(3);
-                    // Update seq to avoid eviction from old tombstone
-                    *n_seq = seq;
+                    // Do NOT update seq here. S3-FIFO hits do not move the item
+                    // to the back of the queue. If we update seq without pushing
+                    // to the queue, the item becomes orphaned and leaks.
                     return;
                 }
                 Node::Ghost { .. } => true,
@@ -480,10 +481,10 @@ where
 
     /// Iterate over all live keys (Small + Main queues, excluding Ghost).
     pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.small
-            .iter()
-            .map(|(k, _)| k)
-            .chain(self.main.iter().map(|(k, _)| k))
+        self.index.iter().filter_map(|(k, node)| match node {
+            Node::Small { .. } | Node::Main { .. } => Some(k),
+            Node::Ghost { .. } => None,
+        })
     }
 }
 
@@ -1149,6 +1150,20 @@ mod tests {
             cache.small.len() <= 10,
             "Small queue leaked tombstones! length is {}",
             cache.small.len()
+        );
+    }
+
+    #[test]
+    fn s3fifo_live_leak_test_manual() {
+        let mut cache = S3FifoCache::new(1); // small=1, main=0
+        cache.insert("a", 1);
+        cache.insert("a", 2); // Updates seq, but doesn't push to queue
+        cache.insert("b", 3); // Evicts "a"'s old seq, breaks, pushes "b"
+        assert_eq!(
+            cache.len(),
+            1,
+            "Cache length should be 1 but is {}",
+            cache.len()
         );
     }
 }

@@ -553,6 +553,20 @@ impl ReadCache {
         cache.remove(&key);
     }
 
+    /// Invalidate ALL cached inbox stats for a specific DB scope.
+    pub fn invalidate_all_inbox_stats_scoped(&self, scope: &str) {
+        let scope_fp = scope_fingerprint(scope);
+        let mut cache = self.inbox_stats.write();
+        let to_remove: Vec<_> = cache
+            .keys()
+            .filter(|(fp, _)| *fp == scope_fp)
+            .copied()
+            .collect();
+        for key in to_remove {
+            cache.remove(&key);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Deferred touch queue
     // -------------------------------------------------------------------------

@@ -2874,16 +2874,16 @@ async fn create_message_with_recipients_tx(
     let mut bcc_names = Vec::new();
 
     if !recipients.is_empty() {
-        let id_list = recipients
+        let ph = placeholders(recipients.len());
+        let lookup_sql = format!("SELECT id, name FROM agents WHERE id IN ({ph})");
+        let params: Vec<Value> = recipients
             .iter()
-            .map(|(id, _)| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let lookup_sql = format!("SELECT id, name FROM agents WHERE id IN ({id_list})");
+            .map(|(id, _)| Value::BigInt(*id))
+            .collect();
         let agent_rows = try_in_tx!(
             cx,
             tracked,
-            map_sql_outcome(traw_query(cx, tracked, &lookup_sql, &[]).await)
+            map_sql_outcome(traw_query(cx, tracked, &lookup_sql, &params).await)
         );
         let mut name_map = std::collections::HashMap::new();
         for r in agent_rows {
@@ -2980,6 +2980,11 @@ async fn create_message_with_recipients_tx(
             tracked,
             map_sql_outcome(traw_execute(cx, tracked, insert_recipient_sql, &params).await)
         );
+    }
+
+    // Rebuild inbox_stats for each recipient from ground truth.
+    for (agent_id, _kind) in recipients {
+        rebuild_agent_inbox_stats_in_tx(cx, tracked, *agent_id).await;
     }
 
     // COMMIT (single fsync)
@@ -4760,9 +4765,20 @@ pub async fn mark_message_read(
     run_with_mvcc_retry(cx, "mark_message_read", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        // Idempotent: only set read_ts if currently NULL.
-        let sql = "UPDATE message_recipients SET read_ts = COALESCE(read_ts, ?) WHERE agent_id = ? AND message_id = ?";
+        // Idempotent: set read_ts if NULL.  Also auto-acknowledge if the
+        // message has ack_required=1 — agents consistently fail to call
+        // acknowledge_message explicitly, so reading IS acknowledgment.
+        let sql = "UPDATE message_recipients \
+                   SET read_ts = COALESCE(read_ts, ?), \
+                       ack_ts = CASE \
+                           WHEN ack_ts IS NOT NULL THEN ack_ts \
+                           WHEN (SELECT m.ack_required FROM messages m \
+                                 WHERE m.id = message_recipients.message_id) = 1 THEN ? \
+                           ELSE ack_ts \
+                       END \
+                   WHERE agent_id = ? AND message_id = ?";
         let params = [
+            Value::BigInt(now),
             Value::BigInt(now),
             Value::BigInt(agent_id),
             Value::BigInt(message_id),
@@ -4773,7 +4789,10 @@ pub async fn mark_message_read(
             map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
         );
 
-        // Invalidate cached inbox stats (unread_count may have changed).
+        // Rebuild inbox_stats from ground truth.
+        rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await;
+
+        // Invalidate cached inbox stats (unread/ack counts may have changed).
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
@@ -4863,11 +4882,19 @@ pub async fn mark_all_messages_read_in_project(
 
         let count = rows.len();
         if count > 0 {
+            // Mark unread messages as read, and auto-ack any with ack_required=1.
             let sql = "UPDATE message_recipients \
-                       SET read_ts = ? \
+                       SET read_ts = ?, \
+                           ack_ts = CASE \
+                               WHEN ack_ts IS NOT NULL THEN ack_ts \
+                               WHEN (SELECT m.ack_required FROM messages m \
+                                     WHERE m.id = message_recipients.message_id) = 1 THEN ? \
+                               ELSE ack_ts \
+                           END \
                        WHERE agent_id = ? AND read_ts IS NULL \
                        AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
             let params = [
+                Value::BigInt(now),
                 Value::BigInt(now),
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
@@ -4877,6 +4904,9 @@ pub async fn mark_all_messages_read_in_project(
                 &tracked,
                 map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
             );
+
+            // Rebuild inbox_stats from ground truth.
+            rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await;
         }
 
         crate::cache::read_cache()
@@ -4925,6 +4955,9 @@ pub async fn acknowledge_message(
             &tracked,
             map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
         );
+
+        // Rebuild inbox_stats from ground truth.
+        rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await;
 
         // Invalidate cached inbox stats (ack_pending_count may have changed).
         crate::cache::read_cache()
@@ -5059,6 +5092,81 @@ pub async fn get_inbox_stats(
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
     }
+}
+
+/// Rebuild `inbox_stats` for a single agent from ground truth, inside an
+/// already-open transaction.
+///
+/// Uses DELETE + INSERT … SELECT to recompute counters from
+/// `message_recipients` joined with `messages`.  This is the canonical way to
+/// keep `inbox_stats` consistent — it is always correct regardless of whether
+/// SQLite triggers fire, partially fire, or are absent.
+async fn rebuild_agent_inbox_stats_in_tx(cx: &Cx, tracked: &TrackedConnection<'_>, agent_id: i64) {
+    let reset_sql = "DELETE FROM inbox_stats WHERE agent_id = ?";
+    let rebuild_sql = "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         SELECT \
+             r.agent_id, \
+             COUNT(*) AS total_count, \
+             SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+             SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+             MAX(m.created_ts) AS last_message_ts \
+         FROM message_recipients r \
+         JOIN messages m ON m.id = r.message_id \
+         WHERE r.agent_id = ? \
+         GROUP BY r.agent_id";
+    let params = [Value::BigInt(agent_id)];
+    // Best-effort: if the inbox_stats table doesn't exist (e.g. test schemas
+    // without v6 migration), silently skip rather than fail the transaction.
+    let _ = map_sql_outcome(traw_execute(cx, tracked, reset_sql, &params).await);
+    let _ = map_sql_outcome(traw_execute(cx, tracked, rebuild_sql, &params).await);
+}
+
+/// Rebuild **all** rows in `inbox_stats` from ground truth.
+///
+/// Typically called once at startup via the sync counterpart in pool.rs.
+pub async fn rebuild_all_inbox_stats(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+    let delete_sql = "DELETE FROM inbox_stats";
+    try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_execute(cx, &tracked, delete_sql, &[]).await)
+    );
+
+    let rebuild_sql = "\
+        INSERT INTO inbox_stats \
+            (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+        SELECT \
+            r.agent_id, \
+            COUNT(*) AS total_count, \
+            SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+            SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+            MAX(m.created_ts) AS last_message_ts \
+        FROM message_recipients r \
+        JOIN messages m ON m.id = r.message_id \
+        GROUP BY r.agent_id";
+    try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_execute(cx, &tracked, rebuild_sql, &[]).await)
+    );
+
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+
+    crate::cache::read_cache().invalidate_all_inbox_stats_scoped(&cache_scope_for_pool(pool));
+
+    Outcome::Ok(())
 }
 
 // =============================================================================
