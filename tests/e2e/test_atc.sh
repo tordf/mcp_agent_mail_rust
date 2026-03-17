@@ -218,6 +218,12 @@ else
     e2e_fail "ATC summary is not live summary JSON: $(echo "$ATC_SUMMARY" | head -c 200)"
 fi
 
+if echo "$ATC_SUMMARY" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d["summary"]; assert "budget_mode" in s and "incumbent_policy_id" in s and "due_agents" in s' 2>/dev/null; then
+    e2e_pass "ATC summary exposes budget, policy, and kernel telemetry"
+else
+    e2e_fail "ATC summary missing budget/policy/kernel telemetry"
+fi
+
 # ── Phase 4: Cleanup ─────────────────────────────────────────────────
 
 e2e_section "Phase 4: Cleanup"
