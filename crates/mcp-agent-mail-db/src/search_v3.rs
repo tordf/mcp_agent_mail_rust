@@ -497,7 +497,7 @@ fn refresh_index_health_metrics(bridge: &TantivyBridge) {
     static LAST_MEASURED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let now = current_unix_micros();
     let last = LAST_MEASURED.load(std::sync::atomic::Ordering::Relaxed);
-    
+
     // Measure at most once every 60 seconds
     let index_size_bytes = if now - last > 60_000_000 {
         let size = measure_index_dir_bytes(bridge.index_dir());
@@ -507,7 +507,7 @@ fn refresh_index_health_metrics(bridge: &TantivyBridge) {
         // Fallback to the last known recorded metric value
         mcp_agent_mail_core::metrics::global_metrics()
             .search
-            .index_size_bytes
+            .tantivy_index_size_bytes
             .load()
     };
 
@@ -2653,11 +2653,11 @@ mod tests {
             let extracted = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(input) {
                 ":memory:".to_string()
             } else if let Some(path) =
-                mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)
+                mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(input)
             {
                 crate::pool::normalize_sqlite_path_for_pool_key(path.to_string_lossy().as_ref())
             } else {
-                db_url.to_string()
+                input.to_string()
             };
             assert_eq!(
                 extracted, *expected,

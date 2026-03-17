@@ -30,8 +30,8 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::models::{AgentRow, InboxStatsRow, ProjectRow};
@@ -179,6 +179,9 @@ impl CacheMetrics {
 
 static CACHE_METRICS: CacheMetrics = CacheMetrics::new();
 
+type SharedProjectRow = Arc<ProjectRow>;
+type SharedAgentRow = Arc<AgentRow>;
+
 /// Get the global cache metrics.
 #[must_use]
 pub fn cache_metrics() -> &'static CacheMetrics {
@@ -187,10 +190,11 @@ pub fn cache_metrics() -> &'static CacheMetrics {
 
 /// In-memory read cache for projects, agents, and inbox stats.
 pub struct ReadCache {
-    projects_by_slug: OrderedRwLock<S3FifoCache<(u64, InternedStr), CacheEntry<ProjectRow>>>,
-    projects_by_human_key: OrderedRwLock<S3FifoCache<(u64, InternedStr), CacheEntry<ProjectRow>>>,
-    agents_by_key: OrderedRwLock<S3FifoCache<(u64, i64, InternedStr), CacheEntry<AgentRow>>>,
-    agents_by_id: OrderedRwLock<S3FifoCache<(u64, i64), CacheEntry<AgentRow>>>,
+    projects_by_slug: OrderedRwLock<S3FifoCache<(u64, InternedStr), CacheEntry<SharedProjectRow>>>,
+    projects_by_human_key:
+        OrderedRwLock<S3FifoCache<(u64, InternedStr), CacheEntry<SharedProjectRow>>>,
+    agents_by_key: OrderedRwLock<S3FifoCache<(u64, i64, InternedStr), CacheEntry<SharedAgentRow>>>,
+    agents_by_id: OrderedRwLock<S3FifoCache<(u64, i64), CacheEntry<SharedAgentRow>>>,
     /// Cached inbox aggregate counters keyed by `(db_scope, agent_id)` (30s TTL).
     inbox_stats: OrderedRwLock<S3FifoCache<(u64, i64), CacheEntry<InboxStatsRow>>>,
     /// Sharded deferred touch queue (16 shards, keyed by `(scope, agent_id) % 16`).
@@ -276,7 +280,7 @@ impl ReadCache {
             return None;
         }
         entry.touch();
-        let value = entry.value.clone();
+        let value = entry.value.as_ref().clone();
         CACHE_METRICS.record_project_hit();
         Some(value)
     }
@@ -306,7 +310,7 @@ impl ReadCache {
             return None;
         }
         entry.touch();
-        let value = entry.value.clone();
+        let value = entry.value.as_ref().clone();
         CACHE_METRICS.record_project_hit();
         Some(value)
     }
@@ -320,18 +324,19 @@ impl ReadCache {
     /// Cache a project (write-through after DB mutation) in a specific DB scope.
     pub fn put_project_scoped(&self, scope: &str, project: &ProjectRow) {
         let scope_fp = scope_fingerprint(scope);
+        let shared = Arc::new(project.clone());
         {
             let mut cache = self.projects_by_slug.write();
             cache.insert(
                 (scope_fp, InternedStr::new(&project.slug)),
-                CacheEntry::new(project.clone()),
+                CacheEntry::new(Arc::clone(&shared)),
             );
         }
         {
             let mut cache = self.projects_by_human_key.write();
             cache.insert(
                 (scope_fp, InternedStr::new(&project.human_key)),
-                CacheEntry::new(project.clone()),
+                CacheEntry::new(shared),
             );
         }
     }
@@ -361,7 +366,7 @@ impl ReadCache {
             return None;
         }
         entry.touch();
-        let value = entry.value.clone();
+        let value = entry.value.as_ref().clone();
         CACHE_METRICS.record_agent_hit();
         Some(value)
     }
@@ -387,7 +392,7 @@ impl ReadCache {
             return None;
         }
         entry.touch();
-        let value = entry.value.clone();
+        let value = entry.value.as_ref().clone();
         CACHE_METRICS.record_agent_hit();
         Some(value)
     }
@@ -401,16 +406,17 @@ impl ReadCache {
     /// Cache an agent (write-through after DB mutation) in a specific DB scope.
     pub fn put_agent_scoped(&self, scope: &str, agent: &AgentRow) {
         let scope_fp = scope_fingerprint(scope);
+        let shared = Arc::new(agent.clone());
         {
             let mut cache = self.agents_by_key.write();
             cache.insert(
                 (scope_fp, agent.project_id, InternedStr::new(&agent.name)),
-                CacheEntry::new(agent.clone()),
+                CacheEntry::new(Arc::clone(&shared)),
             );
         }
         if let Some(id) = agent.id {
             let mut cache = self.agents_by_id.write();
-            cache.insert((scope_fp, id), CacheEntry::new(agent.clone()));
+            cache.insert((scope_fp, id), CacheEntry::new(shared));
         }
     }
 
@@ -424,20 +430,31 @@ impl ReadCache {
     /// Bulk-insert agents into the cache (cache warming on startup) in a DB scope.
     pub fn warm_agents_scoped(&self, scope: &str, agents: &[AgentRow]) {
         let scope_fp = scope_fingerprint(scope);
+        let prepared: Vec<_> = agents
+            .iter()
+            .map(|agent| {
+                (
+                    agent.project_id,
+                    InternedStr::new(&agent.name),
+                    agent.id,
+                    Arc::new(agent.clone()),
+                )
+            })
+            .collect();
         {
             let mut cache = self.agents_by_key.write();
-            for agent in agents {
+            for (project_id, name, _id, shared) in &prepared {
                 cache.insert(
-                    (scope_fp, agent.project_id, InternedStr::new(&agent.name)),
-                    CacheEntry::new(agent.clone()),
+                    (scope_fp, *project_id, name.clone()),
+                    CacheEntry::new(Arc::clone(shared)),
                 );
             }
         }
         {
             let mut cache = self.agents_by_id.write();
-            for agent in agents {
-                if let Some(id) = agent.id {
-                    cache.insert((scope_fp, id), CacheEntry::new(agent.clone()));
+            for (_project_id, _name, id, shared) in &prepared {
+                if let Some(id) = id {
+                    cache.insert((scope_fp, *id), CacheEntry::new(Arc::clone(shared)));
                 }
             }
         }
@@ -451,21 +468,31 @@ impl ReadCache {
     /// Bulk-insert projects into the cache (cache warming on startup) in a DB scope.
     pub fn warm_projects_scoped(&self, scope: &str, projects: &[ProjectRow]) {
         let scope_fp = scope_fingerprint(scope);
+        let prepared: Vec<_> = projects
+            .iter()
+            .map(|project| {
+                (
+                    InternedStr::new(&project.slug),
+                    InternedStr::new(&project.human_key),
+                    Arc::new(project.clone()),
+                )
+            })
+            .collect();
         {
             let mut cache = self.projects_by_slug.write();
-            for project in projects {
+            for (slug, _human_key, shared) in &prepared {
                 cache.insert(
-                    (scope_fp, InternedStr::new(&project.slug)),
-                    CacheEntry::new(project.clone()),
+                    (scope_fp, slug.clone()),
+                    CacheEntry::new(Arc::clone(shared)),
                 );
             }
         }
         {
             let mut cache = self.projects_by_human_key.write();
-            for project in projects {
+            for (_slug, human_key, shared) in &prepared {
                 cache.insert(
-                    (scope_fp, InternedStr::new(&project.human_key)),
-                    CacheEntry::new(project.clone()),
+                    (scope_fp, human_key.clone()),
+                    CacheEntry::new(Arc::clone(shared)),
                 );
             }
         }
@@ -1219,6 +1246,60 @@ mod tests {
                 "proj-{i} should be cached by human_key"
             );
         }
+    }
+
+    #[test]
+    fn project_dual_indexes_share_backing_allocation() {
+        let cache = ReadCache::new();
+        let project = make_project("shared-proj");
+        cache.put_project(&project);
+
+        let scope_fp = scope_fingerprint("");
+        let slug_key = (scope_fp, InternedStr::new("shared-proj"));
+        let human_key = (scope_fp, InternedStr::new("/data/shared-proj"));
+
+        let shared_from_slug = {
+            let by_slug = cache.projects_by_slug.read();
+            Arc::clone(
+                &by_slug
+                    .get(&slug_key)
+                    .expect("project cached by slug")
+                    .value,
+            )
+        };
+        let by_human_key = cache.projects_by_human_key.read();
+        let shared_from_human_key = &by_human_key
+            .get(&human_key)
+            .expect("project cached by human key")
+            .value;
+
+        assert!(
+            Arc::ptr_eq(&shared_from_slug, shared_from_human_key),
+            "project dual indexes should share the same backing allocation"
+        );
+    }
+
+    #[test]
+    fn agent_dual_indexes_share_backing_allocation() {
+        let cache = ReadCache::new();
+        let agent = make_agent_with_id("SharedAgent", 7, 707);
+        cache.put_agent(&agent);
+
+        let scope_fp = scope_fingerprint("");
+        let key = (scope_fp, 7, InternedStr::new("SharedAgent"));
+        let id_key = (scope_fp, 707);
+
+        let shared_from_key = {
+            let by_key = cache.agents_by_key.read();
+            Arc::clone(&by_key.get(&key).expect("agent cached by key").value)
+        };
+        let by_id = cache.agents_by_id.read();
+        let shared_from_id = &by_id.get(&id_key).expect("agent cached by id").value;
+
+        assert!(
+            Arc::ptr_eq(&shared_from_key, shared_from_id),
+            "agent dual indexes should share the same backing allocation"
+        );
     }
 
     // ─── Property tests ───────────────────────────────────────────────────────

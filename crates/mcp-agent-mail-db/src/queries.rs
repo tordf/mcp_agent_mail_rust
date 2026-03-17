@@ -1105,32 +1105,11 @@ async fn cleanup_committed_message_after_consistency_failure(
         )
     );
 
-    let reset_stats_sql = "DELETE FROM inbox_stats WHERE agent_id = ?";
-    let rebuild_stats_sql = "INSERT INTO inbox_stats \
-         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-         SELECT \
-             r.agent_id, \
-             COUNT(*) AS total_count, \
-             SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-             SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-             MAX(m.created_ts) AS last_message_ts \
-         FROM message_recipients r \
-         JOIN messages m ON m.id = r.message_id \
-         WHERE r.agent_id = ? \
-         GROUP BY r.agent_id";
-    for agent_id in &affected_agent_ids {
-        let stats_params = [Value::BigInt(*agent_id)];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, reset_stats_sql, &stats_params).await)
-        );
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, rebuild_stats_sql, &stats_params).await)
-        );
-    }
+    try_in_tx!(
+        cx,
+        &tracked,
+        rebuild_agents_inbox_stats_in_tx(cx, &tracked, &affected_agent_ids).await
+    );
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     drop(conn);
@@ -2982,14 +2961,12 @@ async fn create_message_with_recipients_tx(
         );
     }
 
-    // Rebuild inbox_stats for each recipient from ground truth.
-    for (agent_id, _kind) in recipients {
-        try_in_tx!(
-            cx,
-            tracked,
-            rebuild_agent_inbox_stats_in_tx(cx, tracked, *agent_id).await
-        );
-    }
+    let recipient_agent_ids: Vec<i64> = recipients.iter().map(|(id, _)| *id).collect();
+    try_in_tx!(
+        cx,
+        tracked,
+        rebuild_agents_inbox_stats_in_tx(cx, tracked, &recipient_agent_ids).await
+    );
 
     // COMMIT (single fsync)
     try_in_tx!(cx, tracked, commit_tx(cx, tracked).await);
@@ -4797,7 +4774,7 @@ pub async fn mark_message_read(
         try_in_tx!(
             cx,
             &tracked,
-            rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await
+            rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
         );
 
         // Invalidate cached inbox stats (unread/ack counts may have changed).
@@ -4914,7 +4891,7 @@ pub async fn mark_messages_read_batch(
         try_in_tx!(
             cx,
             &tracked,
-            rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await
+            rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
         );
 
         crate::cache::read_cache()
@@ -4992,7 +4969,7 @@ pub async fn mark_all_messages_read_in_project(
             try_in_tx!(
                 cx,
                 &tracked,
-                rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await
+                rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
             );
         }
 
@@ -5047,7 +5024,7 @@ pub async fn acknowledge_message(
         try_in_tx!(
             cx,
             &tracked,
-            rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await
+            rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
         );
 
         // Invalidate cached inbox stats (ack_pending_count may have changed).
@@ -5202,45 +5179,64 @@ fn is_missing_inbox_stats_table_error(error: &DbError) -> bool {
     }
 }
 
-async fn rebuild_agent_inbox_stats_in_tx(
+async fn rebuild_agents_inbox_stats_in_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
-    agent_id: i64,
+    agent_ids: &[i64],
 ) -> Outcome<(), DbError> {
-    let reset_sql = "DELETE FROM inbox_stats WHERE agent_id = ?";
-    let rebuild_sql = "INSERT INTO inbox_stats \
-         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-         SELECT \
-             r.agent_id, \
-             COUNT(*) AS total_count, \
-             SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-             SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-             MAX(m.created_ts) AS last_message_ts \
-         FROM message_recipients r \
-         JOIN messages m ON m.id = r.message_id \
-         WHERE r.agent_id = ? \
-         GROUP BY r.agent_id";
-    let params = [Value::BigInt(agent_id)];
-    // Compatibility: tolerate older base schemas that predate the inbox_stats
-    // table, but surface every other SQL failure so callers do not silently
-    // commit inconsistent counters.
-    match map_sql_outcome(traw_execute(cx, tracked, reset_sql, &params).await) {
-        Outcome::Ok(_) => {}
-        Outcome::Err(error) if is_missing_inbox_stats_table_error(&error) => {
-            return Outcome::Ok(());
-        }
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    if agent_ids.is_empty() {
+        return Outcome::Ok(());
     }
 
-    match map_sql_outcome(traw_execute(cx, tracked, rebuild_sql, &params).await) {
-        Outcome::Ok(_) => Outcome::Ok(()),
-        Outcome::Err(error) if is_missing_inbox_stats_table_error(&error) => Outcome::Ok(()),
-        Outcome::Err(error) => Outcome::Err(error),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(panic) => Outcome::Panicked(panic),
+    // Deduplicate and chunk to stay safely within SQLite's bind-parameter cap
+    // even when a project has hundreds or thousands of recipients.
+    let mut unique_agent_ids = agent_ids.to_vec();
+    unique_agent_ids.sort_unstable();
+    unique_agent_ids.dedup();
+
+    for chunk in unique_agent_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let reset_sql = format!("DELETE FROM inbox_stats WHERE agent_id IN ({placeholders})");
+        let rebuild_sql = format!(
+            "INSERT INTO inbox_stats \
+             (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+             SELECT \
+                 r.agent_id, \
+                 COUNT(*) AS total_count, \
+                 SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+                 SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+                 MAX(m.created_ts) AS last_message_ts \
+             FROM message_recipients r \
+             JOIN messages m ON m.id = r.message_id \
+             WHERE r.agent_id IN ({placeholders}) \
+             GROUP BY r.agent_id"
+        );
+
+        let params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
+
+        match map_sql_outcome(traw_execute(cx, tracked, &reset_sql, &params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) if is_missing_inbox_stats_table_error(&error) => {
+                return Outcome::Ok(());
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        }
+
+        let rebuild_params = params.clone();
+        match map_sql_outcome(traw_execute(cx, tracked, &rebuild_sql, &rebuild_params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) if is_missing_inbox_stats_table_error(&error) => {
+                return Outcome::Ok(());
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        }
     }
+
+    Outcome::Ok(())
 }
 
 /// Rebuild **all** rows in `inbox_stats` from ground truth.
@@ -5773,37 +5769,37 @@ async fn release_reservations_by_ids_matching_expiry(
 
     let mut release_marker = now_micros();
     let mut released = Vec::with_capacity(ids.len());
-    let mut probe_sql = format!(
-        "SELECT 1 FROM file_reservations WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+    let mut release_sql = format!(
+        "INSERT OR REPLACE INTO file_reservation_releases (reservation_id, released_ts) \
+         SELECT ?, ? \
+         WHERE EXISTS( \
+             SELECT 1 FROM file_reservations \
+             WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
     );
     if expires_at_or_before.is_some() {
-        probe_sql.push_str(" AND expires_ts <= ?");
+        release_sql.push_str(" AND expires_ts <= ?");
     }
-    probe_sql.push_str(" LIMIT 1");
-    let release_sql = "INSERT OR REPLACE INTO file_reservation_releases (reservation_id, released_ts) VALUES (?, ?)";
+    release_sql.push_str(" LIMIT 1)");
 
     for id in ids {
-        let mut probe_params = Vec::with_capacity(2);
-        probe_params.push(Value::BigInt(*id));
+        let released_ts = release_marker;
+        let mut release_params =
+            Vec::with_capacity(if expires_at_or_before.is_some() { 4 } else { 3 });
+        release_params.push(Value::BigInt(*id));
+        release_params.push(Value::BigInt(released_ts));
+        release_params.push(Value::BigInt(*id));
         if let Some(expiry_cutoff) = expires_at_or_before {
-            probe_params.push(Value::BigInt(expiry_cutoff));
+            release_params.push(Value::BigInt(expiry_cutoff));
         }
-        let rows = try_in_tx!(
+        let affected = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &probe_sql, &probe_params).await)
+            map_sql_outcome(traw_execute(cx, &tracked, &release_sql, &release_params).await)
         );
-        if rows.is_empty() {
+        if affected == 0 {
             continue;
         }
 
-        let released_ts = release_marker;
-        let release_params = [Value::BigInt(*id), Value::BigInt(released_ts)];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, release_sql, &release_params).await)
-        );
         release_marker = release_marker.saturating_add(1);
         released.push(ReleasedReservationMarker {
             id: *id,
@@ -9679,6 +9675,101 @@ mod tests {
             0,
             "cleanup must clear stale inbox_stats even when recipient rows are already missing"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn create_message_with_recipients_rebuilds_inbox_stats_across_sqlite_bind_chunks() {
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_core::test_harness::Harness;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("create_message_rebuild_inbox_stats_chunks.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-chunks-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("chunk sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            let harness = Harness::with_seed(17, "inbox_stats_chunking");
+            let recipient_names = harness.agent_names(SQLITE_MAX_BIND_PARAMS + 1);
+            let mut recipients = Vec::with_capacity(recipient_names.len());
+            let mut first_recipient_id = None;
+            let mut last_recipient_id = None;
+            for name in recipient_names {
+                let agent = create_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    &name,
+                    "e2e-test",
+                    "test-model",
+                    Some("chunk recipient"),
+                    Some("auto"),
+                )
+                .await
+                .into_result()
+                .expect("create recipient");
+                let agent_id = agent.id.expect("recipient id");
+                first_recipient_id.get_or_insert(agent_id);
+                last_recipient_id = Some(agent_id);
+                recipients.push((agent_id, "to"));
+            }
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "chunked inbox stats rebuild",
+                "body",
+                Some("THREAD-INBOX-CHUNKS"),
+                "normal",
+                false,
+                "[]",
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("create message for many recipients");
+
+            for recipient_id in [
+                first_recipient_id.expect("first recipient id"),
+                last_recipient_id.expect("last recipient id"),
+            ] {
+                let stats = get_inbox_stats(&cx, &pool, recipient_id)
+                    .await
+                    .into_result()
+                    .expect("fetch inbox stats")
+                    .expect("stats row");
+                assert_eq!(stats.total_count, 1, "recipient should see one message");
+                assert_eq!(stats.unread_count, 1, "recipient should see one unread");
+                assert_eq!(
+                    stats.ack_pending_count, 0,
+                    "non-ack-required message should not create ack debt"
+                );
+            }
+        });
     }
 
     #[test]
