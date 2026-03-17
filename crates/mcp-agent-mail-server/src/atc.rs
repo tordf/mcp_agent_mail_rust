@@ -52,6 +52,16 @@ fn elapsed_micros(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
 }
 
+fn floor_f64_to_u64(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        value.floor() as u64
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Decision Core (Track 1)
 // ──────────────────────────────────────────────────────────────────────
@@ -3940,6 +3950,7 @@ impl AtcEngine {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_tick(&mut self, now_micros: i64) -> AtcTickReport {
         let total_started = Instant::now();
         self.tick_count = self.tick_count.saturating_add(1);
@@ -4003,9 +4014,9 @@ impl AtcEngine {
             .config
             .tick_budget_micros
             .saturating_sub(projected_non_probe_micros);
-        let probe_budget_micros = ((u64_to_f64(available_budget_micros)
-            * self.incumbent_policy.probe_budget_fraction(mode))
-            .floor() as u64)
+        let probe_budget_micros = floor_f64_to_u64(
+            u64_to_f64(available_budget_micros) * self.incumbent_policy.probe_budget_fraction(mode),
+        )
             .min(self.config.tick_budget_micros);
 
         let probe_started = Instant::now();
@@ -4023,9 +4034,9 @@ impl AtcEngine {
             .map(|candidate| candidate.agent.clone())
             .collect();
         if let Some(candidate) = candidate_policy.as_ref() {
-            let candidate_probe_budget_micros = ((u64_to_f64(available_budget_micros)
-                * candidate.probe_budget_fraction(mode))
-                .floor() as u64)
+            let candidate_probe_budget_micros = floor_f64_to_u64(
+                u64_to_f64(available_budget_micros) * candidate.probe_budget_fraction(mode),
+            )
                 .min(self.config.tick_budget_micros);
             let candidate_probe_agents: Vec<String> = budgeted_probe_schedule(
                 &self.agents,
@@ -5465,6 +5476,8 @@ mod predictive_tests {
             probe_sent_at: 0,
             sprt_log_lr: 0.0,
             core: default_liveness_core(),
+            schedule_version: 0,
+            next_review_micros: i64::MAX,
         };
         // Push posterior toward uncertainty by boosting Flaky/Dead
         // relative to the strong Alive prior (0.95)
@@ -5487,6 +5500,8 @@ mod predictive_tests {
             probe_sent_at: 0,
             sprt_log_lr: 0.0,
             core: default_liveness_core(),
+            schedule_version: 0,
+            next_review_micros: i64::MAX,
         };
         agents.insert("Confident".to_string(), confident);
 
@@ -5512,6 +5527,8 @@ mod predictive_tests {
                 probe_sent_at: 0,
                 sprt_log_lr: 0.0,
                 core: default_liveness_core(),
+                schedule_version: 0,
+                next_review_micros: i64::MAX,
             },
         );
 
@@ -7009,128 +7026,19 @@ pub enum AtcTickAction {
 
 /// Run one ATC tick: evaluate liveness, detect deadlocks, update calibration.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
-    let mut actions = Vec::new();
+    atc_tick_report(now_micros).map_or_else(Vec::new, |report| report.actions)
+}
 
-    let Some(engine_lock) = ATC_ENGINE.get() else {
-        return actions;
-    };
-    let Ok(mut engine) = engine_lock.lock() else {
-        return actions;
-    };
-
+/// Run one ATC tick and return both actions and the fully-populated summary snapshot.
+#[must_use]
+pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
+    let engine_lock = ATC_ENGINE.get()?;
+    let mut engine = engine_lock.lock().ok()?;
     if !engine.enabled() {
-        return actions;
+        return None;
     }
-
-    engine.tick_count += 1;
-
-    // 1. Evaluate liveness
-    let liveness_actions = engine.evaluate_liveness(now_micros);
-
-    for (agent_name, action) in &liveness_actions {
-        match action {
-            LivenessAction::Suspect => {
-                actions.push(AtcTickAction::SendAdvisory {
-                    agent: agent_name.clone(),
-                    message: format!("[ATC] Agent {agent_name} appears unresponsive. Monitoring."),
-                });
-            }
-            LivenessAction::ReleaseReservations => {
-                actions.push(AtcTickAction::ReleaseReservations {
-                    agent: agent_name.clone(),
-                });
-            }
-            LivenessAction::DeclareAlive => {}
-        }
-    }
-
-    // 2. Detect deadlocks
-    let deadlocks = engine.detect_deadlocks();
-    for (project, cycles) in &deadlocks {
-        for cycle in cycles {
-            let agents_str = cycle.join(" → ");
-            actions.push(AtcTickAction::SendAdvisory {
-                agent: cycle[0].clone(),
-                message: format!(
-                    "[ATC] Deadlock detected in {project}: {agents_str}. \
-                     Consider releasing reservations.",
-                ),
-            });
-        }
-    }
-
-    // 3. Submodular probe scheduling
-    let probe_targets = submodular_probe_schedule(&engine.agents, 3, 60.0, now_micros);
-    for (agent_name, _gain) in &probe_targets {
-        if let Some(entry) = engine.agents.get_mut(agent_name) {
-            entry.probe_sent_at = now_micros;
-        }
-        actions.push(AtcTickAction::ProbeAgent {
-            agent: agent_name.clone(),
-        });
-    }
-
-    // 4. Conformal uncertainty gating — suppress aggressive actions under high uncertainty
-    let mut withheld_releases = Vec::new();
-    if let Some(conformal_lock) = ATC_CONFORMAL.get()
-        && let Ok(conformal) = conformal_lock.lock()
-        && conformal.is_uncertain(AtcSubsystem::Liveness)
-    {
-        actions.retain(|action| match action {
-            AtcTickAction::ReleaseReservations { agent } => {
-                withheld_releases.push(agent.clone());
-                false
-            }
-            _ => true,
-        });
-    }
-
-    for agent_name in withheld_releases {
-        if let Some(entry) = engine.agents.get_mut(&agent_name)
-            && entry.state == LivenessState::Dead
-        {
-            entry.state = LivenessState::Flaky;
-            if entry.suspect_since == 0 {
-                entry.suspect_since = now_micros;
-            }
-        }
-        actions.push(AtcTickAction::SendAdvisory {
-            agent: agent_name.clone(),
-            message: format!(
-                "[ATC] Agent {agent_name} appears unresponsive. \
-                 Automated reservation release withheld under high uncertainty."
-            ),
-        });
-    }
-
-    let release_targets: Vec<String> = actions
-        .iter()
-        .filter_map(|action| match action {
-            AtcTickAction::ReleaseReservations { agent } => Some(agent.clone()),
-            _ => None,
-        })
-        .collect();
-    for agent_name in release_targets {
-        actions.push(AtcTickAction::SendAdvisory {
-            agent: agent_name.clone(),
-            message: format!(
-                "[ATC] Agent {agent_name} declared dead. \
-                 Automated reservation release requested."
-            ),
-        });
-    }
-
-    // 5. Periodically update population model
-    if engine.tick_count % 50 == 0
-        && let Some(pop_lock) = ATC_POPULATION.get()
-        && let Ok(mut pop) = pop_lock.lock()
-    {
-        engine.absorb_population_snapshot(&mut pop);
-    }
-
-    actions
+    Some(engine.run_tick(now_micros))
 }
 
 /// Record the outcome of an ATC decision for calibration feedback.
@@ -7156,9 +7064,12 @@ pub fn atc_record_outcome(
         // Clone to satisfy borrow checker (calibration borrows eprocess/cusum)
         let ep_snapshot = engine.eprocess.clone();
         let cusum_snapshot = engine.cusum.clone();
-        engine
+        let changed = engine
             .calibration
             .update(&ep_snapshot, &cusum_snapshot, correct, now);
+        if changed {
+            engine.mark_agents_dirty();
+        }
     }
 
     // Feed conformal predictor
@@ -7237,35 +7148,13 @@ pub fn atc_record_outcome(
 pub fn atc_summary() -> Option<AtcSummarySnapshot> {
     let engine_lock = ATC_ENGINE.get()?;
     let engine = engine_lock.lock().ok()?;
-
-    let mut agent_states = Vec::with_capacity(engine.agents.len());
-    let now = mcp_agent_mail_core::timestamps::now_micros();
-    for (name, entry) in &engine.agents {
-        agent_states.push(AgentStateSnapshot {
-            name: name.clone(),
-            state: entry.state,
-            silence_secs: entry.rhythm.silence_duration(now) / 1_000_000,
-            posterior_alive: entry.core.posterior_probability(LivenessState::Alive),
-        });
-    }
-    agent_states.sort_by(|left, right| left.name.cmp(&right.name));
-
-    let deadlock_count: usize = engine
-        .conflict_graphs
-        .values()
-        .map(|g| find_deadlock_cycles(g).len())
-        .sum();
-
-    Some(AtcSummarySnapshot {
-        enabled: engine.enabled(),
-        safe_mode: engine.is_safe_mode(),
-        tick_count: engine.tick_count(),
-        tracked_agents: agent_states,
-        deadlock_cycles: deadlock_count,
-        eprocess_value: engine.eprocess().e_value(),
-        regret_avg: engine.regret().average_regret(),
-        decisions_total: engine.ledger().latest_id(),
-    })
+    Some(engine.build_summary_snapshot_with(
+        mcp_agent_mail_core::timestamps::now_micros(),
+        &engine.last_stage_timings,
+        &engine.last_kernel_telemetry,
+        &engine.last_budget_telemetry,
+        &engine.last_policy_telemetry,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -7278,6 +7167,10 @@ pub struct AtcSummarySnapshot {
     pub eprocess_value: f64,
     pub regret_avg: f64,
     pub decisions_total: u64,
+    pub stage_timings: AtcStageTimings,
+    pub kernel: AtcKernelTelemetry,
+    pub budget: AtcBudgetTelemetry,
+    pub policy: AtcPolicyTelemetry,
 }
 
 #[derive(Debug, Clone)]
@@ -7568,6 +7461,8 @@ mod alien_enhancement_tests {
                     probe_sent_at: 0,
                     sprt_log_lr: 0.0,
                     core: default_liveness_core(),
+                    schedule_version: 0,
+                    next_review_micros: i64::MAX,
                 },
             );
         }
@@ -7597,6 +7492,8 @@ mod alien_enhancement_tests {
                 probe_sent_at: 0,
                 sprt_log_lr: 0.0,
                 core: dead_core,
+                schedule_version: 0,
+                next_review_micros: i64::MAX,
             },
         );
         agents.insert(
@@ -7610,6 +7507,8 @@ mod alien_enhancement_tests {
                 probe_sent_at: 0,
                 sprt_log_lr: 0.0,
                 core: default_liveness_core(),
+                schedule_version: 0,
+                next_review_micros: i64::MAX,
             },
         );
 

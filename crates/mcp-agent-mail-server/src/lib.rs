@@ -2978,6 +2978,10 @@ pub(crate) struct AtcOperatorSnapshot {
     pub(crate) last_tick_duration_micros: u64,
     pub(crate) last_tick_budget_micros: u64,
     pub(crate) last_tick_budget_exceeded: bool,
+    pub(crate) stage_timings: atc::AtcStageTimings,
+    pub(crate) kernel: atc::AtcKernelTelemetry,
+    pub(crate) budget: atc::AtcBudgetTelemetry,
+    pub(crate) policy: atc::AtcPolicyTelemetry,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) note: Option<String>,
 }
@@ -3132,6 +3136,10 @@ fn build_atc_operator_snapshot(
             last_tick_duration_micros,
             last_tick_budget_micros,
             last_tick_budget_exceeded,
+            stage_timings: summary.stage_timings,
+            kernel: summary.kernel,
+            budget: summary.budget,
+            policy: summary.policy,
             note,
         };
     }
@@ -3191,12 +3199,14 @@ fn maybe_emit_atc_summary_log(state: &tui_bridge::TuiSharedState, snapshot: &Atc
         .filter(|agent| agent.state != "alive")
         .count();
     state.push_console_log(format!(
-        "[ATC] tick={} decisions={} deadlocks={} suspect_agents={} safe_mode={} e={:.2} regret={:.2}",
+        "[ATC] tick={} decisions={} deadlocks={} suspect_agents={} safe_mode={} mode={} policy={} e={:.2} regret={:.2}",
         snapshot.tick_count,
         snapshot.decisions_total,
         snapshot.deadlock_cycles,
         suspect_count,
         snapshot.safe_mode,
+        snapshot.budget.mode,
+        snapshot.policy.incumbent_policy_id,
         snapshot.eprocess_value,
         snapshot.regret_avg
     ));
@@ -3220,11 +3230,20 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     while !stop.load(Ordering::Relaxed) {
         let now_micros = mcp_agent_mail_core::timestamps::now_micros();
         let started_at = Instant::now();
-        let actions = atc::atc_tick(now_micros);
+        let report = atc::atc_tick_report(now_micros);
         let tick_duration_micros =
             u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX)))
                 .unwrap_or(u64::MAX);
-        let tick_budget_exceeded = tick_duration_micros > atc_config.tick_budget_micros;
+        let actions = report
+            .as_ref()
+            .map_or_else(Vec::new, |report| report.actions.clone());
+        let live_summary = report.map(|report| report.summary);
+        let tick_budget_micros = live_summary
+            .as_ref()
+            .map_or(atc_config.tick_budget_micros, |summary| {
+                summary.budget.tick_budget_micros
+            });
+        let tick_budget_exceeded = tick_duration_micros > tick_budget_micros;
 
         let mut visible_actions = Vec::new();
         for action in actions {
@@ -3248,11 +3267,10 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             recent_actions.push_back(snapshot);
         }
 
-        let live_summary = atc::atc_summary();
         let note = tick_budget_exceeded.then(|| {
             format!(
                 "ATC tick exceeded budget: {}us > {}us",
-                tick_duration_micros, atc_config.tick_budget_micros
+                tick_duration_micros, tick_budget_micros
             )
         });
         let snapshot = build_atc_operator_snapshot(
@@ -3260,7 +3278,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             &recent_actions,
             now_micros,
             tick_duration_micros,
-            atc_config.tick_budget_micros,
+            tick_budget_micros,
             tick_budget_exceeded,
             note.clone(),
         );
@@ -3279,7 +3297,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         if tick_budget_exceeded {
             tracing::warn!(
                 duration_micros = tick_duration_micros,
-                budget_micros = atc_config.tick_budget_micros,
+                budget_micros = tick_budget_micros,
                 "ATC operator tick exceeded configured budget"
             );
         }
