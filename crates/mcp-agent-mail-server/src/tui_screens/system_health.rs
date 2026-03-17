@@ -213,6 +213,7 @@ struct DiagnosticsSnapshot {
     tcp_error: Option<String>,
     path_probes: Vec<PathProbe>,
     lines: Vec<ProbeLine>,
+    atc: crate::AtcOperatorSnapshot,
     /// Tailscale remote-access URL with token, if Tailscale is active.
     remote_url: Option<String>,
 }
@@ -409,6 +410,103 @@ impl SystemHealthScreen {
             Span::styled("Uptime:    ", label_style),
             Span::styled(format!("{}s", uptime.as_secs()), value_style),
         ]));
+
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::from_spans([Span::styled(
+            "\u{2500}\u{2500} ATC Operator \u{2500}\u{2500}",
+            section_style,
+        )]));
+        let atc_status_style = if snap.atc.enabled {
+            crate::tui_theme::text_success(&tp)
+        } else {
+            crate::tui_theme::text_warning(&tp)
+        };
+        lines.push(Line::from_spans([
+            Span::styled("ATC:       ", label_style),
+            Span::styled(
+                if snap.atc.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+                .to_string(),
+                atc_status_style,
+            ),
+            Span::styled(format!(" ({})", snap.atc.source), hint_style),
+        ]));
+        lines.push(Line::from_spans([
+            Span::styled("Ticks:     ", label_style),
+            Span::styled(
+                format!(
+                    "{} ticks  {} decisions  {} deadlocks",
+                    snap.atc.tick_count, snap.atc.decisions_total, snap.atc.deadlock_cycles
+                ),
+                value_style,
+            ),
+        ]));
+        lines.push(Line::from_spans([
+            Span::styled("Budget:    ", label_style),
+            Span::styled(
+                format!(
+                    "{}us / {}us",
+                    snap.atc.last_tick_duration_micros, snap.atc.last_tick_budget_micros
+                ),
+                if snap.atc.last_tick_budget_exceeded {
+                    crate::tui_theme::text_warning(&tp)
+                } else {
+                    value_style
+                },
+            ),
+            Span::styled(
+                format!(
+                    "  safe_mode={}  tracked={}",
+                    snap.atc.safe_mode,
+                    snap.atc.tracked_agents.len()
+                ),
+                hint_style,
+            ),
+        ]));
+        let degraded_agents: Vec<&crate::AtcOperatorAgentSnapshot> = snap
+            .atc
+            .tracked_agents
+            .iter()
+            .filter(|agent| agent.state != "alive")
+            .collect();
+        if degraded_agents.is_empty() {
+            lines.push(Line::from_spans([
+                Span::styled("Liveness:  ", label_style),
+                Span::styled("all tracked agents are alive".to_string(), value_style),
+            ]));
+        } else {
+            let degraded_summary = degraded_agents
+                .iter()
+                .take(3)
+                .map(|agent| {
+                    format!(
+                        "{}:{} ({}s, p={:.2})",
+                        agent.name, agent.state, agent.silence_secs, agent.posterior_alive
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(Line::from_spans([
+                Span::styled("Liveness:  ", label_style),
+                Span::styled(
+                    format!(
+                        "{} degraded agent(s): {}",
+                        degraded_agents.len(),
+                        degraded_summary
+                    ),
+                    crate::tui_theme::text_warning(&tp),
+                ),
+            ]));
+        }
+        if let Some(note) = &snap.atc.note {
+            lines.push(Line::from_spans([
+                Span::styled("Note:      ", label_style),
+                Span::styled(note.clone(), hint_style),
+            ]));
+        }
 
         lines.push(Line::raw(String::new()));
 
@@ -1433,6 +1531,7 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
         localhost_unauth_allowed: env_cfg.http_allow_localhost_unauthenticated,
         token_present: env_cfg.http_bearer_token.is_some(),
         token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
+        atc: crate::atc_operator_snapshot(),
         remote_url,
         ..Default::default()
     };
@@ -1505,8 +1604,100 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
 
     add_base_path_findings(&mut out);
     add_auth_findings(&mut out);
+    add_atc_findings(&mut out);
 
     out
+}
+
+fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
+    if !out.atc.enabled {
+        return;
+    }
+
+    if out.atc.source == "warming_up" {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-startup",
+            detail: "ATC supervisor is warming up; no live control summary yet".into(),
+            remediation: Some(
+                "Wait for the ATC tick loop to publish its first live snapshot.".into(),
+            ),
+        });
+    } else if out.atc.source == "spawn_failed" {
+        out.lines.push(ProbeLine {
+            level: Level::Fail,
+            name: "atc-startup",
+            detail: "ATC supervisor failed to start".into(),
+            remediation: Some(
+                "Inspect the ATC startup error note and recent server logs before trusting ATC surfaces.".into(),
+            ),
+        });
+    }
+
+    if out.atc.safe_mode {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-safe-mode",
+            detail: "ATC is in safe mode and is suppressing aggressive interventions".into(),
+            remediation: Some(
+                "Inspect recent ATC advisories and evidence for repeated control-path uncertainty."
+                    .into(),
+            ),
+        });
+    }
+
+    if out.atc.deadlock_cycles > 0 {
+        out.lines.push(ProbeLine {
+            level: Level::Fail,
+            name: "atc-deadlocks",
+            detail: format!(
+                "ATC detected {} reservation deadlock cycle(s)",
+                out.atc.deadlock_cycles
+            ),
+            remediation: Some(
+                "Review reservation holders and the latest ATC conflict advisories, then break the cycle.".into(),
+            ),
+        });
+    }
+
+    if out.atc.last_tick_budget_exceeded {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-budget",
+            detail: format!(
+                "ATC tick exceeded budget: {}us > {}us",
+                out.atc.last_tick_duration_micros, out.atc.last_tick_budget_micros
+            ),
+            remediation: Some(
+                "Profile the ATC hot path before increasing the tick interval or budget.".into(),
+            ),
+        });
+    }
+
+    for agent in out
+        .atc
+        .tracked_agents
+        .iter()
+        .filter(|agent| agent.state != "alive")
+        .take(3)
+    {
+        let level = if agent.state == "dead" {
+            Level::Fail
+        } else {
+            Level::Warn
+        };
+        out.lines.push(ProbeLine {
+            level,
+            name: "atc-liveness",
+            detail: format!(
+                "ATC marks {} as {} after {}s of silence (p_alive={:.2})",
+                agent.name, agent.state, agent.silence_secs, agent.posterior_alive
+            ),
+            remediation: Some(
+                "Check the agent inbox, build activity, and reservation ownership before force-releasing work.".into(),
+            ),
+        });
+    }
 }
 
 fn push_unique_path(list: &mut Vec<String>, path: &str) {
@@ -2589,6 +2780,69 @@ mod tests {
                 .iter()
                 .any(|l| l.name == "auth" && l.level == Level::Fail)
         );
+    }
+
+    #[test]
+    fn atc_findings_surface_deadlocks_budget_and_dead_agents() {
+        let mut out = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                safe_mode: true,
+                deadlock_cycles: 2,
+                last_tick_duration_micros: 120,
+                last_tick_budget_micros: 60,
+                last_tick_budget_exceeded: true,
+                tracked_agents: vec![
+                    crate::AtcOperatorAgentSnapshot {
+                        name: "AlphaAgent".to_string(),
+                        state: "alive".to_string(),
+                        silence_secs: 3,
+                        posterior_alive: 0.99,
+                    },
+                    crate::AtcOperatorAgentSnapshot {
+                        name: "BetaAgent".to_string(),
+                        state: "dead".to_string(),
+                        silence_secs: 420,
+                        posterior_alive: 0.02,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        add_atc_findings(&mut out);
+
+        assert!(out.lines.iter().any(|line| line.name == "atc-safe-mode"));
+        assert!(out.lines.iter().any(|line| line.name == "atc-deadlocks"));
+        assert!(out.lines.iter().any(|line| line.name == "atc-budget"));
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line.name == "atc-liveness" && line.detail.contains("BetaAgent"))
+        );
+    }
+
+    #[test]
+    fn atc_findings_surface_spawn_failure() {
+        let mut out = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "spawn_failed".to_string(),
+                note: Some("ATC operator thread failed to start: boom".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        add_atc_findings(&mut out);
+
+        assert!(out.lines.iter().any(|line| {
+            line.name == "atc-startup"
+                && line.level == Level::Fail
+                && line.detail.contains("failed to start")
+        }));
     }
 
     // --- parse_http_endpoint edge cases ---

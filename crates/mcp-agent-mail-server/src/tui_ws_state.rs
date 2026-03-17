@@ -90,6 +90,7 @@ fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
         "event_ring_stats": ring,
         "config": config_json(state),
         "db_stats": state.db_stats_snapshot(),
+        "atc": crate::atc_operator_snapshot(),
         "sparkline_ms": state.sparkline_snapshot(),
         "events": events,
     })
@@ -119,6 +120,7 @@ fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
         },
         "event_ring_stats": ring,
         "db_stats": state.db_stats_snapshot(),
+        "atc": crate::atc_operator_snapshot(),
         "sparkline_ms": state.sparkline_snapshot(),
         "events": events,
     })
@@ -173,6 +175,10 @@ mod tests {
         assert_eq!(payload["mode"], "snapshot");
         assert_eq!(payload["transport"], "http-poll");
         assert!(payload["next_seq"].as_u64().is_some());
+        assert!(
+            payload.get("atc").is_some(),
+            "snapshot payload should include ATC state"
+        );
     }
 
     #[test]
@@ -193,6 +199,10 @@ mod tests {
             payload["events"]
                 .as_array()
                 .is_some_and(|events| !events.is_empty())
+        );
+        assert!(
+            payload.get("atc").is_some(),
+            "delta payload should include ATC state"
         );
     }
 

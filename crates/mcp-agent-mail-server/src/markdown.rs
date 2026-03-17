@@ -118,7 +118,8 @@ static HTML_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
             if value_lower.starts_with("data:") {
                 // Only allow data: URIs for image sources, completely block them in links
                 // to prevent navigating to malicious SVG data URIs containing scripts.
-                if element == "img" && attribute == "src" && value_lower.starts_with("data:image/") {
+                if element == "img" && attribute == "src" && value_lower.starts_with("data:image/")
+                {
                     Some(value.into())
                 } else {
                     None
@@ -292,10 +293,14 @@ mod tests {
 
     #[test]
     fn clean_data_uri_xss() {
-        let html = render_markdown_to_safe_html("<a href=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">Click me</a>");
+        let html = render_markdown_to_safe_html(
+            "<a href=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">Click me</a>",
+        );
         assert!(!html.contains("data:text/html"));
 
-        let html2 = render_markdown_to_safe_html("<a href=\"data:image/svg+xml;base64,PHN2ZyB4bWxuc... \">Click me</a>");
+        let html2 = render_markdown_to_safe_html(
+            "<a href=\"data:image/svg+xml;base64,PHN2ZyB4bWxuc... \">Click me</a>",
+        );
         assert!(!html2.contains("data:image"));
     }
 

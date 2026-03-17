@@ -52,9 +52,24 @@ pub fn contains_ci(text: &str, query_lower: &str) -> bool {
     }
     if query_lower.is_ascii() {
         let q_bytes = query_lower.as_bytes();
-        text.as_bytes()
-            .windows(q_bytes.len())
-            .any(|w| w.eq_ignore_ascii_case(q_bytes))
+        let q_first = q_bytes[0]; // query_lower is already lowercase
+        let q_first_upper = q_first.to_ascii_uppercase();
+
+        let t_bytes = text.as_bytes();
+        if t_bytes.len() < q_bytes.len() {
+            return false;
+        }
+
+        let max_idx = t_bytes.len() - q_bytes.len();
+        for i in 0..=max_idx {
+            let b = t_bytes[i];
+            if b == q_first || b == q_first_upper {
+                if t_bytes[i..i + q_bytes.len()].eq_ignore_ascii_case(q_bytes) {
+                    return true;
+                }
+            }
+        }
+        false
     } else {
         text.to_lowercase().contains(query_lower)
     }

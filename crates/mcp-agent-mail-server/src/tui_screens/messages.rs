@@ -901,9 +901,12 @@ impl ComposeFormState {
             .available_agents
             .iter()
             .filter(|name| {
-                let name_lower = name.to_ascii_lowercase();
-                (prefix_lower.is_empty() || name_lower.starts_with(&prefix_lower))
-                    && !already.iter().any(|existing| existing == *name)
+                let starts_with_ci = prefix_lower.is_empty() || {
+                    name.len() >= prefix_lower.len()
+                        && name.as_bytes()[..prefix_lower.len()]
+                            .eq_ignore_ascii_case(prefix_lower.as_bytes())
+                };
+                starts_with_ci && !already.iter().any(|existing| existing == *name)
             })
             .take(6)
             .cloned()
@@ -5456,7 +5459,7 @@ fn prefixed_reply_subject(subject: &str) -> String {
     if trimmed.is_empty() {
         return "Re:".to_string();
     }
-    if trimmed.to_ascii_lowercase().starts_with("re:") {
+    if trimmed.len() >= 3 && trimmed.as_bytes()[..3].eq_ignore_ascii_case(b"re:") {
         trimmed.to_string()
     } else {
         format!("Re: {trimmed}")

@@ -73,8 +73,8 @@ pub trait AtcAction: Copy + Eq + Hash + fmt::Debug + 'static {}
 /// per update with no matrix inversions.
 #[derive(Debug, Clone)]
 pub struct DecisionCore<S: AtcState, A: AtcAction> {
-    /// Loss matrix: `L[(action, state)] = cost`.
-    loss_matrix: HashMap<(A, S), f64>,
+    /// Dense row-major loss matrix aligned to `actions x posterior`.
+    loss_matrix: Vec<f64>,
     /// Current posterior belief over states.  Values sum to 1.0.
     posterior: Vec<(S, f64)>,
     /// How fast the posterior moves toward new evidence (0.0–1.0).
@@ -82,6 +82,10 @@ pub struct DecisionCore<S: AtcState, A: AtcAction> {
     alpha: f64,
     /// All known actions (for argmin enumeration).  Always non-empty.
     actions: Vec<A>,
+    /// Dense lookup for actions.
+    action_index: HashMap<A, usize>,
+    /// Dense lookup for states.
+    state_index: HashMap<S, usize>,
 }
 
 impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
@@ -90,28 +94,70 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
     /// `prior` must be a valid probability distribution (non-negative, sums to ~1).
     /// `loss_entries` are `(action, state, cost)` triples.
     pub fn new(prior: &[(S, f64)], loss_entries: &[(A, S, f64)], alpha: f64) -> Self {
-        let mut loss_matrix = HashMap::new();
-        let mut actions_set = Vec::new();
-        for &(a, s, cost) in loss_entries {
-            loss_matrix.insert((a, s), cost);
-            if !actions_set.contains(&a) {
-                actions_set.push(a);
+        let mut actions = Vec::new();
+        let mut action_index = HashMap::new();
+        for &(action, _, _) in loss_entries {
+            if let std::collections::hash_map::Entry::Vacant(slot) = action_index.entry(action) {
+                slot.insert(actions.len());
+                actions.push(action);
             }
         }
         assert!(
-            !actions_set.is_empty(),
+            !actions.is_empty(),
             "DecisionCore requires at least one action in loss_entries"
         );
         assert!(
             !prior.is_empty(),
             "DecisionCore requires at least one state in prior"
         );
+        let mut state_index = HashMap::with_capacity(prior.len());
+        for (idx, &(state, _)) in prior.iter().enumerate() {
+            let previous = state_index.insert(state, idx);
+            assert!(
+                previous.is_none(),
+                "DecisionCore prior contains duplicate state entries"
+            );
+        }
+        let state_count = prior.len();
+        let mut loss_matrix = vec![0.0; actions.len() * state_count];
+        for &(action, state, cost) in loss_entries {
+            let action_idx = action_index
+                .get(&action)
+                .copied()
+                .expect("DecisionCore action index must exist");
+            let state_idx = state_index.get(&state).copied().unwrap_or_else(|| {
+                panic!("DecisionCore loss entry references unknown state: {state:?}")
+            });
+            loss_matrix[action_idx * state_count + state_idx] = cost;
+        }
         Self {
             loss_matrix,
             posterior: prior.to_vec(),
             alpha: alpha.clamp(0.01, 1.0),
-            actions: actions_set,
+            actions,
+            action_index,
+            state_index,
         }
+    }
+
+    #[inline]
+    fn state_count(&self) -> usize {
+        self.posterior.len()
+    }
+
+    #[inline]
+    fn loss_offset(&self, action_idx: usize, state_idx: usize) -> usize {
+        action_idx * self.state_count() + state_idx
+    }
+
+    fn expected_loss_for_index(&self, action_idx: usize) -> f64 {
+        let state_count = self.state_count();
+        let start = action_idx * state_count;
+        self.posterior
+            .iter()
+            .zip(&self.loss_matrix[start..start + state_count])
+            .map(|((_, prob), cost)| *prob * *cost)
+            .sum()
     }
 
     /// Choose the action that minimizes expected loss under the current posterior.
@@ -125,8 +171,8 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
         let mut best_loss = f64::INFINITY;
         let mut runner_up_loss = f64::INFINITY;
 
-        for &action in &self.actions {
-            let expected_loss = self.expected_loss_for(action);
+        for (action_idx, &action) in self.actions.iter().enumerate() {
+            let expected_loss = self.expected_loss_for_index(action_idx);
             if expected_loss < best_loss {
                 runner_up_loss = best_loss;
                 best_loss = expected_loss;
@@ -141,17 +187,10 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
 
     /// Compute expected loss for a specific action under current posterior.
     pub fn expected_loss_for(&self, action: A) -> f64 {
-        self.posterior
-            .iter()
-            .map(|&(state, prob)| {
-                let cost = self
-                    .loss_matrix
-                    .get(&(action, state))
-                    .copied()
-                    .unwrap_or(0.0);
-                cost * prob
-            })
-            .sum()
+        self.action_index
+            .get(&action)
+            .copied()
+            .map_or(0.0, |action_idx| self.expected_loss_for_index(action_idx))
     }
 
     /// Update the posterior given observed evidence.
@@ -170,12 +209,10 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
         /// but large enough to keep the posterior recoverable.
         const PROB_FLOOR: f64 = 1e-10;
 
-        let likelihood_map: HashMap<S, f64> = likelihoods.iter().copied().collect();
-
         for entry in &mut self.posterior {
-            let lk = likelihood_map
-                .get(&entry.0)
-                .copied()
+            let lk = likelihoods
+                .iter()
+                .find_map(|&(candidate, likelihood)| (candidate == entry.0).then_some(likelihood))
                 .unwrap_or(1.0)
                 .max(0.0); // clamp negative likelihoods — they're nonsensical
             // Raise likelihood to alpha power for EWMA-style blending
@@ -206,32 +243,76 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
             .collect()
     }
 
+    /// Get the posterior mass for a single state.
+    #[must_use]
+    pub fn posterior_probability(&self, state: S) -> f64 {
+        self.state_index
+            .get(&state)
+            .copied()
+            .map_or(0.0, |state_idx| self.posterior[state_idx].1)
+    }
+
     /// Look up a single loss matrix entry.
     #[must_use]
     pub fn loss_entry(&self, action: A, state: S) -> f64 {
-        self.loss_matrix
-            .get(&(action, state))
-            .copied()
-            .unwrap_or(0.0)
+        let Some(action_idx) = self.action_index.get(&action).copied() else {
+            return 0.0;
+        };
+        let Some(state_idx) = self.state_index.get(&state).copied() else {
+            return 0.0;
+        };
+        self.loss_matrix[self.loss_offset(action_idx, state_idx)]
     }
 
     /// Get the best action for a known true state (for regret computation).
     #[must_use]
     pub fn best_action_for_state(&self, state: S) -> A {
+        let Some(state_idx) = self.state_index.get(&state).copied() else {
+            return self.actions[0];
+        };
         self.actions
             .iter()
-            .copied()
-            .min_by(|&a, &b| {
-                let la = self.loss_entry(a, state);
-                let lb = self.loss_entry(b, state);
+            .enumerate()
+            .min_by(|(left_idx, _), (right_idx, _)| {
+                let la = self.loss_matrix[self.loss_offset(*left_idx, state_idx)];
+                let lb = self.loss_matrix[self.loss_offset(*right_idx, state_idx)];
                 la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .unwrap_or(self.actions[0])
+            .map_or(self.actions[0], |(_, &action)| action)
     }
 
-    /// Mutably access the loss matrix (for PID regret controller tuning).
-    pub const fn loss_matrix_mut(&mut self) -> &mut HashMap<(A, S), f64> {
-        &mut self.loss_matrix
+    /// Update a single loss entry while keeping the dense matrix coherent.
+    pub fn set_loss_entry(&mut self, action: A, state: S, cost: f64) {
+        let action_idx =
+            self.action_index.get(&action).copied().unwrap_or_else(|| {
+                panic!("DecisionCore unknown action in set_loss_entry: {action:?}")
+            });
+        let state_idx =
+            self.state_index.get(&state).copied().unwrap_or_else(|| {
+                panic!("DecisionCore unknown state in set_loss_entry: {state:?}")
+            });
+        let offset = self.loss_offset(action_idx, state_idx);
+        self.loss_matrix[offset] = cost;
+    }
+
+    /// Refresh the decision policy from another core while preserving the
+    /// receiver's posterior state.
+    pub fn sync_policy_from(&mut self, other: &Self) {
+        self.actions.clone_from(&other.actions);
+        self.action_index.clear();
+        for (idx, action) in self.actions.iter().copied().enumerate() {
+            self.action_index.insert(action, idx);
+        }
+        self.loss_matrix.clear();
+        self.loss_matrix
+            .resize(self.actions.len() * self.state_count(), 0.0);
+        for (action_idx, action) in self.actions.iter().copied().enumerate() {
+            for (state_idx, (state, _)) in self.posterior.iter().copied().enumerate() {
+                let offset = self.loss_offset(action_idx, state_idx);
+                self.loss_matrix[offset] = other.loss_entry(action, state);
+            }
+        }
+        self.alpha = other.alpha;
     }
 }
 
@@ -1397,6 +1478,8 @@ impl AgentRhythm {
 pub struct AgentLivenessEntry {
     /// Agent name.
     pub name: String,
+    /// Agent program (used for hierarchical priors and cohort updates).
+    pub program: String,
     /// Current state.
     pub state: LivenessState,
     /// Rhythm tracker.
@@ -2756,6 +2839,16 @@ pub struct AtcEngine {
 }
 
 impl AtcEngine {
+    fn seeded_rhythm(program: &str) -> AgentRhythm {
+        ATC_POPULATION
+            .get()
+            .and_then(|lock| lock.lock().ok())
+            .map_or_else(
+                || AgentRhythm::new(program_prior_interval_secs(program)),
+                |pop| pop.create_rhythm(program),
+            )
+    }
+
     /// Create a new ATC engine with the given configuration.
     #[must_use]
     pub fn new(config: AtcConfig) -> Self {
@@ -2868,18 +2961,34 @@ impl AtcEngine {
         if name == ATC_AGENT_NAME {
             return; // self-exclusion
         }
-        self.agents.entry(name.to_string()).or_insert_with(|| {
-            let prior_secs = program_prior_interval_secs(program);
-            AgentLivenessEntry {
-                name: name.to_string(),
-                state: LivenessState::Alive,
-                rhythm: AgentRhythm::new(prior_secs),
-                suspect_since: 0,
-                probe_sent_at: 0,
-                sprt_log_lr: 0.0,
-                core: default_liveness_core(),
+        match self.agents.entry(name.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                let program_changed = entry.program != program;
+                entry.program = program.to_string();
+                if program_changed {
+                    let seeded = Self::seeded_rhythm(program);
+                    if entry.rhythm.observation_count == 0 && entry.rhythm.last_activity_ts == 0 {
+                        entry.rhythm = seeded;
+                    } else {
+                        entry.rhythm.prior_interval = seeded.prior_interval;
+                    }
+                }
+                entry.core.sync_policy_from(&self.liveness_core);
             }
-        });
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(AgentLivenessEntry {
+                    name: name.to_string(),
+                    program: program.to_string(),
+                    state: LivenessState::Alive,
+                    rhythm: Self::seeded_rhythm(program),
+                    suspect_since: 0,
+                    probe_sent_at: 0,
+                    sprt_log_lr: 0.0,
+                    core: self.liveness_core.clone(),
+                });
+            }
+        }
     }
 
     /// Process an agent activity signal (message, reservation, commit).
@@ -2907,11 +3016,9 @@ impl AtcEngine {
     pub fn evaluate_liveness(&mut self, now_micros: i64) -> Vec<(String, LivenessAction)> {
         let k = self.config.suspicion_k;
         let mut actions = Vec::new();
-
-        let agent_names: Vec<String> = self.agents.keys().cloned().collect();
-        for name in agent_names {
-            let entry = self.agents.get_mut(&name).unwrap();
-
+        let safe_mode = self.calibration.is_safe_mode();
+        let ledger = &mut self.ledger;
+        for entry in self.agents.values_mut() {
             // Skip agents already declared dead
             if entry.state == LivenessState::Dead {
                 continue;
@@ -2934,26 +3041,32 @@ impl AtcEngine {
                     (LivenessState::Dead, dead_lk),
                 ]);
 
-                let (action, expected_loss, runner_up) = entry.core.choose_action();
+                let (chosen_action, expected_loss, runner_up) = entry.core.choose_action();
+                let action = if chosen_action == LivenessAction::ReleaseReservations && safe_mode {
+                    LivenessAction::Suspect
+                } else {
+                    chosen_action
+                };
 
                 // Only act if the action is different from DeclareAlive
                 if action != LivenessAction::DeclareAlive {
                     // Log to evidence ledger
-                    self.ledger.record(&DecisionBuilder {
+                    let evidence_summary = format!(
+                        "silence {}s (avg {}s, {:.1}σ)",
+                        entry.rhythm.silence_duration(now_micros) / 1_000_000,
+                        micros_f64_to_i64(entry.rhythm.effective_avg()) / 1_000_000,
+                        silence_ratio,
+                    );
+                    ledger.record(&DecisionBuilder {
                         subsystem: AtcSubsystem::Liveness,
-                        subject: &name,
+                        subject: &entry.name,
                         core: &entry.core,
                         action,
                         expected_loss,
                         runner_up_loss: runner_up,
-                        evidence_summary: &format!(
-                            "silence {}s (avg {}s, {:.1}σ)",
-                            entry.rhythm.silence_duration(now_micros) / 1_000_000,
-                            micros_f64_to_i64(entry.rhythm.effective_avg()) / 1_000_000,
-                            silence_ratio,
-                        ),
-                        calibration_healthy: !self.calibration.is_safe_mode(),
-                        safe_mode_active: self.calibration.is_safe_mode(),
+                        evidence_summary: &evidence_summary,
+                        calibration_healthy: !safe_mode,
+                        safe_mode_active: safe_mode,
                         timestamp_micros: now_micros,
                     });
 
@@ -2966,19 +3079,12 @@ impl AtcEngine {
                             }
                         }
                         LivenessAction::ReleaseReservations => {
-                            if !self.calibration.is_safe_mode() {
-                                entry.state = LivenessState::Dead;
-                            }
-                            // In safe mode, downgrade to Suspect only
-                            else if entry.state != LivenessState::Flaky {
-                                entry.state = LivenessState::Flaky;
-                                entry.suspect_since = now_micros;
-                            }
+                            entry.state = LivenessState::Dead;
                         }
                         LivenessAction::DeclareAlive => {}
                     }
 
-                    actions.push((name.clone(), action));
+                    actions.push((entry.name.clone(), action));
                 }
             }
         }
@@ -2997,6 +3103,18 @@ impl AtcEngine {
             }
         }
         results
+    }
+
+    fn propagate_liveness_policy(&mut self) {
+        for entry in self.agents.values_mut() {
+            entry.core.sync_policy_from(&self.liveness_core);
+        }
+    }
+
+    fn absorb_population_snapshot(&self, population: &mut HierarchicalAgentModel) {
+        for entry in self.agents.values() {
+            population.absorb_agent(&entry.program, &entry.rhythm);
+        }
     }
 }
 
@@ -3228,7 +3346,7 @@ mod engine_tests {
         }
 
         let now = 9 * 60_000_000 + 600_000_000; // 10 min silence
-        let _actions = engine.evaluate_liveness(now);
+        let actions = engine.evaluate_liveness(now);
 
         // In safe mode, even if the core recommends Release, the state
         // transition is downgraded to Flaky (Suspect), never Dead.
@@ -3237,6 +3355,17 @@ mod engine_tests {
             state,
             LivenessState::Dead,
             "safe mode should prevent Dead state, got {state:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|(agent, action)| agent == "BlueFox" && *action == LivenessAction::Suspect),
+            "safe mode should downgrade release actions to Suspect"
+        );
+        assert!(
+            !actions.iter().any(|(agent, action)| agent == "BlueFox"
+                && *action == LivenessAction::ReleaseReservations),
+            "safe mode should not emit release actions"
         );
     }
 
@@ -4260,6 +4389,7 @@ mod predictive_tests {
         // Uncertain agent (uniform posterior)
         let mut uncertain = AgentLivenessEntry {
             name: "Uncertain".to_string(),
+            program: "claude-code".to_string(),
             state: LivenessState::Alive,
             rhythm: AgentRhythm::new(60.0),
             suspect_since: 0,
@@ -4281,6 +4411,7 @@ mod predictive_tests {
         // Confident agent (strong alive posterior — default)
         let confident = AgentLivenessEntry {
             name: "Confident".to_string(),
+            program: "claude-code".to_string(),
             state: LivenessState::Alive,
             rhythm: AgentRhythm::new(60.0),
             suspect_since: 0,
@@ -4305,6 +4436,7 @@ mod predictive_tests {
             ATC_AGENT_NAME.to_string(),
             AgentLivenessEntry {
                 name: ATC_AGENT_NAME.to_string(),
+                program: "mcp-agent-mail".to_string(),
                 state: LivenessState::Alive,
                 rhythm: AgentRhythm::new(60.0),
                 suspect_since: 0,
@@ -5206,7 +5338,6 @@ impl<A: AtcAction, S: AtcState> LossMatrixTuner<A, S> {
         }
         self.decisions_since_update = 0;
         let dt = 1.0;
-        let loss_matrix = core.loss_matrix_mut();
         let mut any_changed = false;
         for ((action, state), pid) in &mut self.pids {
             let (total_regret, count) = self
@@ -5219,7 +5350,7 @@ impl<A: AtcAction, S: AtcState> LossMatrixTuner<A, S> {
             }
             let avg_regret = total_regret / u64_to_f64(count);
             let new_loss = pid.update(avg_regret, dt);
-            loss_matrix.insert((*action, *state), new_loss);
+            core.set_loss_entry(*action, *state, new_loss);
             any_changed = true;
         }
         self.regret_accum.clear();
@@ -5496,10 +5627,12 @@ pub fn submodular_probe_schedule<S: BuildHasher>(
         return Vec::new();
     }
 
-    let mut candidates: Vec<(String, f64)> = agents
-        .iter()
-        .filter(|(name, _)| name.as_str() != ATC_AGENT_NAME)
-        .map(|(name, entry)| {
+    let mut candidates: Vec<(String, f64)> = Vec::with_capacity(max_probes);
+    for (name, entry) in agents {
+        if name.as_str() == ATC_AGENT_NAME || entry.state == LivenessState::Dead {
+            continue;
+        }
+        let gain = {
             let base_gain = probe_information_gain(entry.core.posterior());
             let time_since_probe = if entry.probe_sent_at > 0 {
                 nonnegative_i64_to_f64((now_micros - entry.probe_sent_at).max(0))
@@ -5507,14 +5640,22 @@ pub fn submodular_probe_schedule<S: BuildHasher>(
                 1_000_000_000.0
             };
             let recency = 1.0 - (-time_since_probe / (recency_decay * 1_000_000.0)).exp();
-            (name.clone(), base_gain * recency.max(0.01))
-        })
-        .filter(|(_, gain)| *gain > 0.001)
-        .collect();
+            base_gain * recency.max(0.01)
+        };
+        if gain <= 0.001 {
+            continue;
+        }
+        let insert_at = candidates.partition_point(|(_, existing_gain)| *existing_gain >= gain);
+        if insert_at >= max_probes {
+            continue;
+        }
+        candidates.insert(insert_at, (name.clone(), gain));
+        if candidates.len() > max_probes {
+            candidates.pop();
+        }
+    }
 
-    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut selected = Vec::new();
+    let mut selected = Vec::with_capacity(candidates.len());
     let mut total_gain = 0.0;
     for (name, gain) in candidates {
         if selected.len() >= max_probes {
@@ -5644,13 +5785,39 @@ impl AtcEngine {
 /// Initialize the global ATC engine. Call once at server startup.
 pub fn init_global_atc(config: &mcp_agent_mail_core::Config) {
     let atc_config = AtcEngine::config_from_env(config);
-    ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new(atc_config)));
-    ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
-    ATC_CONFORMAL.get_or_init(|| Mutex::new(AtcConformalSet::new(200, 0.90)));
-    ATC_THRESHOLDS.get_or_init(|| Mutex::new(HashMap::new()));
-    ATC_SURVIVAL.get_or_init(|| Mutex::new(HashMap::new()));
-    ATC_LIVENESS_TUNER
+    let engine_lock = ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new(atc_config.clone())));
+    *engine_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = AtcEngine::new(atc_config);
+
+    let population_lock = ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
+    *population_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = HierarchicalAgentModel::new();
+
+    let conformal_lock = ATC_CONFORMAL.get_or_init(|| Mutex::new(AtcConformalSet::new(200, 0.90)));
+    *conformal_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = AtcConformalSet::new(200, 0.90);
+
+    let thresholds_lock = ATC_THRESHOLDS.get_or_init(|| Mutex::new(HashMap::new()));
+    thresholds_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+
+    let survival_lock = ATC_SURVIVAL.get_or_init(|| Mutex::new(HashMap::new()));
+    survival_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+
+    let tuner_lock = ATC_LIVENESS_TUNER
         .get_or_init(|| Mutex::new(LossMatrixTuner::from_core(&default_liveness_core(), 50)));
+    *tuner_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        LossMatrixTuner::from_core(&default_liveness_core(), 50);
 }
 
 /// Whether the global ATC is initialized and enabled.
@@ -5664,6 +5831,9 @@ pub fn atc_enabled() -> bool {
 
 /// Record an agent registration in the ATC.
 pub fn atc_register_agent(name: &str, program: &str) {
+    if !atc_enabled() {
+        return;
+    }
     if let Some(engine) = ATC_ENGINE.get()
         && let Ok(mut e) = engine.lock()
     {
@@ -5683,6 +5853,9 @@ pub fn atc_register_agent(name: &str, program: &str) {
 
 /// Record agent activity (tool call, message, etc.) in the ATC.
 pub fn atc_observe_activity(agent: &str, timestamp_micros: i64) {
+    if !atc_enabled() {
+        return;
+    }
     if let Some(engine) = ATC_ENGINE.get()
         && let Ok(mut e) = engine.lock()
     {
@@ -5731,12 +5904,6 @@ pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
                 actions.push(AtcTickAction::ReleaseReservations {
                     agent: agent_name.clone(),
                 });
-                actions.push(AtcTickAction::SendAdvisory {
-                    agent: agent_name.clone(),
-                    message: format!(
-                        "[ATC] Agent {agent_name} declared dead. Reservations released."
-                    ),
-                });
             }
             LivenessAction::DeclareAlive => {}
         }
@@ -5769,11 +5936,53 @@ pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
     }
 
     // 4. Conformal uncertainty gating — suppress aggressive actions under high uncertainty
+    let mut withheld_releases = Vec::new();
     if let Some(conformal_lock) = ATC_CONFORMAL.get()
         && let Ok(conformal) = conformal_lock.lock()
         && conformal.is_uncertain(AtcSubsystem::Liveness)
     {
-        actions.retain(|a| !matches!(a, AtcTickAction::ReleaseReservations { .. }));
+        actions.retain(|action| match action {
+            AtcTickAction::ReleaseReservations { agent } => {
+                withheld_releases.push(agent.clone());
+                false
+            }
+            _ => true,
+        });
+    }
+
+    for agent_name in withheld_releases {
+        if let Some(entry) = engine.agents.get_mut(&agent_name)
+            && entry.state == LivenessState::Dead
+        {
+            entry.state = LivenessState::Flaky;
+            if entry.suspect_since == 0 {
+                entry.suspect_since = now_micros;
+            }
+        }
+        actions.push(AtcTickAction::SendAdvisory {
+            agent: agent_name.clone(),
+            message: format!(
+                "[ATC] Agent {agent_name} appears unresponsive. \
+                 Automated reservation release withheld under high uncertainty."
+            ),
+        });
+    }
+
+    let release_targets: Vec<String> = actions
+        .iter()
+        .filter_map(|action| match action {
+            AtcTickAction::ReleaseReservations { agent } => Some(agent.clone()),
+            _ => None,
+        })
+        .collect();
+    for agent_name in release_targets {
+        actions.push(AtcTickAction::SendAdvisory {
+            agent: agent_name.clone(),
+            message: format!(
+                "[ATC] Agent {agent_name} declared dead. \
+                 Automated reservation release requested."
+            ),
+        });
     }
 
     // 5. Periodically update population model
@@ -5781,9 +5990,7 @@ pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
         && let Some(pop_lock) = ATC_POPULATION.get()
         && let Ok(mut pop) = pop_lock.lock()
     {
-        for entry in engine.agents.values() {
-            pop.absorb_agent("unknown", &entry.rhythm);
-        }
+        engine.absorb_population_snapshot(&mut pop);
     }
 
     actions
@@ -5797,6 +6004,10 @@ pub fn atc_record_outcome(
     actual_loss: f64,
     correct: bool,
 ) {
+    if !atc_enabled() {
+        return;
+    }
+
     // Feed e-process, CUSUM, and calibration guard
     if let Some(engine_lock) = ATC_ENGINE.get()
         && let Ok(mut engine) = engine_lock.lock()
@@ -5850,8 +6061,9 @@ pub fn atc_record_outcome(
 
         if let Some(engine_lock) = ATC_ENGINE.get()
             && let Ok(mut engine) = engine_lock.lock()
+            && tuner.maybe_update(&mut engine.liveness_core)
         {
-            tuner.maybe_update(&mut engine.liveness_core);
+            engine.propagate_liveness_policy();
         }
     }
 
@@ -5889,21 +6101,17 @@ pub fn atc_summary() -> Option<AtcSummarySnapshot> {
     let engine_lock = ATC_ENGINE.get()?;
     let engine = engine_lock.lock().ok()?;
 
-    let mut agent_states = Vec::new();
+    let mut agent_states = Vec::with_capacity(engine.agents.len());
     let now = mcp_agent_mail_core::timestamps::now_micros();
     for (name, entry) in &engine.agents {
         agent_states.push(AgentStateSnapshot {
             name: name.clone(),
             state: entry.state,
             silence_secs: entry.rhythm.silence_duration(now) / 1_000_000,
-            posterior_alive: entry
-                .core
-                .posterior()
-                .iter()
-                .find(|(s, _)| *s == LivenessState::Alive)
-                .map_or(0.0, |(_, p)| *p),
+            posterior_alive: entry.core.posterior_probability(LivenessState::Alive),
         });
     }
+    agent_states.sort_by(|left, right| left.name.cmp(&right.name));
 
     let deadlock_count: usize = engine
         .conflict_graphs
@@ -5948,6 +6156,48 @@ pub struct AgentStateSnapshot {
 #[cfg(test)]
 mod alien_enhancement_tests {
     use super::*;
+    static GLOBAL_ATC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Config) {
+        let atc_config = AtcEngine::config_from_env(config);
+        let fresh_engine = AtcEngine::new(atc_config);
+
+        let engine_lock = ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new_for_testing()));
+        *engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh_engine;
+
+        let population_lock =
+            ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
+        *population_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HierarchicalAgentModel::new();
+
+        let conformal_lock =
+            ATC_CONFORMAL.get_or_init(|| Mutex::new(AtcConformalSet::new(200, 0.90)));
+        *conformal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = AtcConformalSet::new(200, 0.90);
+
+        let thresholds_lock = ATC_THRESHOLDS.get_or_init(|| Mutex::new(HashMap::new()));
+        thresholds_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        let survival_lock = ATC_SURVIVAL.get_or_init(|| Mutex::new(HashMap::new()));
+        survival_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        let tuner_lock = ATC_LIVENESS_TUNER
+            .get_or_init(|| Mutex::new(LossMatrixTuner::from_core(&default_liveness_core(), 10)));
+        *tuner_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            LossMatrixTuner::from_core(&default_liveness_core(), 10);
+    }
 
     #[test]
     fn tuner_from_core_creates_pids() {
@@ -5981,6 +6231,55 @@ mod alien_enhancement_tests {
         assert!(
             (new_loss - original_loss).abs() > 0.001,
             "PID should adjust loss: original={original_loss}, new={new_loss}"
+        );
+    }
+
+    #[test]
+    fn tuned_liveness_policy_propagates_to_existing_and_new_agents() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Existing", "claude-code");
+
+        let original_loss = engine
+            .agents
+            .get("Existing")
+            .expect("existing agent")
+            .core
+            .loss_entry(LivenessAction::Suspect, LivenessState::Alive);
+
+        let mut tuner = LossMatrixTuner::from_core(&engine.liveness_core, 1);
+        tuner.record_outcome(LivenessAction::Suspect, LivenessState::Alive, 20.0);
+        assert!(tuner.maybe_update(&mut engine.liveness_core));
+        engine.propagate_liveness_policy();
+
+        let tuned_loss = engine
+            .liveness_core
+            .loss_entry(LivenessAction::Suspect, LivenessState::Alive);
+        let existing_loss = engine
+            .agents
+            .get("Existing")
+            .expect("existing agent after propagate")
+            .core
+            .loss_entry(LivenessAction::Suspect, LivenessState::Alive);
+
+        assert!(
+            (tuned_loss - original_loss).abs() > 0.001,
+            "tuned template should change: original={original_loss}, tuned={tuned_loss}"
+        );
+        assert!(
+            (existing_loss - tuned_loss).abs() < 1e-9,
+            "existing agent should receive tuned policy: existing={existing_loss}, tuned={tuned_loss}"
+        );
+
+        engine.register_agent("NewAgent", "claude-code");
+        let new_loss = engine
+            .agents
+            .get("NewAgent")
+            .expect("new agent")
+            .core
+            .loss_entry(LivenessAction::Suspect, LivenessState::Alive);
+        assert!(
+            (new_loss - tuned_loss).abs() < 1e-9,
+            "new agent should inherit tuned policy: new={new_loss}, tuned={tuned_loss}"
         );
     }
 
@@ -6030,6 +6329,37 @@ mod alien_enhancement_tests {
         model.absorb_agent("claude-code", &rhythm);
         let (mean, _) = model.prior_for("claude-code");
         assert!(mean < 60_000_000.0, "mean should shift: {mean}");
+    }
+
+    #[test]
+    fn engine_population_snapshot_uses_agent_programs() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Claude", "claude-code");
+        engine.register_agent("Codex", "codex-cli");
+
+        let claude = engine.agents.get_mut("Claude").expect("claude entry");
+        for i in 1..=10 {
+            claude.rhythm.observe(i * 30_000_000);
+        }
+
+        let codex = engine.agents.get_mut("Codex").expect("codex entry");
+        for i in 1..=10 {
+            codex.rhythm.observe(i * 120_000_000);
+        }
+
+        let mut population = HierarchicalAgentModel::new();
+        engine.absorb_population_snapshot(&mut population);
+
+        let (claude_mean, _) = population.prior_for("claude-code");
+        let (codex_mean, _) = population.prior_for("codex-cli");
+        assert!(
+            claude_mean < 60_000_000.0,
+            "claude prior should shift: {claude_mean}"
+        );
+        assert!(
+            (codex_mean - 120_000_000.0).abs() < 1.0,
+            "codex prior should stay near baseline when cadence matches it: {codex_mean}"
+        );
     }
 
     #[test]
@@ -6094,6 +6424,7 @@ mod alien_enhancement_tests {
                 name.clone(),
                 AgentLivenessEntry {
                     name,
+                    program: "claude-code".to_string(),
                     state: LivenessState::Alive,
                     rhythm: AgentRhythm::new(60.0),
                     suspect_since: 0,
@@ -6105,6 +6436,51 @@ mod alien_enhancement_tests {
         }
         let schedule = submodular_probe_schedule(&agents, 3, 60.0, 1_000_000);
         assert!(schedule.len() <= 3);
+    }
+
+    #[test]
+    fn submodular_schedule_skips_dead_agents() {
+        let mut agents = HashMap::new();
+        let mut dead_core = default_liveness_core();
+        for _ in 0..30 {
+            dead_core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+        agents.insert(
+            "DeadProbe".to_string(),
+            AgentLivenessEntry {
+                name: "DeadProbe".to_string(),
+                program: "claude-code".to_string(),
+                state: LivenessState::Dead,
+                rhythm: AgentRhythm::new(60.0),
+                suspect_since: 0,
+                probe_sent_at: 0,
+                sprt_log_lr: 0.0,
+                core: dead_core,
+            },
+        );
+        agents.insert(
+            "LiveProbe".to_string(),
+            AgentLivenessEntry {
+                name: "LiveProbe".to_string(),
+                program: "claude-code".to_string(),
+                state: LivenessState::Alive,
+                rhythm: AgentRhythm::new(60.0),
+                suspect_since: 0,
+                probe_sent_at: 0,
+                sprt_log_lr: 0.0,
+                core: default_liveness_core(),
+            },
+        );
+
+        let schedule = submodular_probe_schedule(&agents, 2, 60.0, 1_000_000);
+        assert!(
+            !schedule.iter().any(|(name, _)| name == "DeadProbe"),
+            "dead agents should not consume probe budget"
+        );
     }
 
     #[test]
@@ -6167,8 +6543,11 @@ mod alien_enhancement_tests {
 
     #[test]
     fn global_atc_init_and_query() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = mcp_agent_mail_core::Config::default();
-        init_global_atc(&config);
+        reset_global_atc_state_for_test(&config);
         assert!(atc_enabled());
         atc_register_agent("TestAlpha", "claude-code");
         atc_observe_activity("TestAlpha", 1_000_000);
@@ -6176,9 +6555,138 @@ mod alien_enhancement_tests {
     }
 
     #[test]
-    fn atc_tick_no_actions_for_active_agent() {
+    fn atc_summary_sorts_tracked_agents_by_name() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = mcp_agent_mail_core::Config::default();
-        init_global_atc(&config);
+        reset_global_atc_state_for_test(&config);
+
+        atc_register_agent("Zulu", "claude-code");
+        atc_register_agent("Alpha", "claude-code");
+        atc_register_agent("Mike", "claude-code");
+
+        let summary = atc_summary().expect("summary available");
+        let names: Vec<&str> = summary
+            .tracked_agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Alpha", "Mike", "Zulu"]);
+    }
+
+    #[test]
+    fn disabled_global_atc_ignores_registration_and_activity() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: false,
+            ..Default::default()
+        };
+        reset_global_atc_state_for_test(&config);
+
+        atc_register_agent("IgnoredAgent", "claude-code");
+        atc_observe_activity("IgnoredAgent", 1_000_000);
+
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        let engine = engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!engine.enabled(), "test setup should keep ATC disabled");
+        assert!(
+            engine.agents.is_empty(),
+            "disabled ATC should not accumulate tracked agents"
+        );
+    }
+
+    #[test]
+    fn disabled_global_atc_ignores_recorded_outcomes() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: false,
+            ..Default::default()
+        };
+        reset_global_atc_state_for_test(&config);
+
+        atc_record_outcome(
+            AtcSubsystem::Liveness,
+            Some("IgnoredAgent"),
+            10.0,
+            90.0,
+            false,
+        );
+
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        let engine = engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!engine.enabled(), "test setup should keep ATC disabled");
+        assert!(
+            (engine.eprocess().e_value() - 1.0).abs() < f64::EPSILON,
+            "disabled ATC should not update calibration state"
+        );
+    }
+
+    #[test]
+    fn init_global_atc_reinitializes_engine_and_clears_stale_agents() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let disabled_config = mcp_agent_mail_core::Config {
+            atc_enabled: false,
+            atc_probe_interval_secs: 7,
+            ..Default::default()
+        };
+        init_global_atc(&disabled_config);
+        atc_register_agent("StickyAgent", "claude-code");
+        atc_observe_activity("StickyAgent", 1_000_000);
+
+        {
+            let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+            let engine = engine_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !engine.enabled(),
+                "ATC config should refresh disabled state"
+            );
+            assert_eq!(engine.config.probe_interval_micros, 7_000_000);
+            assert!(
+                engine.agents.contains_key("StickyAgent"),
+                "setup should register a tracked agent before reinit"
+            );
+        }
+
+        let enabled_config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            atc_probe_interval_secs: 13,
+            ..Default::default()
+        };
+        init_global_atc(&enabled_config);
+
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        let engine = engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(engine.enabled(), "reinit should refresh enabled state");
+        assert_eq!(engine.config.probe_interval_micros, 13_000_000);
+        assert!(
+            engine.agents.is_empty(),
+            "reinit should discard stale tracked agents from prior runtime"
+        );
+    }
+
+    #[test]
+    fn atc_tick_no_actions_for_active_agent() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
         let now = mcp_agent_mail_core::timestamps::now_micros();
         atc_register_agent("TickTest", "claude-code");
         atc_observe_activity("TickTest", now);
@@ -6186,5 +6694,124 @@ mod alien_enhancement_tests {
         assert!(!actions.iter().any(
             |a| matches!(a, AtcTickAction::ReleaseReservations { agent } if agent == "TickTest")
         ));
+    }
+
+    #[test]
+    fn atc_tick_release_candidate_is_not_probed_in_same_tick() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+
+        let now = 9 * 60_000_000 + 600_000_000;
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        {
+            let mut engine = engine_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            engine.register_agent("ReleaseNoProbe", "claude-code");
+            for i in 0..10 {
+                engine.observe_activity("ReleaseNoProbe", i * 60_000_000);
+            }
+            let entry = engine.agents.get_mut("ReleaseNoProbe").expect("agent");
+            for _ in 0..30 {
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, 0.01),
+                    (LivenessState::Flaky, 0.05),
+                    (LivenessState::Dead, 0.95),
+                ]);
+            }
+        }
+
+        let actions = atc_tick(now);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                AtcTickAction::ReleaseReservations { agent } if agent == "ReleaseNoProbe"
+            )),
+            "severely silent agent should still surface a release recommendation"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                AtcTickAction::ProbeAgent { agent } if agent == "ReleaseNoProbe"
+            )),
+            "same tick should not both release and probe the same agent"
+        );
+    }
+
+    #[test]
+    fn atc_tick_uncertainty_withholds_release_without_false_release_notice() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+
+        let now = 9 * 60_000_000 + 600_000_000;
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        {
+            let mut engine = engine_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            engine.register_agent("ConformalTick", "claude-code");
+            for i in 0..10 {
+                engine.observe_activity("ConformalTick", i * 60_000_000);
+            }
+            let entry = engine.agents.get_mut("ConformalTick").expect("agent");
+            for _ in 0..30 {
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, 0.01),
+                    (LivenessState::Flaky, 0.05),
+                    (LivenessState::Dead, 0.95),
+                ]);
+            }
+        }
+
+        let conformal_lock = ATC_CONFORMAL.get().expect("conformal initialized");
+        {
+            let mut conformal = conformal_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for _ in 0..6 {
+                conformal.observe(AtcSubsystem::Liveness, 100.0, 0.0);
+            }
+        }
+
+        let actions = atc_tick(now);
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                AtcTickAction::ReleaseReservations { agent } if agent == "ConformalTick"
+            )),
+            "uncertain liveness should suppress automated release"
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                AtcTickAction::SendAdvisory { agent, message }
+                    if agent == "ConformalTick"
+                        && message.contains("withheld under high uncertainty")
+            )),
+            "suppressed release should emit a softer advisory"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                AtcTickAction::SendAdvisory { agent, message }
+                    if agent == "ConformalTick"
+                        && message.contains("release requested")
+            )),
+            "suppressed release should not claim a release request was made"
+        );
+        let engine = engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_ne!(
+            engine.agent_liveness("ConformalTick"),
+            Some(LivenessState::Dead),
+            "suppressed release should not leave the agent in Dead state"
+        );
     }
 }

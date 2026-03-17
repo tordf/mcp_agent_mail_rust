@@ -689,7 +689,7 @@ impl DashboardScreen {
                 .filter(|(_, (entry, searchable_key))| {
                     self.verbosity.includes(entry.severity)
                         && (self.type_filter.is_empty() || self.type_filter.contains(&entry.kind))
-                        && text_matches_query_terms(searchable_key, &query_terms)
+                        && text_matches_query_terms_exact(searchable_key, &query_terms)
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -1766,6 +1766,15 @@ fn text_matches_query_terms(haystack: &str, query_terms: &[String]) -> bool {
     query_terms
         .iter()
         .all(|term| crate::tui_screens::contains_ci(haystack, term))
+}
+
+fn text_matches_query_terms_exact(lowercased_haystack: &str, query_terms: &[String]) -> bool {
+    if query_terms.is_empty() {
+        return true;
+    }
+    query_terms
+        .iter()
+        .all(|term| lowercased_haystack.contains(term))
 }
 
 fn fields_match_query_terms(fields: &[&str], query_terms: &[String]) -> bool {

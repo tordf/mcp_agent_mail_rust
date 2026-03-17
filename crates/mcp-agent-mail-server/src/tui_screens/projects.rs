@@ -247,22 +247,16 @@ impl ProjectsScreen {
         let filter_text = self.filter.trim().to_ascii_lowercase();
         if !filter_text.is_empty() {
             rows.retain(|r| {
-                r.slug.to_ascii_lowercase().contains(&filter_text)
-                    || r.human_key.to_ascii_lowercase().contains(&filter_text)
+                crate::tui_screens::contains_ci(&r.slug, &filter_text)
+                    || crate::tui_screens::contains_ci(&r.human_key, &filter_text)
             });
         }
 
-        // Sort (use to_ascii_lowercase for consistency with filter phase)
+        // Sort
         rows.sort_by(|a, b| {
             let cmp = match self.sort_col {
-                COL_SLUG => a
-                    .slug
-                    .to_ascii_lowercase()
-                    .cmp(&b.slug.to_ascii_lowercase()),
-                COL_HUMAN_KEY => a
-                    .human_key
-                    .to_ascii_lowercase()
-                    .cmp(&b.human_key.to_ascii_lowercase()),
+                COL_SLUG => crate::tui_screens::cmp_ci(&a.slug, &b.slug),
+                COL_HUMAN_KEY => crate::tui_screens::cmp_ci(&a.human_key, &b.human_key),
                 COL_AGENTS => a.agent_count.cmp(&b.agent_count),
                 COL_MESSAGES => a.message_count.cmp(&b.message_count),
                 COL_RESERVATIONS => a.reservation_count.cmp(&b.reservation_count),
@@ -1452,7 +1446,8 @@ mod tests {
         // Apply filter manually
         let f = screen.filter.to_lowercase();
         screen.projects.retain(|r| {
-            r.slug.to_lowercase().contains(&f) || r.human_key.to_lowercase().contains(&f)
+            crate::tui_screens::contains_ci(&r.slug, &f)
+                || crate::tui_screens::contains_ci(&r.human_key, &f)
         });
         assert_eq!(screen.projects.len(), 1);
         assert_eq!(screen.projects[0].slug, "alpha");
@@ -1496,16 +1491,16 @@ mod tests {
             projects: 2,
             projects_list: vec![
                 ProjectSummary {
-                    slug: "alpha".into(),
-                    human_key: "/tmp/alpha".into(),
+                    slug: "alpha".to_string(),
+                    human_key: "/tmp/alpha".to_string(),
                     agent_count: 3,
                     message_count: 10,
                     reservation_count: 2,
                     ..Default::default()
                 },
                 ProjectSummary {
-                    slug: "beta".into(),
-                    human_key: "/tmp/beta".into(),
+                    slug: "beta".to_string(),
+                    human_key: "/tmp/beta".to_string(),
                     agent_count: 5,
                     message_count: 20,
                     reservation_count: 1,
@@ -1758,7 +1753,7 @@ mod tests {
                 expires_ts INTEGER NOT NULL
             )",
         )
-        .expect("create file_reservations");
+        .expect("create reservations");
         conn.execute_raw(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES
                 (1, 'alpha', '/tmp/alpha', 1773187200000000),

@@ -380,6 +380,8 @@ pub struct TuiSharedState {
     /// Startup latches used to stage heavyweight background work behind first
     /// paint and behind the initial DB readiness result.
     startup_signals: (Mutex<StartupSignalState>, Condvar),
+    /// Latest rendered TUI frame for the web dashboard mirror.
+    web_dashboard_frame: crate::tui_web_dashboard::WebDashboardFrameStore,
 }
 
 impl TuiSharedState {
@@ -425,6 +427,7 @@ impl TuiSharedState {
             next_active_reservation_expiry_micros: AtomicI64::new(0),
             request_gen: AtomicU64::new(0),
             startup_signals: (Mutex::new(StartupSignalState::default()), Condvar::new()),
+            web_dashboard_frame: crate::tui_web_dashboard::WebDashboardFrameStore::new(),
         })
     }
 
@@ -886,6 +889,12 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(tx);
+    }
+
+    /// Access the web dashboard frame store for frame capture / serving.
+    #[must_use]
+    pub fn web_dashboard_frame_store(&self) -> &crate::tui_web_dashboard::WebDashboardFrameStore {
+        &self.web_dashboard_frame
     }
 
     /// Queue a remote terminal event from browser ingress.

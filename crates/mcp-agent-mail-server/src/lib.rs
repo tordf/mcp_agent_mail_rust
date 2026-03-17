@@ -71,6 +71,7 @@ pub mod tui_poller;
 pub mod tui_preset;
 pub mod tui_screens;
 pub mod tui_theme;
+pub mod tui_web_dashboard;
 pub mod tui_widgets;
 mod tui_ws_input;
 mod tui_ws_state;
@@ -130,7 +131,7 @@ use mcp_agent_mail_tools::{
     ViewsAckOverdueResource, ViewsAckRequiredResource, ViewsAcksStaleResource,
     ViewsUrgentUnreadResource, Whois, clusters,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
@@ -1019,6 +1020,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
     atc::init_global_atc(config);
+    start_atc_operator_runtime(config);
 
     // Start background backfill for Search V3 if enabled.
     spawn_startup_search_backfill(config);
@@ -1032,6 +1034,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     #[allow(unreachable_code)]
     {
         tracing::info!("stdio loop exited; performing graceful shutdown of background services");
+        stop_atc_operator_runtime();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
         mcp_agent_mail_storage::wbq_shutdown();
@@ -1828,6 +1831,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
     atc::init_global_atc(config);
+    start_atc_operator_runtime(config);
 
     cleanup::start(config);
     ack_ttl::start(config);
@@ -1852,6 +1856,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     cleanup::shutdown();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
+    stop_atc_operator_runtime();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
     if let Some(dashboard) = dashboard.as_ref() {
@@ -1898,12 +1903,15 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // ── 2. Pre-paint essentials only ────────────────────────────────
     heal_storage_lock_artifacts(config);
     mcp_agent_mail_storage::wbq_start();
+    atc::init_global_atc(config);
+    start_atc_operator_runtime(config);
 
     // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
     let tui_state = tui_bridge::TuiSharedState::new(config);
     let http_runtime = match build_http_runtime() {
         Ok(runtime) => runtime,
         Err(err) => {
+            stop_atc_operator_runtime();
             mcp_agent_mail_storage::wbq_shutdown();
             mcp_agent_mail_storage::flush_async_commits();
             return Err(err);
@@ -1927,6 +1935,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         Err(err) => {
             set_tui_state_handle(None);
             drop(http_runtime);
+            stop_atc_operator_runtime();
             mcp_agent_mail_storage::wbq_shutdown();
             mcp_agent_mail_storage::flush_async_commits();
             return Err(err);
@@ -1976,6 +1985,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         cleanup::shutdown();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
+        stop_atc_operator_runtime();
         mcp_agent_mail_storage::wbq_shutdown();
         mcp_agent_mail_storage::flush_async_commits();
 
@@ -2000,6 +2010,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     cleanup::shutdown();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
+    stop_atc_operator_runtime();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
 
@@ -2945,6 +2956,379 @@ fn tui_state_handle() -> Option<Arc<tui_bridge::TuiSharedState>> {
 
 fn set_tui_state_handle(state: Option<Arc<tui_bridge::TuiSharedState>>) {
     *lock_mutex(&TUI_STATE) = state;
+}
+
+const ATC_OPERATOR_ACTION_CAPACITY: usize = 64;
+const ATC_OPERATOR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const ATC_OPERATOR_MIN_TICK_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct AtcOperatorSnapshot {
+    pub(crate) enabled: bool,
+    pub(crate) source: String,
+    pub(crate) safe_mode: bool,
+    pub(crate) tick_count: u64,
+    pub(crate) tracked_agents: Vec<AtcOperatorAgentSnapshot>,
+    pub(crate) deadlock_cycles: usize,
+    pub(crate) eprocess_value: f64,
+    pub(crate) regret_avg: f64,
+    pub(crate) decisions_total: u64,
+    pub(crate) recent_actions: Vec<AtcOperatorActionSnapshot>,
+    pub(crate) last_tick_micros: i64,
+    pub(crate) last_tick_duration_micros: u64,
+    pub(crate) last_tick_budget_micros: u64,
+    pub(crate) last_tick_budget_exceeded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+}
+
+impl AtcOperatorSnapshot {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            source: "disabled".to_string(),
+            note: Some("ATC is disabled by configuration.".to_string()),
+            ..Self::default()
+        }
+    }
+
+    fn warming_up(enabled: bool) -> Self {
+        Self {
+            enabled,
+            source: "warming_up".to_string(),
+            note: Some("ATC supervisor starting; no live summary published yet.".to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct AtcOperatorAgentSnapshot {
+    pub(crate) name: String,
+    pub(crate) state: String,
+    pub(crate) silence_secs: i64,
+    pub(crate) posterior_alive: f64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct AtcOperatorActionSnapshot {
+    pub(crate) timestamp_micros: i64,
+    pub(crate) kind: String,
+    pub(crate) category: String,
+    pub(crate) agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<String>,
+}
+
+impl AtcOperatorActionSnapshot {
+    fn console_line(&self) -> String {
+        match self.message.as_deref() {
+            Some(message) => format!("[ATC:{}] {} -> {}", self.category, self.agent, message),
+            None => format!("[ATC:{}] {} {}", self.category, self.kind, self.agent),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AtcOperatorRuntime {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl AtcOperatorRuntime {
+    fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+static ATC_OPERATOR_SNAPSHOT: std::sync::LazyLock<Mutex<AtcOperatorSnapshot>> =
+    std::sync::LazyLock::new(|| Mutex::new(AtcOperatorSnapshot::disabled()));
+static ATC_OPERATOR_RUNTIME: std::sync::LazyLock<Mutex<Option<AtcOperatorRuntime>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+fn atc_liveness_state_label(state: atc::LivenessState) -> &'static str {
+    match state {
+        atc::LivenessState::Alive => "alive",
+        atc::LivenessState::Flaky => "flaky",
+        atc::LivenessState::Dead => "dead",
+    }
+}
+
+fn atc_tick_action_snapshot(
+    now_micros: i64,
+    action: atc::AtcTickAction,
+) -> AtcOperatorActionSnapshot {
+    match action {
+        atc::AtcTickAction::SendAdvisory { agent, message } => {
+            let category = if message.contains("Deadlock detected") {
+                "conflict"
+            } else {
+                "liveness"
+            };
+            let message = if message.contains("Reservations released.") {
+                message.replace("Reservations released.", "Reservation release recommended.")
+            } else {
+                message
+            };
+            AtcOperatorActionSnapshot {
+                timestamp_micros: now_micros,
+                kind: "send_advisory".to_string(),
+                category: category.to_string(),
+                agent,
+                message: Some(message),
+            }
+        }
+        atc::AtcTickAction::ReleaseReservations { agent } => AtcOperatorActionSnapshot {
+            timestamp_micros: now_micros,
+            kind: "release_reservations_requested".to_string(),
+            category: "liveness".to_string(),
+            agent,
+            message: Some("ATC recommends releasing this agent's reservations.".to_string()),
+        },
+        atc::AtcTickAction::ProbeAgent { agent } => AtcOperatorActionSnapshot {
+            timestamp_micros: now_micros,
+            kind: "probe_agent".to_string(),
+            category: "probe".to_string(),
+            agent,
+            message: None,
+        },
+    }
+}
+
+fn build_atc_operator_snapshot(
+    summary: Option<atc::AtcSummarySnapshot>,
+    recent_actions: &VecDeque<AtcOperatorActionSnapshot>,
+    last_tick_micros: i64,
+    last_tick_duration_micros: u64,
+    last_tick_budget_micros: u64,
+    last_tick_budget_exceeded: bool,
+    note: Option<String>,
+) -> AtcOperatorSnapshot {
+    if let Some(summary) = summary {
+        return AtcOperatorSnapshot {
+            enabled: summary.enabled,
+            source: "live".to_string(),
+            safe_mode: summary.safe_mode,
+            tick_count: summary.tick_count,
+            tracked_agents: summary
+                .tracked_agents
+                .into_iter()
+                .map(|agent| AtcOperatorAgentSnapshot {
+                    name: agent.name,
+                    state: atc_liveness_state_label(agent.state).to_string(),
+                    silence_secs: agent.silence_secs,
+                    posterior_alive: agent.posterior_alive,
+                })
+                .collect(),
+            deadlock_cycles: summary.deadlock_cycles,
+            eprocess_value: summary.eprocess_value,
+            regret_avg: summary.regret_avg,
+            decisions_total: summary.decisions_total,
+            recent_actions: recent_actions.iter().cloned().collect(),
+            last_tick_micros,
+            last_tick_duration_micros,
+            last_tick_budget_micros,
+            last_tick_budget_exceeded,
+            note,
+        };
+    }
+
+    AtcOperatorSnapshot {
+        enabled: true,
+        source: "warming_up".to_string(),
+        recent_actions: recent_actions.iter().cloned().collect(),
+        last_tick_micros,
+        last_tick_duration_micros,
+        last_tick_budget_micros,
+        last_tick_budget_exceeded,
+        note,
+        ..AtcOperatorSnapshot::default()
+    }
+}
+
+pub(crate) fn atc_operator_snapshot() -> AtcOperatorSnapshot {
+    lock_mutex(&ATC_OPERATOR_SNAPSHOT).clone()
+}
+
+fn set_atc_operator_snapshot(snapshot: AtcOperatorSnapshot) {
+    *lock_mutex(&ATC_OPERATOR_SNAPSHOT) = snapshot;
+}
+
+fn atc_action_cooldown_key(snapshot: &AtcOperatorActionSnapshot) -> String {
+    snapshot.message.as_deref().map_or_else(
+        || format!("{}:{}:{}", snapshot.kind, snapshot.category, snapshot.agent),
+        |message| {
+            format!(
+                "{}:{}:{}:{}",
+                snapshot.kind, snapshot.category, snapshot.agent, message
+            )
+        },
+    )
+}
+
+fn wait_for_atc_operator_interval(stop: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now()
+        .checked_add(duration)
+        .unwrap_or_else(Instant::now);
+    while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(remaining.min(ATC_OPERATOR_STOP_POLL_INTERVAL));
+    }
+    false
+}
+
+fn maybe_emit_atc_summary_log(state: &tui_bridge::TuiSharedState, snapshot: &AtcOperatorSnapshot) {
+    let suspect_count = snapshot
+        .tracked_agents
+        .iter()
+        .filter(|agent| agent.state != "alive")
+        .count();
+    state.push_console_log(format!(
+        "[ATC] tick={} decisions={} deadlocks={} suspect_agents={} safe_mode={} e={:.2} regret={:.2}",
+        snapshot.tick_count,
+        snapshot.decisions_total,
+        snapshot.deadlock_cycles,
+        suspect_count,
+        snapshot.safe_mode,
+        snapshot.eprocess_value,
+        snapshot.regret_avg
+    ));
+}
+
+fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBool>) {
+    let atc_config = atc::AtcEngine::config_from_env(&config);
+    let tick_interval = Duration::from_micros(
+        u64::try_from(atc_config.probe_interval_micros.max(250_000)).unwrap_or(250_000),
+    )
+    .max(ATC_OPERATOR_MIN_TICK_INTERVAL);
+    let advisory_cooldown_micros = atc_config.advisory_cooldown_micros.max(0);
+    let summary_interval_micros = atc_config.summary_interval_micros.max(1);
+
+    let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
+    let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
+    let mut last_summary_log_micros = 0_i64;
+
+    set_atc_operator_snapshot(AtcOperatorSnapshot::warming_up(true));
+
+    while !stop.load(Ordering::Relaxed) {
+        let now_micros = mcp_agent_mail_core::timestamps::now_micros();
+        let started_at = Instant::now();
+        let actions = atc::atc_tick(now_micros);
+        let tick_duration_micros =
+            u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX)))
+                .unwrap_or(u64::MAX);
+        let tick_budget_exceeded = tick_duration_micros > atc_config.tick_budget_micros;
+
+        let mut visible_actions = Vec::new();
+        for action in actions {
+            let snapshot = atc_tick_action_snapshot(now_micros, action);
+            let cooldown_key = atc_action_cooldown_key(&snapshot);
+            let suppressed = last_action_by_key
+                .get(&cooldown_key)
+                .copied()
+                .is_some_and(|last| {
+                    advisory_cooldown_micros > 0
+                        && now_micros.saturating_sub(last) < advisory_cooldown_micros
+                });
+            if suppressed {
+                continue;
+            }
+            last_action_by_key.insert(cooldown_key, now_micros);
+            visible_actions.push(snapshot.clone());
+            if recent_actions.len() >= ATC_OPERATOR_ACTION_CAPACITY {
+                let _ = recent_actions.pop_front();
+            }
+            recent_actions.push_back(snapshot);
+        }
+
+        let live_summary = atc::atc_summary();
+        let note = tick_budget_exceeded.then(|| {
+            format!(
+                "ATC tick exceeded budget: {}us > {}us",
+                tick_duration_micros, atc_config.tick_budget_micros
+            )
+        });
+        let snapshot = build_atc_operator_snapshot(
+            live_summary,
+            &recent_actions,
+            now_micros,
+            tick_duration_micros,
+            atc_config.tick_budget_micros,
+            tick_budget_exceeded,
+            note.clone(),
+        );
+        set_atc_operator_snapshot(snapshot.clone());
+
+        if let Some(state) = tui_state_handle() {
+            for action in &visible_actions {
+                state.push_console_log(action.console_line());
+            }
+            if now_micros.saturating_sub(last_summary_log_micros) >= summary_interval_micros {
+                maybe_emit_atc_summary_log(&state, &snapshot);
+                last_summary_log_micros = now_micros;
+            }
+        }
+
+        if tick_budget_exceeded {
+            tracing::warn!(
+                duration_micros = tick_duration_micros,
+                budget_micros = atc_config.tick_budget_micros,
+                "ATC operator tick exceeded configured budget"
+            );
+        }
+
+        if !wait_for_atc_operator_interval(stop.as_ref(), tick_interval) {
+            break;
+        }
+    }
+}
+
+fn start_atc_operator_runtime(config: &mcp_agent_mail_core::Config) {
+    stop_atc_operator_runtime();
+    if !config.atc_enabled {
+        set_atc_operator_snapshot(AtcOperatorSnapshot::disabled());
+        return;
+    }
+
+    set_atc_operator_snapshot(AtcOperatorSnapshot::warming_up(true));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let config = config.clone();
+    let stop_for_thread = Arc::clone(&stop);
+    let join = match std::thread::Builder::new()
+        .name("atc-operator".to_string())
+        .spawn(move || run_atc_operator_loop(config, stop_for_thread))
+    {
+        Ok(join) => join,
+        Err(error) => {
+            tracing::error!(%error, "failed to spawn ATC operator thread");
+            set_atc_operator_snapshot(AtcOperatorSnapshot {
+                enabled: true,
+                source: "spawn_failed".to_string(),
+                note: Some(format!("ATC operator thread failed to start: {error}")),
+                ..AtcOperatorSnapshot::default()
+            });
+            return;
+        }
+    };
+
+    *lock_mutex(&ATC_OPERATOR_RUNTIME) = Some(AtcOperatorRuntime {
+        stop,
+        join: Some(join),
+    });
+}
+
+fn stop_atc_operator_runtime() {
+    if let Some(runtime) = lock_mutex(&ATC_OPERATOR_RUNTIME).take() {
+        runtime.shutdown();
+    }
 }
 
 /// Emit a [`MailEvent`] to the TUI ring buffer (non-blocking).
@@ -5527,6 +5911,48 @@ impl HttpState {
                 }
             };
             return Some(self.json_response(req, 200, &payload));
+        }
+
+        // ── Web Dashboard (TUI mirror in browser) ────────────────────
+        if path == "/web-dashboard" || path == "/web-dashboard/" {
+            if !matches!(req.method, Http1Method::Get) {
+                return Some(self.error_response(req, 405, "Method Not Allowed"));
+            }
+            let host = req
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                .map_or("", |(_, v)| v.as_str());
+            let html = tui_web_dashboard::handle_page(host);
+            return Some(self.raw_response(
+                req,
+                200,
+                "text/html; charset=utf-8",
+                html.into_bytes(),
+            ));
+        }
+
+        if path == "/web-dashboard/state" {
+            if !matches!(req.method, Http1Method::Get) {
+                return Some(self.error_response(req, 405, "Method Not Allowed"));
+            }
+            let Some(state) = tui_state_handle() else {
+                return Some(self.error_response(req, 503, "TUI state is not active"));
+            };
+            let (_path_part, query_part) = split_path_query(&req.uri);
+            let payload = tui_web_dashboard::handle_state(&state, query_part.as_deref());
+            return Some(self.raw_response(req, 200, "application/json", payload.into_bytes()));
+        }
+
+        if path == "/web-dashboard/input" {
+            if !matches!(req.method, Http1Method::Post) {
+                return Some(self.error_response(req, 405, "Method Not Allowed"));
+            }
+            let Some(state) = tui_state_handle() else {
+                return Some(self.error_response(req, 503, "TUI state is not active"));
+            };
+            let (status, payload) = tui_web_dashboard::handle_input(&state, &req.body);
+            return Some(self.raw_response(req, status, "application/json", payload.into_bytes()));
         }
 
         if path == "/mail" || path.starts_with("/mail/") {
@@ -9508,6 +9934,38 @@ mod tests {
         assert_eq!(payload["mode"], "snapshot");
         assert_eq!(payload["transport"], "http-poll");
         assert!(payload["next_seq"].as_u64().is_some());
+    }
+
+    #[test]
+    fn atc_action_cooldown_key_distinguishes_message_variants() {
+        let base = AtcOperatorActionSnapshot {
+            timestamp_micros: 1,
+            kind: "send_advisory".to_string(),
+            category: "liveness".to_string(),
+            agent: "AlphaAgent".to_string(),
+            message: Some("Agent appears unresponsive.".to_string()),
+        };
+        let other_message = AtcOperatorActionSnapshot {
+            message: Some("Automated reservation release requested.".to_string()),
+            ..base.clone()
+        };
+        let probe = AtcOperatorActionSnapshot {
+            kind: "probe_agent".to_string(),
+            category: "probe".to_string(),
+            message: None,
+            ..base.clone()
+        };
+
+        assert_ne!(
+            atc_action_cooldown_key(&base),
+            atc_action_cooldown_key(&other_message),
+            "distinct advisories for the same agent must not share one cooldown key"
+        );
+        assert_ne!(
+            atc_action_cooldown_key(&base),
+            atc_action_cooldown_key(&probe),
+            "probe actions and advisories must not share a cooldown key"
+        );
     }
 
     #[test]

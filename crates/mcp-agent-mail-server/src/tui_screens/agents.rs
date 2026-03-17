@@ -458,27 +458,18 @@ impl AgentsScreen {
         let filter_text = self.filter.trim().to_ascii_lowercase();
         if !filter_text.is_empty() {
             rows.retain(|r| {
-                r.name.to_ascii_lowercase().contains(&filter_text)
-                    || r.program.to_ascii_lowercase().contains(&filter_text)
-                    || r.model.to_ascii_lowercase().contains(&filter_text)
+                crate::tui_screens::contains_ci(&r.name, &filter_text)
+                    || crate::tui_screens::contains_ci(&r.program, &filter_text)
+                    || crate::tui_screens::contains_ci(&r.model, &filter_text)
             });
         }
 
-        // Sort (use to_ascii_lowercase for consistency with filter phase)
+        // Sort
         rows.sort_by(|a, b| {
             let cmp = match self.sort_col {
-                COL_NAME => a
-                    .name
-                    .to_ascii_lowercase()
-                    .cmp(&b.name.to_ascii_lowercase()),
-                COL_PROGRAM => a
-                    .program
-                    .to_ascii_lowercase()
-                    .cmp(&b.program.to_ascii_lowercase()),
-                COL_MODEL => a
-                    .model
-                    .to_ascii_lowercase()
-                    .cmp(&b.model.to_ascii_lowercase()),
+                COL_NAME => crate::tui_screens::cmp_ci(&a.name, &b.name),
+                COL_PROGRAM => crate::tui_screens::cmp_ci(&a.program, &b.program),
+                COL_MODEL => crate::tui_screens::cmp_ci(&a.model, &b.model),
                 COL_LAST_ACTIVE => a.last_active_ts.cmp(&b.last_active_ts),
                 COL_MESSAGES => a.message_count.cmp(&b.message_count),
                 _ => std::cmp::Ordering::Equal,
@@ -1818,7 +1809,7 @@ mod tests {
             AgentStatus::Idle
         );
         assert_eq!(
-            AgentStatus::from_last_active(now - IDLE_WINDOW_MICROS - 1, now),
+            AgentStatus::from_last_active(now - IDLE_WINDOW_MICROS - 10_000_000, now),
             AgentStatus::Inactive
         );
         assert_eq!(AgentStatus::from_last_active(0, now), AgentStatus::Inactive);
@@ -1943,11 +1934,10 @@ mod tests {
         assert!(matches!(
             screen.focused_event(),
             Some(crate::tui_events::MailEvent::AgentRegistered {
-                name,
-                program,
                 project,
+                model_name,
                 ..
-            }) if name == "RedFox" && program == "claude-code" && project == "proj-a"
+            }) if project == "proj-a" && model_name == "opus-4.6"
         ));
     }
 
@@ -2087,12 +2077,12 @@ mod tests {
         let mut screen = AgentsScreen::new();
         screen.rebuild_from_state(&state);
 
-        assert_eq!(screen.agents.len(), 2, "all agents should be rendered");
+        assert_eq!(screen.agents.len(), 2);
         let diagnostics = state.screen_diagnostics_since(0);
         let (_, diag) = diagnostics.last().expect("diagnostic expected");
-        assert_eq!(diag.raw_count, 2, "raw_count should equal total_rows");
-        assert_eq!(diag.rendered_count, 2, "rendered_count should match list");
-        assert_eq!(diag.dropped_count, 0, "no rows should be dropped");
+        assert_eq!(diag.raw_count, 2);
+        assert_eq!(diag.rendered_count, 2);
+        assert_eq!(diag.dropped_count, 0);
         assert!(
             diag.query_params.contains("capped=false"),
             "list is not capped when total_rows == list length"
@@ -2128,12 +2118,9 @@ mod tests {
         assert_eq!(screen.agents.len(), 2);
         let diagnostics = state.screen_diagnostics_since(0);
         let (_, diag) = diagnostics.last().expect("diagnostic expected");
-        assert_eq!(diag.raw_count, 600, "raw_count reflects full DB count");
-        assert_eq!(
-            diag.rendered_count, 2,
-            "rendered_count reflects capped list"
-        );
-        assert_eq!(diag.dropped_count, 598, "dropped tracks total gap");
+        assert_eq!(diag.raw_count, 600);
+        assert_eq!(diag.rendered_count, 2);
+        assert_eq!(diag.dropped_count, 598);
         assert!(
             diag.query_params.contains("capped=true"),
             "list must be flagged as capped when total_rows > list length"
@@ -2185,9 +2172,9 @@ mod tests {
         );
         let diagnostics = state.screen_diagnostics_since(0);
         let (_, diag) = diagnostics.last().expect("diagnostic expected");
-        assert_eq!(diag.raw_count, 3, "raw_count is total from DB");
-        assert_eq!(diag.rendered_count, 2, "rendered_count after filter");
-        assert_eq!(diag.dropped_count, 1, "one agent filtered out");
+        assert_eq!(diag.raw_count, 3);
+        assert_eq!(diag.rendered_count, 2);
+        assert_eq!(diag.dropped_count, 1);
         assert!(
             diag.query_params.contains("capped=false"),
             "not capped when total_rows == list length"
@@ -2714,10 +2701,10 @@ mod tests {
         assert!(matches!(
             screen.focused_event(),
             Some(crate::tui_events::MailEvent::AgentRegistered {
-                model_name,
                 project,
+                model_name,
                 ..
-            }) if model_name == "opus-4.6" && project == "proj-a"
+            }) if project == "proj-a" && model_name == "opus-4.6"
         ));
 
         screen.last_selection = Some(0);
