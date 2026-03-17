@@ -1623,18 +1623,21 @@ impl Config {
         if let Some(v) = console_value("AM_ATC_EPROCESS_THRESHOLD")
             && let Ok(f) = v.trim().parse::<f64>()
             && f > 0.0
+            && f.is_finite()
         {
             config.atc_eprocess_threshold = f;
         }
         if let Some(v) = console_value("AM_ATC_CUSUM_THRESHOLD")
             && let Ok(f) = v.trim().parse::<f64>()
             && f > 0.0
+            && f.is_finite()
         {
             config.atc_cusum_threshold = f;
         }
         if let Some(v) = console_value("AM_ATC_CUSUM_DELTA")
             && let Ok(f) = v.trim().parse::<f64>()
             && f > 0.0
+            && f.is_finite()
         {
             config.atc_cusum_delta = f;
         }
@@ -1647,6 +1650,7 @@ impl Config {
         if let Some(v) = console_value("AM_ATC_SUSPICION_K")
             && let Ok(f) = v.trim().parse::<f64>()
             && f > 0.0
+            && f.is_finite()
         {
             config.atc_suspicion_k = f;
         }
@@ -2247,51 +2251,8 @@ fn parse_dotenv_value(raw: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-
-    // Handle double quotes with escapes
-    if trimmed.starts_with('"') {
-        let chars = trimmed.char_indices().skip(1);
-        let mut escaped = false;
-        let mut closing_idx = None;
-        for (i, c) in chars {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                closing_idx = Some(i);
-                break;
-            }
-        }
-        if let Some(end) = closing_idx {
-            let remainder = &trimmed[end + 1..];
-            let rem_trim = remainder.trim_start();
-            if rem_trim.is_empty() || rem_trim.starts_with('#') {
-                return unescape_double_quotes(&trimmed[1..end]);
-            }
-        }
-    }
-
-    // Handle single quotes (no escapes)
-    if trimmed.starts_with('\'') {
-        let chars = trimmed.char_indices().skip(1);
-        let mut closing_idx = None;
-        for (i, c) in chars {
-            if c == '\'' {
-                closing_idx = Some(i);
-                break;
-            }
-        }
-        if let Some(end) = closing_idx {
-            let remainder = &trimmed[end + 1..];
-            let rem_trim = remainder.trim_start();
-            if rem_trim.is_empty() || rem_trim.starts_with('#') {
-                return trimmed[1..end].to_string();
-            }
-        }
-    }
-
-    strip_inline_comment(trimmed).to_string()
+    let uncommented = strip_inline_comment(trimmed);
+    parse_dotenv_quoted_segments(uncommented).unwrap_or_else(|| uncommented.to_string())
 }
 
 fn strip_inline_comment(value: &str) -> &str {
@@ -2338,27 +2299,77 @@ fn extract_inline_comment(line: &str) -> Option<&str> {
     None
 }
 
-fn unescape_double_quotes(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('\\') | None => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
+fn parse_dotenv_quoted_segments(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped_in_double_quote = false;
+    let mut escaped_unquoted = false;
+    let mut saw_quote = false;
+
+    for ch in value.chars() {
+        if in_single_quote {
+            if ch == '\'' {
+                in_single_quote = false;
+            } else {
+                out.push(ch);
             }
-        } else {
+            continue;
+        }
+
+        if in_double_quote {
+            if escaped_in_double_quote {
+                match ch {
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                escaped_in_double_quote = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => escaped_in_double_quote = true,
+                '"' => in_double_quote = false,
+                _ => out.push(ch),
+            }
+            continue;
+        }
+
+        if escaped_unquoted {
             out.push(ch);
+            escaped_unquoted = false;
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                in_single_quote = true;
+                saw_quote = true;
+            }
+            '"' => {
+                in_double_quote = true;
+                saw_quote = true;
+            }
+            '\\' => {
+                out.push('\\');
+                escaped_unquoted = true;
+            }
+            _ => out.push(ch),
         }
     }
-    out
+
+    if in_single_quote || in_double_quote || escaped_in_double_quote {
+        return None;
+    }
+
+    saw_quote.then_some(out)
 }
 
 fn parse_bool(value: &str, default: bool) -> bool {
@@ -2444,7 +2455,8 @@ fn normalize_tool_filter_mode(value: &str) -> String {
 
 fn env_f64(key: &str, default: f64) -> f64 {
     env_value(key)
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|f| f.is_finite())
         .unwrap_or(default)
 }
 
@@ -2786,6 +2798,28 @@ mod tests {
         assert_eq!(values.get("SINGLE"), Some(&"hi".to_string()));
         assert_eq!(values.get("TRAIL"), Some(&"keep".to_string()));
         assert_eq!(values.get("ESCAPED"), Some(&"line\nnext".to_string()));
+    }
+
+    #[test]
+    fn test_parse_dotenv_contents_with_inline_quote_segments() {
+        let contents = r#"
+            CONCAT=bar" # not a comment"
+            MIXED=prefix"quoted"suffix # real comment
+            SINGLE=pre'quoted # literal'post # trailing comment
+        "#;
+        let values = parse_dotenv_contents(contents);
+        assert_eq!(
+            values.get("CONCAT").map(String::as_str),
+            Some("bar # not a comment")
+        );
+        assert_eq!(
+            values.get("MIXED").map(String::as_str),
+            Some("prefixquotedsuffix")
+        );
+        assert_eq!(
+            values.get("SINGLE").map(String::as_str),
+            Some("prequoted # literalpost")
+        );
     }
 
     // -----------------------------------------------------------------------

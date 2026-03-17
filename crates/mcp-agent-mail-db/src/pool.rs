@@ -1303,15 +1303,24 @@ fn startup_data_repairs(conn: &DbConn) -> Result<(), SqlError> {
         .is_empty();
 
     if has_messages {
-        // Seconds → microseconds (timestamps < 10^13 are clearly seconds)
-        conn.execute_raw(
-            "UPDATE messages SET created_ts = created_ts * 1000000 \
-             WHERE created_ts > 0 AND created_ts < 10000000000000",
-        )?;
-        // Milliseconds → microseconds (timestamps < 10^16 are clearly millis)
+        // Magnitude-based detection (non-overlapping ranges):
+        //   2026 seconds  ≈ 1.77 × 10⁹   →  < 10¹² is definitely seconds
+        //   2026 millis   ≈ 1.77 × 10¹²   →  [10¹², 10¹⁵) is definitely millis
+        //   2026 micros   ≈ 1.77 × 10¹⁵   →  ≥ 10¹⁵ is already correct
+        //
+        // Order matters: handle millis FIRST to avoid seconds check catching
+        // millis values that happen to be < 10¹² (they can't — millis are ≥ 10¹²).
+        // But we still process millis first as a safety measure.
+
+        // Milliseconds → microseconds  [10^12, 10^15)
         conn.execute_raw(
             "UPDATE messages SET created_ts = created_ts * 1000 \
-             WHERE created_ts > 0 AND created_ts < 10000000000000000",
+             WHERE created_ts >= 1000000000000 AND created_ts < 1000000000000000",
+        )?;
+        // Seconds → microseconds  (0, 10^12)
+        conn.execute_raw(
+            "UPDATE messages SET created_ts = created_ts * 1000000 \
+             WHERE created_ts > 0 AND created_ts < 1000000000000",
         )?;
     }
 
@@ -3162,8 +3171,8 @@ mod tests {
     fn ensure_sqlite_file_healthy_restores_from_timestamped_bak() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
-        let backup1 = dir.path().join("storage.sqlite3.20240101_120000.bak");
-        let backup2 = dir.path().join("storage.sqlite3.20240102_120000.bak"); // Should pick the newest
+        let backup1 = dir.path().join("storage.sqlite3.bak.20240101_120000");
+        let backup2 = dir.path().join("storage.sqlite3.bak.20240102_120000"); // Should pick the newest
 
         // Create a healthy DB.
         let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();

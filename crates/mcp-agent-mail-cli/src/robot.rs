@@ -3047,7 +3047,11 @@ fn build_reservations(
     expiring_minutes: Option<u32>,
 ) -> Result<(ReservationsData, Vec<String>), CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
-    let expiring_threshold = now_us + i64::from(expiring_minutes.unwrap_or(10)) * 60 * 1_000_000;
+    let expiring_threshold = now_us.saturating_add(
+        i64::from(expiring_minutes.unwrap_or(10))
+            .saturating_mul(60)
+            .saturating_mul(1_000_000),
+    );
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let active_reservation_join =

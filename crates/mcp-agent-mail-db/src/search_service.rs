@@ -502,7 +502,7 @@ fn unresolved_result_matches_agent_filter(query: &SearchQuery, result: &SearchRe
     );
 
     // If the result has recipient info, check it.
-    let recipient_matches = result.to.as_ref().is_none_or(|to| {
+    let recipient_matches = result.to.as_ref().is_some_and(|to| {
         to.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
             || result
                 .cc

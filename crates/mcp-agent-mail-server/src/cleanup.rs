@@ -562,11 +562,18 @@ fn check_git_listed_activity(
     };
 
     let reader = BufReader::new(stdout);
+    let mut count = 0;
     for line in reader.lines().map_while(Result::ok) {
         if path_modified_within_grace(&workspace.join(line), now_us, grace_us) {
             let _ = child.kill();
             let _ = child.wait();
             return ActivityProbeResult::Active;
+        }
+        count += 1;
+        if count >= ACTIVITY_PROBE_PATH_LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return ActivityProbeResult::Truncated;
         }
     }
 

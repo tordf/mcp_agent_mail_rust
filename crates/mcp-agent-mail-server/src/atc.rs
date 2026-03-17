@@ -5958,28 +5958,26 @@ mod alien_enhancement_tests {
 
     #[test]
     fn tuner_update_interval_respected() {
-        let core = default_liveness_core();
+        let mut core = default_liveness_core();
         let mut tuner = LossMatrixTuner::from_core(&core, 5);
-        let mut core_clone = core.clone();
         for _ in 0..4 {
             tuner.record_outcome(LivenessAction::DeclareAlive, LivenessState::Alive, 1.0);
         }
-        assert!(!tuner.maybe_update(&mut core_clone));
+        assert!(!tuner.maybe_update(&mut core));
         tuner.record_outcome(LivenessAction::DeclareAlive, LivenessState::Alive, 1.0);
-        assert!(tuner.maybe_update(&mut core_clone));
+        assert!(tuner.maybe_update(&mut core));
     }
 
     #[test]
     fn tuner_adjusts_loss_values() {
-        let core = default_liveness_core();
+        let mut core = default_liveness_core();
         let original_loss = core.loss_entry(LivenessAction::Suspect, LivenessState::Alive);
         let mut tuner = LossMatrixTuner::from_core(&core, 3);
-        let mut core_clone = core.clone();
         for _ in 0..3 {
             tuner.record_outcome(LivenessAction::Suspect, LivenessState::Alive, 20.0);
         }
-        tuner.maybe_update(&mut core_clone);
-        let new_loss = core_clone.loss_entry(LivenessAction::Suspect, LivenessState::Alive);
+        tuner.maybe_update(&mut core);
+        let new_loss = core.loss_entry(LivenessAction::Suspect, LivenessState::Alive);
         assert!(
             (new_loss - original_loss).abs() > 0.001,
             "PID should adjust loss: original={original_loss}, new={new_loss}"

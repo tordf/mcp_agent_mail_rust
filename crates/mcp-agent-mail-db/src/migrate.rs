@@ -141,7 +141,7 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
                 .ok()
                 .map(|rows| !rows.is_empty())
         });
-        
+
         let has_rows = table_has_rows.unwrap_or(false);
         if !has_rows {
             continue; // Table doesn't exist or is empty

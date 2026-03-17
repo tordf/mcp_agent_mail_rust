@@ -232,7 +232,7 @@ fn build_importance_filter_plan(query: &PlannerQuery) -> ImportanceFilterPlan {
 
     let filter = if has_urgent && !has_high && !has_normal && !has_low {
         Some(ImportanceFilter::Urgent)
-    } else if has_high && !has_normal && !has_low {
+    } else if has_high && !has_normal && !has_urgent && !has_low {
         Some(ImportanceFilter::High)
     } else if has_normal && !has_high && !has_urgent && !has_low {
         Some(ImportanceFilter::Normal)
@@ -491,7 +491,26 @@ fn refresh_index_health_metrics(bridge: &TantivyBridge) {
         .index()
         .reader()
         .map_or(0, |reader| reader.searcher().num_docs());
-    let index_size_bytes = measure_index_dir_bytes(bridge.index_dir());
+
+    // Only perform the expensive recursive filesystem scan occasionally
+    // to avoid blocking the synchronous message send path.
+    static LAST_MEASURED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = current_unix_micros();
+    let last = LAST_MEASURED.load(std::sync::atomic::Ordering::Relaxed);
+    
+    // Measure at most once every 60 seconds
+    let index_size_bytes = if now - last > 60_000_000 {
+        let size = measure_index_dir_bytes(bridge.index_dir());
+        LAST_MEASURED.store(now, std::sync::atomic::Ordering::Relaxed);
+        size
+    } else {
+        // Fallback to the last known recorded metric value
+        mcp_agent_mail_core::metrics::global_metrics()
+            .search
+            .index_size_bytes
+            .load()
+    };
+
     mcp_agent_mail_core::metrics::global_metrics()
         .search
         .update_index_health(index_size_bytes, doc_count);
@@ -2634,11 +2653,11 @@ mod tests {
             let extracted = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(input) {
                 ":memory:".to_string()
             } else if let Some(path) =
-                mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(input)
+                mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)
             {
-                path.to_string_lossy().into_owned()
+                crate::pool::normalize_sqlite_path_for_pool_key(path.to_string_lossy().as_ref())
             } else {
-                input.to_string()
+                db_url.to_string()
             };
             assert_eq!(
                 extracted, *expected,

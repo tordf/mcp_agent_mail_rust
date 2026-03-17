@@ -1041,7 +1041,7 @@ mod tests {
         });
         ctx.sender_policies.push(SenderPolicy {
             project_id: 1,
-            agent_id: 50,
+            agent_id: 30,
             policy: ContactPolicyKind::ContactsOnly,
         });
 

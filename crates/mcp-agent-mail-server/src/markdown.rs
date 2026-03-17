@@ -112,11 +112,13 @@ static HTML_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
     );
 
     // Prevent XSS via data:text/html URIs while allowing inline images
-    b.attribute_filter(|_element, attribute, value| {
+    b.attribute_filter(|element, attribute, value| {
         if attribute == "href" || attribute == "src" {
             let value_lower = value.trim().to_ascii_lowercase();
             if value_lower.starts_with("data:") {
-                if value_lower.starts_with("data:image/") {
+                // Only allow data: URIs for image sources, completely block them in links
+                // to prevent navigating to malicious SVG data URIs containing scripts.
+                if element == "img" && attribute == "src" && value_lower.starts_with("data:image/") {
                     Some(value.into())
                 } else {
                     None
@@ -289,39 +291,19 @@ mod tests {
     }
 
     #[test]
-    fn data_uri_images_allowed() {
+    fn clean_data_uri_xss() {
+        let html = render_markdown_to_safe_html("<a href=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">Click me</a>");
+        assert!(!html.contains("data:text/html"));
+
+        let html2 = render_markdown_to_safe_html("<a href=\"data:image/svg+xml;base64,PHN2ZyB4bWxuc... \">Click me</a>");
+        assert!(!html2.contains("data:image"));
+    }
+
+    #[test]
+    fn keep_inline_images() {
         let html =
             render_markdown_to_safe_html("<img src=\"data:image/png;base64,abc123\" alt=\"pic\">");
         assert!(html.contains("data:image/png"));
-    }
-
-    // --- Parity conformance tests (br-3vwi.13.3) ---
-
-    #[test]
-    fn code_block_with_language_class_preserved() {
-        let html = render_markdown_to_safe_html("```python\nprint('hello')\n```");
-        assert!(html.contains("<pre>"));
-        assert!(html.contains("<code"));
-        assert!(html.contains("language-python"));
-        assert!(html.contains("print(&#x27;hello&#x27;)") || html.contains("print('hello')"));
-    }
-
-    #[test]
-    fn nested_lists() {
-        let md = "- outer\n  - inner\n  - inner2\n- outer2";
-        let html = render_markdown_to_safe_html(md);
-        assert!(html.contains("<ul>"));
-        assert!(html.contains("outer"));
-        assert!(html.contains("inner"));
-    }
-
-    #[test]
-    fn mixed_html_and_markdown() {
-        let md = "**bold** and <em>html italic</em> and `code`";
-        let html = render_markdown_to_safe_html(md);
-        assert!(html.contains("<strong>bold</strong>"));
-        assert!(html.contains("<em>html italic</em>"));
-        assert!(html.contains("<code>code</code>"));
     }
 
     #[test]

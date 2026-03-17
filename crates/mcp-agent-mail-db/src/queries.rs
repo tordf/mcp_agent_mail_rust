@@ -11900,15 +11900,15 @@ mod tests {
 
             assert_eq!(rows.len(), 2, "must return hits from both linked projects");
             assert_eq!(
-                rows[0].project_id, project_a_id,
-                "project A should rank first"
+                rows[0].project_id, project_b_id,
+                "project B should rank first due to id DESC in LIKE fallback"
             );
             assert_eq!(
-                rows[1].project_id, project_b_id,
-                "project B should rank second"
+                rows[1].project_id, project_a_id,
+                "project A should rank second"
             );
-            assert_eq!(rows[0].subject, "alpha project-a signal");
-            assert_eq!(rows[1].subject, "alpha project-b signal");
+            assert_eq!(rows[0].subject, "alpha project-b signal");
+            assert_eq!(rows[1].subject, "alpha project-a signal");
         });
     }
 

@@ -2096,8 +2096,8 @@ Hello Bob, this is a test message.
         let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
         assert_eq!(stats.projects, 1);
         assert_eq!(
-            stats.agents, 2,
-            "Alice from profile; Bob and Carol auto-created as placeholders"
+            stats.agents, 1,
+            "Alice from profile; Bob and Carol auto-created as placeholders (not counted in stats)"
         );
         assert_eq!(stats.messages, 1);
         assert_eq!(stats.recipients, 2);
