@@ -2360,7 +2360,6 @@ fn parse_dotenv_quoted_segments(value: &str) -> Option<String> {
                 saw_quote = true;
             }
             '\\' => {
-                out.push('\\');
                 escaped_unquoted = true;
             }
             _ => out.push(ch),
