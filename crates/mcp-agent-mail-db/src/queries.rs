@@ -5779,7 +5779,7 @@ async fn release_reservations_by_ids_matching_expiry(
     if expires_at_or_before.is_some() {
         release_sql.push_str(" AND expires_ts <= ?");
     }
-    release_sql.push_str(" LIMIT 1)");
+    release_sql.push_str(" LIMIT 1) RETURNING reservation_id");
 
     for id in ids {
         let released_ts = release_marker;
@@ -5791,13 +5791,25 @@ async fn release_reservations_by_ids_matching_expiry(
         if let Some(expiry_cutoff) = expires_at_or_before {
             release_params.push(Value::BigInt(expiry_cutoff));
         }
-        let affected = try_in_tx!(
+        let rows = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, &release_sql, &release_params).await)
+            map_sql_outcome(traw_query(cx, &tracked, &release_sql, &release_params).await)
         );
-        if affected == 0 {
+        let Some(row) = rows.first() else {
             continue;
+        };
+        let Some(returned_id) = row_first_i64(row) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "release reservation RETURNING id yielded non-integer id".to_string(),
+            ));
+        };
+        if returned_id != *id {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "release reservation RETURNING id mismatch: expected {id}, got {returned_id}"
+            )));
         }
 
         release_marker = release_marker.saturating_add(1);

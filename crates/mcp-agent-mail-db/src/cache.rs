@@ -1259,7 +1259,7 @@ mod tests {
         let human_key = (scope_fp, InternedStr::new("/data/shared-proj"));
 
         let shared_from_slug = {
-            let by_slug = cache.projects_by_slug.read();
+            let mut by_slug = cache.projects_by_slug.write();
             Arc::clone(
                 &by_slug
                     .get(&slug_key)
@@ -1267,7 +1267,7 @@ mod tests {
                     .value,
             )
         };
-        let by_human_key = cache.projects_by_human_key.read();
+        let mut by_human_key = cache.projects_by_human_key.write();
         let shared_from_human_key = &by_human_key
             .get(&human_key)
             .expect("project cached by human key")
@@ -1290,10 +1290,10 @@ mod tests {
         let id_key = (scope_fp, 707);
 
         let shared_from_key = {
-            let by_key = cache.agents_by_key.read();
+            let mut by_key = cache.agents_by_key.write();
             Arc::clone(&by_key.get(&key).expect("agent cached by key").value)
         };
-        let by_id = cache.agents_by_id.read();
+        let mut by_id = cache.agents_by_id.write();
         let shared_from_id = &by_id.get(&id_key).expect("agent cached by id").value;
 
         assert!(
