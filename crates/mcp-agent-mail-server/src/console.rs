@@ -329,6 +329,13 @@ pub fn render_tool_call_start(
     project: Option<&str>,
     agent: Option<&str>,
 ) -> Vec<String> {
+    // Sanitize user-supplied values to prevent terminal escape injection.
+    let tool_name = &strip_ansi_content(tool_name);
+    let project = project.map(|p| strip_ansi_content(p));
+    let project = project.as_deref();
+    let agent = agent.map(|a| strip_ansi_content(a));
+    let agent = agent.as_deref();
+
     let mut lines = Vec::with_capacity(20);
     let timestamp = chrono::Utc::now().format("%H:%M:%S%.3f").to_string();
 
@@ -421,6 +428,9 @@ pub fn render_tool_call_end(
     per_table: &[(String, u64)],
     max_chars: usize,
 ) -> Vec<String> {
+    // Sanitize user-supplied tool name to prevent terminal escape injection.
+    let tool_name = &strip_ansi_content(tool_name);
+
     let mut lines = Vec::with_capacity(16);
     let w = 78;
     let sep = "\u{2500}".repeat(w);

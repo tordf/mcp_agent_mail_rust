@@ -4858,25 +4858,14 @@ mod palette_action_ids {
     pub const SCREEN_ARCHIVE_BROWSER: &str = "screen:archive_browser";
 }
 
-fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
-    match id {
-        palette_action_ids::SCREEN_DASHBOARD => Some(MailScreenId::Dashboard),
-        palette_action_ids::SCREEN_MESSAGES => Some(MailScreenId::Messages),
-        palette_action_ids::SCREEN_THREADS => Some(MailScreenId::Threads),
-        palette_action_ids::SCREEN_TIMELINE => Some(MailScreenId::Timeline),
-        palette_action_ids::SCREEN_AGENTS => Some(MailScreenId::Agents),
-        palette_action_ids::SCREEN_SEARCH => Some(MailScreenId::Search),
-        palette_action_ids::SCREEN_RESERVATIONS => Some(MailScreenId::Reservations),
-        palette_action_ids::SCREEN_TOOL_METRICS => Some(MailScreenId::ToolMetrics),
-        palette_action_ids::SCREEN_SYSTEM_HEALTH => Some(MailScreenId::SystemHealth),
-        palette_action_ids::SCREEN_PROJECTS => Some(MailScreenId::Projects),
-        palette_action_ids::SCREEN_CONTACTS => Some(MailScreenId::Contacts),
-        palette_action_ids::SCREEN_EXPLORER => Some(MailScreenId::Explorer),
-        palette_action_ids::SCREEN_ANALYTICS => Some(MailScreenId::Analytics),
-        palette_action_ids::SCREEN_ATTACHMENTS => Some(MailScreenId::Attachments),
-        palette_action_ids::SCREEN_ARCHIVE_BROWSER => Some(MailScreenId::ArchiveBrowser),
-        _ => None,
+pub(crate) fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
+    let (prefix, screen_key) = id.split_once(':')?;
+    if !prefix.eq_ignore_ascii_case("screen") {
+        return None;
     }
+
+    let normalized = screen_key.to_ascii_lowercase();
+    screen_id_from_tick_key(&normalized)
 }
 
 const fn screen_palette_action_id(id: MailScreenId) -> &'static str {
@@ -8475,6 +8464,18 @@ mod tests {
     fn palette_action_ids_unknown_returns_none() {
         assert_eq!(screen_from_palette_action_id("screen:unknown"), None);
         assert_eq!(screen_from_palette_action_id(""), None);
+    }
+
+    #[test]
+    fn palette_action_ids_accept_mixed_case_screen_names() {
+        assert_eq!(
+            screen_from_palette_action_id("screen:Messages"),
+            Some(MailScreenId::Messages)
+        );
+        assert_eq!(
+            screen_from_palette_action_id("Screen:Archive_Browser"),
+            Some(MailScreenId::ArchiveBrowser)
+        );
     }
 
     #[test]

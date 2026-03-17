@@ -1332,8 +1332,8 @@ impl AgentRhythm {
 
     /// Record a new activity observation.
     pub fn observe(&mut self, timestamp_micros: i64) {
-        if self.last_activity_ts > 0 {
-            let delta_micros = timestamp_micros.saturating_sub(self.last_activity_ts);
+        if self.last_activity_ts > 0 && timestamp_micros > self.last_activity_ts {
+            let delta_micros = timestamp_micros - self.last_activity_ts;
             let delta = nonnegative_i64_to_f64(delta_micros);
             let old_avg = self.effective_avg();
             self.avg_interval = self
@@ -1345,7 +1345,7 @@ impl AgentRhythm {
             );
             self.observation_count = self.observation_count.saturating_add(1);
         }
-        self.last_activity_ts = timestamp_micros;
+        self.last_activity_ts = self.last_activity_ts.max(timestamp_micros);
     }
 
     /// Effective average interval, blending observed data with the prior.
@@ -1676,25 +1676,13 @@ mod liveness_tests {
         rhythm.observe(100_000_000); // anchor at 100s
         rhythm.observe(50_000_000); // earlier timestamp (clock skew)
 
-        // Delta should be clamped to 0 via .max(0)
+        // Out of order should be ignored, so avg remains the prior
         assert!(
             rhythm.avg_interval >= 0.0,
             "avg_interval should not go negative after out-of-order timestamps, got {}",
             rhythm.avg_interval
         );
-        assert!(
-            rhythm.var_interval >= 0.0,
-            "var_interval should not go negative, got {}",
-            rhythm.var_interval
-        );
-        assert!(
-            rhythm.avg_interval.is_finite(),
-            "avg_interval should be finite"
-        );
-        assert!(
-            rhythm.var_interval.is_finite(),
-            "var_interval should be finite"
-        );
+        assert_eq!(rhythm.last_activity_ts, 100_000_000);
     }
 
     #[test]
@@ -1703,7 +1691,7 @@ mod liveness_tests {
         rhythm.observe(100_000_000);
         rhythm.observe(100_000_000); // delta = 0
 
-        // No division by zero or NaN
+        // No division by zero or NaN, should just be ignored to prevent variance collapse
         assert!(
             rhythm.avg_interval.is_finite(),
             "avg should be finite with zero delta"
@@ -1713,7 +1701,10 @@ mod liveness_tests {
             "var should be finite with zero delta"
         );
         assert!(rhythm.std_dev().is_finite(), "std_dev should be finite");
-        assert_eq!(rhythm.observation_count, 1, "should count 1 observation");
+        assert_eq!(
+            rhythm.observation_count, 0,
+            "should ignore identical timestamps to prevent variance collapse"
+        );
     }
 
     #[test]

@@ -387,23 +387,7 @@ impl AnalyticsScreen {
         let (prefix, value) = link.split_once(':')?;
         match prefix {
             "screen" => {
-                let target = match value {
-                    "dashboard" => Some(MailScreenId::Dashboard),
-                    "messages" => Some(MailScreenId::Messages),
-                    "threads" => Some(MailScreenId::Threads),
-                    "agents" => Some(MailScreenId::Agents),
-                    "search" => Some(MailScreenId::Search),
-                    "reservations" => Some(MailScreenId::Reservations),
-                    "tool_metrics" => Some(MailScreenId::ToolMetrics),
-                    "system_health" => Some(MailScreenId::SystemHealth),
-                    "timeline" => Some(MailScreenId::Timeline),
-                    "projects" => Some(MailScreenId::Projects),
-                    "contacts" => Some(MailScreenId::Contacts),
-                    "explorer" => Some(MailScreenId::Explorer),
-                    "analytics" => Some(MailScreenId::Analytics),
-                    _ => None,
-                };
-                target.map(MailScreenMsg::Navigate)
+                crate::tui_app::screen_from_palette_action_id(link).map(MailScreenMsg::Navigate)
             }
             "thread" => Some(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(
                 value.to_string(),
@@ -3662,6 +3646,8 @@ mod tests {
             ("screen:contacts", MailScreenId::Contacts),
             ("screen:explorer", MailScreenId::Explorer),
             ("screen:analytics", MailScreenId::Analytics),
+            ("screen:attachments", MailScreenId::Attachments),
+            ("screen:archive_browser", MailScreenId::ArchiveBrowser),
         ];
         for (link, expected) in &targets {
             let msg = AnalyticsScreen::parse_deep_link(link);
