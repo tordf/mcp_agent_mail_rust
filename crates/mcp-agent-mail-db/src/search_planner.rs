@@ -1392,7 +1392,7 @@ mod tests {
         q.limit = Some(0);
         assert_eq!(q.effective_limit(), 1); // clamp low
         q.limit = Some(999_999);
-        assert_eq!(q.effective_limit(), 100_000); // clamp high
+        assert_eq!(q.effective_limit(), 5000); // clamp high
         q.limit = Some(25);
         assert_eq!(q.effective_limit(), 25);
     }

@@ -5100,7 +5100,7 @@ pub async fn get_inbox_stats(
 /// Uses DELETE + INSERT … SELECT to recompute counters from
 /// `message_recipients` joined with `messages`.  This is the canonical way to
 /// keep `inbox_stats` consistent — it is always correct regardless of whether
-/// SQLite triggers fire, partially fire, or are absent.
+/// `SQLite` triggers fire, partially fire, or are absent.
 async fn rebuild_agent_inbox_stats_in_tx(cx: &Cx, tracked: &TrackedConnection<'_>, agent_id: i64) {
     let reset_sql = "DELETE FROM inbox_stats WHERE agent_id = ?";
     let rebuild_sql = "INSERT INTO inbox_stats \
@@ -7500,6 +7500,13 @@ mod tests {
         let human_key = "/tmp/scoped-project-cache";
 
         rt.block_on(async {
+            let conn_a = acquire_conn(&cx, &pool_a).await.into_result().expect("acquire a");
+            crate::schema::migrate_to_latest(&cx, &conn_a).await.into_result().expect("migrate a");
+            drop(conn_a);
+            let conn_b = acquire_conn(&cx, &pool_b).await.into_result().expect("acquire b");
+            crate::schema::migrate_to_latest(&cx, &conn_b).await.into_result().expect("migrate b");
+            drop(conn_b);
+
             ensure_project(&cx, &pool_a, human_key)
                 .await
                 .into_result()
@@ -12553,6 +12560,13 @@ mod tests {
         let pool_b = crate::create_pool(&cfg).expect("create pool b");
 
         rt.block_on(async {
+            let conn_a = acquire_conn(&cx, &pool_a).await.into_result().expect("acquire a");
+            crate::schema::migrate_to_latest(&cx, &conn_a).await.into_result().expect("migrate a");
+            drop(conn_a);
+            let conn_b = acquire_conn(&cx, &pool_b).await.into_result().expect("acquire b");
+            crate::schema::migrate_to_latest(&cx, &conn_b).await.into_result().expect("migrate b");
+            drop(conn_b);
+
             let project_a = ensure_project(&cx, &pool_a, "/tmp/deferred-touch-scope-a")
                 .await
                 .into_result()
@@ -12675,7 +12689,7 @@ mod tests {
                 &cx,
                 &pool,
                 project_b.id.unwrap_or(0),
-                "RedField",
+                "RedCat",
                 "codex-cli",
                 "gpt-5",
                 None,

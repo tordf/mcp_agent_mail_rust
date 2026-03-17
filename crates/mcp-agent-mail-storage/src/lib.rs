@@ -2005,8 +2005,7 @@ fn self_process_repo(
 
     // Phase 3: Drain queue + spill for this repo
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
-    let mut queue_is_empty = false;
-    {
+    let queue_is_empty = {
         let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
         while batch.len() < COALESCER_MAX_BATCH_SIZE {
             let next = q.front();
@@ -2025,8 +2024,8 @@ fn self_process_repo(
         if !batch.is_empty() {
             coalescer_depth_decrement(&rq.depth, batch.len() as u64);
         }
-        queue_is_empty = q.is_empty();
-    }
+        q.is_empty()
+    };
 
     // Drain spill ONLY if the main queue is completely empty to preserve FIFO order.
     // If the queue still has items, we'll get to the spill on a future iteration.

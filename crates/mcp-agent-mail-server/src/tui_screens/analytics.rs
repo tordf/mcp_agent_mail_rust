@@ -22,7 +22,7 @@ use mcp_agent_mail_core::{
 };
 
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::fancy::SummaryFooter;
 
 /// Refresh the insight feed every N ticks (~100ms each → ~5s).

@@ -3819,7 +3819,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     // Cleanup: release any expired (TTL) reservations and any stale reservations.
     //
     // Parity with Python: this resource is allowed to perform best-effort cleanup.
-    let mut release_payloads: Vec<serde_json::Value> = Vec::with_capacity(8);
+    let mut released_ids: Vec<i64> = Vec::with_capacity(8);
 
     // We only need agents map + mail cache for stale evaluation.
     let agent_rows = db_outcome_to_mcp_result(
@@ -3857,21 +3857,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         if updated == 0 {
             continue;
         }
-        let agent_name = agent_by_id
-            .get(&row.agent_id)
-            .map_or_else(|| format!("agent_{}", row.agent_id), |a| a.name.clone());
-
-        release_payloads.push(serde_json::json!({
-            "id": id,
-            "project": project.human_key.clone(),
-            "agent": agent_name,
-            "path_pattern": row.path_pattern.clone(),
-            "exclusive": row.exclusive != 0,
-            "reason": row.reason.clone(),
-            "created_ts": micros_to_iso(row.created_ts),
-            "expires_ts": micros_to_iso(row.expires_ts),
-            "released_ts": micros_to_iso(now_micros),
-        }));
+        released_ids.push(id);
     }
 
     // Release stale reservations (unreleased + agent inactive + no recent mail/fs/git).
@@ -3941,21 +3927,50 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             continue;
         }
 
-        release_payloads.push(serde_json::json!({
-            "id": id,
-            "project": project.human_key.clone(),
-            "agent": agent.name,
-            "path_pattern": row.path_pattern.clone(),
-            "exclusive": row.exclusive != 0,
-            "reason": row.reason.clone(),
-            "created_ts": micros_to_iso(row.created_ts),
-            "expires_ts": micros_to_iso(row.expires_ts),
-            "released_ts": micros_to_iso(now_micros),
-        }));
+        released_ids.push(id);
     }
 
     // Best-effort archive artifact writes for any releases.
-    if !release_payloads.is_empty() {
+    if !released_ids.is_empty() {
+        let released_rows = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_reservations_by_ids(ctx.cx(), &pool, &released_ids)
+                .await,
+        )?;
+        let mut release_payloads: Vec<serde_json::Value> = Vec::with_capacity(released_rows.len());
+        for row in released_rows {
+            let Some(id) = row.id else { continue };
+            let Some(released_ts) = row.released_ts else {
+                tracing::warn!(
+                    project = project.slug.as_str(),
+                    reservation_id = id,
+                    "skipping reservation release artifact with missing released_ts"
+                );
+                continue;
+            };
+            let agent_name = agent_by_id
+                .get(&row.agent_id)
+                .map_or_else(|| format!("agent_{}", row.agent_id), |a| a.name.clone());
+
+            release_payloads.push(serde_json::json!({
+                "id": id,
+                "project": project.human_key.clone(),
+                "agent": agent_name,
+                "path_pattern": row.path_pattern,
+                "exclusive": row.exclusive != 0,
+                "reason": row.reason,
+                "created_ts": micros_to_iso(row.created_ts),
+                "expires_ts": micros_to_iso(row.expires_ts),
+                "released_ts": micros_to_iso(released_ts),
+            }));
+        }
+
+        if release_payloads.is_empty() {
+            tracing::warn!(
+                project = project.slug.as_str(),
+                "reservation cleanup released rows but none were eligible for archive artifacts"
+            );
+        }
+
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
             project_slug: project.slug.clone(),
             config: config.clone(),
@@ -5694,6 +5709,91 @@ mod resource_shape_tests {
                     row.released_ts.is_none(),
                     "missing workspace must not auto-release reservations"
                 );
+            });
+        });
+    }
+
+    #[test]
+    fn file_reservations_cleanup_artifacts_use_authoritative_release_timestamps() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                mcp_agent_mail_storage::wbq_start();
+
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-release-artifacts-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let agent_id = agent.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/**", "docs/**"],
+                    3600,
+                    true,
+                    "resource-artifact timestamp test",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create reservations failed: {other:?}"),
+                };
+                let released_ids: Vec<i64> = created
+                    .iter()
+                    .map(|row| row.id.unwrap_or(0))
+                    .collect();
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                for id in &released_ids {
+                    conn.execute_sync(
+                        "UPDATE file_reservations SET expires_ts = 0 WHERE id = ?",
+                        &[mcp_agent_mail_db::sqlmodel::Value::BigInt(*id)],
+                    )
+                    .expect("expire reservation");
+                }
+                drop(conn);
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                file_reservations(&ctx, format!("{}?active_only=false", project.slug))
+                    .await
+                    .expect("file reservations cleanup");
+
+                mcp_agent_mail_storage::wbq_flush();
+                mcp_agent_mail_storage::flush_async_commits();
+
+                let rows = match queries::get_reservations_by_ids(&cx, &pool, &released_ids).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_reservations_by_ids failed: {other:?}"),
+                };
+
+                let config = mcp_agent_mail_core::Config::from_env();
+                let archive = mcp_agent_mail_storage::open_archive(&config, &project.slug)
+                    .expect("open archive")
+                    .expect("archive should exist");
+
+                for row in rows {
+                    let id = row.id.expect("released reservation id");
+                    let released_ts = row.released_ts.expect("released_ts should be recorded");
+                    let artifact_path = archive.root.join("file_reservations").join(format!("id-{id}.json"));
+                    let artifact_text =
+                        std::fs::read_to_string(&artifact_path).expect("read reservation artifact");
+                    let artifact_json: Value =
+                        serde_json::from_str(&artifact_text).expect("parse reservation artifact");
+                    let released_iso = micros_to_iso(released_ts);
+                    assert_eq!(
+                        artifact_json["released_ts"].as_str(),
+                        Some(released_iso.as_str()),
+                        "artifact should persist the DB-authoritative release timestamp"
+                    );
+                }
             });
         });
     }

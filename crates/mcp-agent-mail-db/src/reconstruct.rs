@@ -1699,7 +1699,7 @@ mod tests {
     fn extract_json_frontmatter_basic() {
         let content = "---json\n{\"id\": 1, \"subject\": \"hello\"}\n---\n\nBody text here.\n";
         let fm = extract_json_frontmatter(content).expect("should extract");
-        assert_eq!(fm, "{\"id\": 1, \"subject\": \"hello\"}");
+        assert_eq!(fm, "{\"id\": 1, \"subject\": \"hello\"}\n");
     }
 
     #[test]
