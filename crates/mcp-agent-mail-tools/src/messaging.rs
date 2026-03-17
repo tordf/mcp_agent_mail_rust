@@ -3021,6 +3021,29 @@ pub async fn fetch_inbox(
         since_ts
     );
 
+    // Auto-mark fetched messages as read (and auto-ack if ack_required=1).
+    // Agents consistently fail to call mark_message_read explicitly, so
+    // fetching IS reading.  Best-effort: errors are logged but don't fail
+    // the fetch.
+    for msg in &messages {
+        if let Err(e) = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::mark_message_read(
+                ctx.cx(),
+                &pool,
+                agent_id,
+                msg.id,
+            )
+            .await,
+        ) {
+            tracing::warn!(
+                message_id = msg.id,
+                agent_id = agent_id,
+                error = %e,
+                "auto-mark-read on fetch_inbox failed"
+            );
+        }
+    }
+
     // Clear notification signal (best-effort).
     let config = &Config::get();
     let _ = mcp_agent_mail_storage::clear_notification_signal(config, &project.slug, &agent.name);

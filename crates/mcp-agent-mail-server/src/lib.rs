@@ -2882,6 +2882,7 @@ fn dispatch_compose_envelope(
             );
         }
         Err(e) => {
+            println!("ERR IN DISPATCH: {e:?}");
             tracing::error!("compose: failed to dispatch message: {e}");
         }
     }
@@ -17081,7 +17082,8 @@ mod tests {
                 importance TEXT NOT NULL DEFAULT 'normal',
                 ack_required INTEGER NOT NULL DEFAULT 0,
                 created_ts INTEGER NOT NULL,
-                attachments TEXT NOT NULL DEFAULT '[]'
+                attachments TEXT NOT NULL DEFAULT '[]',
+                recipients_json TEXT NOT NULL DEFAULT '[]'
             )",
             &[],
         )
@@ -17135,8 +17137,8 @@ mod tests {
         let conn =
             mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
         conn.execute_sync(
-            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             &[
                 Value::BigInt(1),
                 Value::BigInt(1),
@@ -17147,6 +17149,7 @@ mod tests {
                 Value::Text("normal".to_string()),
                 Value::BigInt(0),
                 Value::BigInt(1),
+                Value::Text("[]".to_string()),
                 Value::Text("[]".to_string()),
             ],
         )

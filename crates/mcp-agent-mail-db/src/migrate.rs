@@ -22,7 +22,6 @@
 
 use crate::DbConn;
 use chrono::NaiveDateTime;
-use sqlmodel_core::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
@@ -133,24 +132,9 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
     let mut saw_nonempty_table = false;
     let mut saw_incompatible_timestamp_schema = false;
     let mut text_tables = BTreeSet::new();
-    let mut table_exists_cache: HashMap<&'static str, bool> = HashMap::new();
     let mut table_has_rows_cache: HashMap<&'static str, Option<bool>> = HashMap::new();
 
     for &(table, column, _nullable) in TIMESTAMP_COLUMNS {
-        // Check if table exists first (the table might not exist in older schemas).
-        let table_exists = *table_exists_cache.entry(table).or_insert_with(|| {
-            let table_check = conn.query_sync(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
-                &[Value::Text(table.to_string())],
-            );
-            // FrankenSQLite may not support sqlite_master — assume table exists and
-            // let the typeof query below fail gracefully instead.
-            table_check.as_ref().map_or(true, |rows| !rows.is_empty())
-        });
-        if !table_exists {
-            continue;
-        }
-
         // Query the typeof() of the first non-NULL value in the column.
         let sql =
             format!("SELECT typeof({column}) AS t FROM {table} WHERE {column} IS NOT NULL LIMIT 1");

@@ -1238,8 +1238,84 @@ async fn run_sqlite_init_once(
         // Non-fatal: reads/writes can still proceed, but concurrency may degrade.
     }
 
+    // Rebuild inbox_stats from ground truth, drop legacy triggers, and fix
+    // mixed-scale timestamps left by the Python server.
+    if let Err(err) = startup_data_repairs(&runtime_conn) {
+        tracing::warn!(
+            path = %sqlite_path,
+            error = %err,
+            "startup data repairs failed; some counters/timestamps may be stale"
+        );
+    }
+
     drop(runtime_conn);
     Outcome::Ok(())
+}
+
+/// One-shot data repairs run at startup before pool connections are handed out.
+///
+/// 1. Drop legacy `inbox_stats` triggers (redundant with explicit rebuilds).
+/// 2. Rebuild `inbox_stats` from ground truth.
+/// 3. Fix mixed-scale timestamps (seconds/millis → microseconds).
+#[allow(clippy::result_large_err)]
+fn startup_data_repairs(conn: &DbConn) -> Result<(), SqlError> {
+    // ── inbox_stats rebuild ──────────────────────────────────────────
+    let has_inbox_stats = !conn
+        .query_sync(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='inbox_stats'",
+            &[],
+        )?
+        .is_empty();
+
+    if has_inbox_stats {
+        // Drop legacy triggers to prevent double-counting.
+        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_insert")?;
+        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_mark_read")?;
+        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_ack")?;
+
+        // Full rebuild from ground truth.
+        conn.execute_raw("DELETE FROM inbox_stats")?;
+        conn.execute_raw(
+            "INSERT INTO inbox_stats \
+                (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+            SELECT \
+                r.agent_id, \
+                COUNT(*) AS total_count, \
+                SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+                SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+                MAX(m.created_ts) AS last_message_ts \
+            FROM message_recipients r \
+            JOIN messages m ON m.id = r.message_id \
+            GROUP BY r.agent_id",
+        )?;
+    }
+
+    // ── Fix mixed-scale timestamps ───────────────────────────────────
+    // The Python server occasionally wrote created_ts in seconds or
+    // milliseconds instead of microseconds.  Detect and upscale:
+    //   seconds  (< 1e13)  → × 1_000_000
+    //   millis   (< 1e16)  → × 1_000
+    let has_messages = !conn
+        .query_sync(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
+            &[],
+        )?
+        .is_empty();
+
+    if has_messages {
+        // Seconds → microseconds (timestamps < 10^13 are clearly seconds)
+        conn.execute_raw(
+            "UPDATE messages SET created_ts = created_ts * 1000000 \
+             WHERE created_ts > 0 AND created_ts < 10000000000000",
+        )?;
+        // Milliseconds → microseconds (timestamps < 10^16 are clearly millis)
+        conn.execute_raw(
+            "UPDATE messages SET created_ts = created_ts * 1000 \
+             WHERE created_ts > 0 AND created_ts < 10000000000000000",
+        )?;
+    }
+
+    Ok(())
 }
 
 #[must_use]
@@ -3096,14 +3172,26 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
         let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
 
-        // Create dummy older backup and real newer backup.
+        // Create dummy older backup and real newer backup (which must be a valid DB!).
         std::fs::write(&backup1, b"corrupted-old-backup").unwrap();
-        std::fs::write(&backup2, b"corrupted-new-backup").unwrap();
+        let conn2 = DbConn::open_file(backup2.to_string_lossy().as_ref()).unwrap();
+        conn2
+            .execute_raw("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42);")
+            .unwrap();
+        drop(conn2);
+
+        // Corrupt the primary to trigger recovery.
+        std::fs::write(&primary, b"broken").unwrap();
 
         ensure_sqlite_file_healthy(&primary).expect("auto-recovery should succeed");
+
+        // Verify the restored DB is exactly the valid backup.
+        let restored_conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let val: i64 = restored_conn.query_sync("SELECT x FROM t", &[]).unwrap()[0]
+            .get_named("x")
+            .unwrap();
         assert_eq!(
-            sqlite_marker_value(&primary).as_deref(),
-            Some("corrupted-new-backup"),
+            val, 42,
             "restored DB should preserve timestamped backup data"
         );
     }

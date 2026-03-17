@@ -7534,14 +7534,14 @@ mod tests {
             .expect("build runtime");
         let cx = asupersync::Cx::for_testing();
 
-        let mut cfg_a = crate::pool::DbPoolConfig {
+        let cfg_a = crate::pool::DbPoolConfig {
             database_url: "sqlite://file:mem_a?mode=memory&cache=shared".to_string(),
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
             ..Default::default()
         };
-        let mut cfg_b = crate::pool::DbPoolConfig {
+        let cfg_b = crate::pool::DbPoolConfig {
             database_url: "sqlite://file:mem_b?mode=memory&cache=shared".to_string(),
             min_connections: 1,
             max_connections: 1,
@@ -7557,7 +7557,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire a");
-            crate::schema::migrate_to_latest(&cx, &*conn_a)
+            crate::schema::migrate_to_latest_base(&cx, &*conn_a)
                 .await
                 .into_result()
                 .expect("migrate a");
@@ -7566,7 +7566,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire b");
-            crate::schema::migrate_to_latest(&cx, &*conn_b)
+            crate::schema::migrate_to_latest_base(&cx, &*conn_b)
                 .await
                 .into_result()
                 .expect("migrate b");
@@ -12619,6 +12619,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn deferred_touch_flush_is_scoped_to_memory_pool() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -12627,14 +12628,14 @@ mod tests {
             .expect("build runtime");
         let cx = asupersync::Cx::for_testing();
 
-        let mut cfg_a = crate::pool::DbPoolConfig {
+        let cfg_a = crate::pool::DbPoolConfig {
             database_url: "sqlite://file:mem_a?mode=memory&cache=shared".to_string(),
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
             ..Default::default()
         };
-        let mut cfg_b = crate::pool::DbPoolConfig {
+        let cfg_b = crate::pool::DbPoolConfig {
             database_url: "sqlite://file:mem_b?mode=memory&cache=shared".to_string(),
             min_connections: 1,
             max_connections: 1,
@@ -12649,7 +12650,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire a");
-            crate::schema::migrate_to_latest(&cx, &*conn_a)
+            crate::schema::migrate_to_latest_base(&cx, &*conn_a)
                 .await
                 .into_result()
                 .expect("migrate a");
@@ -12658,7 +12659,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire b");
-            crate::schema::migrate_to_latest(&cx, &*conn_b)
+            crate::schema::migrate_to_latest_base(&cx, &*conn_b)
                 .await
                 .into_result()
                 .expect("migrate b");
