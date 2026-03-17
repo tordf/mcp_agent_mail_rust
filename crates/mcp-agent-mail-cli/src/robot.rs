@@ -10,7 +10,7 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::{McpContext, McpError, McpResult};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value;
 use std::path::{Path, PathBuf};
 
@@ -971,6 +971,107 @@ pub struct AttachmentRow {
     pub subject: String,
     pub message_id: i64,
     pub project: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotSnapshot {
+    enabled: bool,
+    source: String,
+    safe_mode: bool,
+    tick_count: u64,
+    #[serde(default)]
+    tracked_agents: Vec<AtcRobotAgent>,
+    deadlock_cycles: usize,
+    eprocess_value: f64,
+    regret_avg: f64,
+    decisions_total: u64,
+    #[serde(default)]
+    recent_actions: Vec<AtcRobotAction>,
+    last_tick_micros: i64,
+    last_tick_duration_micros: u64,
+    last_tick_budget_micros: u64,
+    last_tick_budget_exceeded: bool,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotAgent {
+    name: String,
+    state: String,
+    silence_secs: i64,
+    posterior_alive: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotAction {
+    timestamp_micros: i64,
+    kind: String,
+    category: String,
+    agent: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AtcSummaryData {
+    enabled: bool,
+    source: String,
+    safe_mode: bool,
+    tick_count: u64,
+    decisions_total: u64,
+    tracked_agents: usize,
+    degraded_agents: usize,
+    deadlock_cycles: usize,
+    eprocess_value: f64,
+    regret_avg: f64,
+    last_tick: String,
+    last_tick_duration_micros: u64,
+    last_tick_budget_micros: u64,
+    last_tick_budget_exceeded: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AtcLivenessData {
+    agent: String,
+    state: String,
+    silence_seconds: i64,
+    posterior_alive: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcDecisionData {
+    timestamp: String,
+    kind: String,
+    category: String,
+    agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AtcConflictData {
+    deadlock_cycles: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reservation_conflicts: Vec<ReservationConflict>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    recent_actions: Vec<AtcDecisionData>,
+}
+
+#[derive(Debug, Serialize)]
+struct AtcData {
+    enabled: bool,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<AtcSummaryData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decisions: Option<Vec<AtcDecisionData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liveness: Option<Vec<AtcLivenessData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflicts: Option<AtcConflictData>,
 }
 
 // ── Robot subcommand scaffold ────────────────────────────────────────────────
@@ -4386,6 +4487,551 @@ fn build_navigate_file_reservations(
     ))
 }
 
+const ROBOT_ATC_DEFAULT_LIMIT: usize = 5;
+const ROBOT_ATC_HTTP_TIMEOUT_SECS: u64 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtcLiveEndpoint {
+    url: String,
+    bearer_token: Option<String>,
+}
+
+fn atc_default_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(ROBOT_ATC_DEFAULT_LIMIT).max(1)
+}
+
+fn atc_agent_is_degraded(agent: &AtcRobotAgent) -> bool {
+    !agent.state.eq_ignore_ascii_case("alive")
+}
+
+fn atc_focus_agent_name(agent_flag: Option<&str>) -> Option<String> {
+    resolved_agent_flag_or_env(agent_flag)
+}
+
+fn atc_query_param_from_agent_mail_url(
+    raw_url: &str,
+    http_path: &str,
+    name: &str,
+) -> Option<String> {
+    let normalized = crate::normalize_agent_mail_url(raw_url, http_path);
+    let query_start = normalized.find('?')?;
+    let fragment_start = normalized[query_start + 1..]
+        .find('#')
+        .map(|offset| query_start + 1 + offset)
+        .unwrap_or(normalized.len());
+    let query = &normalized[query_start + 1..fragment_start];
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        if key == name && !value.is_empty() {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn atc_ws_state_url_from_agent_mail_url(raw_url: &str, http_path: &str) -> String {
+    let normalized = crate::normalize_agent_mail_url(raw_url, http_path);
+    let boundary = normalized
+        .find('?')
+        .into_iter()
+        .chain(normalized.find('#'))
+        .min()
+        .unwrap_or(normalized.len());
+    let prefix = &normalized[..boundary];
+    let scheme_boundary = prefix.find("://").map_or(0, |index| index + 3);
+    let path_boundary = prefix[scheme_boundary..]
+        .find('/')
+        .map_or(prefix.len(), |index| scheme_boundary + index);
+    let origin = &prefix[..path_boundary];
+    if let Some(token) = atc_query_param_from_agent_mail_url(raw_url, http_path, "token") {
+        return format!("{origin}/mail/ws-state?limit=1&token={token}");
+    }
+    format!("{origin}/mail/ws-state?limit=1")
+}
+
+fn atc_live_bearer_token_from_reader<F>(
+    read_env: F,
+    config: &mcp_agent_mail_core::Config,
+) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    read_env("AGENT_MAIL_TOKEN")
+        .or_else(|| read_env("HTTP_BEARER_TOKEN"))
+        .or_else(|| config.http_bearer_token.clone())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn atc_live_endpoint_from_reader<F>(
+    read_env: F,
+    config: &mcp_agent_mail_core::Config,
+) -> AtcLiveEndpoint
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let url = if let Some(raw_url) = read_env("AGENT_MAIL_URL") {
+        let trimmed = raw_url.trim();
+        if !trimmed.is_empty() {
+            atc_ws_state_url_from_agent_mail_url(trimmed, &config.http_path)
+        } else {
+            let connect_host = crate::normalize_connect_host_for_client_url(&config.http_host);
+            format!(
+                "http://{connect_host}:{}/mail/ws-state?limit=1",
+                config.http_port
+            )
+        }
+    } else {
+        let connect_host = crate::normalize_connect_host_for_client_url(&config.http_host);
+        format!(
+            "http://{connect_host}:{}/mail/ws-state?limit=1",
+            config.http_port
+        )
+    };
+
+    AtcLiveEndpoint {
+        url,
+        bearer_token: atc_live_bearer_token_from_reader(read_env, config),
+    }
+}
+
+fn atc_live_endpoint_from_config(config: &mcp_agent_mail_core::Config) -> AtcLiveEndpoint {
+    atc_live_endpoint_from_reader(|key| std::env::var(key).ok(), config)
+}
+
+fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRobotSnapshot> {
+    let ws_state_url = endpoint.url.clone();
+    let bearer_token = endpoint.bearer_token.clone();
+    crate::context::run_async(async move {
+        use asupersync::http::h1::Method;
+        use asupersync::time::{timeout, wall_now};
+        use std::time::Duration;
+
+        let mut headers = Vec::new();
+        if let Some(token) = bearer_token.as_deref() {
+            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        }
+
+        let cx = asupersync::Cx::for_testing();
+        let request = Box::pin(crate::products_http_client().request(
+            &cx,
+            Method::Get,
+            &ws_state_url,
+            headers,
+            Vec::new(),
+        ));
+        let response = match timeout(
+            wall_now(),
+            Duration::from_secs(ROBOT_ATC_HTTP_TIMEOUT_SECS),
+            request,
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Err(CliError::Other(format!(
+                    "transport failure calling {ws_state_url}: {error}"
+                )));
+            }
+            Err(_) => {
+                return Err(CliError::Other(format!(
+                    "request to {ws_state_url} timed out after {ROBOT_ATC_HTTP_TIMEOUT_SECS}s"
+                )));
+            }
+        };
+
+        if response.status == 401 || response.status == 403 {
+            return Err(CliError::Other(format!(
+                "authentication failed (HTTP {}) while calling {ws_state_url}; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN or the AGENT_MAIL_URL token query parameter",
+                response.status
+            )));
+        }
+        if response.status != 200 {
+            return Err(CliError::Other(format!(
+                "unexpected HTTP status {} from {ws_state_url}",
+                response.status
+            )));
+        }
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(|error| {
+                CliError::Other(format!(
+                    "invalid JSON in ws-state response from {ws_state_url}: {error}"
+                ))
+            })?;
+        let atc_payload = payload.get("atc").cloned().ok_or_else(|| {
+            CliError::Other(format!(
+                "ws-state response from {ws_state_url} missing atc payload"
+            ))
+        })?;
+        serde_json::from_value(atc_payload).map_err(|error| {
+            CliError::Other(format!(
+                "invalid ATC snapshot payload from {ws_state_url}: {error}"
+            ))
+        })
+    })
+}
+
+fn maybe_resolve_robot_scope(
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+) -> Result<Option<ResolvedRobotScope>, CliError> {
+    match resolve_robot_scope(project_flag, agent_flag) {
+        Ok(scope) => Ok(Some(scope)),
+        Err(error) => {
+            let project_requested = resolved_project_flag_or_env(project_flag).is_some();
+            if project_requested {
+                Err(error)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn atc_reservation_conflicts(
+    scope: &ResolvedRobotScope,
+    focus_agent: Option<&str>,
+) -> Result<Vec<ReservationConflict>, CliError> {
+    let (reservations, _actions) = build_reservations(
+        scope.conn(),
+        scope.project_id,
+        &scope.project_slug,
+        scope.agent.clone(),
+        true,
+        false,
+        Some(10),
+    )?;
+    let mut conflicts = reservations.conflicts;
+    if let Some(focus_agent) = focus_agent {
+        let has_focus = conflicts.iter().any(|conflict| {
+            conflict.agent_a.eq_ignore_ascii_case(focus_agent)
+                || conflict.agent_b.eq_ignore_ascii_case(focus_agent)
+        });
+        if has_focus {
+            conflicts.retain(|conflict| {
+                conflict.agent_a.eq_ignore_ascii_case(focus_agent)
+                    || conflict.agent_b.eq_ignore_ascii_case(focus_agent)
+            });
+        }
+    }
+    Ok(conflicts)
+}
+
+fn fallback_atc_liveness(silence_secs: i64, probe_interval_secs: i64) -> (&'static str, f64) {
+    let safe_interval = probe_interval_secs.max(1) as f64;
+    let normalized_silence = silence_secs.max(0) as f64;
+    let posterior_alive = (-(normalized_silence / safe_interval))
+        .exp()
+        .clamp(0.01, 1.0);
+    if normalized_silence <= safe_interval {
+        ("alive", posterior_alive)
+    } else if normalized_silence <= safe_interval * 3.0 {
+        ("flaky", posterior_alive)
+    } else {
+        ("dead", posterior_alive)
+    }
+}
+
+fn build_local_atc_fallback_snapshot(
+    scope: &ResolvedRobotScope,
+    focus_agent: Option<&str>,
+) -> Result<(AtcRobotSnapshot, Vec<ReservationConflict>), CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let config = mcp_agent_mail_core::Config::from_env();
+    let probe_interval_secs = i64::try_from(config.atc_probe_interval_secs.max(5)).unwrap_or(120);
+
+    let rows = scope
+        .conn()
+        .query_sync(
+            "SELECT name, last_active_ts
+             FROM agents
+             WHERE project_id = ?
+             ORDER BY last_active_ts DESC, id DESC",
+            &[Value::BigInt(scope.project_id)],
+        )
+        .map_err(|error| CliError::Other(format!("ATC fallback agent query failed: {error}")))?;
+
+    let mut deduped: std::collections::HashMap<String, (i64, AtcRobotAgent)> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        let name: String = row.get_named("name").unwrap_or_default();
+        let last_active_ts: i64 = row.get_named("last_active_ts").unwrap_or(0);
+        let silence_secs = if last_active_ts > 0 {
+            now_us.saturating_sub(last_active_ts) / 1_000_000
+        } else {
+            probe_interval_secs.saturating_mul(4)
+        };
+        let (state, posterior_alive) = fallback_atc_liveness(silence_secs, probe_interval_secs);
+        let candidate = AtcRobotAgent {
+            name: name.clone(),
+            state: state.to_string(),
+            silence_secs,
+            posterior_alive,
+        };
+        let logical_name = name.to_ascii_lowercase();
+        match deduped.entry(logical_name) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert((last_active_ts, candidate));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if last_active_ts > slot.get().0 {
+                    slot.insert((last_active_ts, candidate));
+                }
+            }
+        }
+    }
+
+    let mut tracked_agents: Vec<AtcRobotAgent> =
+        deduped.into_values().map(|(_, agent)| agent).collect();
+    tracked_agents.sort_by(|left, right| {
+        let left_focus = focus_agent.is_some_and(|focus| left.name.eq_ignore_ascii_case(focus));
+        let right_focus = focus_agent.is_some_and(|focus| right.name.eq_ignore_ascii_case(focus));
+        right_focus
+            .cmp(&left_focus)
+            .then_with(|| atc_agent_is_degraded(right).cmp(&atc_agent_is_degraded(left)))
+            .then_with(|| right.silence_secs.cmp(&left.silence_secs))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let reservation_conflicts = atc_reservation_conflicts(scope, focus_agent)?;
+    let note = if config.atc_enabled {
+        format!(
+            "Live ATC snapshot unavailable; using local DB heuristics with a {}s probe interval.",
+            probe_interval_secs
+        )
+    } else {
+        "ATC is disabled by configuration; local DB fallback is reporting passive liveness only."
+            .to_string()
+    };
+
+    Ok((
+        AtcRobotSnapshot {
+            enabled: config.atc_enabled,
+            source: "local_db_fallback".to_string(),
+            tracked_agents,
+            note: Some(note),
+            ..AtcRobotSnapshot::default()
+        },
+        reservation_conflicts,
+    ))
+}
+
+fn build_unavailable_atc_snapshot(live_error: &str) -> AtcRobotSnapshot {
+    let config = mcp_agent_mail_core::Config::from_env();
+    AtcRobotSnapshot {
+        enabled: config.atc_enabled,
+        source: "unavailable".to_string(),
+        note: Some(format!(
+            "Live ATC snapshot unavailable: {live_error}. No local project scope was available for DB fallback."
+        )),
+        ..AtcRobotSnapshot::default()
+    }
+}
+
+fn atc_decision_data(action: &AtcRobotAction) -> AtcDecisionData {
+    AtcDecisionData {
+        timestamp: if action.timestamp_micros > 0 {
+            mcp_agent_mail_db::micros_to_iso(action.timestamp_micros)
+        } else {
+            "--".to_string()
+        },
+        kind: action.kind.clone(),
+        category: action.category.clone(),
+        agent: action.agent.clone(),
+        message: action.message.clone(),
+    }
+}
+
+fn atc_filtered_decisions(
+    snapshot: &AtcRobotSnapshot,
+    focus_agent: Option<&str>,
+    category: Option<&str>,
+    limit: usize,
+) -> Vec<AtcDecisionData> {
+    let mut actions: Vec<AtcRobotAction> = snapshot
+        .recent_actions
+        .iter()
+        .filter(|action| category.is_none_or(|value| action.category == value))
+        .cloned()
+        .collect();
+    let has_focus_match = focus_agent.is_some_and(|focus| {
+        actions
+            .iter()
+            .any(|action| action.agent.eq_ignore_ascii_case(focus))
+    });
+    if has_focus_match {
+        actions.retain(|action| {
+            focus_agent.is_some_and(|focus| action.agent.eq_ignore_ascii_case(focus))
+        });
+    }
+    actions.sort_by(|left, right| {
+        right
+            .timestamp_micros
+            .cmp(&left.timestamp_micros)
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    actions
+        .into_iter()
+        .take(limit)
+        .map(|action| atc_decision_data(&action))
+        .collect()
+}
+
+fn atc_liveness_data(
+    snapshot: &AtcRobotSnapshot,
+    focus_agent: Option<&str>,
+    limit: usize,
+    prefer_degraded: bool,
+) -> Vec<AtcLivenessData> {
+    let mut agents = snapshot.tracked_agents.clone();
+    let has_focus_match = focus_agent.is_some_and(|focus| {
+        agents
+            .iter()
+            .any(|agent| agent.name.eq_ignore_ascii_case(focus))
+    });
+    if has_focus_match {
+        agents.retain(|agent| {
+            focus_agent.is_some_and(|focus| agent.name.eq_ignore_ascii_case(focus))
+        });
+    } else if prefer_degraded {
+        let degraded: Vec<AtcRobotAgent> = agents
+            .iter()
+            .filter(|agent| atc_agent_is_degraded(agent))
+            .cloned()
+            .collect();
+        if !degraded.is_empty() {
+            agents = degraded;
+        }
+    }
+
+    agents.sort_by(|left, right| {
+        let left_focus = focus_agent.is_some_and(|focus| left.name.eq_ignore_ascii_case(focus));
+        let right_focus = focus_agent.is_some_and(|focus| right.name.eq_ignore_ascii_case(focus));
+        right_focus
+            .cmp(&left_focus)
+            .then_with(|| atc_agent_is_degraded(right).cmp(&atc_agent_is_degraded(left)))
+            .then_with(|| right.silence_secs.cmp(&left.silence_secs))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    agents
+        .into_iter()
+        .take(limit)
+        .map(|agent| AtcLivenessData {
+            agent: agent.name,
+            state: agent.state,
+            silence_seconds: agent.silence_secs,
+            posterior_alive: agent.posterior_alive,
+        })
+        .collect()
+}
+
+fn atc_summary_data(snapshot: &AtcRobotSnapshot) -> AtcSummaryData {
+    AtcSummaryData {
+        enabled: snapshot.enabled,
+        source: snapshot.source.clone(),
+        safe_mode: snapshot.safe_mode,
+        tick_count: snapshot.tick_count,
+        decisions_total: snapshot.decisions_total,
+        tracked_agents: snapshot.tracked_agents.len(),
+        degraded_agents: snapshot
+            .tracked_agents
+            .iter()
+            .filter(|agent| atc_agent_is_degraded(agent))
+            .count(),
+        deadlock_cycles: snapshot.deadlock_cycles,
+        eprocess_value: snapshot.eprocess_value,
+        regret_avg: snapshot.regret_avg,
+        last_tick: if snapshot.last_tick_micros > 0 {
+            mcp_agent_mail_db::micros_to_iso(snapshot.last_tick_micros)
+        } else {
+            "--".to_string()
+        },
+        last_tick_duration_micros: snapshot.last_tick_duration_micros,
+        last_tick_budget_micros: snapshot.last_tick_budget_micros,
+        last_tick_budget_exceeded: snapshot.last_tick_budget_exceeded,
+    }
+}
+
+fn atc_conflict_data(
+    snapshot: &AtcRobotSnapshot,
+    mut reservation_conflicts: Vec<ReservationConflict>,
+    focus_agent: Option<&str>,
+    limit: usize,
+) -> AtcConflictData {
+    if let Some(focus_agent) = focus_agent {
+        let has_focus = reservation_conflicts.iter().any(|conflict| {
+            conflict.agent_a.eq_ignore_ascii_case(focus_agent)
+                || conflict.agent_b.eq_ignore_ascii_case(focus_agent)
+        });
+        if has_focus {
+            reservation_conflicts.retain(|conflict| {
+                conflict.agent_a.eq_ignore_ascii_case(focus_agent)
+                    || conflict.agent_b.eq_ignore_ascii_case(focus_agent)
+            });
+        }
+    }
+    reservation_conflicts.sort_by(|left, right| {
+        left.agent_a
+            .cmp(&right.agent_a)
+            .then(left.path_a.cmp(&right.path_a))
+            .then(left.agent_b.cmp(&right.agent_b))
+            .then(left.path_b.cmp(&right.path_b))
+    });
+    reservation_conflicts.truncate(limit);
+
+    AtcConflictData {
+        deadlock_cycles: snapshot.deadlock_cycles,
+        reservation_conflicts,
+        recent_actions: atc_filtered_decisions(snapshot, focus_agent, Some("conflict"), limit),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_atc_data(
+    snapshot: AtcRobotSnapshot,
+    reservation_conflicts: Vec<ReservationConflict>,
+    focus_agent: Option<&str>,
+    decisions_flag: bool,
+    liveness_flag: bool,
+    conflicts_flag: bool,
+    summary_flag: bool,
+    limit: usize,
+) -> AtcData {
+    let default_sections = !(decisions_flag || liveness_flag || conflicts_flag || summary_flag);
+    let show_summary = summary_flag || default_sections;
+    let show_decisions = decisions_flag || default_sections;
+    let show_liveness = liveness_flag
+        || (default_sections
+            && snapshot
+                .tracked_agents
+                .iter()
+                .any(|agent| atc_agent_is_degraded(agent)));
+    let has_conflicts = snapshot.deadlock_cycles > 0
+        || !reservation_conflicts.is_empty()
+        || snapshot
+            .recent_actions
+            .iter()
+            .any(|action| action.category == "conflict");
+    let show_conflicts = conflicts_flag || (default_sections && has_conflicts);
+
+    AtcData {
+        enabled: snapshot.enabled,
+        source: snapshot.source.clone(),
+        note: snapshot.note.clone(),
+        summary: show_summary.then(|| atc_summary_data(&snapshot)),
+        decisions: show_decisions
+            .then(|| atc_filtered_decisions(&snapshot, focus_agent, None, limit)),
+        liveness: show_liveness
+            .then(|| atc_liveness_data(&snapshot, focus_agent, limit, default_sections)),
+        conflicts: show_conflicts
+            .then(|| atc_conflict_data(&snapshot, reservation_conflicts, focus_agent, limit)),
+    }
+}
+
 fn emit_robot_output(out: &str) {
     #[cfg(test)]
     {
@@ -5760,41 +6406,120 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             summary,
             limit,
         } => {
-            // ATC is a server-side subsystem; the robot CLI surfaces its
-            // state via a lightweight snapshot.  Since the ATC runs on the
-            // poller thread and we're in a separate CLI process, we report
-            // a static "ATC available" status.  Full live state requires
-            // the TUI (Track 9 Option B) or a future HTTP API.
-            #[derive(Serialize)]
-            struct AtcData {
-                enabled: bool,
-                note: String,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                decisions_requested: Option<bool>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                liveness_requested: Option<bool>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                conflicts_requested: Option<bool>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                summary_requested: Option<bool>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                limit: Option<usize>,
-            }
+            let focus_agent = atc_focus_agent_name(args.agent.as_deref());
+            let limit = atc_default_limit(limit);
+            let live_endpoint =
+                atc_live_endpoint_from_config(&mcp_agent_mail_core::Config::from_env());
+            let maybe_scope =
+                maybe_resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
 
-            let data = AtcData {
-                enabled: true,
-                note: "ATC runs as a server-side subsystem. Use the TUI \
-                       System Health screen for live state, or start the \
-                       server with AM_ATC_ENABLED=true."
-                    .to_string(),
-                decisions_requested: if decisions { Some(true) } else { None },
-                liveness_requested: if liveness { Some(true) } else { None },
-                conflicts_requested: if conflicts { Some(true) } else { None },
-                summary_requested: if summary { Some(true) } else { None },
+            let (snapshot, reservation_conflicts, project_slug, live_error) =
+                match fetch_live_atc_snapshot(&live_endpoint) {
+                    Ok(snapshot) => {
+                        let project_slug =
+                            maybe_scope.as_ref().map(|scope| scope.project_slug.clone());
+                        let reservation_conflicts = if let Some(scope) = maybe_scope.as_ref() {
+                            atc_reservation_conflicts(scope, focus_agent.as_deref())?
+                        } else {
+                            Vec::new()
+                        };
+                        (snapshot, reservation_conflicts, project_slug, None)
+                    }
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        if let Some(scope) = maybe_scope {
+                            let project_slug = Some(scope.project_slug.clone());
+                            let (mut snapshot, reservation_conflicts) =
+                                build_local_atc_fallback_snapshot(&scope, focus_agent.as_deref())?;
+                            let fallback_note = snapshot.note.take().unwrap_or_default();
+                            snapshot.note = Some(if fallback_note.is_empty() {
+                                format!("Live ATC snapshot unavailable: {error_text}")
+                            } else {
+                                format!("{fallback_note} Live error: {error_text}")
+                            });
+                            (
+                                snapshot,
+                                reservation_conflicts,
+                                project_slug,
+                                Some(error_text),
+                            )
+                        } else {
+                            (
+                                build_unavailable_atc_snapshot(&error_text),
+                                Vec::new(),
+                                None,
+                                Some(error_text),
+                            )
+                        }
+                    }
+                };
+
+            let data = build_atc_data(
+                snapshot,
+                reservation_conflicts,
+                focus_agent.as_deref(),
+                decisions,
+                liveness,
+                conflicts,
+                summary,
                 limit,
-            };
+            );
 
-            let env = RobotEnvelope::new(cmd_name, format, data);
+            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            env._meta.project = project_slug;
+            if let Some(error) = live_error {
+                let alert_summary = if env.data.source == "local_db_fallback" {
+                    "Live ATC snapshot unavailable; using local DB fallback"
+                } else {
+                    "Live ATC snapshot unavailable"
+                };
+                env = env.with_alert("warn", alert_summary, Some(error));
+            }
+            if env.data.source != "live" {
+                env = env.with_action("Start the local server for live ATC state: am serve-http");
+            }
+            if env.data.source == "live" && env.data.enabled {
+                env = env.with_action("Open System Health for richer ATC diagnostics");
+            }
+            if env
+                .data
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.safe_mode)
+            {
+                env = env.with_alert(
+                    "warn",
+                    "ATC is in safe mode",
+                    Some(
+                        "Inspect recent ATC advisories before trusting automatic interventions"
+                            .to_string(),
+                    ),
+                );
+            }
+            if env
+                .data
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.deadlock_cycles > 0)
+            {
+                env = env.with_alert(
+                    "error",
+                    "ATC detected reservation deadlock cycles",
+                    Some("am robot reservations --conflicts".to_string()),
+                );
+            }
+            if env
+                .data
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.last_tick_budget_exceeded)
+            {
+                env = env.with_alert(
+                    "warn",
+                    "ATC tick budget exceeded",
+                    Some("Profile the ATC hot path before relaxing tick cadence".to_string()),
+                );
+            }
             format_output(&env, format)?
         }
     };
@@ -5836,6 +6561,54 @@ mod tests {
         count: usize,
     }
 
+    fn sample_atc_snapshot() -> AtcRobotSnapshot {
+        AtcRobotSnapshot {
+            enabled: true,
+            source: "live".to_string(),
+            safe_mode: true,
+            tick_count: 7,
+            tracked_agents: vec![
+                AtcRobotAgent {
+                    name: "AlphaAgent".to_string(),
+                    state: "alive".to_string(),
+                    silence_secs: 4,
+                    posterior_alive: 0.99,
+                },
+                AtcRobotAgent {
+                    name: "BetaAgent".to_string(),
+                    state: "dead".to_string(),
+                    silence_secs: 420,
+                    posterior_alive: 0.02,
+                },
+            ],
+            deadlock_cycles: 1,
+            eprocess_value: 3.5,
+            regret_avg: 0.25,
+            decisions_total: 12,
+            recent_actions: vec![
+                AtcRobotAction {
+                    timestamp_micros: 2_000_000,
+                    kind: "send_advisory".to_string(),
+                    category: "conflict".to_string(),
+                    agent: "BetaAgent".to_string(),
+                    message: Some("Deadlock detected".to_string()),
+                },
+                AtcRobotAction {
+                    timestamp_micros: 1_000_000,
+                    kind: "probe_agent".to_string(),
+                    category: "probe".to_string(),
+                    agent: "AlphaAgent".to_string(),
+                    message: None,
+                },
+            ],
+            last_tick_micros: 2_500_000,
+            last_tick_duration_micros: 80,
+            last_tick_budget_micros: 60,
+            last_tick_budget_exceeded: true,
+            note: Some("live snapshot".to_string()),
+        }
+    }
+
     #[test]
     fn test_output_format_display_and_parse() {
         assert_eq!(OutputFormat::Toon.to_string(), "toon");
@@ -5853,6 +6626,108 @@ mod tests {
             OutputFormat::Markdown
         );
         assert!("xml".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn atc_ws_state_url_rewrites_agent_mail_url_to_mail_poll_endpoint() {
+        let url = atc_ws_state_url_from_agent_mail_url(
+            "https://example.test:9999/api/?x=1#frag",
+            "/mcp/",
+        );
+        assert_eq!(url, "https://example.test:9999/mail/ws-state?limit=1");
+    }
+
+    #[test]
+    fn atc_ws_state_url_preserves_token_query_for_mail_auth() {
+        let url = atc_ws_state_url_from_agent_mail_url(
+            "https://example.test:9999/api/?token=a%2Bb%2Fc#frag",
+            "/mcp/",
+        );
+        assert_eq!(
+            url,
+            "https://example.test:9999/mail/ws-state?limit=1&token=a%2Bb%2Fc"
+        );
+    }
+
+    #[test]
+    fn atc_live_endpoint_prefers_env_bearer_token_and_preserves_query_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("config-token".to_string()),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 8765,
+            http_path: "/mcp/".to_string(),
+            ..Default::default()
+        };
+        let env = std::collections::HashMap::from([
+            (
+                "AGENT_MAIL_URL".to_string(),
+                "https://example.test/api/?token=query-token".to_string(),
+            ),
+            ("AGENT_MAIL_TOKEN".to_string(), "env-token".to_string()),
+        ]);
+        let endpoint = atc_live_endpoint_from_reader(|key| env.get(key).cloned(), &config);
+        assert_eq!(
+            endpoint.url,
+            "https://example.test/mail/ws-state?limit=1&token=query-token"
+        );
+        assert_eq!(endpoint.bearer_token.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn fallback_atc_liveness_classifies_alive_flaky_and_dead() {
+        let (alive_state, alive_posterior) = fallback_atc_liveness(5, 10);
+        assert_eq!(alive_state, "alive");
+        assert!(alive_posterior > 0.5);
+
+        let (flaky_state, flaky_posterior) = fallback_atc_liveness(20, 10);
+        assert_eq!(flaky_state, "flaky");
+        assert!(flaky_posterior < alive_posterior);
+
+        let (dead_state, dead_posterior) = fallback_atc_liveness(45, 10);
+        assert_eq!(dead_state, "dead");
+        assert!(dead_posterior < flaky_posterior);
+    }
+
+    #[test]
+    fn build_atc_data_defaults_to_actionable_sections() {
+        let data = build_atc_data(
+            sample_atc_snapshot(),
+            vec![ReservationConflict {
+                agent_a: "AlphaAgent".to_string(),
+                path_a: "src/**".to_string(),
+                agent_b: "BetaAgent".to_string(),
+                path_b: "src/server/**".to_string(),
+            }],
+            None,
+            false,
+            false,
+            false,
+            false,
+            5,
+        );
+
+        assert!(
+            data.summary.is_some(),
+            "default ATC output should include summary"
+        );
+        assert!(
+            data.decisions.is_some(),
+            "default ATC output should include decisions"
+        );
+        assert!(
+            data.liveness.is_some(),
+            "degraded agents should surface in default output"
+        );
+        assert!(
+            data.conflicts.is_some(),
+            "conflict evidence should surface by default"
+        );
+        assert_eq!(
+            data.conflicts
+                .as_ref()
+                .map_or(0, |item| item.deadlock_cycles),
+            1
+        );
     }
 
     #[test]
