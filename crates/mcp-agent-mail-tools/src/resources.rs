@@ -3969,21 +3969,21 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
                 project = project.slug.as_str(),
                 "reservation cleanup released rows but none were eligible for archive artifacts"
             );
-        }
-
-        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
-            project_slug: project.slug.clone(),
-            config: config.clone(),
-            reservations: release_payloads,
-        };
-        match mcp_agent_mail_storage::wbq_enqueue(op) {
-            mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-            | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
-            mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-                tracing::warn!(
-                    "WBQ enqueue failed; skipping reservation release artifacts archive write project={}",
-                    project.slug
-                );
+        } else {
+            let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+                project_slug: project.slug.clone(),
+                config: config.clone(),
+                reservations: release_payloads,
+            };
+            match mcp_agent_mail_storage::wbq_enqueue(op) {
+                mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+                | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
+                mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                    tracing::warn!(
+                        "WBQ enqueue failed; skipping reservation release artifacts archive write project={}",
+                        project.slug
+                    );
+                }
             }
         }
     }
@@ -5741,10 +5741,8 @@ mod resource_shape_tests {
                     Outcome::Ok(rows) => rows,
                     other => panic!("create reservations failed: {other:?}"),
                 };
-                let released_ids: Vec<i64> = created
-                    .iter()
-                    .map(|row| row.id.unwrap_or(0))
-                    .collect();
+                let released_ids: Vec<i64> =
+                    created.iter().map(|row| row.id.unwrap_or(0)).collect();
 
                 let conn = match pool.acquire(&cx).await {
                     Outcome::Ok(c) => c,
@@ -5782,7 +5780,10 @@ mod resource_shape_tests {
                 for row in rows {
                     let id = row.id.expect("released reservation id");
                     let released_ts = row.released_ts.expect("released_ts should be recorded");
-                    let artifact_path = archive.root.join("file_reservations").join(format!("id-{id}.json"));
+                    let artifact_path = archive
+                        .root
+                        .join("file_reservations")
+                        .join(format!("id-{id}.json"));
                     let artifact_text =
                         std::fs::read_to_string(&artifact_path).expect("read reservation artifact");
                     let artifact_json: Value =
