@@ -1171,6 +1171,133 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v16: ATC experience store (br-0qt6e.1.3) ──────────────────────
+    //
+    // Raw experience table for ATC learning. Append-friendly, narrow
+    // rows, optimized for point lookup, open-resolution, and stratum
+    // queries. Rollups are maintained incrementally; raw history stays
+    // in SQLite (not Git). Git receives only selected audit artifacts.
+    //
+    // Migration strategy for existing installations: the table is new,
+    // no backfill needed. Pre-learning installations have no experience
+    // data. Post-learning installations start accumulating rows from the
+    // first ATC tick that emits experiences.
+
+    migrations.push(Migration::new(
+        "v16_create_atc_experiences".to_string(),
+        "ATC experience store for learning: raw experience rows".to_string(),
+        "CREATE TABLE IF NOT EXISTS atc_experiences (\
+            experience_id INTEGER PRIMARY KEY,\
+            decision_id INTEGER NOT NULL,\
+            effect_id INTEGER NOT NULL,\
+            trace_id TEXT NOT NULL,\
+            claim_id TEXT NOT NULL,\
+            evidence_id TEXT NOT NULL,\
+            state TEXT NOT NULL DEFAULT 'planned',\
+            subsystem TEXT NOT NULL,\
+            decision_class TEXT NOT NULL DEFAULT '',\
+            subject TEXT NOT NULL DEFAULT '',\
+            project_key TEXT,\
+            policy_id TEXT,\
+            effect_kind TEXT NOT NULL,\
+            action TEXT NOT NULL DEFAULT '',\
+            posterior_json TEXT NOT NULL DEFAULT '[]',\
+            expected_loss REAL NOT NULL DEFAULT 0.0,\
+            runner_up_action TEXT,\
+            runner_up_loss REAL,\
+            evidence_summary TEXT NOT NULL DEFAULT '',\
+            calibration_healthy INTEGER NOT NULL DEFAULT 1,\
+            safe_mode_active INTEGER NOT NULL DEFAULT 0,\
+            non_execution_json TEXT,\
+            outcome_json TEXT,\
+            features_json TEXT,\
+            feature_ext_json TEXT,\
+            created_ts INTEGER NOT NULL,\
+            dispatched_ts INTEGER,\
+            executed_ts INTEGER,\
+            resolved_ts INTEGER,\
+            context_json TEXT\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v16_idx_atc_experiences_open".to_string(),
+        "index for open experience lookup (resolution candidates)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_atc_exp_open \
+         ON atc_experiences(state) WHERE state = 'open'"
+            .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v16_idx_atc_experiences_decision".to_string(),
+        "index for decision correlation (one-to-many lookup)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_atc_exp_decision \
+         ON atc_experiences(decision_id)"
+            .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v16_idx_atc_experiences_stratum".to_string(),
+        "index for stratum queries (conformal risk control)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_atc_exp_stratum \
+         ON atc_experiences(subsystem, effect_kind, state)"
+            .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v16_idx_atc_experiences_created".to_string(),
+        "index for time-range scans and retention".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_atc_exp_created \
+         ON atc_experiences(created_ts DESC)"
+            .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v16_idx_atc_experiences_subject".to_string(),
+        "index for per-agent experience lookup".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_atc_exp_subject \
+         ON atc_experiences(subject, created_ts DESC)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Rollup table: per-stratum materialized sufficient statistics.
+    // Updated incrementally on resolution, never rescanned from raw.
+    migrations.push(Migration::new(
+        "v16_create_atc_experience_rollups".to_string(),
+        "ATC experience rollups: per-stratum materialized statistics".to_string(),
+        "CREATE TABLE IF NOT EXISTS atc_experience_rollups (\
+            stratum_key TEXT PRIMARY KEY,\
+            subsystem TEXT NOT NULL,\
+            effect_kind TEXT NOT NULL,\
+            risk_tier INTEGER NOT NULL DEFAULT 0,\
+            total_count INTEGER NOT NULL DEFAULT 0,\
+            resolved_count INTEGER NOT NULL DEFAULT 0,\
+            censored_count INTEGER NOT NULL DEFAULT 0,\
+            expired_count INTEGER NOT NULL DEFAULT 0,\
+            correct_count INTEGER NOT NULL DEFAULT 0,\
+            incorrect_count INTEGER NOT NULL DEFAULT 0,\
+            total_regret REAL NOT NULL DEFAULT 0.0,\
+            total_loss REAL NOT NULL DEFAULT 0.0,\
+            last_updated_ts INTEGER NOT NULL DEFAULT 0\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v16_analyze_atc_experiences".to_string(),
+        "update query planner stats after experience indexes".to_string(),
+        "ANALYZE atc_experiences".to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 

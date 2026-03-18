@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_detect;
+pub mod atc_baseline;
 pub mod backpressure;
 pub mod bocpd;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod diagnostics;
 pub mod disk;
 pub mod error;
 pub mod evidence_ledger;
+pub mod experience;
 pub mod flake_triage;
 pub mod identity;
 pub mod intern;
@@ -56,6 +58,11 @@ pub use error::{Error as MailError, Result as MailResult};
 pub use evidence_ledger::{
     EVIDENCE_LEDGER_PATH_ENV, EvidenceLedger, EvidenceLedgerEntry,
     append_evidence_entry_if_configured, append_evidence_entry_to_path, evidence_ledger,
+};
+pub use experience::{
+    FEATURE_VERSION, EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow,
+    ExperienceState, ExperienceSubsystem, FeatureExtension, FeatureVector, NonExecutionReason,
+    loss_to_bp, prob_to_bp, saturating_u16, saturating_u8, validate_transition,
 };
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};
