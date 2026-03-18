@@ -172,15 +172,20 @@ impl AgentContaminationTracker {
         }
         self.event_count_in_window += 1;
 
-        // Only compute burst rate when we have at least 2 events in the
-        // window. A single event cannot define a meaningful rate.
-        // Use max(actual_elapsed, window_duration) as the denominator to
-        // prevent false burst signals after a window reset. Without this,
-        // 2 events arriving 1µs apart after reset would compute as
-        // 200 events/min (vs threshold of 10), a clear false positive.
-        let events_per_minute = if self.event_count_in_window >= 2 && window_duration_micros > 0 {
+        // Only compute burst rate after enough events AND enough elapsed time.
+        // This prevents false burst signals when a few events arrive
+        // near-simultaneously after a window reset.
+        // With min 3 events and min 1 second observation, the worst-case
+        // rate from near-instant events is 3/min × 60 = 180/min — still a
+        // valid signal. True bursts (11 events in 10s = 66/min) are detected
+        // reliably once the 1-second floor is passed.
+        const MIN_BURST_OBSERVATION_MICROS: i64 = 1_000_000; // 1 second
+        const MIN_BURST_EVENT_COUNT: u32 = 3;
+        let events_per_minute = if self.event_count_in_window >= MIN_BURST_EVENT_COUNT
+            && window_duration_micros > 0
+        {
             let actual_elapsed = ts_micros - self.window_start_micros;
-            let elapsed_micros = actual_elapsed.max(window_duration_micros);
+            let elapsed_micros = actual_elapsed.max(MIN_BURST_OBSERVATION_MICROS);
             #[allow(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
@@ -188,7 +193,7 @@ impl AgentContaminationTracker {
             )]
             let rate = {
                 let elapsed_minutes = elapsed_micros as f64 / 60_000_000.0;
-                (self.event_count_in_window as f64 / elapsed_minutes.max(0.001)) as u32
+                (self.event_count_in_window as f64 / elapsed_minutes) as u32
             };
             rate
         } else {

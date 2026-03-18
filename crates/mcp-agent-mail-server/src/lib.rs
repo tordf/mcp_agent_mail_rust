@@ -4323,8 +4323,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         }
 
         let mut visible_actions = Vec::new();
-        let mut executed_this_tick = 0_usize;
-        while executed_this_tick < ATC_OPERATOR_ACTION_CAPACITY {
+        let mut processed_this_tick = 0_usize;
+        while processed_this_tick < ATC_OPERATOR_ACTION_CAPACITY {
             let Some(effect) = pending_effects.front() else {
                 break;
             };
@@ -4357,6 +4357,9 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                     let _ = recent_executions.pop_front();
                 }
                 recent_executions.push_back(execution);
+                // Throttled outcomes still perform durable work, so they must
+                // count against the per-tick action budget.
+                processed_this_tick = processed_this_tick.saturating_add(1);
                 continue;
             }
             let Some(effect) = pending_effects.pop_front() else {
@@ -4392,7 +4395,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 let _ = recent_actions.pop_front();
             }
             recent_actions.push_back(action_snapshot);
-            executed_this_tick = executed_this_tick.saturating_add(1);
+            processed_this_tick = processed_this_tick.saturating_add(1);
         }
 
         // Periodic resolution sweep for open experiences (br-0qt6e.2.3).
