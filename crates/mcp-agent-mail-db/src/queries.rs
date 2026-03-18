@@ -4092,11 +4092,10 @@ pub fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
         if token.len() < 2 {
             continue;
         }
-        if STOPWORDS.contains(&token.to_ascii_uppercase().as_str()) {
+        if STOPWORDS.iter().any(|&sw| sw.eq_ignore_ascii_case(token)) {
             continue;
         }
-        let lower = token.to_lowercase();
-        if !terms.iter().any(|t| t.to_lowercase() == lower) {
+        if !terms.iter().any(|t| t.eq_ignore_ascii_case(token)) {
             terms.push(token.to_string());
         }
         if terms.len() >= max_terms {

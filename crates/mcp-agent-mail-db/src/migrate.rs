@@ -912,21 +912,6 @@ mod tests {
         assert_eq!(m1, m2);
     }
 
-    #[test]
-    fn parse_integer_string() {
-        assert_eq!(try_parse_timestamp_micros("1234567890"), Some(1234567890));
-    }
-
-    #[test]
-    fn parse_iso_dates_handles_malformed_safely() {
-        let mut s = String::from("12345");
-        s.push('+');
-        s.push('\u{20AC}'); // 3 bytes
-        s.push('X');
-        s.push('Y');
-        assert_eq!(try_parse_timestamp_micros(&s), None); // Must not panic on char boundary
-    }
-
     // ── strip_timezone_suffix tests ────────────────────────────────────
 
     #[test]

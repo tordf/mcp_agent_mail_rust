@@ -718,9 +718,11 @@ fn sort_entries(entries: &mut [ExplorerEntry], mode: SortMode) {
                 } else {
                     &b.to_agents
                 };
+                
                 agent_a
-                    .to_lowercase()
-                    .cmp(&agent_b.to_lowercase())
+                    .bytes()
+                    .map(|b| b.to_ascii_lowercase())
+                    .cmp(agent_b.bytes().map(|b| b.to_ascii_lowercase()))
                     .then_with(|| b.created_ts.cmp(&a.created_ts))
             });
         }
