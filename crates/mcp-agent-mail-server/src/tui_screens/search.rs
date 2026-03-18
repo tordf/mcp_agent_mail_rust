@@ -6626,7 +6626,8 @@ mod tests {
             kind: QueryTermKind::Word,
             negated: false,
         }];
-        let snippet = extract_snippet(text, terms.as_slice(), 40);
+        let needles: Vec<String> = terms.iter().map(|term| term.text.clone()).collect();
+        let snippet = extract_snippet(text, needles.as_slice(), 40);
         assert!(snippet.contains("needle"));
         assert!(snippet.starts_with('\u{2026}'));
         assert!(snippet.ends_with('\u{2026}'));
@@ -6653,8 +6654,9 @@ mod tests {
             kind: QueryTermKind::Word,
             negated: false,
         }];
+        let needles: Vec<String> = terms.iter().map(|term| term.text.clone()).collect();
 
-        let snippet = extract_context_snippet_from_lines(&lines, terms.as_slice(), 200);
+        let snippet = extract_context_snippet_from_lines(&lines, needles.as_slice(), 200);
         assert!(snippet.contains("L4:"));
         assert!(snippet.contains("needle"));
         assert!(snippet.contains(" ⟫ "));
@@ -6688,8 +6690,9 @@ mod tests {
                 negated: false,
             },
         ];
+        let needles: Vec<String> = terms.iter().map(|term| term.text.clone()).collect();
 
-        let snippet = extract_context_snippet_from_lines(&lines, terms.as_slice(), 200);
+        let snippet = extract_context_snippet_from_lines(&lines, needles.as_slice(), 200);
         assert!(
             snippet.contains("L12:"),
             "snippet should center strongest hit: {snippet}"

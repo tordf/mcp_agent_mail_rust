@@ -424,6 +424,8 @@ mod route_regressions {
             "[]",
             &[(recipient.id.unwrap_or(0), "to")],
         )));
+        let root_id = root.id.unwrap_or(0);
+        let root_thread_ref = root_id.to_string();
         outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
             &pool,
@@ -3049,8 +3051,14 @@ fn render_api_unified_inbox(
         .filter(|value| !value.is_empty());
 
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-    let messages = collect_unified_message_aggregates(&cx, &pool, &projects, limit, normalized_filter.as_deref())
-        .expect("aggregation should succeed");
+    let messages = collect_unified_message_aggregates(
+        &cx,
+        &pool,
+        &projects,
+        limit,
+        normalized_filter.as_deref(),
+    )
+    .expect("aggregation should succeed");
 
     let mut result = serde_json::json!({ "messages": messages.into_iter().map(|message| unified_api_message_value(&message.into_view())).collect::<Vec<_>>() });
     if include_projects {
@@ -4107,14 +4115,7 @@ mod fresh_eyes_regression_tests {
         let project_id = project.id.expect("project id");
 
         let sender = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project_id,
-            "RedFox",
-            "test",
-            "test",
-            None,
-            None,
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
         )));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
