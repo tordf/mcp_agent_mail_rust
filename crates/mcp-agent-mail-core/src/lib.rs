@@ -15,6 +15,7 @@ pub mod atc_assumptions;
 pub mod atc_attribution;
 pub mod atc_baseline;
 pub mod atc_contamination;
+pub mod atc_effect_semantics;
 pub mod atc_fairness;
 pub mod atc_invariants;
 pub mod atc_labeling;
