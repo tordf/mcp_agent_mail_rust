@@ -245,9 +245,10 @@ pub fn attribute_outcome(
     let closest = sorted[0];
     let next_closest = sorted[1];
 
-    if closest.delay_micros > 0
-        && next_closest.delay_micros > closest.delay_micros * 2
-    {
+    // A zero-delay cause is the strongest possible attribution signal:
+    // the effect and outcome were observed at the same instant.
+    // Use delay + 1 to handle the zero case (0*2=0 would fail the > check).
+    if next_closest.delay_micros > closest.delay_micros.saturating_mul(2).saturating_add(1) {
         // Most recent is clearly dominant (> 2× closer).
         return AttributionResult {
             confidence: AttributionConfidence::Primary,

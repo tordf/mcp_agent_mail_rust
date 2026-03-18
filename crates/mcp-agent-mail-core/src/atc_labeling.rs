@@ -219,9 +219,9 @@ pub const fn attribution_window(kind: EffectKind) -> AttributionWindow {
     match kind {
         // Probes: response expected within 30s, allow up to 60s
         EffectKind::Probe => AttributionWindow {
-            max_window_micros: 60_000_000,     // 60s
-            min_delay_micros: 0,               // immediate response is valid
-            max_concurrent_interventions: 0,   // any overlap censors
+            max_window_micros: 60_000_000,       // 60s
+            min_delay_micros: 0,                 // immediate response is valid
+            max_concurrent_interventions: 0,     // any overlap censors
             censor_on_exogenous_recovery: false, // probe response IS the outcome
         },
         // Advisories: behavior change expected within 5 minutes
@@ -229,34 +229,34 @@ pub const fn attribution_window(kind: EffectKind) -> AttributionWindow {
             max_window_micros: 300_000_000,     // 5 min
             min_delay_micros: 5_000_000,        // 5s minimum (filter noise)
             max_concurrent_interventions: 1,    // one other intervention OK
-            censor_on_exogenous_recovery: true,  // hard to distinguish advisory effect from natural
+            censor_on_exogenous_recovery: true, // hard to distinguish advisory effect from natural
         },
         // Release / Force reservation: outcome visible quickly, no overlap tolerated
         EffectKind::Release | EffectKind::ForceReservation => AttributionWindow {
-            max_window_micros: 120_000_000,     // 2 min
+            max_window_micros: 120_000_000, // 2 min
             min_delay_micros: 0,
-            max_concurrent_interventions: 0,    // no overlap for high-force
+            max_concurrent_interventions: 0, // no overlap for high-force
             censor_on_exogenous_recovery: false, // these are definitive actions
         },
         // Routing suggestions: load change within 5 minutes
         EffectKind::RoutingSuggestion => AttributionWindow {
-            max_window_micros: 300_000_000,     // 5 min
-            min_delay_micros: 10_000_000,       // 10s minimum
+            max_window_micros: 300_000_000, // 5 min
+            min_delay_micros: 10_000_000,   // 10s minimum
             max_concurrent_interventions: 1,
             censor_on_exogenous_recovery: true,
         },
         // Backpressure: queue depth change within 2 minutes
         EffectKind::Backpressure => AttributionWindow {
-            max_window_micros: 120_000_000,     // 2 min
-            min_delay_micros: 5_000_000,        // 5s minimum
+            max_window_micros: 120_000_000, // 2 min
+            min_delay_micros: 5_000_000,    // 5s minimum
             max_concurrent_interventions: 1,
             censor_on_exogenous_recovery: true,
         },
         // No-action: check situation after full probe interval
         EffectKind::NoAction => AttributionWindow {
-            max_window_micros: 300_000_000,     // 5 min (same as advisory)
-            min_delay_micros: 30_000_000,       // 30s minimum (let situation develop)
-            max_concurrent_interventions: 0,    // if someone else acted, can't evaluate inaction
+            max_window_micros: 300_000_000,      // 5 min (same as advisory)
+            min_delay_micros: 30_000_000,        // 30s minimum (let situation develop)
+            max_concurrent_interventions: 0,     // if someone else acted, can't evaluate inaction
             censor_on_exogenous_recovery: false, // stable situation = inaction was correct
         },
     }
@@ -401,7 +401,6 @@ pub fn label_experience(input: &LabelingInput) -> LabelingResult {
 fn label_open_or_executed(input: &LabelingInput) -> LabelingResult {
     let window = attribution_window(input.effect_kind);
     let anchor = input.executed_ts_micros.unwrap_or(input.created_ts_micros);
-    let elapsed = input.now_micros - anchor;
 
     // Check for subject departure
     if input.subject_departed {
@@ -440,30 +439,12 @@ fn label_open_or_executed(input: &LabelingInput) -> LabelingResult {
         };
     }
 
-    // Check for attribution window expiry
-    if elapsed > window.max_window_micros {
-        return LabelingResult {
-            label: OutcomeLabel::Censored {
-                reason: CensorReason::WindowExpired,
-            },
-            new_state: ExperienceState::Expired,
-            rule_id: "window_expired",
-        };
-    }
-
-    // Check if we have evidence
+    // Check if we have evidence. Window enforcement is based on when evidence
+    // arrived relative to the attribution anchor, not when this function
+    // happens to run.
     if let Some(ref evidence) = input.execution_evidence {
-        let evidence_delay = evidence.observed_ts_micros - anchor;
-        if evidence_delay < window.min_delay_micros {
-            return LabelingResult {
-                label: OutcomeLabel::Censored {
-                    reason: CensorReason::AmbiguousResult {
-                        description: "evidence arrived before minimum delay".to_string(),
-                    },
-                },
-                new_state: ExperienceState::Censored,
-                rule_id: "evidence_too_early",
-            };
+        if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
+            return result;
         }
 
         if evidence.exogenous_recovery && window.censor_on_exogenous_recovery {
@@ -477,6 +458,19 @@ fn label_open_or_executed(input: &LabelingInput) -> LabelingResult {
         }
 
         return label_from_evidence(input.effect_kind, evidence);
+    }
+
+    // No evidence yet, so expiry depends on how long we've waited by "now".
+    // Saturating subtraction prevents wrapping on clock skew (anchor > now).
+    let elapsed = input.now_micros.saturating_sub(anchor);
+    if elapsed > window.max_window_micros {
+        return LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::WindowExpired,
+            },
+            new_state: ExperienceState::Expired,
+            rule_id: "window_expired",
+        };
     }
 
     // No evidence yet, still within window
@@ -494,9 +488,15 @@ fn label_open_or_executed(input: &LabelingInput) -> LabelingResult {
 
 /// Label a non-execution experience (Throttled, Suppressed, Skipped).
 fn label_non_execution(input: &LabelingInput) -> LabelingResult {
+    let window = attribution_window(input.effect_kind);
+    let anchor = input.created_ts_micros;
+
     match (&input.non_execution_reason, &input.execution_evidence) {
         // Deliberate inaction with observed outcome
         (Some(NonExecutionReason::DeliberateInaction { .. }), Some(evidence)) => {
+            if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
+                return result;
+            }
             let inaction_correct = matches!(
                 evidence.situation_change,
                 SituationChange::Improved | SituationChange::Unchanged
@@ -512,6 +512,9 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
         }
         // Safety gate suppression with observed outcome
         (Some(NonExecutionReason::SafetyGate { .. }), Some(evidence)) => {
+            if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
+                return result;
+            }
             // If the safety gate was correct (situation didn't worsen), it was right to suppress
             let inaction_correct = !matches!(evidence.situation_change, SituationChange::Worsened);
             LabelingResult {
@@ -525,6 +528,9 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
         }
         // Budget exhaustion with observed outcome
         (Some(NonExecutionReason::BudgetExhausted { .. }), Some(evidence)) => {
+            if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
+                return result;
+            }
             let inaction_correct = !matches!(evidence.situation_change, SituationChange::Worsened);
             LabelingResult {
                 label: OutcomeLabel::NonExecution {
@@ -537,6 +543,9 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
         }
         // Calibration fallback with observed outcome
         (Some(NonExecutionReason::CalibrationFallback { .. }), Some(evidence)) => {
+            if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
+                return result;
+            }
             let inaction_correct = !matches!(evidence.situation_change, SituationChange::Worsened);
             LabelingResult {
                 label: OutcomeLabel::NonExecution {
@@ -549,8 +558,7 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
         }
         // Non-execution without outcome evidence — check window
         (_, None) => {
-            let window = attribution_window(input.effect_kind);
-            let elapsed = input.now_micros - input.created_ts_micros;
+            let elapsed = input.now_micros.saturating_sub(anchor);
             if elapsed > window.max_window_micros {
                 LabelingResult {
                     label: OutcomeLabel::Censored {
@@ -588,6 +596,59 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
     }
 }
 
+fn validate_evidence_timing(
+    anchor_micros: i64,
+    window: AttributionWindow,
+    evidence: &ExecutionEvidence,
+) -> Option<LabelingResult> {
+    if let Some(result) = censor_pre_anchor_evidence(anchor_micros, evidence) {
+        return Some(result);
+    }
+
+    let evidence_delay = evidence.observed_ts_micros.saturating_sub(anchor_micros);
+    if evidence_delay > window.max_window_micros {
+        return Some(LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::WindowExpired,
+            },
+            new_state: ExperienceState::Expired,
+            rule_id: "evidence_after_window",
+        });
+    }
+    if evidence_delay < window.min_delay_micros {
+        return Some(LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::AmbiguousResult {
+                    description: "evidence arrived before minimum delay".to_string(),
+                },
+            },
+            new_state: ExperienceState::Censored,
+            rule_id: "evidence_too_early",
+        });
+    }
+
+    None
+}
+
+fn censor_pre_anchor_evidence(
+    anchor_micros: i64,
+    evidence: &ExecutionEvidence,
+) -> Option<LabelingResult> {
+    if evidence.observed_ts_micros < anchor_micros {
+        return Some(LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::AmbiguousResult {
+                    description: "evidence observed before attribution anchor".to_string(),
+                },
+            },
+            new_state: ExperienceState::Censored,
+            rule_id: "evidence_before_anchor",
+        });
+    }
+
+    None
+}
+
 /// Label an experience from execution evidence using action-family-specific rules.
 fn label_from_evidence(effect_kind: EffectKind, evidence: &ExecutionEvidence) -> LabelingResult {
     match effect_kind {
@@ -605,7 +666,9 @@ fn label_from_evidence(effect_kind: EffectKind, evidence: &ExecutionEvidence) ->
 // Per-action-family labeling rules
 // ──────────────────────────────────────────────────────────────────────
 
-/// Probe labeling: response = success, no response = failure.
+/// Probe labeling: both outcomes are Correct because the decision to probe
+/// was always valid (entropy scheduling only probes uncertain agents). The
+/// realized_loss differs between response (low) and no-response (high).
 const fn label_probe(evidence: &ExecutionEvidence) -> LabelingResult {
     if evidence.effect_achieved {
         // Agent responded to probe
@@ -807,17 +870,30 @@ const fn label_no_action(evidence: &ExecutionEvidence) -> LabelingResult {
 #[must_use]
 pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<ExperienceOutcome> {
     match &result.label {
-        OutcomeLabel::Success { realized_loss, confidence } => Some(ExperienceOutcome {
+        OutcomeLabel::Success {
+            realized_loss,
+            confidence,
+        } => Some(ExperienceOutcome {
             observed_ts_micros: now_micros,
-            label: format!("success (confidence={confidence:.2}, rule={})", result.rule_id),
+            label: format!(
+                "success (confidence={confidence:.2}, rule={})",
+                result.rule_id
+            ),
             correct: true,
             actual_loss: Some(*realized_loss),
             regret: None,
             evidence: None,
         }),
-        OutcomeLabel::Failure { realized_loss, reason, confidence } => Some(ExperienceOutcome {
+        OutcomeLabel::Failure {
+            realized_loss,
+            reason,
+            confidence,
+        } => Some(ExperienceOutcome {
             observed_ts_micros: now_micros,
-            label: format!("failure: {reason} (confidence={confidence:.2}, rule={})", result.rule_id),
+            label: format!(
+                "failure: {reason} (confidence={confidence:.2}, rule={})",
+                result.rule_id
+            ),
             correct: false,
             actual_loss: Some(*realized_loss),
             regret: None,
@@ -831,8 +907,15 @@ pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<Expe
             regret: Some(0.0), // correct = zero regret
             evidence: None,
         }),
-        OutcomeLabel::Incorrect { realized_loss, false_positive } => {
-            let fp_label = if *false_positive { "false_positive" } else { "false_negative" };
+        OutcomeLabel::Incorrect {
+            realized_loss,
+            false_positive,
+        } => {
+            let fp_label = if *false_positive {
+                "false_positive"
+            } else {
+                "false_negative"
+            };
             Some(ExperienceOutcome {
                 observed_ts_micros: now_micros,
                 label: format!("{fp_label} (rule={})", result.rule_id),
@@ -842,11 +925,18 @@ pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<Expe
                 evidence: None,
             })
         }
-        OutcomeLabel::NonExecution { inaction_correct, realized_loss } => Some(ExperienceOutcome {
+        OutcomeLabel::NonExecution {
+            inaction_correct,
+            realized_loss,
+        } => Some(ExperienceOutcome {
             observed_ts_micros: now_micros,
             label: format!(
                 "non_execution_{} (rule={})",
-                if *inaction_correct { "correct" } else { "incorrect" },
+                if *inaction_correct {
+                    "correct"
+                } else {
+                    "incorrect"
+                },
                 result.rule_id,
             ),
             correct: *inaction_correct,
@@ -918,6 +1008,47 @@ mod tests {
     }
 
     #[test]
+    fn evidence_within_window_still_labels_after_late_evaluation() {
+        let mut input = base_input();
+        input.now_micros = 90_000_000;
+        input.execution_evidence = Some(success_evidence());
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Resolved);
+        assert_eq!(result.rule_id, "probe_responded");
+    }
+
+    #[test]
+    fn evidence_after_window_expires_even_if_present() {
+        let mut input = base_input();
+        input.execution_evidence = Some(ExecutionEvidence {
+            observed_ts_micros: 70_000_000,
+            effect_achieved: true,
+            situation_change: SituationChange::Improved,
+            exogenous_recovery: false,
+            realized_loss: 0.5,
+            best_possible_loss: 0.0,
+        });
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Expired);
+        assert_eq!(result.rule_id, "evidence_after_window");
+        assert!(!result.label.has_learning_signal());
+    }
+
+    #[test]
+    fn probe_evidence_before_execution_anchor_censors() {
+        let mut input = base_input();
+        let mut evidence = success_evidence();
+        evidence.observed_ts_micros = 1_400_000;
+        input.execution_evidence = Some(evidence);
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Censored);
+        assert_eq!(result.rule_id, "evidence_before_anchor");
+    }
+
+    #[test]
     fn window_expired_censors() {
         let mut input = base_input();
         input.now_micros = 200_000_000; // well past 60s window
@@ -977,7 +1108,13 @@ mod tests {
         input.execution_evidence = Some(evidence);
         let result = label_experience(&input);
         assert_eq!(result.new_state, ExperienceState::Resolved);
-        assert!(matches!(result.label, OutcomeLabel::Incorrect { false_positive: true, .. }));
+        assert!(matches!(
+            result.label,
+            OutcomeLabel::Incorrect {
+                false_positive: true,
+                ..
+            }
+        ));
         assert_eq!(result.rule_id, "release_false_positive");
     }
 
@@ -1007,7 +1144,13 @@ mod tests {
         input.execution_evidence = Some(evidence);
         let result = label_experience(&input);
         assert_eq!(result.new_state, ExperienceState::Resolved);
-        assert!(matches!(result.label, OutcomeLabel::NonExecution { inaction_correct: true, .. }));
+        assert!(matches!(
+            result.label,
+            OutcomeLabel::NonExecution {
+                inaction_correct: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1026,8 +1169,77 @@ mod tests {
         let result = label_experience(&input);
         assert!(matches!(
             result.label,
-            OutcomeLabel::NonExecution { inaction_correct: false, .. }
+            OutcomeLabel::NonExecution {
+                inaction_correct: false,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn non_execution_evidence_after_window_expires_even_if_present() {
+        let mut input = base_input();
+        input.state = ExperienceState::Suppressed;
+        input.effect_kind = EffectKind::Release;
+        input.non_execution_reason = Some(NonExecutionReason::SafetyGate {
+            gate_name: "conformal_uncertainty".to_string(),
+            risk_score: 0.9,
+            gate_threshold: 0.7,
+        });
+        input.execution_evidence = Some(ExecutionEvidence {
+            observed_ts_micros: 130_000_000,
+            effect_achieved: false,
+            situation_change: SituationChange::Unchanged,
+            exogenous_recovery: false,
+            realized_loss: 0.5,
+            best_possible_loss: 0.0,
+        });
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Expired);
+        assert_eq!(result.rule_id, "evidence_after_window");
+    }
+
+    #[test]
+    fn non_execution_evidence_too_early_censors() {
+        let mut input = base_input();
+        input.state = ExperienceState::Skipped;
+        input.effect_kind = EffectKind::NoAction;
+        input.non_execution_reason = Some(NonExecutionReason::DeliberateInaction {
+            no_action_loss: 0.5,
+            best_action_loss: 1.0,
+        });
+        input.execution_evidence = Some(ExecutionEvidence {
+            observed_ts_micros: 5_000_000,
+            effect_achieved: false,
+            situation_change: SituationChange::Unchanged,
+            exogenous_recovery: false,
+            realized_loss: 0.2,
+            best_possible_loss: 0.0,
+        });
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Censored);
+        assert_eq!(result.rule_id, "evidence_too_early");
+    }
+
+    #[test]
+    fn non_execution_evidence_before_created_anchor_censors() {
+        let mut input = base_input();
+        input.state = ExperienceState::Suppressed;
+        input.effect_kind = EffectKind::Release;
+        input.non_execution_reason = Some(NonExecutionReason::SafetyGate {
+            gate_name: "conformal_uncertainty".to_string(),
+            risk_score: 0.9,
+            gate_threshold: 0.7,
+        });
+        let mut evidence = success_evidence();
+        evidence.observed_ts_micros = 900_000;
+        input.execution_evidence = Some(evidence);
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Censored);
+        assert_eq!(result.rule_id, "evidence_before_anchor");
     }
 
     #[test]
@@ -1051,7 +1263,10 @@ mod tests {
         let result = label_experience(&input);
         assert!(matches!(
             result.label,
-            OutcomeLabel::NonExecution { inaction_correct: false, .. }
+            OutcomeLabel::NonExecution {
+                inaction_correct: false,
+                ..
+            }
         ));
     }
 
@@ -1121,7 +1336,11 @@ mod tests {
     #[test]
     fn outcome_label_realized_loss_extraction() {
         assert_eq!(
-            OutcomeLabel::Success { realized_loss: 1.0, confidence: 0.9 }.realized_loss(),
+            OutcomeLabel::Success {
+                realized_loss: 1.0,
+                confidence: 0.9
+            }
+            .realized_loss(),
             Some(1.0)
         );
         assert_eq!(
@@ -1187,7 +1406,10 @@ mod tests {
             "attribution window expired"
         );
         assert_eq!(
-            CensorReason::OverlappingInterventions { intervention_count: 3 }.to_string(),
+            CensorReason::OverlappingInterventions {
+                intervention_count: 3
+            }
+            .to_string(),
             "3 overlapping interventions"
         );
     }

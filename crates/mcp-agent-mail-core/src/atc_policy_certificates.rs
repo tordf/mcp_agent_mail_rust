@@ -599,15 +599,11 @@ impl ConfidenceSequence {
         }
 
         // Update e-value in log-space: log(E_t) += log(1 + λ × Z_i).
-        // Clamp the argument to prevent log of zero or negative.
-        let factor = 1.0 + self.lambda * advantage;
-        if factor > 0.0 {
-            self.log_e_value += factor.ln();
-        } else {
-            // If factor <= 0, the candidate had a catastrophically bad
-            // observation. Clamp to a small positive value.
-            self.log_e_value += (-10.0_f64).max(factor.abs().ln().copysign(-1.0));
-        }
+        // When factor ≤ 0 (catastrophically bad observation), the e-value
+        // should crash toward zero. Clamping to a small positive value
+        // produces a large negative log update, which is correct.
+        let factor = (1.0 + self.lambda * advantage).max(1e-6);
+        self.log_e_value += factor.ln();
     }
 
     /// Current e-value (exponentiated from log-space).
@@ -987,14 +983,11 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
     }
 
     // ── Gate 3: Evidence quality ──
-    if input.evidence_quality.trusted_fraction < MIN_TRUSTED_EVIDENCE_FRACTION {
-        block_reasons.push(CertificationBlockReason::SuspiciousEvidence {
-            trusted_fraction: input.evidence_quality.trusted_fraction,
-            required_fraction: MIN_TRUSTED_EVIDENCE_FRACTION,
-            quarantined_count: input.evidence_quality.quarantined_count,
-        });
-    }
-    if input.evidence_quality.quarantined_count > 0 {
+    // Low trusted fraction and quarantined evidence are separate concerns
+    // but both produce the same block reason. Avoid duplicates by combining.
+    if input.evidence_quality.trusted_fraction < MIN_TRUSTED_EVIDENCE_FRACTION
+        || input.evidence_quality.quarantined_count > 0
+    {
         block_reasons.push(CertificationBlockReason::SuspiciousEvidence {
             trusted_fraction: input.evidence_quality.trusted_fraction,
             required_fraction: MIN_TRUSTED_EVIDENCE_FRACTION,
@@ -1041,7 +1034,7 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
                 shrinkage_weight: stratum.shrinkage_weight,
                 max_acceptable: MAX_ACCEPTABLE_SHRINKAGE,
             });
-            break; // report only the worst
+            break; // report only the first sparse stratum found
         }
     }
 

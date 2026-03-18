@@ -1,3 +1,4 @@
+#![allow(clippy::cast_precision_loss, clippy::doc_markdown)]
 //! Feedback-loop contamination detection and anti-gaming safeguards
 //! (br-0qt6e.3.12).
 //!
@@ -38,8 +39,6 @@
 //! - **Per-trace deduplication**: Same trace_id counted only once.
 //! - **Burst detection**: Rapid event sequences (>10 events/minute from
 //!   one agent) trigger automatic downweighting.
-
-#![allow(clippy::doc_markdown)]
 
 use serde::{Deserialize, Serialize};
 
@@ -175,10 +174,23 @@ impl AgentContaminationTracker {
 
         // Only compute burst rate when we have at least 2 events in the
         // window. A single event cannot define a meaningful rate.
+        // Use max(actual_elapsed, window_duration) as the denominator to
+        // prevent false burst signals after a window reset. Without this,
+        // 2 events arriving 1µs apart after reset would compute as
+        // 200 events/min (vs threshold of 10), a clear false positive.
         let events_per_minute = if self.event_count_in_window >= 2 && window_duration_micros > 0 {
-            let elapsed_micros = (ts_micros - self.window_start_micros).max(1);
-            let elapsed_minutes = elapsed_micros as f64 / 60_000_000.0;
-            (self.event_count_in_window as f64 / elapsed_minutes.max(0.01)) as u32
+            let actual_elapsed = ts_micros - self.window_start_micros;
+            let elapsed_micros = actual_elapsed.max(window_duration_micros);
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let rate = {
+                let elapsed_minutes = elapsed_micros as f64 / 60_000_000.0;
+                (self.event_count_in_window as f64 / elapsed_minutes.max(0.001)) as u32
+            };
+            rate
         } else {
             0 // not enough events to compute a rate
         };
@@ -201,7 +213,9 @@ impl AgentContaminationTracker {
                     signal_type: ContaminationKind::DuplicateTrace,
                     severity: 0.4,
                     source: String::new(),
-                    description: format!("events {interval}μs apart (< {MIN_EVENT_INTERVAL_MICROS}μs threshold)"),
+                    description: format!(
+                        "events {interval}μs apart (< {MIN_EVENT_INTERVAL_MICROS}μs threshold)"
+                    ),
                     detected_ts_micros: ts_micros,
                 });
             }
@@ -343,6 +357,22 @@ mod tests {
         assert!(signals.is_empty(), "event 1: {signals:?}");
 
         assert_eq!(tracker.quality, EvidenceQuality::Trusted);
+    }
+
+    #[test]
+    fn burst_detection_uses_actual_elapsed_time_not_full_window_average() {
+        let mut tracker = AgentContaminationTracker::default();
+        let window = 600_000_000_i64; // 10 minutes
+
+        for i in 0..11 {
+            let ts = 1_000_000 + i * 1_000_000; // 11 events in 10 seconds
+            let _ = tracker.record_event(ts, window);
+        }
+
+        assert!(
+            tracker.total_signals > 0,
+            "true burst should not be hidden by averaging over the full window"
+        );
     }
 
     #[test]

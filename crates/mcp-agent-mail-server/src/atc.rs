@@ -4972,7 +4972,7 @@ impl AtcEngine {
         message: Option<String>,
     ) -> AtcEffectPlan {
         let semantics =
-            self.effect_semantics_for(record, family, kind, category, &agent, project_key.as_deref());
+            self.effect_semantics_for(record, family, kind, &agent, project_key.as_deref());
         let mut effect_seed = format!("{}:{kind}:{category}:{family}:{agent}", record.trace_id,);
         if let Some(project_key) = project_key.as_deref() {
             effect_seed.push(':');
@@ -5014,7 +5014,6 @@ impl AtcEngine {
         record: &AtcDecisionRecord,
         family: &str,
         kind: &str,
-        category: &str,
         agent: &str,
         project_key: Option<&str>,
     ) -> AtcEffectSemantics {
@@ -9501,7 +9500,7 @@ mod alien_enhancement_tests {
                 action,
                 AtcTickAction::SendAdvisory { agent, message }
                     if agent == "ConformalTick"
-                        && message.contains("withheld under high uncertainty")
+                        && message.contains("withheld automated release")
             )),
             "suppressed release should emit a softer advisory"
         );
@@ -9510,7 +9509,7 @@ mod alien_enhancement_tests {
                 action,
                 AtcTickAction::SendAdvisory { agent, message }
                     if agent == "ConformalTick"
-                        && message.contains("release requested")
+                        && message.contains("requested reservation release")
             )),
             "suppressed release should not claim a release request was made"
         );
@@ -9810,7 +9809,10 @@ mod alien_enhancement_tests {
         assert_eq!(effect.semantics.family, "liveness_monitoring");
         assert!(effect.semantics.requires_project);
         assert!(!effect.semantics.ack_required);
-        assert_eq!(effect.semantics.cooldown_key, "liveness_monitoring:/tmp/project-agent:ProjectAgent");
+        assert_eq!(
+            effect.semantics.cooldown_key,
+            "liveness_monitoring:/tmp/project-agent:ProjectAgent"
+        );
     }
 
     #[test]

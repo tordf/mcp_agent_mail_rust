@@ -1,3 +1,8 @@
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::struct_excessive_bools,
+    clippy::doc_markdown
+)]
 //! Admissibility gates, exploration budget, and automatic rollback
 //! (br-0qt6e.3.7).
 //!
@@ -30,8 +35,6 @@
 //! - Regime change detection (CUSUM)
 //! - Evidence contamination exceeds 30% of recent observations
 //! - Operator explicit override
-
-#![allow(clippy::doc_markdown)]
 
 use serde::{Deserialize, Serialize};
 

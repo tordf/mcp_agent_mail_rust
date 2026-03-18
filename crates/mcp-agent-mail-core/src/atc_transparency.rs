@@ -1054,6 +1054,13 @@ pub fn check_ev_gate(
 ) -> Result<(), String> {
     let gate = ev_gate(family).ok_or_else(|| format!("no EV gate defined for {family}"))?;
 
+    if !improvement.is_finite() {
+        return Err("improvement metric must be finite".to_string());
+    }
+    if !safety_regression.is_finite() {
+        return Err("safety regression metric must be finite".to_string());
+    }
+
     if observations < gate.min_observations {
         return Err(format!(
             "insufficient observations: {observations} < {} required",
@@ -1186,6 +1193,28 @@ mod tests {
         let result = check_ev_gate(MethodFamily::BayesianPosterior, 200, 0.15, 0.01);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("safety regression"));
+    }
+
+    #[test]
+    fn ev_gate_check_rejects_non_finite_improvement() {
+        let result = check_ev_gate(MethodFamily::BayesianPosterior, 200, f64::NAN, 0.0);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("improvement metric must be finite")
+        );
+    }
+
+    #[test]
+    fn ev_gate_check_rejects_non_finite_safety_regression() {
+        let result = check_ev_gate(MethodFamily::BayesianPosterior, 200, 0.15, f64::INFINITY);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("safety regression metric must be finite")
+        );
     }
 
     #[test]

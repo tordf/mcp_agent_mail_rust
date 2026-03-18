@@ -810,7 +810,10 @@ fn normalize_send_message_cc_bcc_argument(
     };
 
     match value {
-        Value::Null => Ok(()),
+        Value::Null => {
+            arguments.remove(field);
+            Ok(())
+        }
         Value::String(s) => {
             arguments.insert(field.to_string(), json!([s]));
             Ok(())
@@ -5541,12 +5544,19 @@ mod tests {
     // ── normalize_send_message_cc_bcc_argument tests ────────────────
 
     #[test]
-    fn normalize_cc_null_is_noop() {
+    fn normalize_cc_null_removes_field() {
         let mut args = serde_json::Map::new();
         args.insert("cc".to_string(), Value::Null);
         normalize_send_message_cc_bcc_argument(&mut args, "cc").unwrap();
-        // Null stays in the map (not removed).
-        assert_eq!(args.get("cc"), Some(&Value::Null));
+        assert!(!args.contains_key("cc"));
+    }
+
+    #[test]
+    fn normalize_bcc_null_removes_field() {
+        let mut args = serde_json::Map::new();
+        args.insert("bcc".to_string(), Value::Null);
+        normalize_send_message_cc_bcc_argument(&mut args, "bcc").unwrap();
+        assert!(!args.contains_key("bcc"));
     }
 
     #[test]

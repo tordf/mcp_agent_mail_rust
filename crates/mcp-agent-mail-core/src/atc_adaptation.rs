@@ -1,3 +1,4 @@
+#![allow(clippy::cast_precision_loss, clippy::doc_markdown)]
 //! Finite-policy regret-bounded adaptation engine (br-0qt6e.3.5).
 //!
 //! Selects among a finite set of candidate policy artifacts using
@@ -41,13 +42,11 @@
 //! # Promotion Criteria
 //!
 //! A candidate policy can replace the incumbent when:
-//! 1. It has been scored on >= `min_observations` experiences
+//! 1. It has been executed on >= `min_observations` experiences
 //! 2. Its estimated regret vs. incumbent is negative (it's better)
 //! 3. No safety metric has regressed beyond tolerance
 //! 4. The regime is stable (not transitioning or cooling)
 //! 5. The risk budget for the stratum is healthy
-
-#![allow(clippy::doc_markdown)]
 
 use serde::{Deserialize, Serialize};
 
@@ -220,19 +219,30 @@ impl AdaptationEngine {
             self.trackers[idx].cumulative_loss += loss;
             self.trackers[idx].selection_count += 1;
 
-            // EXP3 weight update: w *= exp(-eta * loss / p)
+            // EXP3 weight update: w *= exp(-eta * loss_hat) where loss_hat = loss / p.
+            // Cap the importance-weighted loss to prevent variance blowup when
+            // p is very small (e.g., gamma/K = 0.005 with K=20 policies).
+            // Without the cap, loss=1.0 with p=0.005 would cause log_weight -= 200*eta,
+            // an extreme weight swing from a single observation.
             let p = self.trackers[idx].selection_probability.max(1e-10);
-            self.trackers[idx].log_weight -= self.eta * loss / p;
+            let loss_hat = (loss / p).min(10.0); // cap at 10× to prevent variance blowup
+            self.trackers[idx].log_weight -= self.eta * loss_hat;
         }
 
-        // Record counterfactual losses for non-selected policies.
+        // Note: In standard EXP3, non-selected arms receive 0 estimated loss.
+        // The importance-weighted loss estimator for arm i at round t is:
+        //   loss_hat_i = loss_t * I(selected=i) / p_i
+        // For non-selected arms, I(selected=i) = 0, so loss_hat = 0.
+        // We do NOT accumulate counterfactual loss for non-selected policies
+        // because assigning the selected arm's raw loss to all non-selected
+        // arms makes all counterfactual scores identical and useless for
+        // distinguishing policy quality. Instead, promotion decisions should
+        // rely on the EXP3 selection probabilities, which already encode
+        // learned policy quality through the weight update mechanism.
         for (i, tracker) in self.trackers.iter_mut().enumerate() {
             if i != idx {
                 tracker.counterfactual_count += 1;
-                // Counterfactual loss estimation: use the realized loss
-                // as the importance-weighted estimator (simplified IPS).
-                // A full implementation would compute per-policy counterfactual.
-                tracker.counterfactual_loss += loss;
+                // Counterfactual loss = 0 for non-selected arms (standard EXP3).
             }
         }
 
@@ -242,6 +252,7 @@ impl AdaptationEngine {
 
     /// Recompute EXP3 selection probabilities.
     fn recompute_probabilities(&mut self) {
+        #[allow(clippy::cast_precision_loss)]
         let k = self.trackers.len() as f64;
         if k < 1.0 {
             return;
@@ -262,8 +273,7 @@ impl AdaptationEngine {
 
         for tracker in &mut self.trackers {
             let w = (tracker.log_weight - max_log_w).exp();
-            tracker.selection_probability =
-                (1.0 - self.gamma) * w / sum_w + self.gamma / k;
+            tracker.selection_probability = (1.0 - self.gamma) * w / sum_w + self.gamma / k;
         }
     }
 
@@ -303,7 +313,7 @@ impl AdaptationEngine {
             };
         };
 
-        let total_obs = tracker.selection_count + tracker.counterfactual_count;
+        let total_obs = tracker.selection_count;
         if total_obs < self.min_promotion_observations {
             return PromotionStatus::InsufficientData {
                 observations: total_obs,
@@ -326,16 +336,7 @@ impl AdaptationEngine {
         } else {
             0.0
         };
-        let candidate_avg = if tracker.selection_count > 0 {
-            tracker.cumulative_loss / tracker.selection_count as f64
-        } else if tracker.counterfactual_count > 0 {
-            tracker.counterfactual_loss / tracker.counterfactual_count as f64
-        } else {
-            return PromotionStatus::InsufficientData {
-                observations: total_obs,
-                required: self.min_promotion_observations,
-            };
-        };
+        let candidate_avg = tracker.cumulative_loss / tracker.selection_count as f64;
 
         let regret_gap = candidate_avg - incumbent_avg;
         if regret_gap >= 0.0 {
@@ -485,7 +486,11 @@ mod tests {
         engine.add_candidate(candidate_policy("v2"));
         engine.add_candidate(candidate_policy("v3"));
 
-        let sum: f64 = engine.trackers.iter().map(|t| t.selection_probability).sum();
+        let sum: f64 = engine
+            .trackers
+            .iter()
+            .map(|t| t.selection_probability)
+            .sum();
         assert!((sum - 1.0).abs() < 1e-10, "prob sum = {sum}");
     }
 
@@ -502,10 +507,7 @@ mod tests {
     fn insufficient_data_blocks_promotion() {
         let engine = AdaptationEngine::new(baseline_policy());
         let status = engine.evaluate_promotion(0, true, true);
-        assert!(matches!(
-            status,
-            PromotionStatus::InsufficientData { .. }
-        ));
+        assert!(matches!(status, PromotionStatus::InsufficientData { .. }));
     }
 
     #[test]
@@ -537,6 +539,28 @@ mod tests {
         assert!(
             matches!(status, PromotionStatus::Ready { .. }),
             "expected Ready, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn counterfactual_only_data_cannot_trigger_promotion() {
+        let mut engine = AdaptationEngine::new(baseline_policy());
+        engine.add_candidate(candidate_policy("v2"));
+
+        engine.trackers[0].selection_count = 300;
+        engine.trackers[0].cumulative_loss = 90.0;
+        engine.trackers[1].counterfactual_count = 300;
+
+        let status = engine.evaluate_promotion(1, true, true);
+        assert!(
+            matches!(
+                status,
+                PromotionStatus::InsufficientData {
+                    observations: 0,
+                    ..
+                }
+            ),
+            "counterfactual-only evidence should not promote an unexecuted candidate: {status:?}"
         );
     }
 

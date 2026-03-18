@@ -511,7 +511,9 @@ pub fn build_scope_sql_clauses(ctx: &ScopeContext) -> (Vec<String>, Vec<ScopeSql
     // The viewer can see messages where:
     // 1. They are the sender
     // 2. They are a recipient
-    // 3. The sender has 'open' or 'auto' contact policy
+    // 3. The sender has 'open' or 'auto' contact policy in a project the viewer
+    //    already belongs to. Cross-project visibility still requires an approved
+    //    contact link, matching `evaluate_scope`.
     // 4. They have an approved contact link with the sender
     //
     // This is an OR of multiple conditions.
@@ -529,11 +531,20 @@ pub fn build_scope_sql_clauses(ctx: &ScopeContext) -> (Vec<String>, Vec<ScopeSql
     );
     params.push(ScopeSqlParam::Int(viewer.agent_id));
 
-    // 3. Sender has permissive policy (open or auto)
-    or_parts.push(
-        "(SELECT a2.contact_policy FROM agents a2 WHERE a2.id = m.sender_id) IN ('open', 'auto')"
-            .to_string(),
-    );
+    // 3. Same-project sender has permissive policy (open or auto)
+    if ctx.viewer_project_ids.is_empty() {
+        or_parts.push("0 = 1".to_string());
+    } else {
+        let placeholders = vec!["?"; ctx.viewer_project_ids.len()].join(", ");
+        or_parts.push(format!(
+            "(m.project_id IN ({placeholders}) AND \
+             (SELECT a2.contact_policy FROM agents a2 WHERE a2.id = m.sender_id) \
+             IN ('open', 'auto'))"
+        ));
+        for project_id in &ctx.viewer_project_ids {
+            params.push(ScopeSqlParam::Int(*project_id));
+        }
+    }
 
     // 4. Approved contact link (bidirectional)
     or_parts.push(
@@ -929,7 +940,31 @@ mod tests {
         assert!(clause.contains("message_recipients"));
         assert!(clause.contains("contact_policy"));
         assert!(clause.contains("agent_links"));
-        // 4 params: sender_id, recipient_id, link_a, link_b + TimestampNow
+        assert!(clause.contains("m.project_id IN (?)"));
+        // sender_id, recipient_id, project_id, link_a, link_b, TimestampNow
+        assert_eq!(params.len(), 6);
+    }
+
+    #[test]
+    fn sql_clauses_policy_branch_requires_viewer_project_membership() {
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.viewer_project_ids = vec![1, 7];
+        let (clauses, params) = build_scope_sql_clauses(&ctx);
+        let clause = &clauses[0];
+
+        assert!(clause.contains("m.project_id IN (?, ?)"));
+        assert!(matches!(params[2], ScopeSqlParam::Int(1)));
+        assert!(matches!(params[3], ScopeSqlParam::Int(7)));
+    }
+
+    #[test]
+    fn sql_clauses_without_viewer_projects_disable_policy_branch() {
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.viewer_project_ids.clear();
+        let (clauses, params) = build_scope_sql_clauses(&ctx);
+        let clause = &clauses[0];
+
+        assert!(clause.contains("0 = 1"));
         assert_eq!(params.len(), 5);
     }
 

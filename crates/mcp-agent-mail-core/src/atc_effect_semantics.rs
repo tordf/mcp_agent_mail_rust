@@ -102,7 +102,7 @@ impl EffectRiskClass {
     #[must_use]
     pub const fn max_repetitions_in_window(self) -> u32 {
         match self {
-            Self::LowRiskNudge => 3,        // can repeat up to 3 times
+            Self::LowRiskNudge => 3,         // can repeat up to 3 times
             Self::MediumRiskCheck => 1,      // once per cooldown window
             Self::HighRiskIntervention => 0, // never repeat (per agent per regime)
         }
@@ -185,10 +185,7 @@ pub struct PreconditionFailure {
 /// Returns a `PreconditionResult` documenting which checks passed
 /// and which failed. The effect should only proceed if `result.passed`.
 #[must_use]
-pub fn validate_preconditions(
-    family: &str,
-    context: &PreconditionContext,
-) -> PreconditionResult {
+pub fn validate_preconditions(family: &str, context: &PreconditionContext) -> PreconditionResult {
     let mut failures = Vec::new();
     let mut total = 0u32;
     let mut passed = 0u32;
@@ -255,7 +252,8 @@ pub fn validate_preconditions(
             } else {
                 failures.push(PreconditionFailure {
                     precondition: "deadlock_cycle_present".to_string(),
-                    reason: "no active deadlock cycle; remediation message would be noise".to_string(),
+                    reason: "no active deadlock cycle; remediation message would be noise"
+                        .to_string(),
                 });
             }
         }
@@ -353,7 +351,8 @@ pub fn validate_preconditions(
             } else {
                 failures.push(PreconditionFailure {
                     precondition: "release_withheld_by_gate".to_string(),
-                    reason: "withheld notice without an active gate withholding release".to_string(),
+                    reason: "withheld notice without an active gate withholding release"
+                        .to_string(),
                 });
             }
         }
@@ -390,10 +389,6 @@ struct CooldownEntry {
     last_ts_micros: i64,
     /// Number of emissions in the current cooldown window.
     emissions_in_window: u32,
-    /// Cooldown duration (microseconds).
-    cooldown_micros: i64,
-    /// Risk class of this effect.
-    risk_class: EffectRiskClass,
 }
 
 /// Tracks cooldown state for effect families, preventing repeated
@@ -441,14 +436,15 @@ impl CooldownTracker {
     ) -> CooldownVerdict {
         let risk_class = EffectRiskClass::for_family(family);
         let max_reps = risk_class.max_repetitions_in_window();
+        let active_cooldown_micros = cooldown_micros.max(0);
 
         if let Some(entry) = self.entries.get(cooldown_key) {
-            let elapsed = now_micros - entry.last_ts_micros;
-            if elapsed < entry.cooldown_micros {
+            let elapsed = now_micros.saturating_sub(entry.last_ts_micros);
+            if elapsed < active_cooldown_micros {
                 // Still within cooldown window.
                 if entry.emissions_in_window >= max_reps {
                     return CooldownVerdict::Suppressed {
-                        remaining_micros: entry.cooldown_micros - elapsed,
+                        remaining_micros: active_cooldown_micros - elapsed,
                         emissions_in_window: entry.emissions_in_window,
                         max_in_window: max_reps,
                     };
@@ -466,27 +462,25 @@ impl CooldownTracker {
         cooldown_key: &str,
         now_micros: i64,
         cooldown_micros: i64,
-        family: &str,
+        _family: &str,
     ) {
-        let risk_class = EffectRiskClass::for_family(family);
-        let entry = self.entries.entry(cooldown_key.to_string()).or_insert(
-            CooldownEntry {
+        let active_cooldown_micros = cooldown_micros.max(0);
+        let entry = self
+            .entries
+            .entry(cooldown_key.to_string())
+            .or_insert(CooldownEntry {
                 last_ts_micros: 0,
                 emissions_in_window: 0,
-                cooldown_micros,
-                risk_class,
-            },
-        );
+            });
 
-        let elapsed = now_micros - entry.last_ts_micros;
-        if elapsed >= entry.cooldown_micros {
+        let elapsed = now_micros.saturating_sub(entry.last_ts_micros);
+        if elapsed >= active_cooldown_micros {
             // Window expired — reset counter.
             entry.emissions_in_window = 1;
         } else {
             entry.emissions_in_window += 1;
         }
         entry.last_ts_micros = now_micros;
-        entry.cooldown_micros = cooldown_micros;
     }
 
     /// Number of tracked cooldown keys.
@@ -503,7 +497,8 @@ impl CooldownTracker {
 
     /// Evict entries older than the given threshold (microseconds).
     pub fn evict_older_than(&mut self, threshold_micros: i64) {
-        self.entries.retain(|_, e| e.last_ts_micros >= threshold_micros);
+        self.entries
+            .retain(|_, e| e.last_ts_micros >= threshold_micros);
     }
 }
 
@@ -548,10 +543,10 @@ impl EscalationLevel {
     #[must_use]
     pub const fn escalation_threshold(self) -> u32 {
         match self {
-            Self::None => 0,      // first advisory is free
-            Self::Advisory => 3,  // 3 unanswered advisories → escalate to probe
-            Self::Probe => 2,     // 2 unanswered probes → escalate to release
-            Self::Release => 0,   // terminal, no further escalation
+            Self::None => 0,     // first advisory is free
+            Self::Advisory => 3, // 3 unanswered advisories → escalate to probe
+            Self::Probe => 2,    // 2 unanswered probes → escalate to release
+            Self::Release => 0,  // terminal, no further escalation
         }
     }
 }
@@ -686,7 +681,9 @@ pub fn build_semantic_message(
         "liveness_probe" => format!("[ATC probe] {agent}: acknowledgment requested"),
         "reservation_release" => format!("[ATC release] {agent}: reservations released"),
         "release_notice" => format!("[ATC notice] {agent}: reservations were released by ATC"),
-        "withheld_release_notice" => format!("[ATC withheld] {agent}: release deferred, manual check suggested"),
+        "withheld_release_notice" => {
+            format!("[ATC withheld] {agent}: release deferred, manual check suggested")
+        }
         _ => format!("[ATC] {agent}: {family}"),
     };
 
@@ -823,17 +820,13 @@ pub const NOISE_ESCALATION_COOLDOWN_MICROS: i64 = 600_000_000; // 10 minutes
 
 /// Check whether the per-agent advisory noise budget is exceeded.
 #[must_use]
-pub fn is_advisory_noise_exceeded(
-    advisories_in_last_hour: u32,
-) -> bool {
+pub fn is_advisory_noise_exceeded(advisories_in_last_hour: u32) -> bool {
     advisories_in_last_hour >= MAX_ADVISORIES_PER_AGENT_PER_HOUR
 }
 
 /// Check whether the global toast rate is exceeded.
 #[must_use]
-pub fn is_toast_rate_exceeded(
-    toasts_in_last_minute: u32,
-) -> bool {
+pub fn is_toast_rate_exceeded(toasts_in_last_minute: u32) -> bool {
     toasts_in_last_minute >= MAX_TOASTS_PER_MINUTE
 }
 
@@ -931,7 +924,12 @@ mod tests {
         ctx.has_project_context = false;
         let result = validate_preconditions("liveness_monitoring", &ctx);
         assert!(!result.passed);
-        assert!(result.failures.iter().any(|f| f.precondition == "project_context_available"));
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|f| f.precondition == "project_context_available")
+        );
     }
 
     #[test]
@@ -947,7 +945,12 @@ mod tests {
         let ctx = default_context();
         let result = validate_preconditions("deadlock_remediation", &ctx);
         assert!(!result.passed);
-        assert!(result.failures.iter().any(|f| f.precondition == "deadlock_cycle_present"));
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|f| f.precondition == "deadlock_cycle_present")
+        );
     }
 
     #[test]
@@ -964,7 +967,12 @@ mod tests {
         ctx.safe_mode_active = true;
         let result = validate_preconditions("reservation_release", &ctx);
         assert!(!result.passed);
-        assert!(result.failures.iter().any(|f| f.precondition == "safe_mode_inactive"));
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|f| f.precondition == "safe_mode_inactive")
+        );
     }
 
     #[test]
@@ -1010,7 +1018,12 @@ mod tests {
     #[test]
     fn test_cooldown_allows_first_emission() {
         let tracker = CooldownTracker::new();
-        let verdict = tracker.check("liveness_monitoring:proj:Agent", 1_000_000, 60_000_000, "liveness_monitoring");
+        let verdict = tracker.check(
+            "liveness_monitoring:proj:Agent",
+            1_000_000,
+            60_000_000,
+            "liveness_monitoring",
+        );
         assert_eq!(verdict, CooldownVerdict::Allowed);
     }
 
@@ -1060,6 +1073,29 @@ mod tests {
         // High risk: max 0 repetitions in window.
         let verdict = tracker.check(key, 2_000_000, 60_000_000, "reservation_release");
         assert!(matches!(verdict, CooldownVerdict::Suppressed { .. }));
+    }
+
+    #[test]
+    fn test_cooldown_check_uses_current_window_argument() {
+        let mut tracker = CooldownTracker::new();
+        let key = "liveness_probe:proj:Agent";
+        tracker.record_emission(key, 1_000_000, 60_000_000, "liveness_probe");
+
+        let verdict = tracker.check(key, 31_000_000, 30_000_000, "liveness_probe");
+        assert_eq!(verdict, CooldownVerdict::Allowed);
+    }
+
+    #[test]
+    fn test_record_emission_uses_current_window_argument() {
+        let mut tracker = CooldownTracker::new();
+        let key = "liveness_monitoring:proj:Agent";
+
+        tracker.record_emission(key, 1_000_000, 60_000_000, "liveness_monitoring");
+        tracker.record_emission(key, 31_000_000, 30_000_000, "liveness_monitoring");
+        tracker.record_emission(key, 32_000_000, 30_000_000, "liveness_monitoring");
+
+        let verdict = tracker.check(key, 33_000_000, 30_000_000, "liveness_monitoring");
+        assert_eq!(verdict, CooldownVerdict::Allowed);
     }
 
     #[test]
@@ -1200,9 +1236,7 @@ mod tests {
             "withheld_release_notice",
         ];
         for family in families {
-            let model = EFFECT_UTILITY_MODELS
-                .iter()
-                .find(|m| m.family == family);
+            let model = EFFECT_UTILITY_MODELS.iter().find(|m| m.family == family);
             assert!(model.is_some(), "Missing utility model for {family}");
             let m = model.unwrap();
             assert!(!m.utility.is_empty());
@@ -1238,8 +1272,14 @@ mod tests {
     #[test]
     fn test_risk_class_display() {
         assert_eq!(EffectRiskClass::LowRiskNudge.to_string(), "low_risk_nudge");
-        assert_eq!(EffectRiskClass::MediumRiskCheck.to_string(), "medium_risk_check");
-        assert_eq!(EffectRiskClass::HighRiskIntervention.to_string(), "high_risk_intervention");
+        assert_eq!(
+            EffectRiskClass::MediumRiskCheck.to_string(),
+            "medium_risk_check"
+        );
+        assert_eq!(
+            EffectRiskClass::HighRiskIntervention.to_string(),
+            "high_risk_intervention"
+        );
     }
 
     #[test]
@@ -1254,6 +1294,9 @@ mod tests {
     fn test_optimization_target_display() {
         assert_eq!(OptimizationTarget::Relevance.to_string(), "relevance");
         assert_eq!(OptimizationTarget::Accuracy.to_string(), "accuracy");
-        assert_eq!(OptimizationTarget::ZeroFalsePositive.to_string(), "zero_false_positive");
+        assert_eq!(
+            OptimizationTarget::ZeroFalsePositive.to_string(),
+            "zero_false_positive"
+        );
     }
 }

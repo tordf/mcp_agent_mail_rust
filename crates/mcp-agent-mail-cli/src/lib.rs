@@ -15117,17 +15117,17 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 &server_url,
                 bearer.as_deref(),
                 "send_message",
-                serde_json::json!({
-                    "project_key": &project_key,
-                    "sender_name": &sender,
-                    "to": &to_names,
-                    "subject": &subject,
-                    "body_md": &body,
-                    "cc": cc_names.as_ref(),
-                    "importance": &importance,
-                    "ack_required": ack_required,
-                    "thread_id": thread_id.as_deref(),
-                }),
+                build_server_send_message_arguments(
+                    &project_key,
+                    &sender,
+                    &to_names,
+                    &subject,
+                    &body,
+                    cc_names.as_deref(),
+                    &importance,
+                    ack_required,
+                    thread_id.as_deref(),
+                ),
             )
             .await
             {
@@ -15233,13 +15233,13 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 &server_url,
                 bearer.as_deref(),
                 "reply_message",
-                serde_json::json!({
-                    "project_key": &project_key,
-                    "message_id": message_id,
-                    "sender_name": &sender,
-                    "body_md": &body,
-                    "to": explicit_to.as_ref(),
-                }),
+                build_server_reply_message_arguments(
+                    &project_key,
+                    message_id,
+                    &sender,
+                    &body,
+                    explicit_to.as_deref(),
+                ),
             )
             .await
             {
@@ -15800,6 +15800,82 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             Ok(())
         }
     }
+}
+
+fn build_server_send_message_arguments(
+    project_key: &str,
+    sender: &str,
+    to_names: &[String],
+    subject: &str,
+    body: &str,
+    cc_names: Option<&[String]>,
+    importance: &str,
+    ack_required: bool,
+    thread_id: Option<&str>,
+) -> serde_json::Value {
+    let mut arguments = serde_json::Map::from_iter([
+        ("project_key".to_string(), serde_json::json!(project_key)),
+        ("sender_name".to_string(), serde_json::json!(sender)),
+        ("to".to_string(), serde_json::json!(to_names)),
+        ("subject".to_string(), serde_json::json!(subject)),
+        ("body_md".to_string(), serde_json::json!(body)),
+        ("importance".to_string(), serde_json::json!(importance)),
+        ("ack_required".to_string(), serde_json::json!(ack_required)),
+    ]);
+    if let Some(cc_names) = cc_names {
+        arguments.insert("cc".to_string(), serde_json::json!(cc_names));
+    }
+    if let Some(thread_id) = thread_id {
+        arguments.insert("thread_id".to_string(), serde_json::json!(thread_id));
+    }
+    serde_json::Value::Object(arguments)
+}
+
+fn build_server_reply_message_arguments(
+    project_key: &str,
+    message_id: i64,
+    sender: &str,
+    body: &str,
+    explicit_to: Option<&[String]>,
+) -> serde_json::Value {
+    let mut arguments = serde_json::Map::from_iter([
+        ("project_key".to_string(), serde_json::json!(project_key)),
+        ("message_id".to_string(), serde_json::json!(message_id)),
+        ("sender_name".to_string(), serde_json::json!(sender)),
+        ("body_md".to_string(), serde_json::json!(body)),
+    ]);
+    if let Some(explicit_to) = explicit_to {
+        arguments.insert("to".to_string(), serde_json::json!(explicit_to));
+    }
+    serde_json::Value::Object(arguments)
+}
+
+fn build_server_fetch_inbox_product_arguments(
+    product_key: &str,
+    agent_name: &str,
+    limit: i64,
+    urgent_only: bool,
+    include_bodies: bool,
+    since_ts: Option<&str>,
+) -> serde_json::Value {
+    let mut arguments = serde_json::Map::from_iter([
+        ("product_key".to_string(), serde_json::json!(product_key)),
+        ("agent_name".to_string(), serde_json::json!(agent_name)),
+        ("limit".to_string(), serde_json::json!(limit)),
+        ("urgent_only".to_string(), serde_json::json!(urgent_only)),
+        (
+            "include_bodies".to_string(),
+            serde_json::json!(include_bodies),
+        ),
+    ]);
+    if let Some(since_ts) = since_ts {
+        arguments.insert("since_ts".to_string(), serde_json::json!(since_ts));
+    }
+    serde_json::Value::Object(arguments)
+}
+
+fn sort_product_inbox_items_desc(items: &mut [(i64, i64, serde_json::Value)]) {
+    items.sort_by(|(a_ts, a_id, _), (b_ts, b_id, _)| b_ts.cmp(a_ts).then_with(|| b_id.cmp(a_id)));
 }
 
 fn handle_amctl(action: AmctlCommand) -> CliResult<()> {
@@ -16833,6 +16909,34 @@ fn inbox_row_to_json(
     v
 }
 
+fn product_inbox_row_to_json(
+    r: &mcp_agent_mail_db::queries::InboxRow,
+    include_body: bool,
+) -> serde_json::Value {
+    let attachments: Vec<serde_json::Value> =
+        serde_json::from_str(&r.message.attachments).unwrap_or_default();
+    let mut v = serde_json::json!({
+        "id": r.message.id.unwrap_or(0),
+        "project_id": r.message.project_id,
+        "sender_id": r.message.sender_id,
+        "thread_id": r.message.thread_id,
+        "subject": r.message.subject,
+        "importance": r.message.importance,
+        "ack_required": r.message.ack_required != 0,
+        "created_ts": mcp_agent_mail_db::micros_to_iso(r.message.created_ts),
+        "from": r.sender_name,
+        "kind": r.kind,
+        "attachments": attachments,
+    });
+    if include_body {
+        v.as_object_mut().unwrap().insert(
+            "body_md".to_string(),
+            serde_json::Value::String(r.message.body_md.clone()),
+        );
+    }
+    v
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max {
@@ -16920,11 +17024,177 @@ fn server_inbox_payload_to_cli_json(
 #[cfg(test)]
 mod mail_server_cli_bridge_tests {
     use super::{
-        CliError, ServerToolCall, classify_server_tool_call, coerce_tool_result_json,
-        coerce_tool_result_json_or_error, ensure_message_in_project,
-        fetch_inbox_server_rejection_allows_local_fallback, server_inbox_payload_to_cli_json,
-        server_message_payload_to_cli_json,
+        CliError, ServerToolCall, build_server_fetch_inbox_product_arguments,
+        build_server_reply_message_arguments, build_server_send_message_arguments,
+        classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
+        ensure_message_in_project, fetch_inbox_server_rejection_allows_local_fallback,
+        product_inbox_row_to_json, server_inbox_payload_to_cli_json,
+        server_message_payload_to_cli_json, sort_product_inbox_items_desc,
     };
+
+    #[test]
+    fn send_message_server_arguments_omit_absent_optional_fields() {
+        let to_names = vec!["WindyGate".to_string()];
+        let args = build_server_send_message_arguments(
+            "/tmp/project",
+            "PinkStone",
+            &to_names,
+            "Subject",
+            "Body",
+            None,
+            "high",
+            true,
+            None,
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert!(!object.contains_key("cc"));
+        assert!(!object.contains_key("thread_id"));
+    }
+
+    #[test]
+    fn send_message_server_arguments_preserve_explicit_empty_cc_array() {
+        let to_names = vec!["WindyGate".to_string()];
+        let cc_names: Vec<String> = Vec::new();
+        let args = build_server_send_message_arguments(
+            "/tmp/project",
+            "PinkStone",
+            &to_names,
+            "Subject",
+            "Body",
+            Some(&cc_names),
+            "normal",
+            false,
+            Some("br-123"),
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert_eq!(
+            object.get("cc"),
+            Some(&serde_json::Value::Array(Vec::new()))
+        );
+        assert_eq!(
+            object.get("thread_id").and_then(serde_json::Value::as_str),
+            Some("br-123")
+        );
+    }
+
+    #[test]
+    fn reply_message_server_arguments_omit_absent_recipient_override() {
+        let args = build_server_reply_message_arguments(
+            "/tmp/project",
+            42,
+            "PinkStone",
+            "Reply body",
+            None,
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert!(!object.contains_key("to"));
+    }
+
+    #[test]
+    fn fetch_inbox_product_server_arguments_omit_absent_since_ts() {
+        let args = build_server_fetch_inbox_product_arguments(
+            "prod-1",
+            "PinkStone",
+            20,
+            true,
+            false,
+            None,
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert!(!object.contains_key("since_ts"));
+    }
+
+    #[test]
+    fn fetch_inbox_product_server_arguments_preserve_since_ts() {
+        let args = build_server_fetch_inbox_product_arguments(
+            "prod-1",
+            "PinkStone",
+            20,
+            false,
+            true,
+            Some("2026-03-18T00:00:00Z"),
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert_eq!(
+            object.get("since_ts").and_then(serde_json::Value::as_str),
+            Some("2026-03-18T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn product_inbox_fallback_sort_matches_server_tie_breaker() {
+        let mut items = vec![
+            (100, 7, serde_json::json!({ "id": 7 })),
+            (100, 9, serde_json::json!({ "id": 9 })),
+            (101, 1, serde_json::json!({ "id": 1 })),
+        ];
+
+        sort_product_inbox_items_desc(&mut items);
+
+        let ordered_ids: Vec<i64> = items
+            .iter()
+            .map(|(_, _, item)| {
+                item.get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+            })
+            .collect();
+        assert_eq!(ordered_ids, vec![1, 9, 7]);
+    }
+
+    #[test]
+    fn product_inbox_row_to_json_matches_server_shape() {
+        let row = mcp_agent_mail_db::queries::InboxRow {
+            message: mcp_agent_mail_db::MessageRow {
+                id: Some(42),
+                project_id: 7,
+                sender_id: 11,
+                thread_id: Some("br-42".to_string()),
+                subject: "Plan".to_string(),
+                body_md: "Body".to_string(),
+                importance: "high".to_string(),
+                ack_required: 1,
+                created_ts: 1_742_208_000_000_000,
+                recipients_json: "{\"to\":[\"WindyGate\"]}".to_string(),
+                attachments: "[{\"name\":\"note.txt\"}]".to_string(),
+            },
+            kind: "message".to_string(),
+            sender_name: "BlueLake".to_string(),
+            read_ts: None,
+            ack_ts: None,
+        };
+
+        let json = product_inbox_row_to_json(&row, true);
+
+        assert_eq!(json.get("id").and_then(serde_json::Value::as_i64), Some(42));
+        assert_eq!(
+            json.get("project_id").and_then(serde_json::Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            json.get("sender_id").and_then(serde_json::Value::as_i64),
+            Some(11)
+        );
+        assert_eq!(
+            json.get("thread_id").and_then(serde_json::Value::as_str),
+            Some("br-42")
+        );
+        assert_eq!(
+            json.get("attachments")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            json.get("body_md").and_then(serde_json::Value::as_str),
+            Some("Body")
+        );
+    }
 
     #[test]
     fn server_message_payload_bridge_uses_first_delivery_payload() {
@@ -35659,14 +35929,14 @@ async fn handle_products_with(
                     url,
                     bearer,
                     "fetch_inbox_product",
-                    serde_json::json!({
-                        "product_key": product_key,
-                        "agent_name": agent,
-                        "limit": limit,
-                        "urgent_only": urgent_only,
-                        "include_bodies": include_bodies,
-                        "since_ts": since_ts.clone().unwrap_or_default(),
-                    }),
+                    build_server_fetch_inbox_product_arguments(
+                        &product_key,
+                        &agent,
+                        limit,
+                        urgent_only,
+                        include_bodies,
+                        since_ts.as_deref(),
+                    ),
                 )
                 .await
                 {
@@ -35763,32 +36033,14 @@ async fn handle_products_with(
                             _ => continue,
                         };
                         for row in rows {
-                            let msg = row.message;
-                            let id = msg.id.unwrap_or(0);
-                            let created_ts = msg.created_ts;
-                            let mut obj = serde_json::json!({
-                                "id": id,
-                                "project_id": msg.project_id,
-                                "subject": msg.subject,
-                                "importance": msg.importance,
-                                "ack_required": msg.ack_required != 0,
-                                "created_ts": mcp_agent_mail_db::micros_to_iso(created_ts),
-                                "from": row.sender_name,
-                                "kind": row.kind,
-                            });
-                            if include_bodies {
-                                obj.as_object_mut().unwrap().insert(
-                                    "body_md".to_string(),
-                                    serde_json::Value::String(msg.body_md),
-                                );
-                            }
+                            let id = row.message.id.unwrap_or(0);
+                            let created_ts = row.message.created_ts;
+                            let obj = product_inbox_row_to_json(&row, include_bodies);
                             merged.push((created_ts, id, obj));
                         }
                     }
 
-                    merged.sort_by(|(a_ts, a_id, _), (b_ts, b_id, _)| {
-                        b_ts.cmp(a_ts).then_with(|| a_id.cmp(b_id))
-                    });
+                    sort_product_inbox_items_desc(&mut merged);
                     items = merged
                         .into_iter()
                         .take(max_messages)

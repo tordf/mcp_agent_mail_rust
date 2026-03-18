@@ -1,3 +1,4 @@
+#![allow(clippy::cast_precision_loss, clippy::doc_markdown)]
 //! Empirical-Bayes shrinkage across agent, project, and program strata
 //! (br-0qt6e.3.3).
 //!
@@ -42,8 +43,6 @@
 //! - Local sample size exceeds 100 observations (strong local evidence)
 //! - Population variance is very high (cohorts are too heterogeneous)
 //! - An operator explicitly flags a stratum as "independent"
-
-#![allow(clippy::doc_markdown)]
 
 use serde::{Deserialize, Serialize};
 

@@ -3195,7 +3195,10 @@ fn atc_effect_subject(effect: &atc::AtcEffectPlan) -> String {
     match effect.semantics.family.as_str() {
         "liveness_monitoring" => format!("[ATC] activity check for {}", effect.agent),
         "deadlock_remediation" => {
-            let target = effect.project_key.as_deref().unwrap_or(effect.agent.as_str());
+            let target = effect
+                .project_key
+                .as_deref()
+                .unwrap_or(effect.agent.as_str());
             format!("[ATC] deadlock remediation for {target}")
         }
         "liveness_probe" => format!("[ATC] acknowledgment requested from {}", effect.agent),
@@ -3249,20 +3252,22 @@ fn atc_effect_default_headline(effect: &atc::AtcEffectPlan) -> String {
     }
 }
 
+fn atc_effect_headline(effect: &atc::AtcEffectPlan) -> String {
+    effect
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| atc_effect_default_headline(effect))
+}
+
 fn atc_effect_operator_message(effect: &atc::AtcEffectPlan) -> Option<String> {
-    Some(
-        effect
-            .message
-            .clone()
-            .unwrap_or_else(|| atc_effect_default_headline(effect)),
-    )
+    Some(atc_effect_headline(effect))
 }
 
 fn atc_effect_body(effect: &atc::AtcEffectPlan) -> String {
-    let headline = effect
-        .message
-        .clone()
-        .unwrap_or_else(|| atc_effect_default_headline(effect));
+    let headline = atc_effect_headline(effect);
     let expected_loss = effect
         .expected_loss
         .map(|value| format!("{value:.4}"))
@@ -3278,7 +3283,10 @@ fn atc_effect_body(effect: &atc::AtcEffectPlan) -> String {
         format!("next_step: {}", effect.semantics.operator_action),
         format!("utility: {}", effect.semantics.utility_model),
         format!("risk: {}", effect.semantics.risk_level),
-        format!("cooldown_micros: {}", effect.semantics.cooldown_micros.max(0)),
+        format!(
+            "cooldown_micros: {}",
+            effect.semantics.cooldown_micros.max(0)
+        ),
         format!("escalation: {}", effect.semantics.escalation_policy),
     ];
     if let Some(project_key) = effect.project_key.as_deref() {
@@ -3699,6 +3707,37 @@ fn capture_atc_execution_result(
     }
 }
 
+fn atc_resolution_anchor_micros(experience: &ExperienceRow) -> i64 {
+    experience
+        .executed_ts_micros
+        .or(experience.dispatched_ts_micros)
+        .unwrap_or(experience.created_ts_micros)
+}
+
+fn atc_resolution_outcome_from_activity(
+    experience: &ExperienceRow,
+    agent_active_since: i64,
+) -> Option<ExperienceOutcome> {
+    let resolution_anchor_micros = atc_resolution_anchor_micros(experience);
+    if agent_active_since <= resolution_anchor_micros {
+        return None;
+    }
+
+    Some(ExperienceOutcome {
+        observed_ts_micros: agent_active_since,
+        label: "later_activity".to_string(),
+        correct: true,
+        actual_loss: Some(0.0),
+        regret: Some(0.0),
+        evidence: Some(serde_json::json!({
+            "resolution_signal": "agent_activity",
+            "agent": experience.subject,
+            "activity_ts_micros": agent_active_since,
+            "latency_micros": agent_active_since - resolution_anchor_micros,
+        })),
+    })
+}
+
 /// Sweep open ATC experiences for resolution signals (br-0qt6e.2.3).
 ///
 /// Checks experiences in `executed` or `open` state and resolves them based on
@@ -3758,30 +3797,17 @@ fn sweep_open_experiences_for_resolution(
             }
         }
 
-        let age_micros = now_micros.saturating_sub(experience.created_ts_micros);
+        let resolution_anchor_micros = atc_resolution_anchor_micros(experience);
+        let age_micros = now_micros.saturating_sub(resolution_anchor_micros);
 
-        // Check if the subject agent has been active since this experience
-        // was created. Agent activity is tracked by the ATC engine.
+        // Check if the subject agent has been active since this effect was
+        // actually dispatched/executed. Agent activity is tracked by the
+        // ATC engine.
         let agent_active_since = atc::atc_agent_last_activity(&experience.subject).unwrap_or(0);
-        let agent_was_active = agent_active_since > experience.created_ts_micros;
-
-        if agent_was_active {
+        if let Some(outcome) = atc_resolution_outcome_from_activity(experience, agent_active_since)
+        {
             // Positive resolution: the agent showed activity after the
             // advisory/probe, indicating the decision was correct.
-            let outcome = ExperienceOutcome {
-                observed_ts_micros: now_micros,
-                label: "later_activity".to_string(),
-                correct: true,
-                actual_loss: Some(0.0),
-                regret: Some(0.0),
-                evidence: Some(serde_json::json!({
-                    "resolution_signal": "agent_activity",
-                    "agent": experience.subject,
-                    "activity_ts_micros": agent_active_since,
-                    "latency_micros": agent_active_since - experience.created_ts_micros,
-                })),
-            };
-
             let cx = Cx::for_request_with_budget(Budget::INFINITE);
             if let asupersync::Outcome::Err(error) =
                 block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
@@ -3837,7 +3863,7 @@ fn sweep_open_experiences_for_resolution(
 /// When wired from domain event derivers, this helper must remain cheap because
 /// it is intended for inline use rather than periodic sweeping: bounded at 20
 /// open experiences per call.
-fn resolve_conflict_experiences_on_reservation_event(
+pub(crate) fn resolve_conflict_experiences_on_reservation_event(
     pool: &mcp_agent_mail_db::DbPool,
     agent: &str,
     project: &str,
@@ -4007,7 +4033,7 @@ fn execute_atc_probe_effect(
                 Some(effect.trace_id.clone()),
                 None,
                 Some(false),
-                Some(effect.semantics.ack_required),
+                Some(true),
             )
             .await
         })
@@ -4043,17 +4069,13 @@ fn execute_atc_effect(
     ensured_projects: &mut HashSet<String>,
     effect: &atc::AtcEffectPlan,
 ) -> String {
-    if effect.semantics.requires_project && effect.project_key.is_none() {
-        return "suppressed:missing_project_precondition".to_string();
-    }
-
     match executor_mode {
         AtcExecutorMode::Shadow => "suppressed:executor_mode_shadow".to_string(),
         AtcExecutorMode::DryRun => "suppressed:executor_mode_dry_run".to_string(),
         AtcExecutorMode::Canary | AtcExecutorMode::Live => match effect.kind.as_str() {
             "send_advisory" if executor_mode.executes_advisories() => {
                 let Some(project_key) = effect.project_key.as_deref() else {
-                    return "failed:missing_project".to_string();
+                    return "suppressed:missing_project_precondition".to_string();
                 };
                 let Some(runtime) = runtime else {
                     return "failed:executor_unavailable".to_string();
@@ -4064,7 +4086,7 @@ fn execute_atc_effect(
             }
             "release_reservations_requested" if executor_mode.executes_releases() => {
                 let Some(project_key) = effect.project_key.as_deref() else {
-                    return "failed:missing_project".to_string();
+                    return "suppressed:missing_project_precondition".to_string();
                 };
                 let Some(runtime) = runtime else {
                     return "failed:executor_unavailable".to_string();
@@ -4075,7 +4097,7 @@ fn execute_atc_effect(
             }
             "probe_agent" if executor_mode.executes_probes() => {
                 let Some(project_key) = effect.project_key.as_deref() else {
-                    return "failed:missing_project".to_string();
+                    return "suppressed:missing_project_precondition".to_string();
                 };
                 let Some(runtime) = runtime else {
                     return "failed:executor_unavailable".to_string();
@@ -4241,7 +4263,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         u64::try_from(atc_config.probe_interval_micros.max(250_000)).unwrap_or(250_000),
     )
     .max(ATC_OPERATOR_MIN_TICK_INTERVAL);
-    let advisory_cooldown_micros = atc_config.advisory_cooldown_micros.max(0);
     let summary_interval_micros = atc_config.summary_interval_micros.max(1);
     let executor_mode = AtcExecutorMode::from_env();
     let executor_runtime = executor_mode
@@ -4336,7 +4357,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                     let _ = recent_executions.pop_front();
                 }
                 recent_executions.push_back(execution);
-                executed_this_tick = executed_this_tick.saturating_add(1);
                 continue;
             }
             let Some(effect) = pending_effects.pop_front() else {
@@ -11274,6 +11294,49 @@ mod tests {
         }
     }
 
+    fn sample_resolution_experience(
+        created_ts_micros: i64,
+        dispatched_ts_micros: Option<i64>,
+        executed_ts_micros: Option<i64>,
+    ) -> ExperienceRow {
+        ExperienceRow {
+            experience_id: 1,
+            decision_id: 7,
+            effect_id: 17,
+            trace_id: "trc-resolution".to_string(),
+            claim_id: "clm-resolution".to_string(),
+            evidence_id: "evi-resolution".to_string(),
+            state: ExperienceState::Open,
+            subsystem: ExperienceSubsystem::Liveness,
+            decision_class: "liveness_probe".to_string(),
+            subject: "AlphaAgent".to_string(),
+            project_key: Some("/tmp/project-a".to_string()),
+            policy_id: Some("policy-a".to_string()),
+            effect_kind: EffectKind::Probe,
+            action: "ProbeAgent".to_string(),
+            posterior: vec![
+                ("Alive".to_string(), 0.3),
+                ("Flaky".to_string(), 0.5),
+                ("Dead".to_string(), 0.2),
+            ],
+            expected_loss: 0.2,
+            runner_up_action: Some("DeferProbe".to_string()),
+            runner_up_loss: Some(0.4),
+            evidence_summary: "selected for probing".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+            non_execution_reason: None,
+            outcome: None,
+            created_ts_micros,
+            dispatched_ts_micros,
+            executed_ts_micros,
+            resolved_ts_micros: None,
+            features: Some(FeatureVector::zeroed()),
+            feature_ext: None,
+            context: None,
+        }
+    }
+
     #[test]
     fn atc_executor_mode_defaults_to_live_for_unknown_values() {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
@@ -11317,6 +11380,22 @@ mod tests {
     }
 
     #[test]
+    fn atc_effect_blank_message_falls_back_to_default_headline() {
+        let mut effect = sample_probe_effect();
+        effect.message = Some("   ".to_string());
+
+        assert_eq!(
+            atc_effect_operator_message(&effect).as_deref(),
+            Some(
+                "ATC needs an acknowledgment from AlphaAgent to distinguish a stale session from active work."
+            )
+        );
+        assert!(atc_effect_body(&effect).starts_with(
+            "ATC needs an acknowledgment from AlphaAgent to distinguish a stale session from active work."
+        ));
+    }
+
+    #[test]
     fn execute_atc_effect_missing_project_is_suppressed_by_precondition() {
         let mut effect = sample_probe_effect();
         effect.project_key = None;
@@ -11330,6 +11409,24 @@ mod tests {
     }
 
     #[test]
+    fn execute_atc_effect_shadow_mode_still_reports_shadow_suppression() {
+        let mut effect = sample_probe_effect();
+        effect.project_key = None;
+        effect.semantics.cooldown_key = "liveness_probe:-:AlphaAgent".to_string();
+        let mut ensured_projects = HashSet::new();
+
+        assert_eq!(
+            execute_atc_effect(
+                None,
+                AtcExecutorMode::Shadow,
+                &mut ensured_projects,
+                &effect
+            ),
+            "suppressed:executor_mode_shadow"
+        );
+    }
+
+    #[test]
     fn execute_atc_effect_live_probe_requires_runtime_instead_of_probe_intent() {
         let effect = sample_probe_effect();
         let mut ensured_projects = HashSet::new();
@@ -11337,6 +11434,71 @@ mod tests {
             execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect),
             "failed:executor_unavailable"
         );
+    }
+
+    #[test]
+    fn resolution_anchor_prefers_execution_timestamp() {
+        let experience = sample_resolution_experience(
+            1_700_000_000_000_000,
+            Some(1_700_000_000_000_100),
+            Some(1_700_000_000_000_200),
+        );
+
+        assert_eq!(
+            atc_resolution_anchor_micros(&experience),
+            1_700_000_000_000_200
+        );
+    }
+
+    #[test]
+    fn resolution_anchor_falls_back_to_dispatch_then_creation() {
+        let dispatched =
+            sample_resolution_experience(1_700_000_000_000_000, Some(1_700_000_000_000_100), None);
+        assert_eq!(
+            atc_resolution_anchor_micros(&dispatched),
+            1_700_000_000_000_100
+        );
+
+        let planned = sample_resolution_experience(1_700_000_000_000_000, None, None);
+        assert_eq!(
+            atc_resolution_anchor_micros(&planned),
+            1_700_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn resolution_outcome_uses_actual_activity_timestamp() {
+        let experience = sample_resolution_experience(
+            1_700_000_000_000_000,
+            Some(1_700_000_000_000_100),
+            Some(1_700_000_000_000_200),
+        );
+
+        let outcome = atc_resolution_outcome_from_activity(&experience, 1_700_000_000_000_350)
+            .expect("later activity should resolve");
+
+        assert_eq!(outcome.observed_ts_micros, 1_700_000_000_000_350);
+        assert_eq!(outcome.label, "later_activity");
+        assert_eq!(outcome.actual_loss, Some(0.0));
+        assert_eq!(outcome.regret, Some(0.0));
+        let latency = outcome
+            .evidence
+            .as_ref()
+            .and_then(|evidence| evidence.get("latency_micros"))
+            .and_then(serde_json::Value::as_i64);
+        assert_eq!(latency, Some(150));
+    }
+
+    #[test]
+    fn resolution_outcome_ignores_pre_anchor_activity() {
+        let experience = sample_resolution_experience(
+            1_700_000_000_000_000,
+            Some(1_700_000_000_000_100),
+            Some(1_700_000_000_000_200),
+        );
+
+        assert!(atc_resolution_outcome_from_activity(&experience, 1_700_000_000_000_200).is_none());
+        assert!(atc_resolution_outcome_from_activity(&experience, 1_700_000_000_000_150).is_none());
     }
 
     #[test]
