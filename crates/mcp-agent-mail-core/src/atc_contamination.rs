@@ -212,7 +212,7 @@ impl AgentContaminationTracker {
 
         // Check for suspiciously rapid events.
         if self.last_event_micros > 0 {
-            let interval = ts_micros - self.last_event_micros;
+            let interval = ts_micros.saturating_sub(self.last_event_micros);
             if interval > 0 && interval < MIN_EVENT_INTERVAL_MICROS {
                 signals.push(ContaminationSignal {
                     signal_type: ContaminationKind::DuplicateTrace,

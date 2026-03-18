@@ -321,7 +321,7 @@ impl BudgetState {
 
         // Check if in cooldown period
         if self.health == BudgetHealth::CoolingDown {
-            let cooldown_elapsed = now_micros - self.cooldown_started_micros;
+            let cooldown_elapsed = now_micros.saturating_sub(self.cooldown_started_micros);
             if cooldown_elapsed < self.config.cooldown_micros {
                 return BudgetHealth::CoolingDown;
             }

@@ -634,7 +634,7 @@ impl ExperimentBudget {
     /// Whether the window has expired.
     #[must_use]
     pub fn is_expired(&self, now_micros: i64) -> bool {
-        now_micros - self.window_start_micros > self.window_duration_micros
+        now_micros.saturating_sub(self.window_start_micros) > self.window_duration_micros
     }
 
     /// Consume one experiment from the budget. Returns false if exhausted.

@@ -595,7 +595,8 @@ impl ExperienceRow {
     /// How long between creation and resolution (if resolved).
     #[must_use]
     pub fn resolution_latency_micros(&self) -> Option<i64> {
-        self.resolved_ts_micros.map(|r| r - self.created_ts_micros)
+        self.resolved_ts_micros
+            .map(|r| r.saturating_sub(self.created_ts_micros))
     }
 }
 
