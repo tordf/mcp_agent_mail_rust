@@ -320,11 +320,12 @@ pub mod tool_util {
         let mut curr = vec![0usize; n + 1];
         for i in 1..=m {
             for j in 1..=n {
-                curr[j] = if a_bytes[i - 1].to_ascii_lowercase() == b_bytes[j - 1].to_ascii_lowercase() {
-                    prev[j - 1] + 1
-                } else {
-                    prev[j].max(curr[j - 1])
-                };
+                curr[j] =
+                    if a_bytes[i - 1].to_ascii_lowercase() == b_bytes[j - 1].to_ascii_lowercase() {
+                        prev[j - 1] + 1
+                    } else {
+                        prev[j].max(curr[j - 1])
+                    };
             }
             std::mem::swap(&mut prev, &mut curr);
             curr.fill(0);

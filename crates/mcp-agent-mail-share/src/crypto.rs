@@ -126,26 +126,26 @@ pub fn verify_bundle(
     {
         sri_checked = true;
         for (relative_path, expected_sri) in sri_map {
-            if let Some(expected) = expected_sri.as_str() {
-                let file_path = resolve_sri_file_path(bundle_root, relative_path);
-                if file_path.exists() {
-                    let content = std::fs::read(&file_path)?;
-                    let actual_hash = format!("sha256-{}", base64_encode(&sha256_bytes(&content)));
-                    if actual_hash != expected {
-                        return Ok(VerifyResult {
-                            bundle: bundle_root.display().to_string(),
-                            sri_checked: true,
-                            sri_valid: false,
-                            signature_checked: false,
-                            signature_verified: false,
-                            key_source: None,
-                            error: Some(format!(
-                                "SRI mismatch for {relative_path}: expected {expected}, got {actual_hash}"
-                            )),
-                        });
-                    }
-                    sri_files_verified += 1;
-                } else {
+            let Some(expected) = expected_sri.as_str() else {
+                // Non-string SRI values (null, number, etc.) are invalid —
+                // treat as verification failure to prevent bypass.
+                return Ok(VerifyResult {
+                    bundle: bundle_root.display().to_string(),
+                    sri_checked: true,
+                    sri_valid: false,
+                    signature_checked: false,
+                    signature_verified: false,
+                    key_source: None,
+                    error: Some(format!(
+                        "SRI entry for {relative_path} has non-string value"
+                    )),
+                });
+            };
+            let file_path = resolve_sri_file_path(bundle_root, relative_path);
+            if file_path.exists() {
+                let content = std::fs::read(&file_path)?;
+                let actual_hash = format!("sha256-{}", base64_encode(&sha256_bytes(&content)));
+                if actual_hash != expected {
                     return Ok(VerifyResult {
                         bundle: bundle_root.display().to_string(),
                         sri_checked: true,
@@ -153,9 +153,22 @@ pub fn verify_bundle(
                         signature_checked: false,
                         signature_verified: false,
                         key_source: None,
-                        error: Some(format!("SRI-referenced file missing: {relative_path}")),
+                        error: Some(format!(
+                            "SRI mismatch for {relative_path}: expected {expected}, got {actual_hash}"
+                        )),
                     });
                 }
+                sri_files_verified += 1;
+            } else {
+                return Ok(VerifyResult {
+                    bundle: bundle_root.display().to_string(),
+                    sri_checked: true,
+                    sri_valid: false,
+                    signature_checked: false,
+                    signature_verified: false,
+                    key_source: None,
+                    error: Some(format!("SRI-referenced file missing: {relative_path}")),
+                });
             }
         }
     }

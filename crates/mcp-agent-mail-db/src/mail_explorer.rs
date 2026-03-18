@@ -718,7 +718,7 @@ fn sort_entries(entries: &mut [ExplorerEntry], mode: SortMode) {
                 } else {
                     &b.to_agents
                 };
-                
+
                 agent_a
                     .bytes()
                     .map(|b| b.to_ascii_lowercase())
