@@ -2061,8 +2061,8 @@ e2e_start_server_with_logs() {
         export HTTP_PORT="${port}"
         export LOG_LEVEL="debug"
         export RUST_LOG="debug"
-        # Ensure server-mode invocations are not accidentally forced into CLI mode by parent env.
-        export AM_INTERFACE_MODE="${AM_INTERFACE_MODE:-mcp}"
+        # Ensure server-mode invocations are never accidentally forced into CLI mode by parent env.
+        export AM_INTERFACE_MODE="mcp"
 
         # Apply extra env vars
         while [ $# -gt 0 ]; do
@@ -2095,6 +2095,109 @@ e2e_start_server_with_logs() {
     export E2E_SERVER_PID="${_E2E_SERVER_PID}"
 
     e2e_log "Server started: pid=${_E2E_SERVER_PID}"
+    return 0
+}
+
+# e2e_start_server_with_pty: Start mcp-agent-mail server under a PTY so the
+# interactive TUI is live for browser-mirror tests.
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: storage_root - Path to storage root directory
+#   $3: label - Server label for transcript naming
+#   $4+: Extra env vars as KEY=VALUE pairs
+#
+# Example:
+#   e2e_start_server_with_pty "/tmp/db.sqlite3" "/tmp/storage" "live" "HTTP_PORT=8765"
+e2e_start_server_with_pty() {
+    local db_path="$1"
+    local storage_root="$2"
+    local label="${3:-server}"
+    shift 3 2>/dev/null || shift 2 2>/dev/null || true
+
+    if ! command -v script >/dev/null 2>&1; then
+        e2e_log "script command not found; PTY-backed server start unavailable"
+        return 1
+    fi
+    if ! command -v timeout >/dev/null 2>&1; then
+        e2e_log "timeout command not found; PTY-backed server start unavailable"
+        return 1
+    fi
+
+    local bin
+    bin="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+
+    local port="${HTTP_PORT:-}"
+    if [ -z "${port}" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+        else
+            port="$((8000 + RANDOM % 1000))"
+        fi
+    fi
+
+    _E2E_SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_${label}.typescript"
+    _E2E_SERVER_LABEL="$label"
+    mkdir -p "$(dirname "${_E2E_SERVER_LOG}")" "${storage_root}"
+
+    e2e_log "Starting PTY server (${label}): 127.0.0.1:${port}"
+    e2e_log "  transcript: ${_E2E_SERVER_LOG}"
+
+    local timeout_s="${AM_E2E_SERVER_TIMEOUT_S:-30}"
+    local pty_cols="${E2E_PTY_COLUMNS:-120}"
+    local pty_rows="${E2E_PTY_ROWS:-36}"
+    local -a cmd_parts=(
+        env
+        "DATABASE_URL=sqlite:////${db_path}"
+        "STORAGE_ROOT=${storage_root}"
+        "HTTP_HOST=127.0.0.1"
+        "HTTP_PORT=${port}"
+        "LOG_LEVEL=debug"
+        "RUST_LOG=debug"
+        "AM_INTERFACE_MODE=mcp"
+        "TERM=xterm-256color"
+        "COLUMNS=${pty_cols}"
+        "LINES=${pty_rows}"
+    )
+
+    while [ $# -gt 0 ]; do
+        cmd_parts+=("$1")
+        shift
+    done
+    cmd_parts+=(timeout "${timeout_s}s" "${bin}" serve --host 127.0.0.1 --port "${port}")
+
+    local server_cmd=""
+    local part
+    for part in "${cmd_parts[@]}"; do
+        printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
+    done
+    server_cmd="${server_cmd# }"
+    printf -v server_cmd 'cd %q && stty rows %q cols %q >/dev/null 2>&1 || true && %s' \
+        "${storage_root}" "${pty_rows}" "${pty_cols}" "${server_cmd}"
+
+    (
+        script -q -f -c "${server_cmd}" \
+            "${_E2E_SERVER_LOG}"
+    ) >/dev/null 2>&1 &
+    _E2E_SERVER_PID=$!
+
+    local start_timeout_s="${E2E_SERVER_START_TIMEOUT_SECONDS:-15}"
+    if ! e2e_wait_port "127.0.0.1" "${port}" "${start_timeout_s}"; then
+        e2e_log "PTY server failed to start within ${start_timeout_s}s"
+        _e2e_server_startup_diagnostics
+        if [ -f "${_E2E_SERVER_LOG}" ]; then
+            e2e_log "PTY transcript tail (${_E2E_SERVER_LOG}):"
+            tail -n 80 "${_E2E_SERVER_LOG}" >&2 || true
+        fi
+        return 1
+    fi
+
+    _e2e_server_log_marker "SERVER_STARTED" "pid=${_E2E_SERVER_PID} port=${port} label=${label} mode=pty"
+
+    export E2E_SERVER_URL="http://127.0.0.1:${port}/mcp/"
+    export E2E_SERVER_PID="${_E2E_SERVER_PID}"
+
+    e2e_log "PTY server started: pid=${_E2E_SERVER_PID}"
     return 0
 }
 
