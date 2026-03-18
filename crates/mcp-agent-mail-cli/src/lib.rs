@@ -6825,7 +6825,7 @@ fn handle_file_reservations_with_conn(
                 let pattern: String = r.get_named("path_pattern").unwrap_or_default();
                 let agent: String = r.get_named("agent_name").unwrap_or_default();
                 let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
-                let remaining_min = (expires - now_us) / 60_000_000;
+                let remaining_min = expires.saturating_sub(now_us) / 60_000_000;
                 table.add_row(vec![pattern, agent, format!("{}min", remaining_min)]);
             }
             table.render();
