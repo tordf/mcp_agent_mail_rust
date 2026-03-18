@@ -3148,21 +3148,7 @@ fn atc_liveness_state_label(state: atc::LivenessState) -> &'static str {
 }
 
 fn atc_effect_semantic_key(effect: &atc::AtcEffectPlan) -> String {
-    let project_key = effect.project_key.as_deref().unwrap_or("-");
-    effect.message.as_deref().map_or_else(
-        || {
-            format!(
-                "{}:{}:{}:{}",
-                effect.kind, effect.category, project_key, effect.agent
-            )
-        },
-        |message| {
-            format!(
-                "{}:{}:{}:{}:{}",
-                effect.kind, effect.category, project_key, effect.agent, message
-            )
-        },
-    )
+    effect.semantics.cooldown_key.clone()
 }
 
 fn atc_execution_snapshot(
@@ -3206,29 +3192,70 @@ fn atc_action_snapshot_from_execution(
 }
 
 fn atc_effect_subject(effect: &atc::AtcEffectPlan) -> String {
-    match effect.kind.as_str() {
-        "send_advisory" => format!("[ATC] {} advisory for {}", effect.category, effect.agent),
-        "release_reservations_requested" => format!("[ATC] release request for {}", effect.agent),
-        "probe_agent" => format!("[ATC] probe request for {}", effect.agent),
-        _ => format!("[ATC] {} for {}", effect.kind, effect.agent),
+    match effect.semantics.family.as_str() {
+        "liveness_monitoring" => format!("[ATC] activity check for {}", effect.agent),
+        "deadlock_remediation" => {
+            let target = effect.project_key.as_deref().unwrap_or(effect.agent.as_str());
+            format!("[ATC] deadlock remediation for {target}")
+        }
+        "liveness_probe" => format!("[ATC] acknowledgment requested from {}", effect.agent),
+        "reservation_release" => format!("[ATC] reservation release for {}", effect.agent),
+        "release_notice" => format!("[ATC] release requested for {}", effect.agent),
+        "withheld_release_notice" => format!("[ATC] release withheld for {}", effect.agent),
+        _ => match effect.kind.as_str() {
+            "send_advisory" => format!("[ATC] {} advisory for {}", effect.category, effect.agent),
+            "release_reservations_requested" => {
+                format!("[ATC] release request for {}", effect.agent)
+            }
+            "probe_agent" => format!("[ATC] probe request for {}", effect.agent),
+            _ => format!("[ATC] {} for {}", effect.kind, effect.agent),
+        },
     }
 }
 
 fn atc_effect_default_headline(effect: &atc::AtcEffectPlan) -> String {
-    match effect.kind.as_str() {
-        "probe_agent" => format!(
-            "ATC liveness probe for {}. Please acknowledge or reply if you are still active.",
+    match effect.semantics.family.as_str() {
+        "liveness_monitoring" => format!(
+            "ATC sees sustained inactivity from {} and is holding at advisory level for now.",
             effect.agent
         ),
-        _ => format!("ATC generated effect '{}'.", effect.kind),
+        "deadlock_remediation" => format!(
+            "ATC found a deterministic reservation deadlock affecting {}.",
+            effect.agent
+        ),
+        "liveness_probe" => format!(
+            "ATC needs an acknowledgment from {} to distinguish a stale session from active work.",
+            effect.agent
+        ),
+        "reservation_release" => format!(
+            "ATC is requesting reservation release for {} after a dead-agent verdict.",
+            effect.agent
+        ),
+        "release_notice" => format!(
+            "ATC requested reservation release for {} and is surfacing the intervention explicitly.",
+            effect.agent
+        ),
+        "withheld_release_notice" => format!(
+            "ATC withheld reservation release for {} because the liveness evidence is still uncertain.",
+            effect.agent
+        ),
+        _ => match effect.kind.as_str() {
+            "probe_agent" => format!(
+                "ATC liveness probe for {}. Please acknowledge or reply if you are still active.",
+                effect.agent
+            ),
+            _ => format!("ATC generated effect '{}'.", effect.kind),
+        },
     }
 }
 
 fn atc_effect_operator_message(effect: &atc::AtcEffectPlan) -> Option<String> {
-    effect
-        .message
-        .clone()
-        .or_else(|| (effect.kind == "probe_agent").then(|| atc_effect_default_headline(effect)))
+    Some(
+        effect
+            .message
+            .clone()
+            .unwrap_or_else(|| atc_effect_default_headline(effect)),
+    )
 }
 
 fn atc_effect_body(effect: &atc::AtcEffectPlan) -> String {
@@ -3244,17 +3271,37 @@ fn atc_effect_body(effect: &atc::AtcEffectPlan) -> String {
         .experience_id
         .map(|value| value.to_string())
         .unwrap_or_else(|| "pending".to_string());
-    format!(
-        "{headline}\n\ndecision_id: {}\nexperience_id: {}\ntrace_id: {}\nclaim_id: {}\nevidence_id: {}\neffect_id: {}\npolicy_revision: {}\nexpected_loss: {}\nmode: automated-atc",
-        effect.decision_id,
-        experience_id,
-        effect.trace_id,
-        effect.claim_id,
-        effect.evidence_id,
-        effect.effect_id,
-        effect.policy_revision,
-        expected_loss
-    )
+    let mut lines = vec![
+        headline,
+        String::new(),
+        format!("signal: {}", effect.semantics.evidence_summary),
+        format!("next_step: {}", effect.semantics.operator_action),
+        format!("utility: {}", effect.semantics.utility_model),
+        format!("risk: {}", effect.semantics.risk_level),
+        format!("cooldown_micros: {}", effect.semantics.cooldown_micros.max(0)),
+        format!("escalation: {}", effect.semantics.escalation_policy),
+    ];
+    if let Some(project_key) = effect.project_key.as_deref() {
+        lines.push(format!("project: {project_key}"));
+    }
+    if !effect.semantics.preconditions.is_empty() {
+        lines.push(format!(
+            "preconditions: {}",
+            effect.semantics.preconditions.join(" | ")
+        ));
+    }
+    lines.extend([
+        format!("decision_id: {}", effect.decision_id),
+        format!("experience_id: {experience_id}"),
+        format!("trace_id: {}", effect.trace_id),
+        format!("claim_id: {}", effect.claim_id),
+        format!("evidence_id: {}", effect.evidence_id),
+        format!("effect_id: {}", effect.effect_id),
+        format!("policy_revision: {}", effect.policy_revision),
+        format!("expected_loss: {expected_loss}"),
+        "mode: automated-atc".to_string(),
+    ]);
+    lines.join("\n")
 }
 
 fn stable_fnv1a64(bytes: &[u8]) -> u64 {
@@ -3362,6 +3409,21 @@ fn build_atc_experience_row(effect: &atc::AtcEffectPlan) -> Result<ExperienceRow
         "action_family": {
             "kind": effect.kind.clone(),
             "category": effect.category.clone(),
+        },
+        "effect_semantics": {
+            "family": effect.semantics.family.clone(),
+            "risk_level": effect.semantics.risk_level.clone(),
+            "utility_model": effect.semantics.utility_model.clone(),
+            "operator_action": effect.semantics.operator_action.clone(),
+            "remediation": effect.semantics.remediation.clone(),
+            "escalation_policy": effect.semantics.escalation_policy.clone(),
+            "evidence_summary": effect.semantics.evidence_summary.clone(),
+            "cooldown_key": effect.semantics.cooldown_key.clone(),
+            "cooldown_micros": effect.semantics.cooldown_micros,
+            "requires_project": effect.semantics.requires_project,
+            "ack_required": effect.semantics.ack_required,
+            "high_risk_intervention": effect.semantics.high_risk_intervention,
+            "preconditions": effect.semantics.preconditions.clone(),
         },
         "decision_timestamp_micros": decision.timestamp_micros,
         "effect_id_raw": effect.effect_id.clone(),
@@ -3906,7 +3968,7 @@ fn execute_atc_advisory_effect(
                 None,
                 None,
                 Some("normal".to_string()),
-                Some(false),
+                Some(effect.semantics.ack_required),
                 Some(effect.trace_id.clone()),
                 None,
                 Some(false),
@@ -3941,11 +4003,11 @@ fn execute_atc_probe_effect(
                 None,
                 None,
                 Some("normal".to_string()),
-                Some(true),
+                Some(effect.semantics.ack_required),
                 Some(effect.trace_id.clone()),
                 None,
                 Some(false),
-                Some(true),
+                Some(effect.semantics.ack_required),
             )
             .await
         })
@@ -3981,6 +4043,10 @@ fn execute_atc_effect(
     ensured_projects: &mut HashSet<String>,
     effect: &atc::AtcEffectPlan,
 ) -> String {
+    if effect.semantics.requires_project && effect.project_key.is_none() {
+        return "suppressed:missing_project_precondition".to_string();
+    }
+
     match executor_mode {
         AtcExecutorMode::Shadow => "suppressed:executor_mode_shadow".to_string(),
         AtcExecutorMode::DryRun => "suppressed:executor_mode_dry_run".to_string(),
@@ -4242,15 +4308,36 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 break;
             };
             let cooldown_key = atc_effect_semantic_key(effect);
+            let cooldown_micros = effect.semantics.cooldown_micros.max(0);
             let throttled = last_action_by_key
                 .get(&cooldown_key)
                 .copied()
                 .is_some_and(|last| {
-                    advisory_cooldown_micros > 0
-                        && now_micros.saturating_sub(last) < advisory_cooldown_micros
+                    cooldown_micros > 0 && now_micros.saturating_sub(last) < cooldown_micros
                 });
             if throttled {
-                break;
+                let Some(effect) = pending_effects.pop_front() else {
+                    continue;
+                };
+                pending_effect_keys.remove(&cooldown_key);
+                let status = format!("throttled:{}", effect.semantics.family);
+                if let Some(pool) = atc_db_pool.as_ref() {
+                    capture_atc_execution_result(
+                        pool,
+                        effect.experience_id,
+                        executor_mode.as_str(),
+                        &status,
+                        now_micros,
+                    );
+                }
+                let execution =
+                    atc_execution_snapshot(now_micros, &effect, executor_mode.as_str(), &status);
+                if recent_executions.len() >= ATC_OPERATOR_EXECUTION_CAPACITY {
+                    let _ = recent_executions.pop_front();
+                }
+                recent_executions.push_back(execution);
+                executed_this_tick = executed_this_tick.saturating_add(1);
+                continue;
             }
             let Some(effect) = pending_effects.pop_front() else {
                 continue;
@@ -11136,6 +11223,32 @@ mod tests {
         );
     }
 
+    fn sample_effect_semantics(
+        family: &str,
+        agent: &str,
+        project_key: Option<&str>,
+    ) -> atc::AtcEffectSemantics {
+        atc::AtcEffectSemantics {
+            family: family.to_string(),
+            risk_level: match family {
+                "reservation_release" => "high".to_string(),
+                "liveness_monitoring" | "withheld_release_notice" => "low".to_string(),
+                _ => "medium".to_string(),
+            },
+            utility_model: format!("utility for {family}"),
+            operator_action: format!("operator action for {family}"),
+            remediation: format!("remediation for {family}"),
+            escalation_policy: format!("escalation for {family}"),
+            evidence_summary: format!("evidence for {family}"),
+            cooldown_key: format!("{}:{}:{}", family, project_key.unwrap_or("-"), agent),
+            cooldown_micros: 60_000_000,
+            requires_project: true,
+            ack_required: family == "liveness_probe",
+            high_risk_intervention: family == "reservation_release",
+            preconditions: vec!["project context available".to_string()],
+        }
+    }
+
     fn sample_probe_effect() -> atc::AtcEffectPlan {
         atc::AtcEffectPlan {
             decision_id: 7,
@@ -11153,6 +11266,11 @@ mod tests {
             policy_revision: 3,
             message: None,
             expected_loss: Some(0.2),
+            semantics: sample_effect_semantics(
+                "liveness_probe",
+                "AlphaAgent",
+                Some("/tmp/project-a"),
+            ),
         }
     }
 
@@ -11187,13 +11305,28 @@ mod tests {
         let effect = sample_probe_effect();
         assert_eq!(
             atc_effect_subject(&effect),
-            "[ATC] probe request for AlphaAgent"
+            "[ATC] acknowledgment requested from AlphaAgent"
         );
         let body = atc_effect_body(&effect);
-        assert!(body.contains("ATC liveness probe for AlphaAgent."));
-        assert!(body.contains("Please acknowledge or reply if you are still active."));
+        assert!(body.contains("ATC needs an acknowledgment from AlphaAgent"));
+        assert!(body.contains("signal: evidence for liveness_probe"));
+        assert!(body.contains("next_step: operator action for liveness_probe"));
+        assert!(body.contains("risk: medium"));
         assert!(body.contains("decision_id: 7"));
         assert!(body.contains("experience_id: 17"));
+    }
+
+    #[test]
+    fn execute_atc_effect_missing_project_is_suppressed_by_precondition() {
+        let mut effect = sample_probe_effect();
+        effect.project_key = None;
+        effect.semantics.cooldown_key = "liveness_probe:-:AlphaAgent".to_string();
+        let mut ensured_projects = HashSet::new();
+
+        assert_eq!(
+            execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect),
+            "suppressed:missing_project_precondition"
+        );
     }
 
     #[test]
@@ -11292,7 +11425,7 @@ mod tests {
         assert_eq!(
             snapshot.message.as_deref(),
             Some(
-                "ATC liveness probe for AlphaAgent. Please acknowledge or reply if you are still active."
+                "ATC needs an acknowledgment from AlphaAgent to distinguish a stale session from active work."
             )
         );
 
@@ -21512,9 +21645,21 @@ mod tests {
             policy_revision: 3,
             message: Some("same message".to_string()),
             expected_loss: Some(0.2),
+            semantics: sample_effect_semantics(
+                "liveness_monitoring",
+                "AgentAlpha",
+                Some("/tmp/project-a"),
+            ),
         };
-        let mut right = left.clone();
-        right.project_key = Some("/tmp/project-b".to_string());
+        let right = atc::AtcEffectPlan {
+            project_key: Some("/tmp/project-b".to_string()),
+            semantics: sample_effect_semantics(
+                "liveness_monitoring",
+                "AgentAlpha",
+                Some("/tmp/project-b"),
+            ),
+            ..left.clone()
+        };
 
         assert_ne!(
             atc_effect_semantic_key(&left),

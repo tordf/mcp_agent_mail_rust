@@ -3748,6 +3748,24 @@ impl AtcShadowPolicyState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AtcEffectSemantics {
+    pub family: String,
+    pub risk_level: String,
+    pub utility_model: String,
+    pub operator_action: String,
+    pub remediation: String,
+    pub escalation_policy: String,
+    pub evidence_summary: String,
+    pub cooldown_key: String,
+    pub cooldown_micros: i64,
+    pub requires_project: bool,
+    pub ack_required: bool,
+    pub high_risk_intervention: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preconditions: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AtcEffectPlan {
     pub decision_id: u64,
     pub effect_id: String,
@@ -3769,6 +3787,7 @@ pub struct AtcEffectPlan {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_loss: Option<f64>,
+    pub semantics: AtcEffectSemantics,
 }
 
 #[derive(Debug, Clone)]
@@ -4947,11 +4966,14 @@ impl AtcEngine {
         timestamp_micros: i64,
         kind: &str,
         category: &str,
+        family: &str,
         agent: String,
         project_key: Option<String>,
         message: Option<String>,
     ) -> AtcEffectPlan {
-        let mut effect_seed = format!("{}:{kind}:{category}:{agent}", record.trace_id,);
+        let semantics =
+            self.effect_semantics_for(record, family, kind, category, &agent, project_key.as_deref());
+        let mut effect_seed = format!("{}:{kind}:{category}:{family}:{agent}", record.trace_id,);
         if let Some(project_key) = project_key.as_deref() {
             effect_seed.push(':');
             effect_seed.push_str(project_key);
@@ -4983,6 +5005,155 @@ impl AtcEngine {
                 .loss_table
                 .iter()
                 .find_map(|entry| (entry.action == record.action).then_some(entry.expected_loss)),
+            semantics,
+        }
+    }
+
+    fn effect_semantics_for(
+        &self,
+        record: &AtcDecisionRecord,
+        family: &str,
+        kind: &str,
+        category: &str,
+        agent: &str,
+        project_key: Option<&str>,
+    ) -> AtcEffectSemantics {
+        let project_scope = project_key.unwrap_or("-");
+        let cooldown_key = format!("{family}:{project_scope}:{agent}");
+        let advisory_cooldown = self.config.advisory_cooldown_micros.max(0);
+        let probe_cooldown = self.config.probe_interval_micros.max(0);
+        let summary_cooldown = self.config.summary_interval_micros.max(0);
+        let (
+            risk_level,
+            utility_model,
+            operator_action,
+            remediation,
+            escalation_policy,
+            cooldown_micros,
+            requires_project,
+            ack_required,
+            high_risk_intervention,
+            preconditions,
+        ) = match family {
+            "liveness_monitoring" => (
+                "low",
+                "nudge on suspicious inactivity while evidence is still below the release bar",
+                "Reply or acknowledge if the session is still active; otherwise ATC will keep monitoring.",
+                "A quick acknowledgment clears the low-confidence inactivity suspicion before probe or release escalation.",
+                "escalate_to_probe_or_release_on_stronger_liveness_evidence",
+                advisory_cooldown,
+                true,
+                false,
+                false,
+                vec![
+                    "project context is available for direct ATC mail".to_string(),
+                    "liveness evidence indicates suspicious inactivity but not a confirmed dead-agent release".to_string(),
+                ],
+            ),
+            "deadlock_remediation" => (
+                "medium",
+                "surface deterministic deadlock cycles only when they point to a concrete reservation cleanup path",
+                "Inspect the contested reservation cycle and release only the stale holder if the work is no longer active.",
+                "Use the cycle evidence to clear the blocking reservation rather than sending repeated generic nudges.",
+                "escalate_to_manual_conflict_resolution_if_cycle_persists",
+                advisory_cooldown.max(summary_cooldown),
+                true,
+                false,
+                false,
+                vec![
+                    "project context is available for direct ATC mail".to_string(),
+                    "a deterministic deadlock cycle is still present at execution time".to_string(),
+                ],
+            ),
+            "liveness_probe" => (
+                "medium",
+                "request a fast acknowledgment that separates stale sessions from active work before stronger intervention",
+                "Reply or acknowledge promptly; lack of response becomes stronger release evidence.",
+                "A probe is lower risk than release, but it should not repeat faster than the probe cadence.",
+                "escalate_to_release_only_after_independent_dead_verdict",
+                probe_cooldown,
+                true,
+                true,
+                false,
+                vec![
+                    "project context is available for direct ATC mail".to_string(),
+                    "the agent is not already marked for release in the same tick".to_string(),
+                ],
+            ),
+            "reservation_release" => (
+                "high",
+                "clear stale reservations only after the dead-agent release policy has crossed its intervention threshold",
+                "Verify the agent is actually inactive and re-reserve files immediately if the session revives.",
+                "Automated release is intentionally narrow because it can disrupt active work.",
+                "escalate_to_operator_review_if_agent_reappears",
+                advisory_cooldown.max(summary_cooldown),
+                true,
+                false,
+                true,
+                vec![
+                    "project context is available for reservation release".to_string(),
+                    "the liveness decision still supports release at execution time".to_string(),
+                    "calibration or safety gates have not withheld release".to_string(),
+                ],
+            ),
+            "release_notice" => (
+                "medium",
+                "make high-risk automated release legible to the affected agent so recovery is explicit instead of silent",
+                "Inspect the worktree now if the agent is still active and re-reserve any files that should remain held.",
+                "This notice accompanies a release request and should not repeat like a generic inactivity advisory.",
+                "no_further_automatic_escalation",
+                advisory_cooldown.max(summary_cooldown),
+                true,
+                false,
+                false,
+                vec![
+                    "project context is available for direct ATC mail".to_string(),
+                    "a paired reservation-release effect was emitted in the same decision flow".to_string(),
+                ],
+            ),
+            "withheld_release_notice" => (
+                "low",
+                "replace risky automated release with a softer, evidence-backed nudge when calibration is uncertain",
+                "Inspect the session manually or ask the agent to acknowledge before any manual cleanup.",
+                "When release is withheld, the operator should get evidence and a safer next step instead of a false intervention notice.",
+                "retry_probe_before_any_release",
+                advisory_cooldown.max(probe_cooldown),
+                true,
+                false,
+                false,
+                vec![
+                    "project context is available for direct ATC mail".to_string(),
+                    "release was withheld by an active calibration or safety gate".to_string(),
+                ],
+            ),
+            _ => (
+                "medium",
+                "carry a concrete ATC effect through execution without silent reinterpretation",
+                "Review the effect details and act according to the attached evidence.",
+                "Unknown effect families should stay explicit rather than inheriting generic copy.",
+                "manual_review_required",
+                advisory_cooldown,
+                true,
+                kind == "probe_agent",
+                kind == "release_reservations_requested",
+                vec![format!("ATC effect family '{family}' must remain explicitly handled")],
+            ),
+        };
+
+        AtcEffectSemantics {
+            family: family.to_string(),
+            risk_level: risk_level.to_string(),
+            utility_model: utility_model.to_string(),
+            operator_action: operator_action.to_string(),
+            remediation: remediation.to_string(),
+            escalation_policy: escalation_policy.to_string(),
+            evidence_summary: record.evidence_summary.clone(),
+            cooldown_key,
+            cooldown_micros,
+            requires_project,
+            ack_required,
+            high_risk_intervention,
+            preconditions,
         }
     }
 
@@ -4992,6 +5163,7 @@ impl AtcEngine {
         timestamp_micros: i64,
         kind: &str,
         category: &str,
+        family: &str,
         agent: String,
         project_key: Option<String>,
         message: Option<String>,
@@ -5002,6 +5174,7 @@ impl AtcEngine {
                 timestamp_micros,
                 kind,
                 category,
+                family,
                 agent,
                 project_key,
                 message,
@@ -5035,8 +5208,9 @@ impl AtcEngine {
                 .map(|metadata| metadata.decision_id);
             match *action {
                 LivenessAction::Suspect => {
-                    let message =
-                        format!("[ATC] Agent {agent_name} appears unresponsive. Monitoring.");
+                    let message = format!(
+                        "[ATC] {agent_name} has been inactive beyond its normal rhythm. Reply or acknowledge if the session is still active; no release has been requested."
+                    );
                     actions.push(AtcTickAction::SendAdvisory {
                         agent: agent_name.clone(),
                         message: message.clone(),
@@ -5047,6 +5221,7 @@ impl AtcEngine {
                             now_micros,
                             "send_advisory",
                             "liveness",
+                            "liveness_monitoring",
                             agent_name.clone(),
                             self.agent_project_key(agent_name),
                             Some(message),
@@ -5065,6 +5240,7 @@ impl AtcEngine {
                             now_micros,
                             "release_reservations_requested",
                             "liveness",
+                            "reservation_release",
                             agent_name.clone(),
                             self.agent_project_key(agent_name),
                             None,
@@ -5102,7 +5278,7 @@ impl AtcEngine {
                     timestamp_micros: now_micros,
                 });
                 let message = format!(
-                    "[ATC] Deadlock detected in {project}: {subject}. Consider releasing reservations."
+                    "[ATC] Deadlock in {project}: {subject}. Inspect the contested reservations and release only the stale holder if safe."
                 );
                 actions.push(AtcTickAction::SendAdvisory {
                     agent: cycle[0].clone(),
@@ -5113,6 +5289,7 @@ impl AtcEngine {
                     now_micros,
                     "send_advisory",
                     "conflict",
+                    "deadlock_remediation",
                     cycle[0].clone(),
                     Some(project.clone()),
                     Some(message),
@@ -5248,6 +5425,7 @@ impl AtcEngine {
                 now_micros,
                 "probe_agent",
                 "probe",
+                "liveness_probe",
                 candidate.agent,
                 probe_project_key,
                 None,
@@ -5330,7 +5508,7 @@ impl AtcEngine {
                 timestamp_micros: now_micros,
             });
             let message = format!(
-                "[ATC] Agent {agent_name} appears unresponsive. Automated reservation release withheld under high uncertainty."
+                "[ATC] {agent_name} looks inactive, but ATC withheld automated release because the liveness evidence is still uncertain. Inspect the session or request an acknowledgment before cleanup."
             );
             actions.push(AtcTickAction::SendAdvisory {
                 agent: agent_name.clone(),
@@ -5341,6 +5519,7 @@ impl AtcEngine {
                 now_micros,
                 "send_advisory",
                 "calibration",
+                "withheld_release_notice",
                 agent_name.clone(),
                 self.agent_project_key(&agent_name),
                 Some(message),
@@ -5358,7 +5537,7 @@ impl AtcEngine {
             .collect();
         for agent_name in release_targets {
             let message = format!(
-                "[ATC] Agent {agent_name} declared dead. Automated reservation release requested."
+                "[ATC] {agent_name} crossed the dead-agent release threshold. ATC requested reservation release; inspect the worktree if the agent is still active."
             );
             let project_key = self.agent_project_key(&agent_name);
             actions.push(AtcTickAction::SendAdvisory {
@@ -5371,6 +5550,7 @@ impl AtcEngine {
                     now_micros,
                     "send_advisory",
                     "liveness",
+                    "release_notice",
                     agent_name,
                     project_key,
                     Some(message),
@@ -9619,6 +9799,7 @@ mod alien_enhancement_tests {
                 1_000_000,
                 "send_advisory",
                 "liveness",
+                "liveness_monitoring",
                 "ProjectAgent".to_string(),
                 engine.agent_project_key("ProjectAgent"),
                 Some("project-aware advisory".to_string()),
@@ -9626,6 +9807,10 @@ mod alien_enhancement_tests {
             .expect("effect plan");
 
         assert_eq!(effect.project_key.as_deref(), Some("/tmp/project-agent"));
+        assert_eq!(effect.semantics.family, "liveness_monitoring");
+        assert!(effect.semantics.requires_project);
+        assert!(!effect.semantics.ack_required);
+        assert_eq!(effect.semantics.cooldown_key, "liveness_monitoring:/tmp/project-agent:ProjectAgent");
     }
 
     #[test]
@@ -9656,6 +9841,7 @@ mod alien_enhancement_tests {
                 1_000_000,
                 "release_reservations_requested",
                 "liveness",
+                "reservation_release",
                 "EffectAgent".to_string(),
                 engine.agent_project_key("EffectAgent"),
                 None,
@@ -9667,6 +9853,7 @@ mod alien_enhancement_tests {
                 1_000_000,
                 "send_advisory",
                 "liveness",
+                "release_notice",
                 "EffectAgent".to_string(),
                 engine.agent_project_key("EffectAgent"),
                 Some("release requested".to_string()),
@@ -9674,6 +9861,9 @@ mod alien_enhancement_tests {
             .expect("advisory effect");
 
         assert_ne!(release.effect_id, advisory.effect_id);
+        assert!(release.semantics.high_risk_intervention);
+        assert_eq!(release.semantics.family, "reservation_release");
+        assert_eq!(advisory.semantics.family, "release_notice");
     }
 
     #[test]

@@ -194,24 +194,33 @@ impl OpenExperienceIndex {
 
     fn evict_oldest(&mut self) {
         // Find the oldest creation timestamp.
-        let Some((&oldest_ts, _)) = self.by_creation.iter().next() else {
+        let Some((&oldest_ts, ids)) = self.by_creation.iter_mut().next() else {
             return;
         };
 
-        // Remove all entries at that timestamp.
-        if let Some(ids) = self.by_creation.remove(&oldest_ts) {
-            for id in ids {
-                if let Some(entry) = self.entries.remove(&id) {
-                    let subject_key = entry.subject.to_ascii_lowercase();
-                    if let Some(set) = self.by_subject.get_mut(&subject_key) {
-                        set.remove(&id);
-                        if set.is_empty() {
-                            self.by_subject.remove(&subject_key);
-                        }
-                    }
-                    self.total_evicted += 1;
+        // Remove ONE entry at the oldest timestamp (not all of them).
+        // Under high load, many experiences can share a timestamp (same ATC tick).
+        // Evicting all of them at once would be overly aggressive.
+        let Some(id) = ids.pop() else {
+            self.by_creation.remove(&oldest_ts);
+            return;
+        };
+
+        // Clean up the BTreeMap entry if now empty.
+        if ids.is_empty() {
+            self.by_creation.remove(&oldest_ts);
+        }
+
+        // Remove from primary and secondary indexes.
+        if let Some(entry) = self.entries.remove(&id) {
+            let subject_key = entry.subject.to_ascii_lowercase();
+            if let Some(set) = self.by_subject.get_mut(&subject_key) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.by_subject.remove(&subject_key);
                 }
             }
+            self.total_evicted += 1;
         }
     }
 

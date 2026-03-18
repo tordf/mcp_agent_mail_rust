@@ -227,6 +227,7 @@ impl RegimeManager {
                     self.phase_started_ts_micros = now_micros;
                     self.promotion_gated = false;
                     self.rapid_detection_count = 0;
+                    self.discount_applied = false; // reset so next transition re-applies
 
                     let reason = self
                         .last_transition_reason
@@ -252,6 +253,7 @@ impl RegimeManager {
                     self.phase_started_ts_micros = now_micros;
                     self.promotion_gated = false;
                     self.rapid_detection_count = 0;
+                    self.discount_applied = false; // reset for next transition
 
                     RegimeAction::TransitionConfirmed {
                         new_regime_id: self.current_regime_id,
