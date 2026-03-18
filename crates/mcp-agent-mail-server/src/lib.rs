@@ -3210,6 +3210,8 @@ fn atc_status_consumes_cooldown(status: &str) -> bool {
     !status.starts_with("failed:") && status != "suppressed:missing_project_precondition"
 }
 
+const ATC_QUEUE_BACKPRESSURE_STATUS: &str = "throttled:pending_queue_capacity";
+
 fn atc_effect_subject(effect: &atc::AtcEffectPlan) -> String {
     match effect.semantics.family.as_str() {
         "liveness_monitoring" => format!("[ATC] activity check for {}", effect.agent),
@@ -4365,6 +4367,25 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                     if let Some(dropped) = pending_effects.pop_front() {
                         let dropped_key = atc_effect_semantic_key(&dropped);
                         pending_effect_keys.remove(&dropped_key);
+                        if let Some(pool) = atc_db_pool.as_ref() {
+                            capture_atc_execution_result(
+                                pool,
+                                dropped.experience_id,
+                                executor_mode.as_str(),
+                                ATC_QUEUE_BACKPRESSURE_STATUS,
+                                now_micros,
+                            );
+                        }
+                        let execution = atc_execution_snapshot(
+                            now_micros,
+                            &dropped,
+                            executor_mode.as_str(),
+                            ATC_QUEUE_BACKPRESSURE_STATUS,
+                        );
+                        if recent_executions.len() >= ATC_OPERATOR_EXECUTION_CAPACITY {
+                            let _ = recent_executions.pop_front();
+                        }
+                        recent_executions.push_back(execution);
                         tracing::warn!(
                             decision_id = dropped.decision_id,
                             effect_id = %dropped.effect_id,
@@ -11703,6 +11724,20 @@ mod tests {
         assert!(!atc_status_consumes_cooldown("failed:executor_unavailable"));
         assert!(!atc_status_consumes_cooldown(
             "suppressed:missing_project_precondition"
+        ));
+    }
+
+    #[test]
+    fn atc_execution_capture_marks_queue_backpressure_as_throttled() {
+        let capture = atc_execution_capture(ATC_QUEUE_BACKPRESSURE_STATUS);
+        assert_eq!(capture.snapshot_status, "throttled");
+        assert_eq!(capture.state, ExperienceState::Throttled);
+        assert_eq!(capture.classification, "budget_throttle");
+        assert_eq!(capture.detail.as_deref(), Some("pending_queue_capacity"));
+        assert!(matches!(
+            capture.non_execution_reason,
+            Some(NonExecutionReason::BudgetExhausted { ref budget_name, .. })
+                if budget_name == "pending_queue_capacity"
         ));
     }
 

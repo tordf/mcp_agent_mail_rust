@@ -526,6 +526,9 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
             if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
                 return result;
             }
+            if let Some(result) = censor_exogenous_recovery(window, evidence) {
+                return result;
+            }
             let inaction_correct = matches!(
                 evidence.situation_change,
                 SituationChange::Improved | SituationChange::Unchanged
@@ -544,6 +547,9 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
             if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
                 return result;
             }
+            if let Some(result) = censor_exogenous_recovery(window, evidence) {
+                return result;
+            }
             // If the safety gate was correct (situation didn't worsen), it was right to suppress
             let inaction_correct = !matches!(evidence.situation_change, SituationChange::Worsened);
             LabelingResult {
@@ -560,6 +566,9 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
             if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
                 return result;
             }
+            if let Some(result) = censor_exogenous_recovery(window, evidence) {
+                return result;
+            }
             let inaction_correct = !matches!(evidence.situation_change, SituationChange::Worsened);
             LabelingResult {
                 label: OutcomeLabel::NonExecution {
@@ -573,6 +582,9 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
         // Calibration fallback with observed outcome
         (Some(NonExecutionReason::CalibrationFallback { .. }), Some(evidence)) => {
             if let Some(result) = validate_evidence_timing(anchor, window, evidence) {
+                return result;
+            }
+            if let Some(result) = censor_exogenous_recovery(window, evidence) {
                 return result;
             }
             let inaction_correct = !matches!(evidence.situation_change, SituationChange::Worsened);
@@ -1324,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn non_execution_exogenous_recovery_still_resolves_for_suppression() {
+    fn non_execution_exogenous_recovery_censors_when_family_requires_it() {
         let mut input = base_input();
         input.state = ExperienceState::Suppressed;
         input.effect_kind = EffectKind::Advisory;
@@ -1339,15 +1351,14 @@ mod tests {
         input.execution_evidence = Some(evidence);
 
         let result = label_experience(&input);
-        assert_eq!(result.new_state, ExperienceState::Resolved);
+        assert_eq!(result.new_state, ExperienceState::Censored);
         assert!(matches!(
             result.label,
-            OutcomeLabel::NonExecution {
-                inaction_correct: true,
-                ..
+            OutcomeLabel::Censored {
+                reason: CensorReason::ExogenousRecovery,
             }
         ));
-        assert_eq!(result.rule_id, "safety_gate_resolved");
+        assert_eq!(result.rule_id, "exogenous_recovery");
     }
 
     #[test]

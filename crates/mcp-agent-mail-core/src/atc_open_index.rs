@@ -121,17 +121,24 @@ impl OpenExperienceIndex {
     /// Create a new empty index with default capacity.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_OPEN_INDEX_CAPACITY, DEFAULT_RESOLUTION_WINDOW_MICROS)
+        Self::with_capacity(
+            DEFAULT_OPEN_INDEX_CAPACITY,
+            DEFAULT_RESOLUTION_WINDOW_MICROS,
+        )
     }
 
     /// Create a new index with custom capacity and resolution window.
     #[must_use]
     pub fn with_capacity(capacity: usize, resolution_window_micros: i64) -> Self {
+        // A zero-capacity index cannot make forward progress: add() would try
+        // to evict forever because len() >= 0 is always true. Clamp to a
+        // single slot instead of constructing a non-functional index.
+        let bounded_capacity = capacity.max(1);
         Self {
-            entries: HashMap::with_capacity(capacity.min(256)),
+            entries: HashMap::with_capacity(bounded_capacity.min(256)),
             by_subject: HashMap::new(),
             by_creation: BTreeMap::new(),
-            capacity,
+            capacity: bounded_capacity,
             resolution_window_micros,
             total_added: 0,
             total_resolved: 0,
@@ -159,7 +166,11 @@ impl OpenExperienceIndex {
 
         // Check for causal confounding: if there's already an open
         // experience for the same subject, both are potentially confounded.
-        if let Some(existing_ids) = self.by_subject.get(&subject_key).filter(|ids| !ids.is_empty()) {
+        if let Some(existing_ids) = self
+            .by_subject
+            .get(&subject_key)
+            .filter(|ids| !ids.is_empty())
+        {
             // Mark the new entry as confounded.
             let mut entry = entry;
             entry.potentially_confounded = true;
@@ -184,12 +195,27 @@ impl OpenExperienceIndex {
             .entry(subject_key)
             .or_default()
             .insert(exp_id);
-        self.by_creation
-            .entry(created_ts)
-            .or_default()
-            .push(exp_id);
+        self.by_creation.entry(created_ts).or_default().push(exp_id);
         self.entries.insert(exp_id, entry);
         self.total_added += 1;
+    }
+
+    fn reconcile_subject_confounding(&mut self, subject_key: &str) {
+        let remaining_id = match self.by_subject.get(subject_key) {
+            Some(set) if set.is_empty() => {
+                self.by_subject.remove(subject_key);
+                None
+            }
+            Some(set) if set.len() == 1 => set.iter().next().copied(),
+            Some(_) => None,
+            None => None,
+        };
+
+        if let Some(id) = remaining_id
+            && let Some(entry) = self.entries.get_mut(&id)
+        {
+            entry.potentially_confounded = false;
+        }
     }
 
     fn evict_oldest(&mut self) {
@@ -216,10 +242,8 @@ impl OpenExperienceIndex {
             let subject_key = entry.subject.to_ascii_lowercase();
             if let Some(set) = self.by_subject.get_mut(&subject_key) {
                 set.remove(&id);
-                if set.is_empty() {
-                    self.by_subject.remove(&subject_key);
-                }
             }
+            self.reconcile_subject_confounding(&subject_key);
             self.total_evicted += 1;
         }
     }
@@ -231,10 +255,8 @@ impl OpenExperienceIndex {
 
         if let Some(set) = self.by_subject.get_mut(&subject_key) {
             set.remove(&experience_id);
-            if set.is_empty() {
-                self.by_subject.remove(&subject_key);
-            }
         }
+        self.reconcile_subject_confounding(&subject_key);
 
         if let Some(ids) = self.by_creation.get_mut(&entry.created_ts_micros) {
             ids.retain(|&id| id != experience_id);
@@ -273,11 +295,7 @@ impl OpenExperienceIndex {
         let subject_key = subject.to_ascii_lowercase();
         self.by_subject
             .get(&subject_key)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.entries.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.entries.get(id)).collect())
             .unwrap_or_default()
     }
 
@@ -330,7 +348,11 @@ impl OpenExperienceIndex {
     pub fn stats(&self) -> OpenIndexStats {
         let oldest = self.by_creation.keys().next().copied();
         let newest = self.by_creation.keys().next_back().copied();
-        let confounded = self.entries.values().filter(|e| e.potentially_confounded).count();
+        let confounded = self
+            .entries
+            .values()
+            .filter(|e| e.potentially_confounded)
+            .count();
 
         OpenIndexStats {
             open_count: self.entries.len(),
@@ -470,6 +492,32 @@ mod tests {
         idx.add(make_entry(2, "AgentA", 2000));
         assert!(idx.entries[&1].potentially_confounded);
         assert!(idx.entries[&2].potentially_confounded);
+    }
+
+    #[test]
+    fn removing_overlap_clears_confounding_for_remaining_entry() {
+        let mut idx = OpenExperienceIndex::new();
+        idx.add(make_entry(1, "AgentA", 1000));
+        idx.add(make_entry(2, "AgentA", 2000));
+
+        idx.mark_resolved(1);
+
+        assert!(idx.contains(2));
+        assert!(!idx.entries[&2].potentially_confounded);
+    }
+
+    #[test]
+    fn zero_capacity_is_clamped_to_single_slot() {
+        let mut idx = OpenExperienceIndex::with_capacity(0, DEFAULT_RESOLUTION_WINDOW_MICROS);
+
+        idx.add(make_entry(1, "AgentA", 1000));
+        idx.add(make_entry(2, "AgentB", 2000));
+
+        assert_eq!(idx.capacity, 1);
+        assert_eq!(idx.len(), 1);
+        assert!(!idx.contains(1));
+        assert!(idx.contains(2));
+        assert_eq!(idx.total_evicted, 1);
     }
 
     #[test]

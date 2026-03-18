@@ -298,76 +298,83 @@ pub async fn request_contact(
     }
     let link_row = db_outcome_to_mcp_result(link_out)?;
 
-    // Send an intro mail (ack_required) so the recipient sees the request in their inbox.
-    let subject = format!("Contact request from {from_agent}");
-    let body_md = format!("{from_agent} requests permission to contact {target_agent_name}.");
+    // Only send intro mail if the target's policy allows it and the link
+    // is not blocked (a re-request against a blocked link should be silent).
+    let should_send_intro =
+        to_row.contact_policy != "block_all" && link_row.status != "blocked";
 
-    let to_id = to_row.id.unwrap_or(0);
-    let recipients: &[(i64, &str)] = &[(to_id, "to")];
-    let message_out = mcp_agent_mail_db::queries::create_message_with_recipients(
-        ctx.cx(),
-        &pool,
-        target_project_id,
-        from_row.id.unwrap_or(0),
-        &subject,
-        &body_md,
-        None,
-        "normal",
-        true,
-        "[]",
-        recipients,
-    )
-    .await;
-    if let Outcome::Err(ref err) = message_out {
-        tracing::error!(
-            from_agent = %from_agent,
-            from_project_id = project_id,
-            to_agent = %target_agent_name,
-            to_project_id = target_project_id,
-            sender_id = from_row.id.unwrap_or(0),
-            recipient_id = to_id,
-            error = %err,
-            "request_contact intro-message insert failed"
+    if should_send_intro {
+        let subject = format!("Contact request from {from_agent}");
+        let body_md =
+            format!("{from_agent} requests permission to contact {target_agent_name}.");
+
+        let to_id = to_row.id.unwrap_or(0);
+        let recipients: &[(i64, &str)] = &[(to_id, "to")];
+        let message_out = mcp_agent_mail_db::queries::create_message_with_recipients(
+            ctx.cx(),
+            &pool,
+            target_project_id,
+            from_row.id.unwrap_or(0),
+            &subject,
+            &body_md,
+            None,
+            "normal",
+            true,
+            "[]",
+            recipients,
+        )
+        .await;
+        if let Outcome::Err(ref err) = message_out {
+            tracing::error!(
+                from_agent = %from_agent,
+                from_project_id = project_id,
+                to_agent = %target_agent_name,
+                to_project_id = target_project_id,
+                sender_id = from_row.id.unwrap_or(0),
+                recipient_id = to_id,
+                error = %err,
+                "request_contact intro-message insert failed"
+            );
+        }
+        let message = db_outcome_to_mcp_result(message_out)?;
+        enqueue_message_semantic_index(
+            target_project_id,
+            message.id.unwrap_or(0),
+            &message.subject,
+            &message.body_md,
+        );
+
+        // Write message to archive
+        let config = mcp_agent_mail_core::Config::get();
+        let message_id = message.id.unwrap_or(0);
+        let all_recipient_names = vec![target_agent_name.clone()];
+
+        let msg_json = serde_json::json!({
+            "id": message_id,
+            "from": &from_agent,
+            "to": &all_recipient_names,
+            "cc": [],
+            "bcc": [],
+            "subject": &message.subject,
+            "created": micros_to_iso(message.created_ts),
+            "thread_id": &message.thread_id,
+            "project": &target_project_row.human_key,
+            "project_slug": &target_project_row.slug,
+            "importance": &message.importance,
+            "ack_required": message.ack_required != 0,
+            "attachments": [],
+        });
+
+        try_write_message_archive(
+            &config,
+            &target_project_row.slug,
+            &msg_json,
+            &message.body_md,
+            &from_agent,
+            &all_recipient_names,
+            &[],
         );
     }
-    let message = db_outcome_to_mcp_result(message_out)?;
-    enqueue_message_semantic_index(
-        target_project_id,
-        message.id.unwrap_or(0),
-        &message.subject,
-        &message.body_md,
-    );
-
-    // Write message to archive
-    let config = mcp_agent_mail_core::Config::get();
-    let message_id = message.id.unwrap_or(0);
-    let all_recipient_names = vec![target_agent_name.clone()];
-
-    let msg_json = serde_json::json!({
-        "id": message_id,
-        "from": &from_agent,
-        "to": &all_recipient_names,
-        "cc": [],
-        "bcc": [],
-        "subject": &message.subject,
-        "created": micros_to_iso(message.created_ts),
-        "thread_id": &message.thread_id,
-        "project": &target_project_row.human_key,
-        "project_slug": &target_project_row.slug,
-        "importance": &message.importance,
-        "ack_required": message.ack_required != 0,
-        "attachments": [],
-    });
-
-    try_write_message_archive(
-        &config,
-        &target_project_row.slug,
-        &msg_json,
-        &message.body_md,
-        &from_agent,
-        &all_recipient_names,
-        &[],
-    );
 
     let response = ContactLinkState {
         from: from_agent,

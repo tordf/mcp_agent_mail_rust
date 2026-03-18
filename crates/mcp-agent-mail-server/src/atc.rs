@@ -8682,7 +8682,19 @@ pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
 pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     let lock_started = Instant::now();
     let engine_lock = ATC_ENGINE.get()?;
-    let mut engine = engine_lock.lock().ok()?;
+    // Recover from poisoned mutex: if a previous tick panicked, clear the
+    // poison and continue. A permanently disabled ATC engine is worse than
+    // operating with potentially inconsistent state (which the calibration
+    // guard and safe mode are designed to handle).
+    let mut engine = match engine_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!(
+                "ATC engine mutex was poisoned (a previous tick panicked); recovering"
+            );
+            poisoned.into_inner()
+        }
+    };
     let lock_wait_micros = elapsed_micros(lock_started);
     if !engine.enabled() {
         return None;
@@ -8697,7 +8709,7 @@ pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
 #[must_use]
 pub fn atc_decision_record(decision_id: u64) -> Option<AtcDecisionRecord> {
     let engine_lock = ATC_ENGINE.get()?;
-    let engine = engine_lock.lock().ok()?;
+    let engine = engine_lock.lock().unwrap_or_else(|p| p.into_inner());
     engine.ledger.get(decision_id).cloned()
 }
 
@@ -8708,7 +8720,7 @@ pub fn atc_decision_record(decision_id: u64) -> Option<AtcDecisionRecord> {
 #[must_use]
 pub fn atc_agent_last_activity(agent: &str) -> Option<i64> {
     let engine_lock = ATC_ENGINE.get()?;
-    let engine = engine_lock.lock().ok()?;
+    let engine = engine_lock.lock().unwrap_or_else(|p| p.into_inner());
     engine
         .agents
         .get(&agent.to_ascii_lowercase())

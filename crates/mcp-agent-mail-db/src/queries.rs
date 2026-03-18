@@ -751,7 +751,8 @@ fn build_approved_contact_sql_with_placeholders(placeholders: &str) -> String {
     format!(
         "SELECT b_agent_id FROM agent_links \
          WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? \
-           AND status = 'approved' AND b_agent_id IN ({placeholders})"
+           AND status = 'approved' AND (expires_ts IS NULL OR expires_ts > ?) \
+           AND b_agent_id IN ({placeholders})"
     )
 }
 
@@ -6672,7 +6673,8 @@ pub async fn request_contact(
                 if is_contact_pair_unique_violation(&e) {
                     let refresh_sql = "UPDATE agent_links \
                         SET status = 'pending', reason = ?, updated_ts = ?, expires_ts = ? \
-                        WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ?";
+                        WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
+                          AND status != 'blocked'";
                     let refresh_params = vec![
                         Value::Text(reason.to_string()),
                         Value::BigInt(now),
@@ -6938,10 +6940,12 @@ pub async fn list_approved_contact_ids(
     let mut out: Vec<i64> = Vec::with_capacity(candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS));
     for chunk in candidate_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
         let sql = approved_contact_sql(chunk.len());
-        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() + 3);
+        let now = now_micros();
+        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() + 4);
         params.push(Value::BigInt(project_id));
         params.push(Value::BigInt(sender_id));
         params.push(Value::BigInt(project_id));
+        params.push(Value::BigInt(now));
         for id in chunk {
             params.push(Value::BigInt(*id));
         }
