@@ -1135,12 +1135,14 @@ mod tests {
         let mut input = base_input();
         input.state = ExperienceState::Skipped;
         input.effect_kind = EffectKind::NoAction;
+        input.now_micros = 100_000_000; // 100s — well within 5min window
         input.non_execution_reason = Some(NonExecutionReason::DeliberateInaction {
             no_action_loss: 0.5,
             best_action_loss: 1.0,
         });
         let mut evidence = success_evidence();
         evidence.situation_change = SituationChange::Unchanged;
+        evidence.observed_ts_micros = 50_000_000; // 50s — past 30s min delay
         input.execution_evidence = Some(evidence);
         let result = label_experience(&input);
         assert_eq!(result.new_state, ExperienceState::Resolved);
