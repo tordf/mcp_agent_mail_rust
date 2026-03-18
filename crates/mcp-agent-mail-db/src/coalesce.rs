@@ -105,7 +105,12 @@ impl<V: Clone> Slot<V> {
         let result = match &*guard {
             SlotState::Ready(v) => Ok(v.clone()),
             SlotState::Failed(msg) => Err(CoalesceJoinError::LeaderFailed(msg.clone())),
-            SlotState::Pending => unreachable!("condvar spurious wakeup with timeout"),
+            // Reachable when the leader panicked (poisoning the mutex) and
+            // we recovered the guard via PoisonError::into_inner. The state
+            // was never advanced past Pending.
+            SlotState::Pending => Err(CoalesceJoinError::LeaderFailed(
+                "leader did not complete (possible panic or poison recovery)".to_string(),
+            )),
         };
         drop(guard);
         result
