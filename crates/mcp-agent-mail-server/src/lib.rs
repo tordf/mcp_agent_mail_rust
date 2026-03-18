@@ -3187,8 +3187,27 @@ fn atc_action_snapshot_from_execution(
         kind: execution.kind.clone(),
         category: execution.category.clone(),
         agent: execution.agent.clone(),
-        message: execution.message.clone(),
+        message: atc_action_snapshot_message(execution),
     }
+}
+
+fn atc_action_snapshot_message(execution: &AtcOperatorExecutionSnapshot) -> Option<String> {
+    if execution.status == "executed" {
+        return execution.message.clone();
+    }
+
+    let status_prefix = execution.status_detail.as_deref().map_or_else(
+        || format!("[{}]", execution.status),
+        |detail| format!("[{}:{detail}]", execution.status),
+    );
+    Some(match execution.message.as_deref() {
+        Some(message) => format!("{status_prefix} {message}"),
+        None => status_prefix,
+    })
+}
+
+fn atc_status_consumes_cooldown(status: &str) -> bool {
+    !status.starts_with("failed:") && status != "suppressed:missing_project_precondition"
 }
 
 fn atc_effect_subject(effect: &atc::AtcEffectPlan) -> String {
@@ -3252,14 +3271,25 @@ fn atc_effect_default_headline(effect: &atc::AtcEffectPlan) -> String {
     }
 }
 
-fn atc_effect_headline(effect: &atc::AtcEffectPlan) -> String {
+fn atc_effect_has_explicit_message(effect: &atc::AtcEffectPlan) -> bool {
     effect
         .message
         .as_deref()
         .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| atc_effect_default_headline(effect))
+        .is_some_and(|message| !message.is_empty())
+}
+
+fn atc_effect_headline(effect: &atc::AtcEffectPlan) -> String {
+    if atc_effect_has_explicit_message(effect) {
+        effect
+            .message
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_string)
+            .unwrap_or_else(|| atc_effect_default_headline(effect))
+    } else {
+        atc_effect_default_headline(effect)
+    }
 }
 
 fn atc_effect_operator_message(effect: &atc::AtcEffectPlan) -> Option<String> {
@@ -3436,7 +3466,7 @@ fn build_atc_experience_row(effect: &atc::AtcEffectPlan) -> Result<ExperienceRow
         "decision_timestamp_micros": decision.timestamp_micros,
         "effect_id_raw": effect.effect_id.clone(),
         "policy_revision": effect.policy_revision,
-        "message_present": effect.message.is_some(),
+        "explicit_message_present": atc_effect_has_explicit_message(effect),
         "fallback_reason": decision.fallback_reason.clone(),
     }));
     if let Some(project_key) = effect.project_key.as_ref() {
@@ -3654,12 +3684,18 @@ fn capture_atc_execution_result(
     ts_micros: i64,
 ) {
     let Some(exp_id) = experience_id else {
+        // No experience ID means append_atc_experience_for_effect failed earlier.
+        // The effect was still executed but has no durable experience record.
+        // This is tracked as an ATC diagnostic gap, not silently swallowed.
+        tracing::debug!("skipping execution capture: no experience_id (append may have failed)");
         return;
     };
 
     let capture = atc_execution_capture(status);
 
     // Transition: Planned → Dispatched (effect was handed to executor).
+    // If this fails, we still attempt the second transition because an
+    // orphaned experience stuck in Planned is worse than skipping a step.
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
         &cx,
@@ -3676,10 +3712,12 @@ fn capture_atc_execution_result(
             ..
         }) => {}
         asupersync::Outcome::Err(error) => {
-            tracing::warn!(experience_id = exp_id, %error, "failed to mark experience dispatched");
-            return;
+            tracing::warn!(experience_id = exp_id, %error, "failed to mark experience dispatched, continuing to final state");
+            // Do NOT return — fall through to the second transition so the
+            // execution result is still captured. An experience in Planned state
+            // with no execution record is worse than a skipped Dispatched step.
         }
-        _ => return,
+        _ => {}
     }
 
     // Transition: Dispatched → Executed/Failed/Throttled/Suppressed/Skipped.
@@ -4280,6 +4318,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
     let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
     let mut last_summary_log_micros = 0_i64;
+    /// Maximum pending effects before backpressure drops oldest.
+    const MAX_PENDING_EFFECTS: usize = 512;
     let mut pending_effects: VecDeque<atc::AtcEffectPlan> = VecDeque::new();
     let mut pending_effect_keys: HashSet<String> = HashSet::new();
     let mut atc_resolution_tick_counter: u64 = 0;
@@ -4318,6 +4358,21 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             }
             let effect_key = atc_effect_semantic_key(&effect);
             if pending_effect_keys.insert(effect_key) {
+                // Enforce backpressure: if the queue is full, drop the oldest
+                // pending effect to make room. This prevents unbounded memory
+                // growth under sustained alert conditions.
+                while pending_effects.len() >= MAX_PENDING_EFFECTS {
+                    if let Some(dropped) = pending_effects.pop_front() {
+                        let dropped_key = atc_effect_semantic_key(&dropped);
+                        pending_effect_keys.remove(&dropped_key);
+                        tracing::warn!(
+                            decision_id = dropped.decision_id,
+                            effect_id = %dropped.effect_id,
+                            queue_len = pending_effects.len(),
+                            "ATC pending effect queue at capacity, dropping oldest effect"
+                        );
+                    }
+                }
                 pending_effects.push_back(effect);
             }
         }
@@ -4366,13 +4421,15 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 continue;
             };
             pending_effect_keys.remove(&cooldown_key);
-            last_action_by_key.insert(cooldown_key, now_micros);
             let status = execute_atc_effect(
                 executor_runtime.as_ref(),
                 executor_mode,
                 &mut executor_registered_projects,
                 &effect,
             );
+            if atc_status_consumes_cooldown(&status) {
+                last_action_by_key.insert(cooldown_key, now_micros);
+            }
             // Capture execution result into durable experience store (br-0qt6e.2.2).
             if let Some(pool) = atc_db_pool.as_ref() {
                 capture_atc_execution_result(
@@ -11399,6 +11456,16 @@ mod tests {
     }
 
     #[test]
+    fn atc_effect_blank_message_is_not_treated_as_explicit_metadata() {
+        let mut effect = sample_probe_effect();
+        effect.message = Some("   ".to_string());
+        assert!(!atc_effect_has_explicit_message(&effect));
+
+        effect.message = Some("still active".to_string());
+        assert!(atc_effect_has_explicit_message(&effect));
+    }
+
+    #[test]
     fn execute_atc_effect_missing_project_is_suppressed_by_precondition() {
         let mut effect = sample_probe_effect();
         effect.project_key = None;
@@ -11598,8 +11665,45 @@ mod tests {
         assert!(
             action
                 .console_line()
-                .contains("ATC liveness probe for AlphaAgent.")
+                .contains("ATC needs an acknowledgment from AlphaAgent")
         );
+    }
+
+    #[test]
+    fn atc_action_snapshot_marks_nonexecuted_effects_in_console_output() {
+        let effect = sample_probe_effect();
+        let snapshot = atc_execution_snapshot(
+            1_700_000_000_000_111,
+            &effect,
+            "dry_run",
+            "suppressed:executor_mode_dry_run",
+        );
+
+        let action = atc_action_snapshot_from_execution(&snapshot);
+        assert_eq!(
+            action.message.as_deref(),
+            Some(
+                "[suppressed:executor_mode_dry_run] ATC needs an acknowledgment from AlphaAgent to distinguish a stale session from active work."
+            )
+        );
+        assert!(
+            action
+                .console_line()
+                .contains("[suppressed:executor_mode_dry_run]")
+        );
+    }
+
+    #[test]
+    fn atc_status_consumes_cooldown_only_when_retry_should_wait() {
+        assert!(atc_status_consumes_cooldown("executed"));
+        assert!(atc_status_consumes_cooldown(
+            "suppressed:executor_mode_shadow"
+        ));
+        assert!(atc_status_consumes_cooldown("skipped:deliberate_no_action"));
+        assert!(!atc_status_consumes_cooldown("failed:executor_unavailable"));
+        assert!(!atc_status_consumes_cooldown(
+            "suppressed:missing_project_precondition"
+        ));
     }
 
     #[test]

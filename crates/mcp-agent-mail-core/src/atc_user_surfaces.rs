@@ -145,6 +145,34 @@ impl SurfaceState {
             Self::SafeToIgnore => "check_circle",
         }
     }
+
+    /// Default evidence-trust metadata implied by this surface state.
+    #[must_use]
+    pub const fn default_evidence_trust(self) -> EvidenceTrustLevel {
+        match self {
+            Self::EvidenceDistrust => EvidenceTrustLevel::Quarantined,
+            _ => EvidenceTrustLevel::High,
+        }
+    }
+
+    /// Default attribution-clarity metadata implied by this surface state.
+    #[must_use]
+    pub const fn default_attribution_clarity(self) -> AttributionClarity {
+        match self {
+            Self::AttributionConfounded => AttributionClarity::Confounded,
+            _ => AttributionClarity::Clean,
+        }
+    }
+
+    /// Whether the operator can safely dismiss this state after reading it.
+    ///
+    /// This is intentionally different from `silent_by_default()`: some states
+    /// are worth showing by default for transparency, even though they do not
+    /// require follow-up action.
+    #[must_use]
+    pub const fn safe_to_ignore(self) -> bool {
+        !self.is_actionable()
+    }
 }
 
 impl std::fmt::Display for SurfaceState {
@@ -253,7 +281,9 @@ impl EvidenceTrustLevel {
             Self::High => "Evidence is clean and reliable.",
             Self::Moderate => "Some uncertainty in the evidence, but sufficient for action.",
             Self::Low => "Evidence quality is low. Exercise caution with automated decisions.",
-            Self::Quarantined => "Evidence has been quarantined due to suspected contamination. Do not act on this alone.",
+            Self::Quarantined => {
+                "Evidence has been quarantined due to suspected contamination. Do not act on this alone."
+            }
         }
     }
 }
@@ -290,7 +320,9 @@ impl AttributionClarity {
         match self {
             Self::Clean => "Clear single cause identified.",
             Self::Dominant => "Multiple factors, but one primary cause identified.",
-            Self::Confounded => "Multiple overlapping interventions make the credit story unclear. The outcome is real, but ATC cannot confidently assign credit.",
+            Self::Confounded => {
+                "Multiple overlapping interventions make the credit story unclear. The outcome is real, but ATC cannot confidently assign credit."
+            }
             Self::Unknown => "Cannot determine what caused this outcome.",
         }
     }
@@ -576,8 +608,8 @@ pub fn build_surface_card(
 
     let ttl = match state {
         SurfaceState::SafeToIgnore | SurfaceState::DeliberateNoOp => 60_000_000, // 1 min
-        SurfaceState::Observation => 300_000_000,    // 5 min
-        SurfaceState::FairnessThrottle => 600_000_000, // 10 min
+        SurfaceState::Observation => 300_000_000,                                // 5 min
+        SurfaceState::FairnessThrottle => 600_000_000,                           // 10 min
         _ => 1_800_000_000, // 30 min for actionable items
     };
 
@@ -592,9 +624,9 @@ pub fn build_surface_card(
             required: state.is_actionable(),
             command_hint: None,
         },
-        safe_to_ignore: state.silent_by_default(),
-        evidence_trust: EvidenceTrustLevel::High,
-        attribution_clarity: AttributionClarity::Clean,
+        safe_to_ignore: state.safe_to_ignore(),
+        evidence_trust: state.default_evidence_trust(),
+        attribution_clarity: state.default_attribution_clarity(),
         target,
         severity,
         generated_ts_micros: now_micros,
@@ -687,7 +719,11 @@ mod tests {
     fn test_evidence_trust_explanations() {
         assert!(!EvidenceTrustLevel::High.explanation().is_empty());
         assert!(!EvidenceTrustLevel::Quarantined.explanation().is_empty());
-        assert!(EvidenceTrustLevel::Quarantined.explanation().contains("quarantined"));
+        assert!(
+            EvidenceTrustLevel::Quarantined
+                .explanation()
+                .contains("quarantined")
+        );
     }
 
     // ── Attribution clarity ──
@@ -695,7 +731,11 @@ mod tests {
     #[test]
     fn test_attribution_clarity_explanations() {
         assert!(AttributionClarity::Clean.explanation().contains("single"));
-        assert!(AttributionClarity::Confounded.explanation().contains("unclear"));
+        assert!(
+            AttributionClarity::Confounded
+                .explanation()
+                .contains("unclear")
+        );
     }
 
     // ── Noise policies ──
@@ -703,9 +743,14 @@ mod tests {
     #[test]
     fn test_noise_policies_complete() {
         let surfaces = [
-            "advisory", "probe", "release_warning",
-            "degraded_learning_alert", "suspicious_evidence_alert",
-            "confounded_outcome_alert", "safe_no_action", "fairness_throttle",
+            "advisory",
+            "probe",
+            "release_warning",
+            "degraded_learning_alert",
+            "suspicious_evidence_alert",
+            "confounded_outcome_alert",
+            "safe_no_action",
+            "fairness_throttle",
         ];
         for surface in surfaces {
             let policy = NOISE_POLICIES.iter().find(|p| p.surface == surface);
@@ -715,7 +760,10 @@ mod tests {
 
     #[test]
     fn test_safe_no_action_is_never_proactive() {
-        let policy = NOISE_POLICIES.iter().find(|p| p.surface == "safe_no_action").unwrap();
+        let policy = NOISE_POLICIES
+            .iter()
+            .find(|p| p.surface == "safe_no_action")
+            .unwrap();
         assert_eq!(policy.max_per_agent_per_hour, 0);
         assert_eq!(policy.max_global_per_minute, 0);
         assert!(!policy.is_interruptive);
@@ -723,7 +771,10 @@ mod tests {
 
     #[test]
     fn test_probe_is_interruptive() {
-        let policy = NOISE_POLICIES.iter().find(|p| p.surface == "probe").unwrap();
+        let policy = NOISE_POLICIES
+            .iter()
+            .find(|p| p.surface == "probe")
+            .unwrap();
         assert!(policy.is_interruptive);
     }
 
@@ -754,7 +805,10 @@ mod tests {
 
     #[test]
     fn test_all_quiet_workflow_expects_silence() {
-        let wf = GOLDEN_WORKFLOWS.iter().find(|w| w.name == "all_quiet").unwrap();
+        let wf = GOLDEN_WORKFLOWS
+            .iter()
+            .find(|w| w.name == "all_quiet")
+            .unwrap();
         assert!(wf.anti_pattern.contains("NOT"));
         assert!(wf.expected_action.contains("Nothing"));
     }
@@ -797,16 +851,62 @@ mod tests {
     }
 
     #[test]
+    fn test_build_surface_card_evidence_distrust_defaults_to_quarantined_trust() {
+        let card = build_surface_card(
+            SurfaceState::EvidenceDistrust,
+            "Low-trust evidence".into(),
+            "ATC detected contaminated evidence".into(),
+            "Trace replay made this outcome unsafe to trust".into(),
+            RiskAssessment::High,
+            "Do not act automatically",
+            Some("AgentX".into()),
+            1_000_000,
+        );
+
+        assert_eq!(card.evidence_trust, EvidenceTrustLevel::Quarantined);
+        assert_eq!(card.attribution_clarity, AttributionClarity::Clean);
+    }
+
+    #[test]
+    fn test_build_surface_card_confounded_defaults_to_confounded_attribution() {
+        let card = build_surface_card(
+            SurfaceState::AttributionConfounded,
+            "Confounded outcome".into(),
+            "The target recovered".into(),
+            "Multiple overlapping interventions make credit unclear".into(),
+            RiskAssessment::Medium,
+            "Inspect overlapping actions",
+            Some("AgentY".into()),
+            1_000_000,
+        );
+
+        assert_eq!(card.evidence_trust, EvidenceTrustLevel::High);
+        assert_eq!(card.attribution_clarity, AttributionClarity::Confounded);
+        assert!(card.safe_to_ignore);
+        assert!(!card.state.silent_by_default());
+    }
+
+    #[test]
     fn test_surface_card_ttl_varies_by_state() {
         let actionable = build_surface_card(
             SurfaceState::ExecutedIntervention,
-            "h".into(), "w".into(), "y".into(),
-            RiskAssessment::High, "act", None, 0,
+            "h".into(),
+            "w".into(),
+            "y".into(),
+            RiskAssessment::High,
+            "act",
+            None,
+            0,
         );
         let passive = build_surface_card(
             SurfaceState::SafeToIgnore,
-            "h".into(), "w".into(), "y".into(),
-            RiskAssessment::None, "nothing", None, 0,
+            "h".into(),
+            "w".into(),
+            "y".into(),
+            RiskAssessment::None,
+            "nothing",
+            None,
+            0,
         );
         assert!(actionable.ttl_micros > passive.ttl_micros);
     }

@@ -739,7 +739,8 @@ impl FeatureVector {
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub const fn prob_to_bp(p: f64) -> u16 {
-    if p <= 0.0 {
+    // NaN comparisons are always false, so check explicitly.
+    if p.is_nan() || p <= 0.0 {
         return 0;
     }
     if p >= 1.0 {
@@ -755,7 +756,8 @@ pub const fn prob_to_bp(p: f64) -> u16 {
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub const fn loss_to_bp(loss: f64) -> u16 {
-    if loss <= 0.0 {
+    // NaN comparisons are always false, so check explicitly.
+    if loss.is_nan() || loss <= 0.0 {
         return 0;
     }
     let scaled = loss * 100.0;

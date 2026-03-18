@@ -782,7 +782,17 @@ fn listener_host_matches_request(listener_host: &str, requested_host: &str) -> b
         parse_canonical_ip(&listener_host),
         parse_canonical_ip(&requested_host),
     ) {
-        (Some(listener_ip), Some(requested_ip)) => listener_ip == requested_ip,
+        (Some(listener_ip), Some(requested_ip)) => {
+            // Direct IP match (covers IPv4-mapped IPv6 via canonicalization).
+            listener_ip == requested_ip
+            // Cross-family loopback: on dual-stack systems 127.0.0.1 and ::1
+            // both serve loopback traffic and conflict with each other.
+            // Only match cross-family (V4↔V6), not same-family different-address
+            // (e.g. 127.0.0.1 vs 127.0.0.2 are distinct listeners).
+            || (listener_ip.is_loopback()
+                && requested_ip.is_loopback()
+                && listener_ip.is_ipv4() != requested_ip.is_ipv4())
+        }
         _ => listener_host.eq_ignore_ascii_case(&requested_host),
     }
 }

@@ -19,10 +19,9 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const TWO_POW_32_F64: f64 = 4_294_967_296.0;
-const MICROS_PER_SECOND_F64: f64 = 1_000_000.0;
 
 fn u64_to_f64(value: u64) -> f64 {
     let upper = u32::try_from(value >> 32).unwrap_or(u32::MAX);
@@ -42,10 +41,16 @@ fn micros_f64_to_i64(value: f64) -> i64 {
     if !value.is_finite() || value <= 0.0 {
         return 0;
     }
-
-    let seconds = value / MICROS_PER_SECOND_F64;
-    let micros = Duration::from_secs_f64(seconds).as_micros();
-    i64::try_from(micros).unwrap_or(i64::MAX)
+    // Direct cast — value is already in microseconds. The previous
+    // roundtrip through Duration::from_secs_f64 could panic on large
+    // values (>~2^63 nanoseconds). Clamp to i64::MAX instead.
+    if value > i64::MAX as f64 {
+        return i64::MAX;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        value as i64
+    }
 }
 
 fn elapsed_micros(started_at: Instant) -> u64 {
@@ -4893,6 +4898,12 @@ impl AtcEngine {
                 .extend(self.conflict_graphs.keys().cloned());
         }
         let dirty_projects: Vec<String> = self.dirty_projects.drain().collect();
+        // Count cache hits for non-dirty projects still served from cache.
+        let reused = self
+            .conflict_graphs
+            .len()
+            .saturating_sub(dirty_projects.len());
+        self.deadlock_cache_hits = self.deadlock_cache_hits.saturating_add(reused as u64);
         for project in dirty_projects {
             self.update_deadlock_cache_for_project(&project);
         }

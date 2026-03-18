@@ -53,7 +53,8 @@ use crate::experience::{EffectKind, ExperienceOutcome, ExperienceState, NonExecu
 /// The resolved label for an ATC experience.
 ///
 /// This is the learning signal. Each variant carries enough information
-/// for the loss computation and regret tracking downstream.
+/// for correctness and realized-loss tracking downstream. Regret remains
+/// optional and depends on caller-supplied optimal-loss context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeLabel {
@@ -447,14 +448,8 @@ fn label_open_or_executed(input: &LabelingInput) -> LabelingResult {
             return result;
         }
 
-        if evidence.exogenous_recovery && window.censor_on_exogenous_recovery {
-            return LabelingResult {
-                label: OutcomeLabel::Censored {
-                    reason: CensorReason::ExogenousRecovery,
-                },
-                new_state: ExperienceState::Censored,
-                rule_id: "exogenous_recovery",
-            };
+        if let Some(result) = censor_exogenous_recovery(window, evidence) {
+            return result;
         }
 
         return label_from_evidence(input.effect_kind, evidence);
@@ -490,6 +485,40 @@ fn label_open_or_executed(input: &LabelingInput) -> LabelingResult {
 fn label_non_execution(input: &LabelingInput) -> LabelingResult {
     let window = attribution_window(input.effect_kind);
     let anchor = input.created_ts_micros;
+
+    if input.subject_departed {
+        return LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::SubjectDeparted,
+            },
+            new_state: ExperienceState::Censored,
+            rule_id: "subject_departed",
+        };
+    }
+
+    if let Some(ref change) = input.operator_change {
+        return LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::ConcurrentOperatorChange {
+                    change_description: change.clone(),
+                },
+            },
+            new_state: ExperienceState::Censored,
+            rule_id: "operator_change",
+        };
+    }
+
+    if input.concurrent_intervention_count > window.max_concurrent_interventions {
+        return LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::OverlappingInterventions {
+                    intervention_count: input.concurrent_intervention_count,
+                },
+            },
+            new_state: ExperienceState::Censored,
+            rule_id: "overlapping_interventions",
+        };
+    }
 
     match (&input.non_execution_reason, &input.execution_evidence) {
         // Deliberate inaction with observed outcome
@@ -556,6 +585,16 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
                 rule_id: "calibration_fallback_resolved",
             }
         }
+        // Non-execution reason missing — ambiguous regardless of evidence.
+        (None, _) => LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::AmbiguousResult {
+                    description: "non-execution state without reason".to_string(),
+                },
+            },
+            new_state: ExperienceState::Censored,
+            rule_id: "missing_non_execution_reason",
+        },
         // Non-execution without outcome evidence — check window
         (_, None) => {
             let elapsed = input.now_micros.saturating_sub(anchor);
@@ -578,19 +617,6 @@ fn label_non_execution(input: &LabelingInput) -> LabelingResult {
                     new_state: input.state, // stay in non-execution state
                     rule_id: "non_execution_awaiting_evidence",
                 }
-            }
-        }
-        // Non-execution reason missing but evidence present
-        (None, Some(_evidence)) => {
-            // Treat as ambiguous — we don't know why it wasn't executed
-            LabelingResult {
-                label: OutcomeLabel::Censored {
-                    reason: CensorReason::AmbiguousResult {
-                        description: "non-execution state without reason".to_string(),
-                    },
-                },
-                new_state: ExperienceState::Censored,
-                rule_id: "missing_non_execution_reason",
             }
         }
     }
@@ -624,6 +650,23 @@ fn validate_evidence_timing(
             },
             new_state: ExperienceState::Censored,
             rule_id: "evidence_too_early",
+        });
+    }
+
+    None
+}
+
+fn censor_exogenous_recovery(
+    window: AttributionWindow,
+    evidence: &ExecutionEvidence,
+) -> Option<LabelingResult> {
+    if evidence.exogenous_recovery && window.censor_on_exogenous_recovery {
+        return Some(LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::ExogenousRecovery,
+            },
+            new_state: ExperienceState::Censored,
+            rule_id: "exogenous_recovery",
         });
     }
 
@@ -867,14 +910,20 @@ const fn label_no_action(evidence: &ExecutionEvidence) -> LabelingResult {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Convert a labeling result into an [`ExperienceOutcome`] for storage.
+///
+/// `observed_ts_micros` must be the actual timestamp when the outcome evidence
+/// was observed, not when labeling happened to run.
 #[must_use]
-pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<ExperienceOutcome> {
+pub fn label_to_outcome(
+    result: &LabelingResult,
+    observed_ts_micros: i64,
+) -> Option<ExperienceOutcome> {
     match &result.label {
         OutcomeLabel::Success {
             realized_loss,
             confidence,
         } => Some(ExperienceOutcome {
-            observed_ts_micros: now_micros,
+            observed_ts_micros,
             label: format!(
                 "success (confidence={confidence:.2}, rule={})",
                 result.rule_id
@@ -889,7 +938,7 @@ pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<Expe
             reason,
             confidence,
         } => Some(ExperienceOutcome {
-            observed_ts_micros: now_micros,
+            observed_ts_micros,
             label: format!(
                 "failure: {reason} (confidence={confidence:.2}, rule={})",
                 result.rule_id
@@ -900,7 +949,7 @@ pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<Expe
             evidence: None,
         }),
         OutcomeLabel::Correct { realized_loss } => Some(ExperienceOutcome {
-            observed_ts_micros: now_micros,
+            observed_ts_micros,
             label: format!("correct (rule={})", result.rule_id),
             correct: true,
             actual_loss: Some(*realized_loss),
@@ -917,7 +966,7 @@ pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<Expe
                 "false_negative"
             };
             Some(ExperienceOutcome {
-                observed_ts_micros: now_micros,
+                observed_ts_micros,
                 label: format!("{fp_label} (rule={})", result.rule_id),
                 correct: false,
                 actual_loss: Some(*realized_loss),
@@ -929,7 +978,7 @@ pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<Expe
             inaction_correct,
             realized_loss,
         } => Some(ExperienceOutcome {
-            observed_ts_micros: now_micros,
+            observed_ts_micros,
             label: format!(
                 "non_execution_{} (rule={})",
                 if *inaction_correct {
@@ -1245,6 +1294,123 @@ mod tests {
     }
 
     #[test]
+    fn non_execution_subject_departed_censors() {
+        let mut input = base_input();
+        input.state = ExperienceState::Skipped;
+        input.effect_kind = EffectKind::NoAction;
+        input.non_execution_reason = Some(NonExecutionReason::DeliberateInaction {
+            no_action_loss: 0.5,
+            best_action_loss: 1.0,
+        });
+        input.subject_departed = true;
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Censored);
+        assert_eq!(result.rule_id, "subject_departed");
+    }
+
+    #[test]
+    fn non_execution_missing_reason_censors_even_without_evidence() {
+        let mut input = base_input();
+        input.state = ExperienceState::Suppressed;
+        input.effect_kind = EffectKind::Release;
+        input.non_execution_reason = None;
+        input.execution_evidence = None;
+        input.now_micros = 10_000_000;
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Censored);
+        assert_eq!(result.rule_id, "missing_non_execution_reason");
+    }
+
+    #[test]
+    fn non_execution_exogenous_recovery_still_resolves_for_suppression() {
+        let mut input = base_input();
+        input.state = ExperienceState::Suppressed;
+        input.effect_kind = EffectKind::Advisory;
+        input.non_execution_reason = Some(NonExecutionReason::SafetyGate {
+            gate_name: "calibration_guard".to_string(),
+            risk_score: 0.9,
+            gate_threshold: 0.7,
+        });
+        let mut evidence = success_evidence();
+        evidence.exogenous_recovery = true;
+        evidence.observed_ts_micros = 10_000_000;
+        input.execution_evidence = Some(evidence);
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Resolved);
+        assert!(matches!(
+            result.label,
+            OutcomeLabel::NonExecution {
+                inaction_correct: true,
+                ..
+            }
+        ));
+        assert_eq!(result.rule_id, "safety_gate_resolved");
+    }
+
+    #[test]
+    fn deliberate_inaction_exogenous_recovery_still_resolves_for_no_action() {
+        let mut input = base_input();
+        input.state = ExperienceState::Skipped;
+        input.effect_kind = EffectKind::NoAction;
+        input.now_micros = 100_000_000;
+        input.non_execution_reason = Some(NonExecutionReason::DeliberateInaction {
+            no_action_loss: 0.5,
+            best_action_loss: 1.0,
+        });
+        let mut evidence = success_evidence();
+        evidence.exogenous_recovery = true;
+        evidence.situation_change = SituationChange::Unchanged;
+        evidence.observed_ts_micros = 50_000_000;
+        input.execution_evidence = Some(evidence);
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Resolved);
+        assert!(matches!(
+            result.label,
+            OutcomeLabel::NonExecution {
+                inaction_correct: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_execution_operator_change_censors() {
+        let mut input = base_input();
+        input.state = ExperienceState::Suppressed;
+        input.effect_kind = EffectKind::Release;
+        input.non_execution_reason = Some(NonExecutionReason::SafetyGate {
+            gate_name: "conformal_uncertainty".to_string(),
+            risk_score: 0.9,
+            gate_threshold: 0.7,
+        });
+        input.operator_change = Some("manual override".to_string());
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Censored);
+        assert_eq!(result.rule_id, "operator_change");
+    }
+
+    #[test]
+    fn non_execution_overlapping_interventions_censor() {
+        let mut input = base_input();
+        input.state = ExperienceState::Skipped;
+        input.effect_kind = EffectKind::NoAction;
+        input.non_execution_reason = Some(NonExecutionReason::DeliberateInaction {
+            no_action_loss: 0.5,
+            best_action_loss: 1.0,
+        });
+        input.concurrent_intervention_count = 1;
+
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Censored);
+        assert_eq!(result.rule_id, "overlapping_interventions");
+    }
+
+    #[test]
     fn failed_dispatch_censored() {
         let mut input = base_input();
         input.state = ExperienceState::Failed;
@@ -1321,6 +1487,7 @@ mod tests {
         let outcome = label_to_outcome(&result, 42_000_000);
         assert!(outcome.is_some());
         let outcome = outcome.unwrap();
+        assert_eq!(outcome.observed_ts_micros, 42_000_000);
         assert!(outcome.correct);
         assert_eq!(outcome.actual_loss, Some(1.5));
         assert_eq!(outcome.regret, Some(0.0));

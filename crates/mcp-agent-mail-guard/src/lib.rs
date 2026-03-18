@@ -437,14 +437,14 @@ def is_real_file(path):
 
 def slugify(value):
     out = []
-    prev_dash = false
+    prev_dash = False
     for ch in value.strip().lower():
         if ch.isalnum():
             out.append(ch)
-            prev_dash = false
+            prev_dash = False
         elif not prev_dash:
             out.append("-")
-            prev_dash = true
+            prev_dash = True
     slug = "".join(out).strip("-")
     return slug or "project"
 

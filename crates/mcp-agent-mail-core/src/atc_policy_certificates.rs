@@ -457,6 +457,7 @@ pub fn compute_doubly_robust(
 
     let mut sum_dr = 0.0;
     let mut sum_dr_sq = 0.0;
+    let mut sum_iw = 0.0;
     let mut sum_iw_sq = 0.0;
     let mut n_contributing = 0u64;
     let mut n_selected = 0u64;
@@ -479,6 +480,7 @@ pub fn compute_doubly_robust(
             } else {
                 raw_iw
             };
+            sum_iw += iw;
             sum_iw_sq += iw * iw;
 
             // DR term: μ̂ + iw × (Y - μ̂), weighted by evidence and attribution.
@@ -509,12 +511,11 @@ pub fn compute_doubly_robust(
         f64::INFINITY
     };
 
-    // Effective sample size: n / (1 + cv²(importance weights)).
-    let ess = if sum_iw_sq > 0.0 && n_selected > 0 {
-        let mean_iw_sq = sum_iw_sq / n_selected as f64;
-        let mean_iw = n / n_selected as f64; // approximate
-        let cv_sq = (mean_iw_sq / (mean_iw * mean_iw)) - 1.0;
-        n / (1.0 + cv_sq.max(0.0))
+    // Effective sample size via Kish's formula: ESS = (Σw)² / Σ(w²).
+    // This correctly accounts for the actual importance weight distribution
+    // rather than approximating the mean weight.
+    let ess = if sum_iw_sq > 0.0 && sum_iw > 0.0 {
+        (sum_iw * sum_iw) / sum_iw_sq
     } else {
         n
     };
@@ -578,9 +579,12 @@ impl ConfidenceSequence {
     }
 
     /// Create with a custom significance level.
+    ///
+    /// Alpha is clamped to `[1e-15, 1.0]` to prevent division-by-zero
+    /// in `threshold()` and infinite propagation in downstream logic.
     #[must_use]
     pub fn with_alpha(alpha: f64) -> Self {
-        Self { alpha, ..Self::new() }
+        Self { alpha: alpha.clamp(1e-15, 1.0), ..Self::new() }
     }
 
     /// Process a new observation (advantage = incumbent_loss - candidate_loss).
@@ -1077,6 +1081,11 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
     // ── Gate 11: Tail-risk spike ──
     let tail_risk_ratio = if input.tail_mean_loss > 0.0 {
         input.tail_max_loss / input.tail_mean_loss
+    } else if input.tail_max_loss > 0.0 {
+        // Any spike with zero mean loss is an extreme ratio — always flag.
+        // Use a large finite value (not INFINITY) because this field is
+        // stored in a Serialize struct and serde_json rejects non-finite f64.
+        1e15
     } else {
         0.0
     };
@@ -1117,7 +1126,7 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
     };
 
     let valid_until = input.validity_duration_micros
-        .map(|dur| input.now_ts_micros + dur);
+        .map(|dur| input.now_ts_micros.saturating_add(dur));
 
     PolicyPromotionCertificate {
         certificate_id: input.certificate_id,
