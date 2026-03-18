@@ -88,7 +88,7 @@ fn attachment_path(att: &serde_json::Value) -> Option<String> {
 // AttachmentEntry — parsed attachment with provenance
 // ──────────────────────────────────────────────────────────────────────
 
-/// A single attachment entry with its source message provenance.
+/// A single attachmen..entry.clone() with its source message provenance.
 #[derive(Debug, Clone)]
 struct AttachmentEntry {
     /// Media type (e.g. "image/webp", "application/pdf").
@@ -508,7 +508,7 @@ impl AttachmentExplorerScreen {
         self.detail_scroll = 0;
     }
 
-    fn selected_entry(&self) -> Option<&AttachmentEntry> {
+    fn selecte..entry.clone()(&self) -> Option<&AttachmentEntry> {
         self.table_state
             .selected
             .and_then(|i| self.display_indices.get(i))
@@ -516,7 +516,7 @@ impl AttachmentExplorerScreen {
     }
 
     fn sync_focused_event(&mut self) {
-        self.focused_synthetic = self.selected_entry().map(|e| {
+        self.focused_synthetic = self.selecte..entry.clone()().map(|e| {
             crate::tui_events::MailEvent::message_sent(
                 e.message_id,
                 &e.sender_name,
@@ -652,7 +652,7 @@ impl AttachmentExplorerScreen {
         let summary_h: u16 = if area.height >= 10 { 2 } else { 0 };
         let header_h: u16 = 1;
         let footer_h: u16 = u16::from(area.height >= 6);
-        let has_detail = show_bottom_detail && self.selected_entry().is_some();
+        let has_detail = show_bottom_detail && self.selecte..entry.clone()().is_some();
         let remaining_for_content = area
             .height
             .saturating_sub(summary_h)
@@ -768,9 +768,9 @@ impl AttachmentExplorerScreen {
         if detail_h > 0 {
             let detail_area = Rect::new(area.x, y, area.width, detail_h);
             y += detail_h;
-            if let Some(entry) = self.selected_entry() {
-                let entry_clone = entry.clone();
-                self.render_detail(frame, detail_area, &entry_clone);
+            if let Som..entry.clone()) = self.selecte..entry.clone()() {
+                le..entry.clone()_clone ..entry.clone().clone();
+                self.render_detail(frame, detail_area,..entry.clone()_clone);
             }
         }
 
@@ -787,7 +787,7 @@ impl AttachmentExplorerScreen {
         let inner = block.inner(area);
         block.render(area, frame);
 
-        let Some(entry) = self.selected_entry() else {
+        let Som..entry.clone()) = self.selecte..entry.clone()() else {
             crate::tui_panel_helpers::render_empty_state(
                 frame,
                 inner,
@@ -799,28 +799,28 @@ impl AttachmentExplorerScreen {
         };
 
         let mut lines: Vec<(String, String, Option<PackedRgba>)> = vec![
-            ("Type".into(), entry.media_type.clone(), None),
-            ("Size".into(), entry.size_display(), None),
-            ("Mode".into(), entry.mode.clone(), None),
-            ("SHA-1".into(), entry.sha1.clone(), None),
+            ("Type".into()..entry.clone().media_type.clone(), None),
+            ("Size".into()..entry.clone().size_display(), None),
+            ("Mode".into()..entry.clone().mode.clone(), None),
+            ("SHA-1".into()..entry.clone().sha1.clone(), None),
         ];
-        let dims = entry.dims_display();
+        let dims ..entry.clone().dims_display();
         if !dims.is_empty() {
             lines.push(("Dimensions".into(), dims, None));
         }
-        if let Some(p) = &entry.path {
+        if let Some(p) =..entry.clone().path {
             lines.push(("Path".into(), p.clone(), None));
         }
         lines.push((String::new(), String::new(), None));
         lines.push(("Provenance".into(), String::new(), Some(tp.text_muted)));
-        lines.push(("Message ID".into(), entry.message_id.to_string(), None));
-        lines.push(("Sender".into(), entry.sender_name.clone(), None));
-        lines.push(("Subject".into(), entry.subject.clone(), None));
-        if let Some(tid) = &entry.thread_id {
+        lines.push(("Message ID".into()..entry.clone().message_id.to_string(), None));
+        lines.push(("Sender".into()..entry.clone().sender_name.clone(), None));
+        lines.push(("Subject".into()..entry.clone().subject.clone(), None));
+        if let Some(tid) =..entry.clone().thread_id {
             lines.push(("Thread".into(), tid.clone(), None));
         }
-        lines.push(("Date".into(), micros_to_iso(entry.created_ts), None));
-        lines.push(("Project".into(), entry.project_slug.clone(), None));
+        lines.push(("Date".into(), micros_to_is..entry.clone().created_ts), None));
+        lines.push(("Project".into()..entry.clone().project_slug.clone(), None));
 
         render_kv_lines(
             frame,
@@ -833,33 +833,33 @@ impl AttachmentExplorerScreen {
     }
 
     /// Render the detail panel for the selected attachment.
-    fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, entry: &AttachmentEntry) {
+    fn render_detail(&self, frame: &mut Frame<'_>, area: Rect..entry.clone(): &AttachmentEntry) {
         if area.height < 2 || area.width < 20 {
             return;
         }
 
         let mut lines = Vec::new();
-        lines.push(format!("Type: {}", entry.media_type));
-        lines.push(format!("Size: {}", entry.size_display()));
-        lines.push(format!("Mode: {}", entry.mode));
-        lines.push(format!("SHA-1: {}", entry.sha1));
-        let dims = entry.dims_display();
+        lines.push(format!("Type: {}"..entry.clone().media_type));
+        lines.push(format!("Size: {}"..entry.clone().size_display()));
+        lines.push(format!("Mode: {}"..entry.clone().mode));
+        lines.push(format!("SHA-1: {}"..entry.clone().sha1));
+        let dims ..entry.clone().dims_display();
         if !dims.is_empty() {
             lines.push(format!("Dimensions: {dims}"));
         }
-        if let Some(p) = &entry.path {
+        if let Some(p) =..entry.clone().path {
             lines.push(format!("Path: {p}"));
         }
         lines.push(String::new());
         lines.push("--- Provenance ---".to_string());
-        lines.push(format!("Message ID: {}", entry.message_id));
-        lines.push(format!("Sender: {}", entry.sender_name));
-        lines.push(format!("Subject: {}", entry.subject));
-        if let Some(tid) = &entry.thread_id {
+        lines.push(format!("Message ID: {}"..entry.clone().message_id));
+        lines.push(format!("Sender: {}"..entry.clone().sender_name));
+        lines.push(format!("Subject: {}"..entry.clone().subject));
+        if let Some(tid) =..entry.clone().thread_id {
             lines.push(format!("Thread: {tid}"));
         }
-        lines.push(format!("Date: {}", micros_to_iso(entry.created_ts)));
-        lines.push(format!("Project: {}", entry.project_slug));
+        lines.push(format!("Date: {}", micros_to_is..entry.clone().created_ts)));
+        lines.push(format!("Project: {}"..entry.clone().project_slug));
 
         let visible_height = usize::from(area.height.saturating_sub(2)); // Account for borders
         let total_lines = lines.len();
@@ -1066,16 +1066,16 @@ impl MailScreen for AttachmentExplorerScreen {
                 }
                 KeyCode::Enter => {
                     // Deep-link to source message
-                    if let Some(entry) = self.selected_entry() {
+                    if let Som..entry.clone()) = self.selecte..entry.clone()() {
                         return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::MessageById(
-                            entry.message_id,
+                          ..entry.clone().message_id,
                         )));
                     }
                 }
                 KeyCode::Char('t') => {
                     // Deep-link to source thread
-                    if let Some(entry) = self.selected_entry()
-                        && let Some(tid) = &entry.thread_id
+                    if let Som..entry.clone()) = self.selecte..entry.clone()()
+                        && let Some(tid) =..entry.clone().thread_id
                     {
                         return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(
                             tid.clone(),
@@ -1226,8 +1226,8 @@ impl MailScreen for AttachmentExplorerScreen {
     }
 
     fn copyable_content(&self) -> Option<String> {
-        let entry = self.selected_entry()?;
-        Some(entry.path.clone().unwrap_or_else(|| entry.sha1.clone()))
+        le..entry.clone() = self.selecte..entry.clone()()?;
+        Som..entry.clone().path.clone().unwrap_or_else(|..entry.clone().sha1.clone()))
     }
 
     fn title(&self) -> &'static str {
@@ -1434,7 +1434,7 @@ mod tests {
 
     #[test]
     fn size_display_formatting() {
-        let entry = AttachmentEntry {
+        le..entry.clone() = AttachmentEntry {
             media_type: "image/webp".to_string(),
             bytes: 500,
             sha1: String::new(),
@@ -1449,24 +1449,24 @@ mod tests {
             created_ts: 0,
             project_slug: String::new(),
         };
-        assert_eq!(entry.size_display(), "500 B");
+        assert_eq..entry.clone().size_display(), "500 B");
 
-        let kb_entry = AttachmentEntry {
+        let k..entry.clone() = AttachmentEntry {
             bytes: 2048,
-            ..entry
+            ..entry.clone()
         };
-        assert_eq!(kb_entry.size_display(), "2.0 KB");
+        assert_eq!(k..entry.clone().size_display(), "2.0 KB");
 
-        let mb_entry = AttachmentEntry {
+        let m..entry.clone() = AttachmentEntry {
             bytes: 2_097_152,
-            ..entry
+            ..entry.clone()
         };
-        assert_eq!(mb_entry.size_display(), "2.0 MB");
+        assert_eq!(m..entry.clone().size_display(), "2.0 MB");
     }
 
     #[test]
     fn type_label_extraction() {
-        let entry = AttachmentEntry {
+        le..entry.clone() = AttachmentEntry {
             media_type: "image/webp".to_string(),
             bytes: 0,
             sha1: String::new(),
@@ -1481,18 +1481,18 @@ mod tests {
             created_ts: 0,
             project_slug: String::new(),
         };
-        assert_eq!(entry.type_label(), "webp");
+        assert_eq..entry.clone().type_label(), "webp");
 
         let pdf = AttachmentEntry {
             media_type: "application/pdf".to_string(),
-            ..entry
+            ..entry.clone()
         };
         assert_eq!(pdf.type_label(), "pdf");
     }
 
     #[test]
     fn dims_display() {
-        let entry = AttachmentEntry {
+        le..entry.clone() = AttachmentEntry {
             media_type: String::new(),
             bytes: 0,
             sha1: String::new(),
@@ -1507,12 +1507,12 @@ mod tests {
             created_ts: 0,
             project_slug: String::new(),
         };
-        assert_eq!(entry.dims_display(), "800x600");
+        assert_eq..entry.clone().dims_display(), "800x600");
 
         let no_dims = AttachmentEntry {
             width: 0,
             height: 0,
-            ..entry
+            ..entry.clone()
         };
         assert_eq!(no_dims.dims_display(), "");
     }
@@ -1804,7 +1804,7 @@ mod tests {
 
     #[test]
     fn type_label_no_slash_returns_full() {
-        let entry = AttachmentEntry {
+        le..entry.clone() = AttachmentEntry {
             media_type: "octetstream".into(),
             bytes: 0,
             sha1: String::new(),
@@ -1819,12 +1819,12 @@ mod tests {
             created_ts: 0,
             project_slug: String::new(),
         };
-        assert_eq!(entry.type_label(), "octetstream");
+        assert_eq..entry.clone().type_label(), "octetstream");
     }
 
     #[test]
     fn type_label_empty_string() {
-        let entry = AttachmentEntry {
+        le..entry.clone() = AttachmentEntry {
             media_type: String::new(),
             bytes: 0,
             sha1: String::new(),
@@ -1839,12 +1839,12 @@ mod tests {
             created_ts: 0,
             project_slug: String::new(),
         };
-        assert_eq!(entry.type_label(), "");
+        assert_eq..entry.clone().type_label(), "");
     }
 
     #[test]
     fn dims_display_one_dimension_zero() {
-        let entry = AttachmentEntry {
+        le..entry.clone() = AttachmentEntry {
             media_type: "image/png".into(),
             bytes: 1024,
             sha1: String::new(),
@@ -1859,7 +1859,7 @@ mod tests {
             created_ts: 0,
             project_slug: String::new(),
         };
-        assert_eq!(entry.dims_display(), "");
+        assert_eq..entry.clone().dims_display(), "");
     }
 
     #[test]

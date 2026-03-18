@@ -6626,7 +6626,7 @@ mod tests {
             kind: QueryTermKind::Word,
             negated: false,
         }];
-        let snippet = extract_snippet(text, &terms, 40);
+        let snippet = extract_snippet(text, terms.as_slice(), 40);
         assert!(snippet.contains("needle"));
         assert!(snippet.starts_with('\u{2026}'));
         assert!(snippet.ends_with('\u{2026}'));
@@ -6654,7 +6654,7 @@ mod tests {
             negated: false,
         }];
 
-        let snippet = extract_context_snippet_from_lines(&lines, &terms, 200);
+        let snippet = extract_context_snippet_from_lines(&lines, terms.as_slice(), 200);
         assert!(snippet.contains("L4:"));
         assert!(snippet.contains("needle"));
         assert!(snippet.contains(" ⟫ "));
@@ -6689,7 +6689,7 @@ mod tests {
             },
         ];
 
-        let snippet = extract_context_snippet_from_lines(&lines, &terms, 200);
+        let snippet = extract_context_snippet_from_lines(&lines, terms.as_slice(), 200);
         assert!(
             snippet.contains("L12:"),
             "snippet should center strongest hit: {snippet}"
