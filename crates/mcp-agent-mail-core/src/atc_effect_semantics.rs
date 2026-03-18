@@ -442,9 +442,12 @@ impl CooldownTracker {
             // For effects with max_reps == 0 (e.g., HighRiskIntervention),
             // ANY prior emission means suppression, regardless of window.
             if max_reps == 0 && entry.emissions_in_window > 0 {
+                // Structural suppression: max_reps == 0 means "never repeat",
+                // so remaining_micros is 0 (suppression is permanent, not
+                // time-based). Callers should check max_in_window == 0 to
+                // distinguish this from a time-based cooldown that just expired.
                 return CooldownVerdict::Suppressed {
-                    remaining_micros: active_cooldown_micros
-                        .saturating_sub(now_micros.saturating_sub(entry.last_ts_micros)),
+                    remaining_micros: 0,
                     emissions_in_window: entry.emissions_in_window,
                     max_in_window: 0,
                 };
