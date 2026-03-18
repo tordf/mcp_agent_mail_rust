@@ -15,10 +15,12 @@ pub mod atc_assumptions;
 pub mod atc_attribution;
 pub mod atc_baseline;
 pub mod atc_contamination;
+pub mod atc_fairness;
 pub mod atc_invariants;
 pub mod atc_labeling;
 pub mod atc_open_index;
 pub mod atc_participation;
+pub mod atc_policy_certificates;
 pub mod atc_regime;
 pub mod atc_retention;
 pub mod atc_risk_budgets;
@@ -58,6 +60,13 @@ pub mod proptest_generators;
 pub use agent_detect::{
     AgentDetectError, AgentDetectOptions, AgentDetectRootOverride, InstalledAgentDetectionEntry,
     InstalledAgentDetectionReport, InstalledAgentDetectionSummary, detect_installed_agents,
+};
+pub use atc_fairness::{
+    ACCEPTABLE_ASYMMETRY_RULES, AGENT_STARVATION_WINDOW_MICROS, COHORT_STARVATION_WINDOW_MICROS,
+    DEFAULT_REGIME_DISCOUNT_BP, FairnessAssessment, FairnessBudget, FairnessDisposition,
+    FairnessEvent, FairnessEventKind, FairnessMetric, FairnessScope, FairnessSnapshot,
+    FairnessTarget, FairnessViolationCode, ImpactedTarget, PROJECT_STARVATION_WINDOW_MICROS,
+    StarvedTarget, TradeoffWinner, UtilityTradeoff,
 };
 pub use atc_retention::{
     ARCHIVE_DISCOVERABILITY_MIN_DAYS, ATC_RETENTION_RULES, ArchiveRetention, ArchiveTrigger,
