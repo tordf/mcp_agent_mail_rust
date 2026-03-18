@@ -5,6 +5,17 @@
 //! - `macro_prepare_thread`: Align with existing thread
 //! - `macro_file_reservation_cycle`: Reserve and optionally release files
 //! - `macro_contact_handshake`: Request + approve + welcome message
+//!
+//! # Atomicity
+//!
+//! Macros are **NOT atomic**. Each sub-step commits independently.
+//! If step N fails, steps 1..N-1 have already committed. The error
+//! response does NOT include information about which steps succeeded.
+//! Callers should treat macro errors as "partially completed" and
+//! use the granular tools to inspect/repair state if needed.
+//!
+//! This is by design: the macros are convenience wrappers over
+//! independent MCP tools, not database transactions.
 
 use fastmcp::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -225,6 +236,17 @@ pub async fn macro_prepare_thread(
     llm_model: Option<String>,
     inbox_limit: Option<i32>,
 ) -> McpResult<String> {
+    let thread_id_trimmed = thread_id.trim();
+    if thread_id_trimmed.is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_THREAD_ID",
+            "thread_id must not be empty or whitespace-only",
+            true,
+            serde_json::json!({ "thread_id": thread_id }),
+        ));
+    }
+    let thread_id = thread_id_trimmed.to_string();
+
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
 
@@ -411,6 +433,15 @@ pub async fn macro_file_reservation_cycle(
     reason: Option<String>,
     auto_release: Option<bool>,
 ) -> McpResult<String> {
+    if paths.is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_PATHS",
+            "paths must not be empty — provide at least one file pattern to reserve",
+            true,
+            serde_json::json!({}),
+        ));
+    }
+
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
@@ -637,13 +668,12 @@ pub async fn macro_contact_handshake(
         None
     };
 
+    let welcome_sent = welcome_val.is_some();
     let response = HandshakeResponse {
         request: request_val,
         response: response_val,
         welcome_message: welcome_val,
     };
-
-    let welcome_sent = welcome_val.is_some();
     tracing::debug!(
         "Contact handshake from {} to {} in project {} (auto_accept: {}, welcome_sent: {})",
         from_agent,

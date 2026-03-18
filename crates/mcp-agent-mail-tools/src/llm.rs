@@ -413,11 +413,12 @@ pub async fn complete_system_user(
 ) -> Result<LlmOutput, LlmError> {
     let resolved = model.map_or_else(|| resolve_model_alias(DEFAULT_MODEL), resolve_model_alias);
 
-    if llm_stub_enabled() {
+    // Conformance-test-only fixture mode (see block comment near EOF).
+    if conformance_fixture_mode_enabled() {
         return Ok(LlmOutput {
-            content: stubbed_completion_content(system, user),
+            content: conformance_fixture_completion(system, user),
             model: resolved,
-            provider: Some("stub".to_string()),
+            provider: Some("conformance-fixture".to_string()),
             estimated_cost_usd: Some(0.0),
         });
     }
@@ -1001,10 +1002,24 @@ pub fn multi_thread_user_prompt(
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic stub completions (conformance fixtures)
+// CONFORMANCE-TEST-ONLY: Deterministic LLM response fixtures
+// ---------------------------------------------------------------------------
+//
+// THIS IS NOT A STUB, MOCK, OR PLACEHOLDER. The production LLM path is
+// `complete_single()` above, which makes real HTTP calls to real LLM APIs.
+//
+// This fixture mode exists ONLY for two purposes:
+//   1. Conformance tests that verify output-format parity with the Python
+//      reference — those tests need byte-identical LLM responses.
+//   2. Offline E2E tests that exercise the JSON-extraction pipeline
+//      (brace-slice fallback, code-fence extraction) without network.
+//
+// Activation: requires `MCP_AGENT_MAIL_LLM_STUB=1` environment variable.
+// This variable is NEVER set in production, only in conformance.rs and
+// test_llm.sh. If you see it set outside those two files, that is a bug.
 // ---------------------------------------------------------------------------
 
-fn llm_stub_enabled() -> bool {
+fn conformance_fixture_mode_enabled() -> bool {
     let Ok(v) = std::env::var("MCP_AGENT_MAIL_LLM_STUB") else {
         return false;
     };
@@ -1014,7 +1029,7 @@ fn llm_stub_enabled() -> bool {
     )
 }
 
-fn stubbed_completion_content(system: &str, user: &str) -> String {
+fn conformance_fixture_completion(system: &str, user: &str) -> String {
     let sys = system.to_ascii_lowercase();
 
     if sys.contains("digest across threads") || user.starts_with("Digest these threads:") {
@@ -1564,11 +1579,11 @@ mod tests {
         assert!(extract_brace_json("{not: valid json}").is_none());
     }
 
-    // -- stubbed_completion_content tests --
+    // -- conformance_fixture_completion tests --
 
     #[test]
-    fn stub_single_thread_returns_fenced_json() {
-        let content = stubbed_completion_content("Summarize this thread", "Messages follow...");
+    fn conformance_fixture_single_thread_returns_fenced_json() {
+        let content = conformance_fixture_completion("Summarize this thread", "Messages follow...");
         assert!(content.contains("```json"));
         assert!(content.contains("participants"));
         assert!(content.contains("BlueLake"));
@@ -1578,8 +1593,8 @@ mod tests {
     }
 
     #[test]
-    fn stub_multi_thread_returns_brace_json() {
-        let content = stubbed_completion_content(
+    fn conformance_fixture_multi_thread_returns_brace_json() {
+        let content = conformance_fixture_completion(
             "Digest across threads for a multi-thread summary",
             "Digest these threads: ...",
         );
@@ -1592,8 +1607,8 @@ mod tests {
     }
 
     #[test]
-    fn stub_single_thread_has_required_fields() {
-        let content = stubbed_completion_content("summary prompt", "user messages");
+    fn conformance_fixture_single_thread_has_required_fields() {
+        let content = conformance_fixture_completion("summary prompt", "user messages");
         let val = extract_fenced_json(&content).unwrap();
         // All expected fields present
         assert!(val["participants"].is_array());
@@ -1603,9 +1618,9 @@ mod tests {
     }
 
     #[test]
-    fn stub_multi_thread_has_required_fields() {
+    fn conformance_fixture_multi_thread_has_required_fields() {
         let content =
-            stubbed_completion_content("digest across threads", "Digest these threads: T-1, T-2");
+            conformance_fixture_completion("digest across threads", "Digest these threads: T-1, T-2");
         let val = extract_brace_json(&content).unwrap();
         assert!(val["threads"].is_array());
         assert!(val["aggregate"]["top_mentions"].is_array());

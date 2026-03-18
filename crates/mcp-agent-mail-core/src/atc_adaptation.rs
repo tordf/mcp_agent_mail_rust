@@ -336,7 +336,11 @@ impl AdaptationEngine {
         } else {
             0.0
         };
-        let candidate_avg = tracker.cumulative_loss / tracker.selection_count as f64;
+        let candidate_avg = if tracker.selection_count > 0 {
+            tracker.cumulative_loss / tracker.selection_count as f64
+        } else {
+            0.0
+        };
 
         let regret_gap = candidate_avg - incumbent_avg;
         if regret_gap >= 0.0 {

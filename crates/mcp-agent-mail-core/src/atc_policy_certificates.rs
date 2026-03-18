@@ -505,10 +505,13 @@ pub fn compute_doubly_robust(
     // Clamp to 0.0 because the one-pass formula can produce small negative
     // values due to floating-point cancellation when DR terms are similar.
     #[allow(clippy::suspicious_operation_groupings)]
+    // When n ≤ 1 we have insufficient data for variance; use a large finite
+    // sentinel instead of INFINITY because this struct derives Serialize and
+    // serde_json rejects non-finite f64 values.
     let dr_variance = if n > 1.0 {
         ((sum_dr_sq / n - candidate_dr_loss * candidate_dr_loss) / (n - 1.0)).max(0.0)
     } else {
-        f64::INFINITY
+        1e15
     };
 
     // Effective sample size via Kish's formula: ESS = (Σw)² / Σ(w²).
@@ -643,7 +646,9 @@ impl ConfidenceSequence {
         if self.n_observations >= 2 {
             self.running_m2 / (self.n_observations - 1) as f64
         } else {
-            f64::INFINITY
+            // Use a large finite sentinel instead of INFINITY so callers
+            // can safely store the result in serde_json-serializable structs.
+            1e15
         }
     }
 }

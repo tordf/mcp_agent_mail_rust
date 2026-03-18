@@ -3117,7 +3117,10 @@ pub async fn mark_message_read(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
-    // Idempotent - returns timestamp when read (new or existing)
+    // Authorization note: agent_id is globally unique (auto-increment across
+    // all projects), so the DB query `WHERE agent_id = ? AND message_id = ?`
+    // implicitly scopes to the correct project. An agent in project A cannot
+    // match a message_recipients row for project B because the agent_ids differ.
     let read_ts = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::mark_message_read(ctx.cx(), &pool, agent_id, message_id).await,
     )?;
@@ -3175,7 +3178,8 @@ pub async fn acknowledge_message(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
-    // Sets both read_ts and ack_ts - idempotent
+    // Authorization note: agent_id is globally unique (auto-increment), so
+    // the DB query implicitly scopes to the correct project. See mark_message_read.
     let (read_ts, ack_ts) = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::acknowledge_message(ctx.cx(), &pool, agent_id, message_id)
             .await,

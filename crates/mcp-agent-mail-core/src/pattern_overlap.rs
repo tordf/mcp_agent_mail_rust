@@ -82,7 +82,13 @@ pub enum PatternSegment {
 impl PatternSegment {
     fn _matches_literal(&self, literal: &str) -> bool {
         match self {
-            Self::Literal(l) => l == literal,
+            Self::Literal(l) => {
+                if cfg!(any(target_os = "macos", target_os = "windows")) {
+                    l.eq_ignore_ascii_case(literal)
+                } else {
+                    l == literal
+                }
+            }
             Self::Glob(m) => m.is_match(literal),
             Self::Recursive => true,
         }
@@ -90,7 +96,13 @@ impl PatternSegment {
 
     fn overlaps(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Literal(l1), Self::Literal(l2)) => l1 == l2,
+            (Self::Literal(l1), Self::Literal(l2)) => {
+                if cfg!(any(target_os = "macos", target_os = "windows")) {
+                    l1.eq_ignore_ascii_case(l2)
+                } else {
+                    l1 == l2
+                }
+            }
             (Self::Glob(m), Self::Literal(l)) | (Self::Literal(l), Self::Glob(m)) => m.is_match(l),
             (Self::Recursive, _) | (_, Self::Recursive) | (Self::Glob(_), Self::Glob(_)) => true,
         }
@@ -128,9 +140,15 @@ impl CompiledPattern {
         let norm = normalize_pattern(raw);
         let is_glob = has_glob_meta(&norm);
         let first_literal_segment_end = first_literal_segment_end(&norm);
+        // On case-insensitive filesystems (macOS HFS+/APFS, Windows NTFS),
+        // glob matching must be case-insensitive to correctly detect conflicts
+        // between e.g. src/Main.rs and src/main.rs.
+        let case_insensitive = cfg!(any(target_os = "macos", target_os = "windows"));
+
         let matcher = if is_glob {
             GlobBuilder::new(&norm)
                 .literal_separator(true)
+                .case_insensitive(case_insensitive)
                 .build()
                 .ok()
                 .map(|g| g.compile_matcher())
@@ -146,6 +164,7 @@ impl CompiledPattern {
                 } else if has_glob_meta(s) {
                     let m = GlobBuilder::new(s)
                         .literal_separator(true)
+                        .case_insensitive(case_insensitive)
                         .build()
                         .ok()
                         .map(|g| g.compile_matcher());

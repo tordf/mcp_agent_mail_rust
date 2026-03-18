@@ -112,7 +112,8 @@ mod tests {
     use crate::query::SearchMode;
     use std::time::Duration;
 
-    /// Stub implementation to verify traits compile
+    /// Test-only: minimal trait impl to verify trait bounds compile.
+    /// Not compiled in release builds (#[cfg(test)]).
     struct StubEngine;
 
     impl SearchEngine for StubEngine {

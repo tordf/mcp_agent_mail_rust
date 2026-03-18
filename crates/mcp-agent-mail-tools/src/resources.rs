@@ -265,7 +265,10 @@ async fn resolve_existing_resource_project(
         db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), pool).await)?;
     projects
         .into_iter()
-        .find(|project| project.slug == project_key || project.human_key == project_key)
+        .find(|project| {
+            project.slug.eq_ignore_ascii_case(&project_key)
+                || project.human_key == project_key // human_key is a path — case-sensitive
+        })
         .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))
 }
 
@@ -1739,6 +1742,7 @@ pub async fn projects_list(ctx: &McpContext) -> McpResult<String> {
 
     let projects: Vec<ProjectListEntry> = rows
         .into_iter()
+        .take(500) // cap to prevent unbounded response
         .map(|p| ProjectListEntry {
             id: p.id.unwrap_or(0),
             slug: p.slug,
@@ -2624,8 +2628,11 @@ async fn load_outbox_messages(
     mcp_agent_mail_db::record_query(&sql, mcp_agent_mail_db::elapsed_us(start));
     let rows = rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
 
-    let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(rows.len());
-    for row in rows {
+    // Cap at 200 to limit the N+1 recipient queries per message.
+    // Each message triggers one recipient query, so 200 messages = 201 queries.
+    let capped_rows: Vec<_> = rows.into_iter().take(200).collect();
+    let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(capped_rows.len());
+    for row in capped_rows {
         let id: i64 = row.get_as(0).unwrap_or(0);
         let recip_sql = "SELECT a.name, r.kind FROM message_recipients r \
                         JOIN agents a ON a.id = r.agent_id \
@@ -3222,14 +3229,16 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
         .id
         .unwrap_or(0);
 
-    // Fetch unacked ack-required messages (over-fetch, then filter by age)
+    // Fetch unacked ack-required messages (over-fetch, then filter by age).
+    // Use 20x multiplier to reduce the chance of missing qualifying rows
+    // when only a small fraction of unacked messages are stale enough.
     let unacked_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::fetch_unacked_for_agent(
             ctx.cx(),
             &pool,
             project_id,
             agent_id,
-            limit.saturating_mul(5),
+            limit.saturating_mul(20),
         )
         .await,
     )?;
@@ -3329,14 +3338,15 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
             .saturating_mul(1_000_000),
     );
 
-    // Fetch unacked ack-required messages (over-fetch, then filter by cutoff)
+    // Fetch unacked ack-required messages (over-fetch, then filter by cutoff).
+    // Use 20x multiplier to reduce the chance of missing qualifying rows.
     let unacked_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::fetch_unacked_for_agent(
             ctx.cx(),
             &pool,
             project_id,
             agent_id,
-            limit.saturating_mul(5),
+            limit.saturating_mul(20),
         )
         .await,
     )?;

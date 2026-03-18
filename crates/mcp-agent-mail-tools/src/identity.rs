@@ -887,7 +887,19 @@ pub async fn whois(
 
     let agent_out =
         mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, &agent_name).await;
-    let agent_row = db_outcome_to_mcp_result(agent_out)?;
+    let agent_row = match agent_out {
+        asupersync::Outcome::Ok(row) => row,
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+            // Return a user-friendly error without leaking internal project_id.
+            return Err(legacy_tool_error(
+                "AGENT_NOT_FOUND",
+                &format!("Agent '{agent_name}' not found in project '{}'", project.slug),
+                true,
+                serde_json::json!({ "agent_name": agent_name, "project": project.slug }),
+            ));
+        }
+        other => db_outcome_to_mcp_result(other)?,
+    };
 
     // Fetch recent commits from the git archive if requested
     let recent_commits = if include_commits && limit > 0 {

@@ -180,7 +180,7 @@ mod route_regressions {
 
     #[test]
     fn render_attachments_lists_message_attachments() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("attachments");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -256,7 +256,7 @@ mod route_regressions {
 
     #[test]
     fn render_message_renders_sender_recipients_and_thread_preview() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("message");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -327,7 +327,7 @@ mod route_regressions {
 
     #[test]
     fn render_message_root_seed_uses_numeric_thread_reference() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("message-root-thread");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -391,7 +391,7 @@ mod route_regressions {
 
     #[test]
     fn render_inbox_root_seed_uses_numeric_thread_reference() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("inbox-root-thread");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -454,7 +454,7 @@ mod route_regressions {
 
     #[test]
     fn render_message_does_not_client_render_raw_markdown_fallback() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("message-no-client-markdown");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -498,7 +498,7 @@ mod route_regressions {
 
     #[test]
     fn render_unified_inbox_static_export_marks_snapshot_mode() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("unified-static");
         let html = render_unified_inbox(&cx, &pool, 10, None, true)
             .expect("unified inbox render should succeed")
@@ -508,7 +508,7 @@ mod route_regressions {
 
     #[test]
     fn render_unified_inbox_does_not_client_render_raw_markdown_fallback() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("unified-no-client-markdown");
         let html = render_unified_inbox(&cx, &pool, 10, None, false)
             .expect("unified inbox render should succeed")
@@ -518,7 +518,7 @@ mod route_regressions {
 
     #[test]
     fn render_unified_inbox_serializes_normalized_importance_filter() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("unified-importance-filter-template");
         let html = render_unified_inbox(&cx, &pool, 10, Some(" HIGH "), false)
             .expect("unified inbox render should succeed")
@@ -528,7 +528,7 @@ mod route_regressions {
 
     #[test]
     fn render_unified_inbox_wires_importance_filter_refresh_handler() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("unified-importance-filter-handler");
         let html = render_unified_inbox(&cx, &pool, 10, None, false)
             .expect("unified inbox render should succeed")
@@ -539,7 +539,7 @@ mod route_regressions {
 
     #[test]
     fn render_unified_inbox_mark_read_feedback_accounts_for_already_read() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("unified-mark-read-feedback");
         let html = render_unified_inbox(&cx, &pool, 10, None, false)
             .expect("unified inbox render should succeed")
@@ -1004,7 +1004,7 @@ mod route_hardening_tests {
     // F2: Malformed project slugs are rejected with 400 before DB access.
     #[test]
     fn dispatch_project_rejects_path_traversal_slug() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         let result = dispatch_project_route("/../../etc/passwd", "GET", "", &cx, &pool, "");
         let (status, _msg) = result.expect_err("path traversal slug should be rejected");
@@ -1013,7 +1013,7 @@ mod route_hardening_tests {
 
     #[test]
     fn dispatch_project_rejects_dot_dot_slug() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         let result = dispatch_project_route("/..", "GET", "", &cx, &pool, "");
         let (status, _msg) = result.expect_err(".. slug should be rejected");
@@ -1022,7 +1022,7 @@ mod route_hardening_tests {
 
     #[test]
     fn dispatch_project_rejects_special_chars_in_slug() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         for bad_slug in &["/foo bar", "/slug;drop", "/slug'inject", "/slug<xss>"] {
             let result = dispatch_project_route(bad_slug, "GET", "", &cx, &pool, "");
@@ -1034,7 +1034,7 @@ mod route_hardening_tests {
 
     #[test]
     fn dispatch_project_accepts_valid_slug_format() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         // Valid slug format passes validation (may then 404 on project lookup).
         let result = dispatch_project_route("/my-project_1", "GET", "", &cx, &pool, "");
@@ -1047,7 +1047,7 @@ mod route_hardening_tests {
     // F3: Unknown inbox sub-actions return Ok(None) → 404, not the inbox page.
     #[test]
     fn inbox_unknown_subaction_returns_none() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         let result = dispatch_project_route(
             "/my-project/inbox/some-agent/unknown-action",
@@ -1067,7 +1067,7 @@ mod route_hardening_tests {
 
     #[test]
     fn inbox_deep_subpath_returns_none() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         let result = dispatch_project_route(
             "/my-project/inbox/agent/foo/bar/baz",
@@ -1118,7 +1118,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_slug_url_encoded_traversal_rejected() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         // Slugs containing non-alphanumeric/hyphen/underscore chars → 400.
         for slug in &["..%2F..%2Fetc", ".hidden", "slug with space"] {
@@ -1133,7 +1133,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_path_traversal_in_rest_yields_404_not_traversal() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         // "foo/../bar" → slug="foo" (valid), rest="../bar" (unknown route → 404).
         // Path traversal in the rest segment can't escape because routes are
@@ -1175,7 +1175,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_inbox_post_to_nonexistent_action_is_method_not_allowed() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         // POST to an unknown inbox sub-action should be 405, not silently handled.
         let result = dispatch_project_route(
@@ -1192,7 +1192,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_archive_routes_reject_post_method() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         let result = dispatch_project_route("/archive/guide", "", "POST", &cx, &pool, "");
         let (status, _) = result.expect_err("POST to archive should be 405");
@@ -1201,7 +1201,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_unknown_archive_subpath_returns_none() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         let result = dispatch_project_route("/archive/nonexistent", "", "GET", &cx, &pool, "");
         assert_eq!(
@@ -1245,7 +1245,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_message_route_format_requires_numeric_id() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         // message/{mid} where mid is not numeric → 404 (invalid parse returns None).
         let result = dispatch_project_route("/my-project/message/abc", "GET", "", &cx, &pool, "");
@@ -1258,7 +1258,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_thread_route_decodes_percent_encoded_thread_id() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -1307,7 +1307,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_mark_read_only_accepts_post() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         // GET on mark-read should be 405.
         let result = dispatch_project_route(
@@ -1328,7 +1328,7 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_overseer_send_only_accepts_post() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         // GET /mail/{project}/overseer/send → should not render (only POST accepted).
         let result = dispatch_project_route("/my-project/overseer/send", "GET", "", &cx, &pool, "");
@@ -2125,7 +2125,7 @@ mod message_route_authorization_tests {
 
     #[test]
     fn project_message_route_blocks_cross_project_idor_access() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3900,7 +3900,7 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn unified_message_aggregation_deduplicates_multi_recipient_mail() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("mail-ui-unified");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -3982,7 +3982,7 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn unified_message_aggregation_root_seed_uses_numeric_thread_reference() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("mail-ui-unified-root-thread");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -4047,7 +4047,7 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn unified_message_aggregation_importance_filter_overfetches_past_newer_non_matching_rows() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("mail-ui-unified-filter-overfetch");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -4108,7 +4108,7 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn render_api_unified_inbox_root_seed_includes_thread_reference() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("mail-ui-unified-api-root-thread");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -4171,7 +4171,7 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn render_api_unified_inbox_preserves_importance_filter() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("mail-ui-unified-api-filter");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -4235,7 +4235,7 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn archive_time_travel_snapshot_requires_registered_project() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("mail-ui-time-travel");
         let missing_slug = format!(
             "missingfreshsight{}",
@@ -4260,7 +4260,7 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn handle_mark_read_deduplicates_ids_and_excludes_already_read_rows_from_count() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("mail-ui-mark-read-counts");
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
@@ -4326,7 +4326,7 @@ mod fresh_eyes_regression_tests {
 
     #[test]
     fn sibling_update_route_reports_not_implemented() {
-        let cx = Cx::for_testing();
+        let cx = Cx::for_request_with_budget(Budget::seconds(30));
         let pool = make_test_pool("mail-ui-sibling");
 
         let (status, payload) = handle_sibling_update(&cx, &pool, 1, 2, r#"{"action":"confirm"}"#)

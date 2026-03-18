@@ -3394,7 +3394,9 @@ fn handle_serve_http(
         config.http_port,
         config.tui_enabled,
     )?;
-    if let Err(e) = run_setup_self_heal_for_server(&config) {
+    if !running_under_managed_service()
+        && let Err(e) = run_setup_self_heal_for_server(&config)
+    {
         output::warn(&format!(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
         ));
@@ -3414,6 +3416,14 @@ fn handle_serve_http(
         mcp_agent_mail_server::run_http(&config)?;
     }
     Ok(())
+}
+
+fn managed_service_env_detected(mut lookup: impl FnMut(&str) -> Option<String>) -> bool {
+    lookup("INVOCATION_ID").is_some() || lookup("XPC_SERVICE_NAME").is_some()
+}
+
+fn running_under_managed_service() -> bool {
+    managed_service_env_detected(|key| std::env::var(key).ok())
 }
 
 fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
@@ -4118,6 +4128,15 @@ fn path_is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
+fn project_identity_matches_requested_path(
+    stored_human_key: &str,
+    requested_identity: &mcp_agent_mail_core::ProjectIdentity,
+) -> bool {
+    let stored_identity = resolve_project_identity(stored_human_key);
+    stored_identity.human_key == requested_identity.human_key
+        || stored_identity.canonical_path == requested_identity.canonical_path
+}
+
 fn archive_project_matches_repo_path(
     candidate: &Path,
     repo_identity: &mcp_agent_mail_core::ProjectIdentity,
@@ -4142,17 +4161,7 @@ fn archive_project_matches_repo_path(
         return false;
     };
 
-    if human_key.eq_ignore_ascii_case(&repo_identity.human_key) {
-        return true;
-    }
-
-    let archive_identity = resolve_project_identity(human_key);
-    archive_identity
-        .human_key
-        .eq_ignore_ascii_case(&repo_identity.human_key)
-        || archive_identity
-            .canonical_path
-            .eq_ignore_ascii_case(&repo_identity.canonical_path)
+    project_identity_matches_requested_path(human_key, repo_identity)
 }
 
 fn resolve_guard_archive_root_for_check(repo_path: &Path, config: &Config) -> PathBuf {
@@ -19050,6 +19059,27 @@ command = "mcp-agent-mail"
     }
 
     #[test]
+    fn managed_service_env_detects_launchd() {
+        assert!(managed_service_env_detected(|key| match key {
+            "XPC_SERVICE_NAME" => Some("com.agent-mail".to_string()),
+            _ => None,
+        }));
+    }
+
+    #[test]
+    fn managed_service_env_detects_systemd() {
+        assert!(managed_service_env_detected(|key| match key {
+            "INVOCATION_ID" => Some("abc123".to_string()),
+            _ => None,
+        }));
+    }
+
+    #[test]
+    fn managed_service_env_ignores_plain_shell_sessions() {
+        assert!(!managed_service_env_detected(|_| None));
+    }
+
+    #[test]
     fn clap_parses_serve_http_flags() {
         let cli = Cli::try_parse_from([
             "am",
@@ -29347,6 +29377,51 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn get_project_record_rejects_case_variant_absolute_path() {
+        let (pool, dir) = make_test_pool();
+
+        let project_path = dir.path().join("repo").join("CaseRepo");
+        std::fs::create_dir_all(&project_path).expect("mkdir project");
+
+        let project_path = project_path.canonicalize().expect("canonicalize project");
+        let project_key = project_path.display().to_string();
+        let lookup_key = project_path
+            .parent()
+            .expect("parent")
+            .join("caserepo")
+            .display()
+            .to_string();
+
+        let identity = resolve_project_identity(&project_key);
+        let lookup_identity = resolve_project_identity(&lookup_key);
+        assert_eq!(
+            identity.slug, lookup_identity.slug,
+            "test setup requires matching slug"
+        );
+        assert_ne!(
+            identity.human_key, lookup_identity.human_key,
+            "test setup requires distinct path identities"
+        );
+
+        block_on_async(|cx| async move {
+            let existing = mcp_agent_mail_db::queries::ensure_project(&cx, &pool, &project_key)
+                .await
+                .into_result()
+                .expect("ensure project");
+            assert_eq!(existing.human_key, project_key);
+
+            let err = get_project_record(&cx, &pool, &lookup_key)
+                .await
+                .expect_err("case-variant absolute path should not resolve to existing project");
+            let err_msg = format!("{err}");
+            assert!(
+                err_msg.contains("not found"),
+                "expected not-found error for case-variant path lookup, got: {err_msg}"
+            );
+        });
+    }
+
+    #[test]
     fn resolve_agent_async_returns_invalid_argument_for_missing_agent() {
         let (pool, _dir) = make_test_pool();
 
@@ -35645,15 +35720,8 @@ async fn get_project_record(
                 return Ok(row);
             }
 
-            let row_identity = resolve_project_identity(&row.human_key);
             let requested_identity = resolve_project_identity(&canonical);
-            if row_identity
-                .human_key
-                .eq_ignore_ascii_case(&requested_identity.human_key)
-                || row_identity
-                    .canonical_path
-                    .eq_ignore_ascii_case(&requested_identity.canonical_path)
-            {
+            if project_identity_matches_requested_path(&row.human_key, &requested_identity) {
                 return Ok(row);
             }
         }

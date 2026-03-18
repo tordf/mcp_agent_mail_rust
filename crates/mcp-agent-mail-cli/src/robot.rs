@@ -1505,38 +1505,8 @@ use mcp_agent_mail_db::DbConn;
 
 /// Resolve a project by slug or human_key.
 fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliError> {
-    let key = key.trim();
-    // Try slug first
-    let rows = conn
-        .query_sync(
-            "SELECT id, slug FROM projects WHERE lower(slug) = lower(?)",
-            &[Value::Text(key.to_string())],
-        )
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-    if let Some(row) = rows.first() {
-        let id: i64 = row.get_as(0).unwrap_or(0);
-        let slug: String = row.get_as(1).unwrap_or_default();
-        if id > 0 && !slug.is_empty() {
-            return Ok((id, slug));
-        }
-    }
-    // Try human_key
-    let rows = conn
-        .query_sync(
-            "SELECT id, slug FROM projects WHERE human_key = ?",
-            &[Value::Text(key.to_string())],
-        )
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-    if let Some(row) = rows.first() {
-        let id: i64 = row.get_as(0).unwrap_or(0);
-        let slug: String = row.get_as(1).unwrap_or_default();
-        if id > 0 && !slug.is_empty() {
-            return Ok((id, slug));
-        }
-    }
-    Err(CliError::InvalidArgument(format!(
-        "project not found: {key}"
-    )))
+    let project = crate::context::resolve_project(conn, key)?;
+    Ok((project.id, project.slug))
 }
 
 fn normalize_project_lookup_path(path: &Path) -> String {
@@ -9492,6 +9462,59 @@ mod tests {
             }
             other => panic!("unexpected navigate result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_project_sync_rejects_slug_collision_for_absolute_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_resolve_project_sync.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+
+        let project_a = temp_dir.path().join("repo").join("a-b");
+        let project_b = temp_dir.path().join("repo").join("a").join("b");
+        std::fs::create_dir_all(&project_a).expect("mkdir project_a");
+        std::fs::create_dir_all(&project_b).expect("mkdir project_b");
+
+        let project_a = project_a.canonicalize().expect("canonicalize project_a");
+        let project_b = project_b.canonicalize().expect("canonicalize project_b");
+        let project_a_key = project_a.display().to_string();
+        let project_b_key = project_b.display().to_string();
+
+        let identity_a = mcp_agent_mail_core::resolve_project_identity(&project_a_key);
+        let identity_b = mcp_agent_mail_core::resolve_project_identity(&project_b_key);
+        assert_eq!(
+            identity_a.slug, identity_b.slug,
+            "test setup requires a slug collision"
+        );
+
+        conn.query_sync(
+            &format!(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, '{}', '{}', 1000)",
+                identity_a.slug, project_a_key
+            ),
+            &empty,
+        )
+        .expect("insert project");
+
+        let err =
+            resolve_project_sync(&conn, &project_b_key).expect_err("colliding path must fail");
+        assert!(
+            err.to_string().contains("project not found"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

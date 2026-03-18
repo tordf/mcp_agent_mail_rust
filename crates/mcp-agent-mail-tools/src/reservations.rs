@@ -414,10 +414,30 @@ pub async fn file_reservation_paths(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    // Warn about suspicious patterns (matching Python's ctx.info behavior)
+    // Limit: max 200 patterns per call, preventing resource exhaustion.
+    const MAX_PATHS_PER_CALL: usize = 200;
+    if paths.len() > MAX_PATHS_PER_CALL {
+        return Err(legacy_tool_error(
+            "TOO_MANY_PATHS",
+            &format!("Maximum {MAX_PATHS_PER_CALL} paths per reservation call, got {}", paths.len()),
+            true,
+            json!({ "count": paths.len(), "max": MAX_PATHS_PER_CALL }),
+        ));
+    }
+
+    // Reject suspicious patterns that are too broad or malformed.
+    // Previously these were warn-only, but overly-broad patterns like
+    // "**/*" effectively block all other agents, which defeats the purpose
+    // of advisory reservations.
     for pattern in &paths {
         if let Some(warning) = detect_suspicious_file_reservation(pattern) {
             tracing::warn!("[warn] {}", warning);
+            return Err(legacy_tool_error(
+                "SUSPICIOUS_PATTERN",
+                &warning,
+                true,
+                json!({ "path": pattern }),
+            ));
         }
     }
 

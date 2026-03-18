@@ -126,6 +126,17 @@ struct ColumnTypeScan {
     other_types: BTreeSet<String>,
 }
 
+fn unsupported_storage_class_error(
+    table: &str,
+    column: &str,
+    other_types: &BTreeSet<String>,
+) -> MigrationError {
+    MigrationError::Aborted(format!(
+        "unsupported storage classes in {table}.{column}: {}",
+        other_types.iter().cloned().collect::<Vec<_>>().join(", ")
+    ))
+}
+
 fn scan_column_types(
     conn: &DbConn,
     table: &str,
@@ -191,10 +202,9 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
         };
 
         if !scan.other_types.is_empty() {
-            return Ok(TimestampFormat::Unknown(format!(
-                "unsupported storage classes in {table}.{column}: {}",
-                scan.other_types.into_iter().collect::<Vec<_>>().join(", ")
-            )));
+            return Ok(TimestampFormat::Unknown(
+                unsupported_storage_class_error(table, column, &scan.other_types).to_string(),
+            ));
         }
         if !scan.has_non_null {
             if !nullable {
@@ -236,14 +246,19 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
 /// Returns `Some("text")` if any row in the column still stores a TEXT
 /// timestamp, even when other rows are already INTEGER. Returns `Some("integer")`
 /// once the column is fully integer-like, or `None` if the table is empty,
-/// unreadable, or the column has no non-NULL values.
+/// unreadable, or the column has no non-NULL values. Unsupported storage
+/// classes are returned as an error so migration cannot silently skip them.
 pub fn detect_column_format(
     conn: &DbConn,
     table: &str,
     column: &str,
 ) -> Result<Option<String>, MigrationError> {
     match scan_column_types(conn, table, column) {
-        Ok(scan) if !scan.other_types.is_empty() => Ok(scan.other_types.into_iter().next()),
+        Ok(scan) if !scan.other_types.is_empty() => Err(unsupported_storage_class_error(
+            table,
+            column,
+            &scan.other_types,
+        )),
         Ok(scan) if scan.has_text => Ok(Some("text".to_string())),
         Ok(scan) if scan.has_integer_like => Ok(Some("integer".to_string())),
         Ok(_) => Ok(None),
@@ -1416,6 +1431,33 @@ mod tests {
 
         let after = detect_timestamp_format(&conn).expect("detect post-migration format");
         assert_eq!(after, TimestampFormat::RustMicros);
+    }
+
+    #[test]
+    fn detect_column_format_rejects_unsupported_storage_classes() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
+            .expect("create tables");
+
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('blob-project', '/tmp/blob', X'0102')",
+            &[],
+        )
+        .expect("insert blob timestamp");
+
+        let err = detect_column_format(&conn, "projects", "created_at")
+            .expect_err("blob timestamps should be rejected");
+        assert!(
+            err.to_string()
+                .contains("unsupported storage classes in projects.created_at"),
+            "unexpected error: {err}"
+        );
+
+        let format = detect_timestamp_format(&conn).expect("detect timestamp format");
+        assert!(
+            matches!(format, TimestampFormat::Unknown(_)),
+            "unsupported timestamp storage should surface as unknown, got {format:?}"
+        );
     }
 
     #[test]

@@ -1761,13 +1761,31 @@ migrate_env_config() {
   # Rust config location
   local rust_config_dir="$HOME/.config/mcp-agent-mail"
   local rust_env="$rust_config_dir/config.env"
+  local rust_env_compat="$rust_config_dir/.env"
   mkdir -p "$rust_config_dir"
+
+  backup_envfile_if_present() {
+    local path="$1"
+    [ -f "$path" ] || return 0
+
+    local timestamp backup
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup="${path}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
+    if ! cp -p "$path" "$backup"; then
+      warn "Failed to back up existing Rust config before rewrite: $path"
+      return 1
+    fi
+    info "Backed up $path -> $backup"
+  }
 
   local source_env=""
   local updating_existing=0
   local legacy_http_bearer_token="${MIGRATED_BEARER_TOKEN:-}"
   if [ -f "$rust_env" ]; then
     source_env="$rust_env"
+    updating_existing=1
+  elif [ -f "$rust_env_compat" ]; then
+    source_env="$rust_env_compat"
     updating_existing=1
   elif [ -n "$env_file" ]; then
     source_env="$env_file"
@@ -1785,15 +1803,11 @@ migrate_env_config() {
   MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
 
   if [ "$updating_existing" -eq 1 ]; then
-    local timestamp backup
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    backup="${rust_env}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
-    if ! cp -p "$rust_env" "$backup"; then
-      warn "Failed to back up existing Rust config before rewrite: $rust_env"
-      return 1
+    backup_envfile_if_present "$rust_env" || return 1
+    if [ "$rust_env_compat" != "$rust_env" ]; then
+      backup_envfile_if_present "$rust_env_compat" || return 1
     fi
     info "Updating Rust config at $rust_env to adopt legacy Python data paths"
-    info "Backed up $rust_env -> $backup"
   elif [ -n "$env_file" ]; then
     info "Migrating Python .env config into $rust_env"
   else
@@ -1886,11 +1900,16 @@ migrate_env_config() {
 
   mv "$tmpfile" "$rust_env"
   chmod 600 "$rust_env"  # Restrict access (may contain tokens)
+  local compat_tmp="${rust_env_compat}.tmp.$$"
+  cp "$rust_env" "$compat_tmp"
+  mv "$compat_tmp" "$rust_env_compat"
+  chmod 600 "$rust_env_compat"
   if [ "$updating_existing" -eq 1 ]; then
     ok "Updated Rust config at $rust_env"
   else
     ok "Wrote Rust config to $rust_env"
   fi
+  ok "Synced compatibility env mirror to $rust_env_compat"
 }
 
 resolve_migrated_bearer_token() {
@@ -2279,6 +2298,83 @@ wait_for_remote_http_endpoint() {
   return 1
 }
 
+repair_launchd_service_env_from_rust_config() {
+  [ "${OS:-$(uname -s | tr 'A-Z' 'a-z')}" = "darwin" ] || return 0
+
+  local plist_path="$HOME/Library/LaunchAgents/com.agent-mail.plist"
+  [ -f "$plist_path" ] || return 0
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 not found; cannot patch LaunchAgent environment for config.env compatibility."
+    return 0
+  fi
+
+  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  local storage_root database_url bearer_token host port http_path
+  storage_root="${RUST_STORAGE_ROOT:-}"
+  [ -z "$storage_root" ] && storage_root=$(read_env_assignment_value "$rust_env" "STORAGE_ROOT")
+  [ -z "$storage_root" ] && storage_root="$HOME/.mcp_agent_mail_git_mailbox_repo"
+
+  database_url=$(read_env_assignment_value "$rust_env" "DATABASE_URL")
+  [ -z "$database_url" ] && database_url="sqlite:///$storage_root/storage.sqlite3"
+
+  bearer_token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
+  host=$(read_env_assignment_value "$rust_env" "HTTP_HOST")
+  [ -z "$host" ] && host="$(desired_service_bind_host)"
+  port=$(read_env_assignment_value "$rust_env" "HTTP_PORT")
+  [ -z "$port" ] && port="$(desired_service_bind_port)"
+  http_path=$(read_env_assignment_value "$rust_env" "HTTP_PATH")
+  [ -z "$http_path" ] && http_path="${HTTP_PATH:-/mcp/}"
+
+  if ! python3 - "$plist_path" "$HOME" "$storage_root" "$database_url" "$bearer_token" "$host" "$port" "$http_path" <<'PY'
+import plistlib
+import sys
+
+plist_path, home, storage_root, database_url, bearer_token, host, port, http_path = sys.argv[1:]
+
+with open(plist_path, "rb") as fh:
+    data = plistlib.load(fh)
+
+env = dict(data.get("EnvironmentVariables") or {})
+env["RUST_LOG"] = env.get("RUST_LOG", "info")
+env["HOME"] = home
+
+for key, value in (
+    ("STORAGE_ROOT", storage_root),
+    ("DATABASE_URL", database_url),
+    ("HTTP_BEARER_TOKEN", bearer_token),
+    ("HTTP_HOST", host),
+    ("HTTP_PORT", port),
+    ("HTTP_PATH", http_path),
+):
+    if value:
+        env[key] = value
+    else:
+        env.pop(key, None)
+
+data["EnvironmentVariables"] = env
+data["WorkingDirectory"] = storage_root or home
+
+with open(plist_path, "wb") as fh:
+    plistlib.dump(data, fh)
+PY
+  then
+    warn "Failed to inject Rust config environment into LaunchAgent plist."
+    return 0
+  fi
+
+  local uid
+  uid="$(id -u)"
+  launchctl bootout "gui/${uid}" "$plist_path" >/dev/null 2>&1 || true
+  if ! launchctl bootstrap "gui/${uid}" "$plist_path" >/dev/null 2>&1; then
+    warn "LaunchAgent plist was updated, but launchctl could not restart it automatically."
+    return 0
+  fi
+
+  verbose "remote_http_readiness:launchd_env_repaired plist=${plist_path}"
+  return 0
+}
+
 ensure_remote_http_client_readiness() {
   if ! has_remote_http_client_targets; then
     verbose "remote_http_readiness:skip reason=no_codex_targets"
@@ -2316,6 +2412,7 @@ ensure_remote_http_client_readiness() {
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "remote_http_readiness:service ${line}"
     done <<< "$service_output"
+    repair_launchd_service_env_from_rust_config
   else
     warn "Automatic background service setup failed."
     if [ -n "$service_output" ]; then
@@ -4564,6 +4661,7 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   migration_before_counts=""
   migration_after_counts=""
   migration_integrity=""
+  migration_remaining_text_columns=""
   migration_has_unresolved_warnings=0
   migration_requires_fallback=0
   migration_pristine_backup=""
@@ -4571,6 +4669,7 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   migration_restore_ok=0
   migration_fallback_ok=0
   migration_succeeded=0
+  migration_final_verification_failed=0
 
   migration_pristine_ts=$(date -u +%Y%m%d_%H%M%S)
   migration_pristine_backup="${PYTHON_DB_MIGRATED_PATH}.pre-migrate.${migration_pristine_ts}"
@@ -4724,22 +4823,65 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   # Final post-migration invariants: even after fallback, the database must
   # be healthy and core legacy row counts must be preserved.
   if [ "$migration_succeeded" -eq 1 ]; then
+    migration_final_verification_failed=0
     migration_integrity=$(sqlite3 "$PYTHON_DB_MIGRATED_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
     if [ "$migration_integrity" != "ok" ]; then
-      migration_succeeded=0
+      migration_final_verification_failed=1
       warn "Final migration integrity_check failed: '${migration_integrity:-<empty>}'"
     fi
     migration_remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$PYTHON_DB_MIGRATED_PATH")
     if [ -n "${migration_remaining_text_columns:-}" ]; then
-      migration_succeeded=0
+      migration_final_verification_failed=1
       warn "Final migration verification found remaining TEXT timestamps in: ${migration_remaining_text_columns}"
     fi
     if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
-      migration_succeeded=0
+      migration_final_verification_failed=1
       warn "Final migration verification detected reduced core legacy row counts."
     fi
-    if [ "$migration_succeeded" -eq 1 ]; then
+    if [ "$migration_final_verification_failed" -eq 1 ] && [ "$migration_fallback_ok" -eq 0 ]; then
+      warn "Final migration verification failed; reverting to pristine snapshot and running sqlite3 fallback migration."
+      if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
+        if copy_sqlite_snapshot "$migration_pristine_backup" "$PYTHON_DB_MIGRATED_PATH"; then
+          migration_restore_ok=1
+          warn "Restored pristine migration snapshot before final sqlite3 fallback."
+        else
+          migration_restore_ok=0
+          warn "Failed to restore pristine snapshot prior to final sqlite3 fallback migration."
+        fi
+      else
+        migration_restore_ok=1
+        warn "Pristine migration snapshot missing; running final sqlite3 fallback migration in-place."
+      fi
+
+      if [ "$migration_restore_ok" -eq 1 ] && sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
+        migration_fallback_ok=1
+        migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+        verbose "migration:row_counts_after_final_fallback ${migration_after_counts}"
+        migration_integrity=$(sqlite3 "$PYTHON_DB_MIGRATED_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
+        migration_remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$PYTHON_DB_MIGRATED_PATH")
+        migration_final_verification_failed=0
+        if [ "$migration_integrity" != "ok" ]; then
+          migration_final_verification_failed=1
+          warn "Final sqlite3 fallback integrity_check failed: '${migration_integrity:-<empty>}'"
+        fi
+        if [ -n "${migration_remaining_text_columns:-}" ]; then
+          migration_final_verification_failed=1
+          warn "Final sqlite3 fallback left TEXT timestamps in: ${migration_remaining_text_columns}"
+        fi
+        if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
+          migration_final_verification_failed=1
+          warn "Final sqlite3 fallback reduced core legacy row counts."
+        fi
+      else
+        migration_final_verification_failed=1
+      fi
+    fi
+
+    if [ "$migration_final_verification_failed" -eq 0 ]; then
+      migration_succeeded=1
       ok "Database schema migrated"
+    else
+      migration_succeeded=0
     fi
   fi
 

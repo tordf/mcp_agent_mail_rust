@@ -344,7 +344,7 @@ pub fn score_voi(input: &VoIInput) -> VoIScore {
 
     // Raw VoI: combination of information gain, debt severity, and staleness.
     // Higher entropy and staleness increase the value of new information.
-    let staleness_factor = (input.staleness_micros as f64 / 600_000_000.0).min(2.0); // cap at 2×
+    let staleness_factor = (input.staleness_micros.max(0) as f64 / 600_000_000.0).min(2.0); // clamp [0, 2×]
     let raw_voi = input.estimated_info_gain
         * input.debt_severity
         * (1.0 + 0.3 * input.posterior_entropy)

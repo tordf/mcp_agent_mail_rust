@@ -1386,7 +1386,7 @@ fn hardened_http_listener_config() -> Http1ListenerConfig {
         .max_requests(Some(8))
         .idle_timeout(Some(HTTP_IDLE_TIMEOUT))
         .max_headers_size(32 * 1024)
-        .max_body_size(1024 * 1024);
+        .max_body_size(10 * 1024 * 1024); // 10MB — must match HttpHandlerConfig.max_body_size
 
     Http1ListenerConfig::default()
         .http_config(http_config)
@@ -3964,20 +3964,16 @@ fn atc_project_keys_match(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
     if left.is_empty() || right.is_empty() {
-        return left.eq_ignore_ascii_case(right);
+        return left == right;
     }
-    if left.eq_ignore_ascii_case(right) {
+    if left == right {
         return true;
     }
 
     let left_identity = mcp_agent_mail_core::resolve_project_identity(left);
     let right_identity = mcp_agent_mail_core::resolve_project_identity(right);
-    if left_identity
-        .human_key
-        .eq_ignore_ascii_case(&right_identity.human_key)
-        || left_identity
-            .canonical_path
-            .eq_ignore_ascii_case(&right_identity.canonical_path)
+    if left_identity.human_key == right_identity.human_key
+        || left_identity.canonical_path == right_identity.canonical_path
     {
         return true;
     }
@@ -7275,7 +7271,8 @@ impl HttpState {
             let payload = match mcp_agent_mail_storage::collect_lock_status(&self.config) {
                 Ok(v) => v,
                 Err(err) => {
-                    let msg = format!("lock status error: {err}");
+                    tracing::warn!(%err, "lock status query failed");
+                    let msg = "lock status temporarily unavailable".to_string();
                     return Some(self.error_response(req, 500, &msg));
                 }
             };
@@ -22253,6 +22250,15 @@ mod tests {
     fn atc_project_keys_match_rejects_prefix_collision() {
         let left = "/tmp/agent-mail-project";
         let right = "/tmp/agent-mail-project-backup";
+
+        assert!(!atc_project_keys_match(left, right));
+        assert!(!atc_project_keys_match(right, left));
+    }
+
+    #[test]
+    fn atc_project_keys_match_rejects_case_variant_absolute_paths() {
+        let left = "/tmp/agent-mail-project";
+        let right = "/tmp/Agent-Mail-Project";
 
         assert!(!atc_project_keys_match(left, right));
         assert!(!atc_project_keys_match(right, left));

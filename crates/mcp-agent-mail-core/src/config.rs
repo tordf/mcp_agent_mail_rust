@@ -1819,8 +1819,9 @@ pub enum ConfigSource {
     ProcessEnv,
     /// Project-local `.env` file in working directory.
     ProjectDotenv,
-    /// User-global env file: `~/.mcp_agent_mail/.env`, `~/mcp_agent_mail/.env`,
-    /// or `$XDG_CONFIG_HOME/mcp-agent-mail/.env`.
+    /// User-global env file: `$XDG_CONFIG_HOME/mcp-agent-mail/config.env`,
+    /// `$XDG_CONFIG_HOME/mcp-agent-mail/.env`, `~/.mcp_agent_mail/.env`,
+    /// or `~/mcp_agent_mail/.env`.
     UserEnvFile,
     /// CLI argument override.
     CliArg,
@@ -1835,7 +1836,7 @@ impl ConfigSource {
         match self {
             Self::ProcessEnv => "env",
             Self::ProjectDotenv => ".env",
-            Self::UserEnvFile => "~/.mcp_agent_mail/.env",
+            Self::UserEnvFile => "user-env",
             Self::CliArg => "cli",
             Self::Default => "default",
         }
@@ -2051,19 +2052,31 @@ pub fn dotenv_value(key: &str) -> Option<String> {
 
 /// Candidate paths for the user-global env file, checked in order.
 ///
-/// 1. `~/.mcp_agent_mail/.env`            — legacy preferred
-/// 2. `~/mcp_agent_mail/.env`             — legacy (old shell wrapper)
-/// 3. `$XDG_CONFIG_HOME/mcp-agent-mail/.env` — XDG (new installs)
-fn user_env_file_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let mut candidates = vec![
-        home.join(".mcp_agent_mail").join(".env"),
-        home.join("mcp_agent_mail").join(".env"),
-    ];
-    if let Some(xdg) = xdg_config_dir() {
+/// 1. `$XDG_CONFIG_HOME/mcp-agent-mail/config.env` — canonical installer path
+/// 2. `$XDG_CONFIG_HOME/mcp-agent-mail/.env` — compatibility mirror for older binaries
+/// 3. `~/.mcp_agent_mail/.env` — legacy preferred over the old shell wrapper
+/// 4. `~/mcp_agent_mail/.env` — legacy (old shell wrapper)
+fn user_env_file_candidates(home: &Path, xdg_config_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(4);
+    if let Some(xdg) = xdg_config_dir {
+        candidates.push(xdg.join("config.env"));
         candidates.push(xdg.join(".env"));
     }
-    candidates.into_iter().find(|p| p.is_file())
+    candidates.push(home.join(".mcp_agent_mail").join(".env"));
+    candidates.push(home.join("mcp_agent_mail").join(".env"));
+    candidates
+}
+
+fn user_env_file_path_from(home: &Path, xdg_config_dir: Option<&Path>) -> Option<PathBuf> {
+    user_env_file_candidates(home, xdg_config_dir)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn user_env_file_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let xdg = xdg_config_dir();
+    user_env_file_path_from(&home, xdg.as_deref())
 }
 
 fn user_env_values() -> &'static HashMap<String, String> {
@@ -2080,10 +2093,20 @@ pub fn user_env_value(key: &str) -> Option<String> {
 /// Read a value with full precedence: process env → project `.env` → user env file.
 #[must_use]
 pub fn full_env_value(key: &str) -> Option<String> {
-    env_value(key).or_else(|| user_env_value(key))
+    env_value(key)
 }
 
-/// Read a value from the real environment first, falling back to .env.
+fn layered_env_value(
+    process_value: Option<String>,
+    project_dotenv_value: Option<String>,
+    user_envfile_value: Option<String>,
+) -> Option<String> {
+    process_value
+        .or(project_dotenv_value)
+        .or(user_envfile_value)
+}
+
+/// Read a value from the real environment first, falling back to project and user envfiles.
 #[must_use]
 pub fn env_value(key: &str) -> Option<String> {
     #[cfg(test)]
@@ -2093,7 +2116,7 @@ pub fn env_value(key: &str) -> Option<String> {
     if let Some(v) = process_env_override_value(key) {
         return Some(v);
     }
-    env::var(key).ok().or_else(|| dotenv_value(key))
+    layered_env_value(env::var(key).ok(), dotenv_value(key), user_env_value(key))
 }
 
 fn normalize_http_path(raw: &str) -> String {
@@ -3193,7 +3216,7 @@ mod tests {
     fn config_source_labels() {
         assert_eq!(ConfigSource::ProcessEnv.label(), "env");
         assert_eq!(ConfigSource::ProjectDotenv.label(), ".env");
-        assert_eq!(ConfigSource::UserEnvFile.label(), "~/.mcp_agent_mail/.env");
+        assert_eq!(ConfigSource::UserEnvFile.label(), "user-env");
         assert_eq!(ConfigSource::CliArg.label(), "cli");
         assert_eq!(ConfigSource::Default.label(), "default");
     }
@@ -3306,6 +3329,29 @@ mod tests {
     }
 
     #[test]
+    fn layered_env_value_uses_user_env_as_final_fallback() {
+        let value = layered_env_value(None, None, Some("from-user".to_string()));
+        assert_eq!(value.as_deref(), Some("from-user"));
+    }
+
+    #[test]
+    fn layered_env_value_preserves_process_project_user_precedence() {
+        let project_only = layered_env_value(
+            None,
+            Some("from-project".to_string()),
+            Some("from-user".to_string()),
+        );
+        assert_eq!(project_only.as_deref(), Some("from-project"));
+
+        let process_wins = layered_env_value(
+            Some("from-process".to_string()),
+            Some("from-project".to_string()),
+            Some("from-user".to_string()),
+        );
+        assert_eq!(process_wins.as_deref(), Some("from-process"));
+    }
+
+    #[test]
     fn bearer_token_loaded_from_env_override() {
         let _env = TestEnvOverrideGuard::set(&[("HTTP_BEARER_TOKEN", "test-token-12345")]);
         let config = Config::from_env();
@@ -3353,20 +3399,34 @@ mod tests {
     }
 
     #[test]
-    fn user_env_file_path_prefers_dotted_directory() {
+    fn user_env_file_path_prefers_xdg_config_env_over_legacy() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join(".config/mcp-agent-mail");
         let dotted = tmp.path().join(".mcp_agent_mail");
         let legacy = tmp.path().join("mcp_agent_mail");
+        std::fs::create_dir_all(&xdg).unwrap();
         std::fs::create_dir_all(&dotted).unwrap();
         std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(xdg.join("config.env"), "FOO=xdg\n").unwrap();
         std::fs::write(dotted.join(".env"), "FOO=bar\n").unwrap();
         std::fs::write(legacy.join(".env"), "FOO=baz\n").unwrap();
 
-        // Test the loading logic directly
-        let dotted_values = load_dotenv_file(&dotted.join(".env"));
-        let legacy_values = load_dotenv_file(&legacy.join(".env"));
-        assert_eq!(dotted_values.get("FOO").unwrap(), "bar");
-        assert_eq!(legacy_values.get("FOO").unwrap(), "baz");
+        let selected = user_env_file_path_from(tmp.path(), Some(&xdg)).expect("env path");
+        assert_eq!(selected, xdg.join("config.env"));
+    }
+
+    #[test]
+    fn user_env_file_path_prefers_xdg_dotenv_mirror_over_legacy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join(".config/mcp-agent-mail");
+        let dotted = tmp.path().join(".mcp_agent_mail");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&dotted).unwrap();
+        std::fs::write(xdg.join(".env"), "FOO=xdg-mirror\n").unwrap();
+        std::fs::write(dotted.join(".env"), "FOO=legacy\n").unwrap();
+
+        let selected = user_env_file_path_from(tmp.path(), Some(&xdg)).expect("env path");
+        assert_eq!(selected, xdg.join(".env"));
     }
 
     // -----------------------------------------------------------------------

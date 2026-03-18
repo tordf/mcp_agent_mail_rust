@@ -458,7 +458,11 @@ impl ReadCache {
     /// Look up an agent by (`project_id`, name) in a specific DB scope.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_agent_scoped(&self, scope: &str, project_id: i64, name: &str) -> Option<AgentRow> {
-        let key = (scope_fingerprint(scope), project_id, InternedStr::new(name));
+        // Lowercase the cache key to match SQL COLLATE NOCASE behavior.
+        // Without this, "BlueLake" and "bluelake" would be different cache keys
+        // but the same agent in the database.
+        let name_lower = name.to_ascii_lowercase();
+        let key = (scope_fingerprint(scope), project_id, InternedStr::new(&name_lower));
         {
             let cache = self.agents_by_key.read();
             let Some(entry) = cache.peek(&key) else {
@@ -593,8 +597,9 @@ impl ReadCache {
         let shared = Arc::new(agent.clone());
         {
             let mut cache = self.agents_by_key.write();
+            let name_lower = agent.name.to_ascii_lowercase();
             cache.insert(
-                (scope_fp, agent.project_id, InternedStr::new(&agent.name)),
+                (scope_fp, agent.project_id, InternedStr::new(&name_lower)),
                 CacheEntry::new(Arc::clone(&shared)),
             );
         }
@@ -617,9 +622,11 @@ impl ReadCache {
         let prepared: Vec<_> = agents
             .iter()
             .map(|agent| {
+                // Lowercase to match get_agent_scoped key construction.
+                let name_lower = agent.name.to_ascii_lowercase();
                 (
                     agent.project_id,
-                    InternedStr::new(&agent.name),
+                    InternedStr::new(&name_lower),
                     agent.id,
                     Arc::new(agent.clone()),
                 )
@@ -696,7 +703,8 @@ impl ReadCache {
         id: Option<i64>,
     ) {
         let scope_fp = scope_fingerprint(scope);
-        let key = (scope_fp, project_id, InternedStr::new(name));
+        let name_lower = name.to_ascii_lowercase();
+        let key = (scope_fp, project_id, InternedStr::new(&name_lower));
         let mut cache = self.agents_by_key.write();
         let removed_id = cache.remove(&key).and_then(|a| a.value.id);
         drop(cache); // release key map lock first
@@ -1095,7 +1103,8 @@ mod tests {
         let agent = make_agent_with_id("RedCat", 2, 55);
         cache.put_agent(&agent);
 
-        let key = (scope_fingerprint(""), 2, InternedStr::new("RedCat"));
+        // Cache keys are lowercased (matching SQL COLLATE NOCASE).
+        let key = (scope_fingerprint(""), 2, InternedStr::new("redcat"));
         let mut by_key = cache.agents_by_key.write();
         by_key.remove(&key);
         drop(by_key);

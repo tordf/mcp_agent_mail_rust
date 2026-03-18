@@ -13,7 +13,9 @@
 
 #![forbid(unsafe_code)]
 
-use mcp_agent_mail_core::{Config, InterfaceMode};
+use std::path::Path;
+
+use mcp_agent_mail_core::{Config, InterfaceMode, resolve_project_identity};
 use mcp_agent_mail_db::DbPoolConfig;
 
 use crate::{CliError, CliResult};
@@ -128,40 +130,87 @@ pub struct ResolvedProject {
     pub human_key: String,
 }
 
-/// Look up a project by slug or `human_key`.
-///
-/// Tries slug match first, then `human_key` match.
-pub fn resolve_project(conn: &mcp_agent_mail_db::DbConn, key: &str) -> CliResult<ResolvedProject> {
-    // Try slug first
+fn query_project_by_slug(
+    conn: &mcp_agent_mail_db::DbConn,
+    slug: &str,
+) -> CliResult<Option<ResolvedProject>> {
     let rows = conn
         .query_sync(
-            "SELECT id, slug, human_key FROM projects WHERE slug = ? LIMIT 1",
-            &[sqlmodel_core::Value::Text(key.to_string())],
+            "SELECT id, slug, human_key FROM projects WHERE slug = ? COLLATE NOCASE LIMIT 1",
+            &[sqlmodel_core::Value::Text(slug.to_string())],
         )
         .map_err(|e| CliError::Other(format!("project query failed: {e}")))?;
 
-    if let Some(row) = rows.first() {
-        return Ok(ResolvedProject {
-            id: require_i64_column(row, "id", "projects")?,
-            slug: require_text_column(row, "slug", "projects")?,
-            human_key: require_text_column(row, "human_key", "projects")?,
-        });
-    }
+    rows.first()
+        .map(|row| {
+            Ok(ResolvedProject {
+                id: require_i64_column(row, "id", "projects")?,
+                slug: require_text_column(row, "slug", "projects")?,
+                human_key: require_text_column(row, "human_key", "projects")?,
+            })
+        })
+        .transpose()
+}
 
-    // Try human_key
+fn query_project_by_human_key(
+    conn: &mcp_agent_mail_db::DbConn,
+    human_key: &str,
+) -> CliResult<Option<ResolvedProject>> {
     let rows = conn
         .query_sync(
             "SELECT id, slug, human_key FROM projects WHERE human_key = ? LIMIT 1",
-            &[sqlmodel_core::Value::Text(key.to_string())],
+            &[sqlmodel_core::Value::Text(human_key.to_string())],
         )
         .map_err(|e| CliError::Other(format!("project query failed: {e}")))?;
 
-    if let Some(row) = rows.first() {
-        return Ok(ResolvedProject {
-            id: require_i64_column(row, "id", "projects")?,
-            slug: require_text_column(row, "slug", "projects")?,
-            human_key: require_text_column(row, "human_key", "projects")?,
-        });
+    rows.first()
+        .map(|row| {
+            Ok(ResolvedProject {
+                id: require_i64_column(row, "id", "projects")?,
+                slug: require_text_column(row, "slug", "projects")?,
+                human_key: require_text_column(row, "human_key", "projects")?,
+            })
+        })
+        .transpose()
+}
+
+fn project_matches_absolute_lookup(
+    project: &ResolvedProject,
+    requested: &mcp_agent_mail_core::ProjectIdentity,
+) -> bool {
+    let stored = resolve_project_identity(&project.human_key);
+    stored.human_key == requested.human_key || stored.canonical_path == requested.canonical_path
+}
+
+/// Look up a project by slug or `human_key`.
+///
+/// For absolute filesystem paths, prefer exact/canonical `human_key` matching
+/// before accepting a slug hit so slug collisions cannot resolve to the wrong
+/// project.
+pub fn resolve_project(conn: &mcp_agent_mail_db::DbConn, key: &str) -> CliResult<ResolvedProject> {
+    let key = key.trim();
+    if Path::new(key).is_absolute() {
+        let requested = resolve_project_identity(key);
+        if let Some(project) = query_project_by_human_key(conn, &requested.human_key)? {
+            return Ok(project);
+        }
+        if requested.human_key != key
+            && let Some(project) = query_project_by_human_key(conn, key)?
+        {
+            return Ok(project);
+        }
+        if let Some(project) = query_project_by_slug(conn, &requested.slug)?
+            && project_matches_absolute_lookup(&project, &requested)
+        {
+            return Ok(project);
+        }
+    } else {
+        if let Some(project) = query_project_by_slug(conn, key)? {
+            return Ok(project);
+        }
+        if let Some(project) = query_project_by_human_key(conn, key)? {
+            return Ok(project);
+        }
     }
 
     Err(CliError::InvalidArgument(format!(
@@ -513,6 +562,44 @@ mod tests {
         let proj = ctx.resolve_project("/data/myproj").unwrap();
         assert_eq!(proj.slug, "my-slug");
         assert_eq!(proj.human_key, "/data/myproj");
+    }
+
+    #[test]
+    fn resolve_project_rejects_slug_collision_for_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let url = format!("sqlite:///{}", db_path.display());
+        let ctx = CliContext::open_with_url(&url).unwrap();
+
+        let project_a = dir.path().join("repo").join("a-b");
+        let project_b = dir.path().join("repo").join("a").join("b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+
+        let project_a = project_a.canonicalize().unwrap();
+        let project_b = project_b.canonicalize().unwrap();
+        let project_a_key = project_a.display().to_string();
+        let project_b_key = project_b.display().to_string();
+
+        let identity_a = resolve_project_identity(&project_a_key);
+        let identity_b = resolve_project_identity(&project_b_key);
+        assert_eq!(
+            identity_a.slug, identity_b.slug,
+            "test setup requires a slug collision"
+        );
+
+        ctx.conn
+            .execute_raw(&format!(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('{}', '{}', 1000000)",
+                identity_a.slug, project_a_key
+            ))
+            .unwrap();
+
+        let err = ctx.resolve_project(&project_b_key).unwrap_err();
+        assert!(
+            err.to_string().contains("project not found"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
