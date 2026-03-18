@@ -353,7 +353,21 @@ pub fn label_experience(input: &LabelingInput) -> LabelingResult {
         return label_non_execution(input);
     }
 
-    // 2. Handle terminal dispatch failures
+    // 2. Handle pre-execution states — labeling doesn't apply yet
+    if input.state == ExperienceState::Planned || input.state == ExperienceState::Dispatched {
+        return LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::InsufficientEvidence {
+                    expected: 1,
+                    observed: 0,
+                },
+            },
+            new_state: input.state, // stay in current pre-execution state
+            rule_id: "pre_execution",
+        };
+    }
+
+    // 3. Handle terminal dispatch failures
     if input.state == ExperienceState::Failed {
         return LabelingResult {
             label: OutcomeLabel::Censored {
@@ -840,14 +854,11 @@ pub fn label_to_outcome(result: &LabelingResult, now_micros: i64) -> Option<Expe
             regret: None,
             evidence: None,
         }),
-        OutcomeLabel::Censored { reason } => Some(ExperienceOutcome {
-            observed_ts_micros: now_micros,
-            label: format!("censored: {reason} (rule={})", result.rule_id),
-            correct: false, // censored is not "correct"
-            actual_loss: None,
-            regret: None,
-            evidence: None,
-        }),
+        OutcomeLabel::Censored { .. } => {
+            // Censored labels have no learning signal — return None so the
+            // caller doesn't store a misleading outcome record.
+            None
+        }
     }
 }
 
@@ -1136,6 +1147,37 @@ mod tests {
         assert_eq!(r1.label, r2.label);
         assert_eq!(r1.new_state, r2.new_state);
         assert_eq!(r1.rule_id, r2.rule_id);
+    }
+
+    #[test]
+    fn planned_state_stays_planned() {
+        let mut input = base_input();
+        input.state = ExperienceState::Planned;
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Planned);
+        assert_eq!(result.rule_id, "pre_execution");
+        assert!(!result.label.has_learning_signal());
+    }
+
+    #[test]
+    fn dispatched_state_stays_dispatched() {
+        let mut input = base_input();
+        input.state = ExperienceState::Dispatched;
+        let result = label_experience(&input);
+        assert_eq!(result.new_state, ExperienceState::Dispatched);
+        assert_eq!(result.rule_id, "pre_execution");
+    }
+
+    #[test]
+    fn censored_label_to_outcome_returns_none() {
+        let result = LabelingResult {
+            label: OutcomeLabel::Censored {
+                reason: CensorReason::WindowExpired,
+            },
+            new_state: ExperienceState::Expired,
+            rule_id: "window_expired",
+        };
+        assert!(label_to_outcome(&result, 42_000_000).is_none());
     }
 
     #[test]

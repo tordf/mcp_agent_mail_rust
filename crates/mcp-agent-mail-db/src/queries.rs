@@ -419,6 +419,25 @@ fn encode_json_optional<T: serde::Serialize>(
         .transpose()
 }
 
+fn merge_json_object(
+    existing: &mut serde_json::Map<String, serde_json::Value>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, patch_value) in patch {
+        match (existing.get_mut(key), patch_value) {
+            (
+                Some(serde_json::Value::Object(existing_map)),
+                serde_json::Value::Object(patch_map),
+            ) => {
+                merge_json_object(existing_map, patch_map);
+            }
+            _ => {
+                existing.insert(key.clone(), patch_value.clone());
+            }
+        }
+    }
+}
+
 fn merge_context_patch(
     existing: Option<serde_json::Value>,
     patch: Option<&serde_json::Value>,
@@ -442,9 +461,7 @@ fn merge_context_patch(
         }
         None => serde_json::Map::new(),
     };
-    for (key, value) in patch_map {
-        merged.insert(key.clone(), value.clone());
-    }
+    merge_json_object(&mut merged, patch_map);
     Ok(Some(serde_json::Value::Object(merged)))
 }
 
@@ -8391,9 +8408,10 @@ pub async fn fetch_open_atc_experiences(
 
 /// Resolve an ATC experience with an observed outcome.
 ///
-/// Transitions the experience from `open` (or `executed`) to `resolved`
-/// and stores the outcome data. This is the terminal attribution step
-/// for message-driven experiences.
+/// Transitions the experience from `open` to `resolved` and stores the
+/// outcome data. Callers that still hold an `executed` row must first
+/// promote it to `open` via `transition_atc_experience`. This is the
+/// terminal attribution step for message-driven experiences.
 ///
 /// **Idempotent**: Resolving an already-resolved experience succeeds
 /// without mutation.
@@ -8426,11 +8444,14 @@ pub async fn resolve_atc_experience(
 
     let tracked = tracked(&*conn);
 
-    // Only update rows that are still resolvable (executed or open).
-    // Already-resolved rows are idempotently skipped.
+    // Only update rows that are in `open` state. The state machine
+    // requires Executed → Open before Open → Resolved. The caller
+    // must ensure the Executed → Open transition happens first (e.g.,
+    // via the resolution sweep). Already-resolved rows are idempotently
+    // skipped by the WHERE clause.
     let sql = "UPDATE atc_experiences \
                SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
-               WHERE experience_id = ? AND state IN ('executed', 'open')";
+               WHERE experience_id = ? AND state = 'open'";
 
     let params = vec![
         Value::BigInt(outcome.observed_ts_micros),
@@ -9146,6 +9167,10 @@ mod tests {
                 feature_ext: None,
                 context: Some(serde_json::json!({
                     "policy_revision": 9,
+                    "execution": {
+                        "attempt": 1,
+                        "queued_by": "atc"
+                    },
                     "action_family": {
                         "kind": "probe_agent",
                         "category": "probe"
@@ -9195,10 +9220,10 @@ mod tests {
             .into_result();
             assert!(matches!(
                 missing_reason,
-                Err(DbError::InvalidArgument {
+                Err(asupersync::OutcomeError::Err(DbError::InvalidArgument {
                     field: "non_execution_reason",
                     ..
-                })
+                }))
             ));
 
             transition_atc_experience(
@@ -9268,6 +9293,24 @@ mod tests {
                     .context
                     .as_ref()
                     .and_then(|value| value.get("execution"))
+                    .and_then(|value| value.get("attempt"))
+                    .and_then(serde_json::Value::as_i64),
+                Some(1)
+            );
+            assert_eq!(
+                stored
+                    .context
+                    .as_ref()
+                    .and_then(|value| value.get("execution"))
+                    .and_then(|value| value.get("queued_by"))
+                    .and_then(serde_json::Value::as_str),
+                Some("atc")
+            );
+            assert_eq!(
+                stored
+                    .context
+                    .as_ref()
+                    .and_then(|value| value.get("execution"))
                     .and_then(|value| value.get("status"))
                     .and_then(serde_json::Value::as_str),
                 Some("suppressed")
@@ -9286,7 +9329,10 @@ mod tests {
             .into_result();
             assert!(matches!(
                 invalid,
-                Err(DbError::InvalidArgument { field: "state", .. })
+                Err(asupersync::OutcomeError::Err(DbError::InvalidArgument {
+                    field: "state",
+                    ..
+                }))
             ));
         });
     }

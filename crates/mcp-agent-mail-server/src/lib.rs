@@ -3423,6 +3423,11 @@ fn bounded_atc_execution_detail(detail: &str) -> String {
     }
 }
 
+fn bounded_optional_atc_execution_detail(detail: &str) -> Option<String> {
+    let bounded = bounded_atc_execution_detail(detail);
+    (!bounded.is_empty()).then_some(bounded)
+}
+
 fn atc_execution_capture(raw_status: &str) -> AtcExecutionCapture {
     if raw_status == "executed" {
         return AtcExecutionCapture {
@@ -3439,20 +3444,23 @@ fn atc_execution_capture(raw_status: &str) -> AtcExecutionCapture {
             snapshot_status: "failed",
             state: ExperienceState::Failed,
             classification: "runtime_failure",
-            detail: Some(bounded_atc_execution_detail(detail)),
+            detail: bounded_optional_atc_execution_detail(detail),
             non_execution_reason: None,
         };
     }
 
     if let Some(detail) = raw_status.strip_prefix("suppressed:") {
-        let detail = bounded_atc_execution_detail(detail);
+        let detail = bounded_optional_atc_execution_detail(detail);
+        let gate_name = detail
+            .clone()
+            .unwrap_or_else(|| "unspecified_suppression".to_string());
         return AtcExecutionCapture {
             snapshot_status: "suppressed",
             state: ExperienceState::Suppressed,
             classification: "policy_suppression",
-            detail: Some(detail.clone()),
+            detail,
             non_execution_reason: Some(NonExecutionReason::SafetyGate {
-                gate_name: detail,
+                gate_name,
                 risk_score: 0.0,
                 gate_threshold: 0.0,
             }),
@@ -3464,7 +3472,7 @@ fn atc_execution_capture(raw_status: &str) -> AtcExecutionCapture {
             snapshot_status: "skipped",
             state: ExperienceState::Skipped,
             classification: "deliberate_inaction",
-            detail: Some(bounded_atc_execution_detail(detail)),
+            detail: bounded_optional_atc_execution_detail(detail),
             non_execution_reason: Some(NonExecutionReason::DeliberateInaction {
                 no_action_loss: 0.0,
                 best_action_loss: 0.0,
@@ -3473,14 +3481,17 @@ fn atc_execution_capture(raw_status: &str) -> AtcExecutionCapture {
     }
 
     if let Some(detail) = raw_status.strip_prefix("throttled:") {
-        let detail = bounded_atc_execution_detail(detail);
+        let detail = bounded_optional_atc_execution_detail(detail);
+        let budget_name = detail
+            .clone()
+            .unwrap_or_else(|| "unspecified_throttle".to_string());
         return AtcExecutionCapture {
             snapshot_status: "throttled",
             state: ExperienceState::Throttled,
             classification: "budget_throttle",
-            detail: Some(detail.clone()),
+            detail,
             non_execution_reason: Some(NonExecutionReason::BudgetExhausted {
-                budget_name: detail,
+                budget_name,
                 current: 0.0,
                 threshold: 0.0,
             }),
@@ -3512,7 +3523,7 @@ fn atc_execution_capture(raw_status: &str) -> AtcExecutionCapture {
             snapshot_status: "failed",
             state: ExperienceState::Failed,
             classification: "runtime_failure",
-            detail: Some(bounded_atc_execution_detail(raw_status)),
+            detail: bounded_optional_atc_execution_detail(raw_status),
             non_execution_reason: None,
         };
     }
@@ -3521,9 +3532,46 @@ fn atc_execution_capture(raw_status: &str) -> AtcExecutionCapture {
         snapshot_status: "failed",
         state: ExperienceState::Failed,
         classification: "runtime_failure",
-        detail: Some(bounded_atc_execution_detail(raw_status)),
+        detail: bounded_optional_atc_execution_detail(raw_status),
         non_execution_reason: None,
     }
+}
+
+fn atc_execution_context_patch(
+    capture: &AtcExecutionCapture,
+    execution_mode: &str,
+    raw_status: &str,
+    ts_micros: i64,
+) -> serde_json::Value {
+    let mut execution = serde_json::Map::from_iter([
+        (
+            "status".to_string(),
+            serde_json::Value::String(capture.snapshot_status.to_string()),
+        ),
+        (
+            "classification".to_string(),
+            serde_json::Value::String(capture.classification.to_string()),
+        ),
+        (
+            "mode".to_string(),
+            serde_json::Value::String(execution_mode.to_string()),
+        ),
+        (
+            "raw_status".to_string(),
+            serde_json::Value::String(bounded_atc_execution_detail(raw_status)),
+        ),
+        (
+            "captured_ts_micros".to_string(),
+            serde_json::Value::Number(ts_micros.into()),
+        ),
+    ]);
+    if let Some(detail) = capture.detail.as_ref() {
+        execution.insert(
+            "detail".to_string(),
+            serde_json::Value::String(detail.clone()),
+        );
+    }
+    serde_json::json!({ "execution": execution })
 }
 
 /// Capture the execution result for an ATC experience row by transitioning
@@ -3565,16 +3613,7 @@ fn capture_atc_execution_result(
     }
 
     // Transition: Dispatched → Executed/Failed/Throttled/Suppressed/Skipped.
-    let context_patch = serde_json::json!({
-        "execution": {
-            "status": capture.snapshot_status,
-            "classification": capture.classification,
-            "mode": execution_mode,
-            "raw_status": bounded_atc_execution_detail(status),
-            "detail": capture.detail.clone(),
-            "captured_ts_micros": ts_micros
-        }
-    });
+    let context_patch = atc_execution_context_patch(&capture, execution_mode, status, ts_micros);
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
         &cx,
@@ -3633,6 +3672,30 @@ fn sweep_open_experiences_for_resolution(
     };
 
     for experience in &open_experiences {
+        // Ensure executed experiences transition to open before resolution.
+        // The state machine requires Executed → Open → Resolved.
+        if experience.state == ExperienceState::Executed {
+            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            if let asupersync::Outcome::Err(error) =
+                block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+                    &cx,
+                    pool,
+                    experience.experience_id,
+                    ExperienceState::Open,
+                    now_micros,
+                    None,
+                    None,
+                ))
+            {
+                tracing::debug!(
+                    experience_id = experience.experience_id,
+                    %error,
+                    "failed to transition experience to open"
+                );
+                continue;
+            }
+        }
+
         let age_micros = now_micros.saturating_sub(experience.created_ts_micros);
 
         // Check if the subject agent has been active since this experience
@@ -3699,7 +3762,7 @@ fn sweep_open_experiences_for_resolution(
 
 /// Resolve open conflict-subsystem experiences when reservation events arrive (br-0qt6e.2.4).
 ///
-/// Called from domain event derivers after reservation grants, releases, or conflict detections.
+/// Helper for reservation-event domain derivers after grants, releases, or conflict detections.
 /// Finds open experiences for the relevant agent(s) in the Conflict subsystem and resolves them
 /// with the appropriate outcome label.
 ///
@@ -3709,8 +3772,9 @@ fn sweep_open_experiences_for_resolution(
 /// - New conflict detected → Resolve no-action experiences as needing action (not-correct but
 ///   expected, since the system intentionally did not intervene).
 ///
-/// This function is called inline from domain event derivers (not periodically),
-/// so it must remain cheap: bounded at 20 open experiences per call.
+/// When wired from domain event derivers, this helper must remain cheap because
+/// it is intended for inline use rather than periodic sweeping: bounded at 20
+/// open experiences per call.
 fn resolve_conflict_experiences_on_reservation_event(
     pool: &mcp_agent_mail_db::DbPool,
     agent: &str,
@@ -3748,8 +3812,15 @@ fn resolve_conflict_experiences_on_reservation_event(
             continue;
         }
         // Skip experiences from a different project if project scoping is available.
+        // NOTE: project_key may be stored as a slug while `project` may be a human_key
+        // (or vice versa). Case-insensitive contains-check handles both formats:
+        // slug "data-projects-foo" vs human_key "/data/projects/foo".
         if let Some(ref exp_project) = experience.project_key {
-            if !exp_project.is_empty() && exp_project != project {
+            if !exp_project.is_empty()
+                && !exp_project.eq_ignore_ascii_case(project)
+                && !exp_project.contains(project)
+                && !project.contains(exp_project.as_str())
+            {
                 continue;
             }
         }
@@ -11157,6 +11228,22 @@ mod tests {
     }
 
     #[test]
+    fn atc_execution_capture_normalizes_empty_details() {
+        let failed = atc_execution_capture("failed:");
+        assert_eq!(failed.snapshot_status, "failed");
+        assert!(failed.detail.is_none());
+
+        let suppressed = atc_execution_capture("suppressed:");
+        assert_eq!(suppressed.snapshot_status, "suppressed");
+        assert!(suppressed.detail.is_none());
+        assert!(matches!(
+            suppressed.non_execution_reason,
+            Some(NonExecutionReason::SafetyGate { ref gate_name, .. })
+                if gate_name == "unspecified_suppression"
+        ));
+    }
+
+    #[test]
     fn atc_execution_snapshot_exposes_canonical_status_and_detail() {
         let effect = sample_probe_effect();
         let snapshot = atc_execution_snapshot(
@@ -11172,6 +11259,29 @@ mod tests {
             Some("executor_mode_dry_run")
         );
         assert_eq!(snapshot.execution_mode, "dry_run");
+    }
+
+    #[test]
+    fn atc_execution_context_patch_omits_detail_for_success() {
+        let capture = atc_execution_capture("executed");
+        let patch =
+            atc_execution_context_patch(&capture, "live", "executed", 1_700_000_000_000_111);
+
+        let execution = patch
+            .get("execution")
+            .and_then(serde_json::Value::as_object)
+            .expect("execution object");
+        assert_eq!(
+            execution.get("status").and_then(serde_json::Value::as_str),
+            Some("executed")
+        );
+        assert_eq!(
+            execution
+                .get("raw_status")
+                .and_then(serde_json::Value::as_str),
+            Some("executed")
+        );
+        assert!(!execution.contains_key("detail"));
     }
 
     #[test]

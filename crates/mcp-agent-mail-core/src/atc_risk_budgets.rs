@@ -263,7 +263,12 @@ impl BudgetState {
         }
 
         // Update health state
-        self.health = self.compute_health(now_micros);
+        let new_health = self.compute_health(now_micros);
+        // Set cooldown start timestamp on transition into CoolingDown
+        if new_health == BudgetHealth::CoolingDown && self.health != BudgetHealth::CoolingDown {
+            self.cooldown_started_micros = now_micros;
+        }
+        self.health = new_health;
         self.health
     }
 
@@ -335,9 +340,11 @@ impl BudgetState {
             return BudgetHealth::Blocking;
         }
 
-        // Check rate against budget
+        // Check rate against budget — enter CoolingDown first, then Blocking
         if rate > self.config.max_false_action_rate {
-            return BudgetHealth::Blocking;
+            // First violation enters CoolingDown (with cooldown timer).
+            // If already past cooldown without recovery, enters Blocking.
+            return BudgetHealth::CoolingDown;
         }
 
         let stress_threshold =
@@ -649,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn release_budget_blocks_on_false_positive() {
+    fn release_budget_cools_down_on_false_positive() {
         let mut state = BudgetState::new(EffectKind::Release, 2);
         // Record enough correct outcomes to pass min_observations
         for _ in 0..20 {
@@ -657,9 +664,12 @@ mod tests {
         }
         assert_eq!(state.health, BudgetHealth::Healthy);
 
-        // One false positive should block release budget
+        // One false positive should enter CoolingDown for release budget
+        // (rate exceeds 0.0 max, enters cooldown before blocking)
         state.record_outcome(true, 2_000_000);
-        assert_eq!(state.health, BudgetHealth::Blocking);
+        assert_eq!(state.health, BudgetHealth::CoolingDown);
+        assert!(!state.health.allows_action()); // CoolingDown blocks actions
+        assert_eq!(state.cooldown_started_micros, 2_000_000);
     }
 
     #[test]
@@ -679,15 +689,19 @@ mod tests {
     #[test]
     fn recovery_streak_restores_health() {
         let mut state = BudgetState::new(EffectKind::ForceReservation, 1);
-        // Get to blocking state
+        // Get to CoolingDown state
         for _ in 0..20 {
             state.record_outcome(false, 1_000_000);
         }
-        // False positive pushes over 2% budget
+        // False positive pushes over 2% budget → enters CoolingDown
         state.record_outcome(true, 2_000_000);
-        // Need recovery streak
-        for _ in 0..10 {
-            state.record_outcome(false, 3_000_000);
+        assert_eq!(state.health, BudgetHealth::CoolingDown);
+
+        // After cooldown period expires (300s = 300_000_000 micros),
+        // recovery streak of 10 correct outcomes restores Healthy.
+        // Time must be past cooldown: 2_000_000 + 300_000_000 = 302_000_000
+        for i in 0..10 {
+            state.record_outcome(false, 310_000_000 + i * 1_000_000);
         }
         assert_eq!(state.health, BudgetHealth::Healthy);
     }

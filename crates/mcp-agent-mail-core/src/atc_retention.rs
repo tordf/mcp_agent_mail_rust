@@ -418,7 +418,7 @@ pub const GIT_ARCHIVE_DEFAULT_ARTIFACTS: &[LearningArtifactKind] = &[
 pub const GIT_ARCHIVE_PROMOTION_ONLY_ARTIFACTS: &[LearningArtifactKind] =
     &[LearningArtifactKind::ExemplarTraces];
 
-/// Artifact classes that must stay out of Git by default.
+/// Artifact classes that have no Git archive form under the current contract.
 pub const GIT_ARCHIVE_DENYLIST: &[LearningArtifactKind] = &[
     LearningArtifactKind::OpenExperienceRows,
     LearningArtifactKind::ResolvedExperienceRows,
@@ -454,6 +454,11 @@ pub const REPLAY_DISCOVERABILITY_REQUIREMENTS: &[&str] = &[
     "retain enough IDs (decision, experience, stratum, or replay hash) to bridge back to durable evidence",
 ];
 
+const _: () = {
+    assert!(PERIODIC_AUDIT_CADENCE_DAYS >= 1);
+    assert!(PERIODIC_AUDIT_CADENCE_DAYS <= OPEN_EXPERIENCE_STALE_AFTER_DAYS);
+};
+
 /// Return the canonical retention rule for an artifact kind.
 #[must_use]
 pub fn retention_rule(kind: LearningArtifactKind) -> Option<&'static ArtifactRetentionRule> {
@@ -465,6 +470,11 @@ pub fn retention_rule(kind: LearningArtifactKind) -> Option<&'static ArtifactRet
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    fn artifact_set(items: &[LearningArtifactKind]) -> HashSet<LearningArtifactKind> {
+        items.iter().copied().collect()
+    }
 
     #[test]
     fn every_artifact_kind_has_one_rule() {
@@ -510,6 +520,10 @@ mod tests {
         for kind in GIT_ARCHIVE_DENYLIST {
             let rule = retention_rule(*kind).expect("rule");
             assert!(
+                !rule.has_git_archive_path(),
+                "{kind:?} should not have a Git archive path"
+            );
+            assert!(
                 !rule.archives_to_git_by_default(),
                 "{kind:?} must stay out of Git by default"
             );
@@ -524,6 +538,10 @@ mod tests {
     fn default_archived_artifacts_have_archive_contracts() {
         for kind in GIT_ARCHIVE_DEFAULT_ARTIFACTS {
             let rule = retention_rule(*kind).expect("rule");
+            assert!(
+                rule.has_git_archive_path(),
+                "{kind:?} should have a Git archive path"
+            );
             assert!(
                 rule.archives_to_git_by_default(),
                 "{kind:?} should archive to Git"
@@ -541,6 +559,41 @@ mod tests {
                 "{kind:?} must remain comparable after archive"
             );
         }
+    }
+
+    #[test]
+    fn archive_lists_exactly_match_rule_partition() {
+        let default_from_rules: HashSet<_> = ATC_RETENTION_RULES
+            .iter()
+            .filter(|rule| rule.archives_to_git_by_default())
+            .map(|rule| rule.artifact)
+            .collect();
+        let promotion_only_from_rules: HashSet<_> = ATC_RETENTION_RULES
+            .iter()
+            .filter(|rule| rule.requires_explicit_promotion())
+            .map(|rule| rule.artifact)
+            .collect();
+        let denylisted_from_rules: HashSet<_> = ATC_RETENTION_RULES
+            .iter()
+            .filter(|rule| !rule.has_git_archive_path())
+            .map(|rule| rule.artifact)
+            .collect();
+
+        assert_eq!(
+            default_from_rules,
+            artifact_set(GIT_ARCHIVE_DEFAULT_ARTIFACTS),
+            "default archive list drifted from retention rules"
+        );
+        assert_eq!(
+            promotion_only_from_rules,
+            artifact_set(GIT_ARCHIVE_PROMOTION_ONLY_ARTIFACTS),
+            "promotion-only archive list drifted from retention rules"
+        );
+        assert_eq!(
+            denylisted_from_rules,
+            artifact_set(GIT_ARCHIVE_DENYLIST),
+            "denylist drifted from retention rules"
+        );
     }
 
     #[test]
@@ -619,11 +672,6 @@ mod tests {
 
     #[test]
     fn periodic_audit_is_bounded_and_low_write_amplification() {
-        assert!(PERIODIC_AUDIT_CADENCE_DAYS >= 1);
-        assert!(
-            PERIODIC_AUDIT_CADENCE_DAYS <= OPEN_EXPERIENCE_STALE_AFTER_DAYS,
-            "audit cadence should not exceed the stale-open-experience threshold"
-        );
         assert!(!GIT_ARCHIVE_EXPLICIT_EXCLUSIONS.is_empty());
     }
 }

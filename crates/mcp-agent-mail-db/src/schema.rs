@@ -1312,14 +1312,41 @@ pub fn schema_migrations() -> Vec<Migration> {
     // Adds EWMA-smoothed loss, EWMA count weight, and delay histogram
     // bins to the rollup table. These are computed incrementally on
     // resolution and never require raw-history rescans.
+    //
+    // Each ALTER TABLE must be its own migration — SQLite does not
+    // support multiple ALTER TABLE statements in a single execution.
     migrations.push(Migration::new(
-        "v18_rollup_ewma_columns".to_string(),
-        "add EWMA and delay columns to experience rollups".to_string(),
-        "ALTER TABLE atc_experience_rollups ADD COLUMN ewma_loss REAL NOT NULL DEFAULT 0.0;\
-         ALTER TABLE atc_experience_rollups ADD COLUMN ewma_weight REAL NOT NULL DEFAULT 0.0;\
-         ALTER TABLE atc_experience_rollups ADD COLUMN delay_sum_micros INTEGER NOT NULL DEFAULT 0;\
-         ALTER TABLE atc_experience_rollups ADD COLUMN delay_count INTEGER NOT NULL DEFAULT 0;\
-         ALTER TABLE atc_experience_rollups ADD COLUMN delay_max_micros INTEGER NOT NULL DEFAULT 0"
+        "v18_rollup_ewma_loss".to_string(),
+        "add EWMA loss column to experience rollups".to_string(),
+        "ALTER TABLE atc_experience_rollups ADD COLUMN ewma_loss REAL NOT NULL DEFAULT 0.0"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v18_rollup_ewma_weight".to_string(),
+        "add EWMA weight column to experience rollups".to_string(),
+        "ALTER TABLE atc_experience_rollups ADD COLUMN ewma_weight REAL NOT NULL DEFAULT 0.0"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v18_rollup_delay_sum".to_string(),
+        "add delay sum column to experience rollups".to_string(),
+        "ALTER TABLE atc_experience_rollups ADD COLUMN delay_sum_micros INTEGER NOT NULL DEFAULT 0"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v18_rollup_delay_count".to_string(),
+        "add delay count column to experience rollups".to_string(),
+        "ALTER TABLE atc_experience_rollups ADD COLUMN delay_count INTEGER NOT NULL DEFAULT 0"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v18_rollup_delay_max".to_string(),
+        "add delay max column to experience rollups".to_string(),
+        "ALTER TABLE atc_experience_rollups ADD COLUMN delay_max_micros INTEGER NOT NULL DEFAULT 0"
             .to_string(),
         String::new(),
     ));

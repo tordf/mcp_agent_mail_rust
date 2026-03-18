@@ -517,9 +517,10 @@ pub const ASSUMPTIONS_LEDGER: &[AssumptionEntry] = &[
                                    increase.",
             promotion_evidence: "N/A — active by construction as the uncertainty quantifier \
                                  for the release gate.",
-            sunset_evidence: "If empirical coverage drops below 80% (nominal 90%) for \
-                              >500 consecutive observations despite proper sliding window \
-                              maintenance, the method is suspect.",
+            sunset_evidence: "If the conformal interval width is consistently narrow enough \
+                              that is_uncertain() never triggers over 10,000+ decisions, the \
+                              gating mechanism adds no value — predictions are already confident \
+                              and the conformal check is pure overhead.",
             risk_tier: 2,
         },
         assumptions: &[
@@ -606,10 +607,11 @@ pub const ASSUMPTIONS_LEDGER: &[AssumptionEntry] = &[
                                   files. Without rhythm tracking, detection depends on \
                                   fixed timeouts that are too aggressive for slow agents \
                                   or too lenient for fast ones.",
-            what_happens_without: "Fixed timeout (e.g., 300s for all agents). Claude Code \
-                                   agents (typical 60s interval) would be detected slowly; \
-                                   Codex agents (typical 120s interval) would trigger false \
-                                   alarms frequently.",
+            what_happens_without: "A single fixed timeout cannot serve all agent types. Set it \
+                                   high (300s) and fast agents (Claude Code, 60s) have 5-minute \
+                                   detection delays. Set it low (90s) and slow agents trigger \
+                                   constant false suspicion. Per-agent rhythm tracking adapts \
+                                   the threshold to each agent's observed behavior.",
             promotion_evidence: "N/A — active by construction as the primary liveness \
                                  detection mechanism.",
             sunset_evidence: "If all agent types converge to similar activity patterns \
@@ -693,9 +695,11 @@ pub const ASSUMPTIONS_LEDGER: &[AssumptionEntry] = &[
                                   default prior (300s) is too conservative for fast agents \
                                   (Claude Code at 60s) or too aggressive for slow agents.",
             what_happens_without: "All new agents use the same 300s default prior. Fast \
-                                   agents get unnecessary probes for the first ~10 observations; \
-                                   slow agents are falsely declared alive when they are actually \
-                                   unresponsive.",
+                                   agents (Claude Code at 60s) have delayed crash detection \
+                                   during cold start — the 300s threshold is too lenient, so a \
+                                   crash goes unnoticed for ~5 minutes instead of ~1 minute. \
+                                   Very slow agents (>300s natural interval) get false suspicion \
+                                   alerts because the 300s threshold is too aggressive for them.",
             promotion_evidence: "N/A — active by construction as the prior provider.",
             sunset_evidence: "If all agent programs converge to the same activity pattern \
                               (inter-program variance < 10% of intra-program variance), \

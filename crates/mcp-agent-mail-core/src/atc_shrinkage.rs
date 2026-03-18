@@ -264,14 +264,12 @@ pub fn compute_cohort_stats(estimates: &[StratumEstimate]) -> CohortStats {
             .filter_map(|e| e.local_variance)
             .collect();
         if vars.is_empty() {
-            // Fallback: estimate within-variance from grand mean residuals
-            // scaled by sample sizes (assumes Poisson-like variance).
-            let avg_n = total_count as f64 / strata_count as f64;
-            if avg_n > 0.0 {
-                grand_mean * (1.0 - grand_mean) / avg_n
-            } else {
-                0.01 // safe fallback
-            }
+            // Fallback: use the between-strata variance as a proxy for
+            // within-variance. This is conservative (over-estimates within
+            // relative to between, which biases toward more shrinkage).
+            // We avoid the Bernoulli p*(1-p) formula because loss values
+            // can exceed 1.0.
+            (between_variance / strata_count as f64).max(0.01)
         } else {
             vars.iter().sum::<f64>() / vars.len() as f64
         }
