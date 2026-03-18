@@ -178,6 +178,8 @@ import json
 import sys
 
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+if data.get("mode") == "replay" and isinstance(data.get("events"), list) and data["events"]:
+    data = data["events"][-1]
 print(
     "\t".join(
         [
@@ -240,6 +242,42 @@ dashboard_wait_for_live_screen() {
     return 1
 }
 
+dashboard_wait_for_live_screen_stream() {
+    local case_prefix="$1"
+    local expected_key="$2"
+    local expected_title="$3"
+    local timeout_s="${4:-15}"
+    local since_seq="${5:-0}"
+    local case_id="${case_prefix}_stream"
+    local query_url="${DASH_URL}/stream?token=${TOKEN}&since=${since_seq}&wait_ms=$((timeout_s * 1000))"
+    local status=""
+    local body_file=""
+    local summary=""
+    local mode=""
+    local screen_key=""
+    local screen_title=""
+    local seq=""
+
+    status="$(dash_curl "${case_id}" GET "${query_url}")"
+    require_observed_http_status "${case_id}" "${status}"
+    if [ "${status}" != "200" ]; then
+        e2e_fail "${case_id}: expected HTTP 200 from /stream, got ${status}"
+        return 1
+    fi
+    body_file="${E2E_ARTIFACT_DIR}/${case_id}/body.txt"
+    summary="$(dashboard_json_summary "${body_file}")" || return 1
+    IFS=$'\t' read -r mode screen_key screen_title seq <<< "${summary}"
+    if { [ "${mode}" = "snapshot" ] || [ "${mode}" = "delta" ] || [ "${mode}" = "replay" ]; } \
+        && [ "${screen_key}" = "${expected_key}" ] \
+        && [ "${screen_title}" = "${expected_title}" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "${case_id}" "${mode}" "${screen_key}" "${screen_title}" "${seq}"
+        return 0
+    fi
+
+    e2e_fail "${case_id}: expected ${expected_key}/${expected_title} from /stream, got mode=${mode} screen_key=${screen_key} screen_title=${screen_title} seq=${seq}"
+    return 1
+}
+
 if ! start_headless_dashboard_server; then
     e2e_fail "headless dashboard server failed to start"
     e2e_summary
@@ -282,6 +320,15 @@ e2e_assert_contains "dashboard state is inactive in headless mode" "${BODY}" '"m
 e2e_assert_contains "dashboard state carries poll_state payload" "${BODY}" '"poll_state"'
 e2e_mark_case_end "case03_dashboard_state_token"
 
+e2e_case_banner "Dashboard stream with valid token while headless"
+e2e_mark_case_start "case03b_dashboard_stream_token"
+STATUS=$(dash_curl "case03b_dashboard_stream_token" GET "${DASH_URL}/stream?token=${TOKEN}&wait_ms=250")
+require_observed_http_status "case03b_dashboard_stream_token" "${STATUS}"
+e2e_assert_eq "dashboard stream returns 200" "200" "${STATUS}"
+BODY="$(cat "${E2E_ARTIFACT_DIR}/case03b_dashboard_stream_token/body.txt" 2>/dev/null || true)"
+e2e_assert_contains "dashboard stream is inactive in headless mode" "${BODY}" '"mode":"inactive"'
+e2e_mark_case_end "case03b_dashboard_stream_token"
+
 e2e_case_banner "Dashboard state without auth"
 e2e_mark_case_start "case04_dashboard_state_unauthorized"
 STATUS=$(dash_curl "case04_dashboard_state_unauthorized" GET "${DASH_URL}/state")
@@ -296,6 +343,21 @@ else
 fi
 e2e_assert_contains "dashboard state unauthorized response mentions unauthorized" "${BODY}" '"Unauthorized"'
 e2e_mark_case_end "case04_dashboard_state_unauthorized"
+
+e2e_case_banner "Dashboard stream without auth"
+e2e_mark_case_start "case04b_dashboard_stream_unauthorized"
+STATUS=$(dash_curl "case04b_dashboard_stream_unauthorized" GET "${DASH_URL}/stream")
+require_observed_http_status "case04b_dashboard_stream_unauthorized" "${STATUS}"
+e2e_assert_eq "dashboard stream without auth returns 401" "401" "${STATUS}"
+HEADERS="$(cat "${E2E_ARTIFACT_DIR}/case04b_dashboard_stream_unauthorized/headers.txt" 2>/dev/null || true)"
+BODY="$(cat "${E2E_ARTIFACT_DIR}/case04b_dashboard_stream_unauthorized/body.txt" 2>/dev/null || true)"
+if echo "${HEADERS}" | grep -qi "content-type.*application/json"; then
+    e2e_pass "dashboard stream unauthorized route returns JSON"
+else
+    e2e_fail "dashboard stream unauthorized route should return JSON"
+fi
+e2e_assert_contains "dashboard stream unauthorized response mentions unauthorized" "${BODY}" '"Unauthorized"'
+e2e_mark_case_end "case04b_dashboard_stream_unauthorized"
 
 e2e_case_banner "Dashboard input with valid token while headless"
 e2e_mark_case_start "case05_dashboard_input_headless"
@@ -379,17 +441,17 @@ e2e_assert_contains "live dashboard input accepts exactly one event" "${BODY}" '
 e2e_assert_contains "live dashboard input reports queue depth" "${BODY}" '"queue_depth"'
 e2e_mark_case_end "case08_dashboard_live_input"
 
-e2e_case_banner "Live dashboard reflects the Messages screen after browser input"
+e2e_case_banner "Live dashboard stream wakes up on the Messages screen after browser input"
 e2e_mark_case_start "case09_dashboard_live_messages"
-LIVE_RESULT="$(dashboard_wait_for_live_screen "case09_dashboard_live_messages_poll" "messages" "Messages" 15 "${LIVE_SEQ}")"
+LIVE_RESULT="$(dashboard_wait_for_live_screen_stream "case09_dashboard_live_messages" "messages" "Messages" 15 "${LIVE_SEQ}")"
 IFS=$'\t' read -r LIVE_CASE_ID LIVE_MODE LIVE_SCREEN_KEY LIVE_SCREEN_TITLE LIVE_SEQ <<< "${LIVE_RESULT}"
 e2e_assert_eq "live dashboard screen changes to Messages" "messages" "${LIVE_SCREEN_KEY}"
 e2e_assert_eq "live dashboard title changes to Messages" "Messages" "${LIVE_SCREEN_TITLE}"
 BODY="$(cat "${E2E_ARTIFACT_DIR}/${LIVE_CASE_ID}/body.txt" 2>/dev/null || true)"
-if [[ "${BODY}" == *'"mode":"delta"'* ]] || [[ "${BODY}" == *'"mode":"snapshot"'* ]]; then
-    e2e_pass "live dashboard change published as delta or snapshot"
+if [[ "${BODY}" == *'"mode":"delta"'* ]] || [[ "${BODY}" == *'"mode":"snapshot"'* ]] || [[ "${BODY}" == *'"mode":"replay"'* ]]; then
+    e2e_pass "live dashboard stream returns delta, snapshot, or replay"
 else
-    e2e_fail "live dashboard change should publish a delta or snapshot"
+    e2e_fail "live dashboard stream should publish a delta, snapshot, or replay"
 fi
 e2e_assert_contains "live dashboard change advertises Messages screen key" "${BODY}" '"screen_key":"messages"'
 e2e_mark_case_end "case09_dashboard_live_messages"

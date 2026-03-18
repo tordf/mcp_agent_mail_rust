@@ -22,10 +22,12 @@
 //!
 //! Target: < 500µs capture for 200×50 grids, < 1µs serve.
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use ftui::render::buffer::Buffer;
 use mcp_agent_mail_core::now_micros;
@@ -41,21 +43,80 @@ use crate::tui_ws_state;
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Pre-computed "unchanged" response (no frame data).
-fn unchanged_response(seq: u64) -> String {
-    format!(r#"{{"mode":"unchanged","seq":{seq}}}"#)
+fn unchanged_response(seq: u64, active_viewers: usize, journal_depth: usize) -> String {
+    format!(
+        r#"{{"mode":"unchanged","seq":{seq},"active_viewers":{active_viewers},"journal_depth":{journal_depth}}}"#
+    )
 }
 
 const WARMING_RETRY_MS: u64 = 250;
 const INACTIVE_RETRY_MS: u64 = 1_000;
+const DEFAULT_STREAM_WAIT_MS: u64 = 15_000;
+const MIN_STREAM_WAIT_MS: u64 = 100;
+const MAX_STREAM_WAIT_MS: u64 = 30_000;
+const MAX_DELTA_JOURNAL: usize = 64;
+const VIEWER_STALE_AFTER_US: i64 = 15_000_000;
+const IDLE_CAPTURE_INTERVAL_US: i64 = 1_000_000;
+const MAX_TRACKED_VIEWERS: usize = 64;
+
+#[derive(Debug, Clone)]
+struct JournalEntry {
+    seq: u64,
+    payload: Arc<str>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct DashboardQuery {
+    since_seq: Option<u64>,
+    wait_ms: Option<u64>,
+    client_id: Option<String>,
+}
+
+fn parse_dashboard_query(query: Option<&str>) -> DashboardQuery {
+    let mut out = DashboardQuery::default();
+    let Some(query) = query else {
+        return out;
+    };
+
+    for part in query.split('&') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "since" => {
+                out.since_seq = value.parse::<u64>().ok();
+            }
+            "wait_ms" => {
+                out.wait_ms = value
+                    .parse::<u64>()
+                    .ok()
+                    .map(|wait_ms| wait_ms.clamp(MIN_STREAM_WAIT_MS, MAX_STREAM_WAIT_MS));
+            }
+            "client" => {
+                if !value.is_empty()
+                    && value.len() <= 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                {
+                    out.client_id = Some(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
 
 // ─── Frame store ────────────────────────────────────────────────────────────
 
 /// Internal state held under the mutex.
 struct FrameState {
-    /// Raw cell bytes from previous capture (for delta computation).
-    prev_bytes: Vec<u8>,
-    /// Current raw cell bytes.
-    curr_bytes: Vec<u8>,
+    /// Raw cell bytes for the currently published frame.
+    published_bytes: Vec<u8>,
+    /// Scratch buffer reused while preparing the next frame.
+    scratch_bytes: Vec<u8>,
     /// Grid dimensions of the current frame.
     cols: u16,
     rows: u16,
@@ -68,6 +129,16 @@ struct FrameState {
     cached_delta: Arc<str>,
     /// Sequence number of the cached snapshot.
     snapshot_seq: u64,
+    /// Recently published frame updates, oldest-first.
+    journal: VecDeque<JournalEntry>,
+    /// Active browser viewers keyed by their ephemeral client id.
+    viewers: HashMap<String, i64>,
+    /// Last timestamp at which any browser viewer was seen.
+    last_viewer_seen_us: i64,
+    /// Last timestamp at which an idle fallback capture was still published.
+    last_idle_publish_us: i64,
+    /// Number of captures skipped because there were no recent viewers.
+    idle_skip_total: u64,
 }
 
 impl Default for FrameState {
@@ -76,8 +147,8 @@ impl Default for FrameState {
             r#"{"mode":"snapshot","seq":0,"cols":0,"rows":0,"screen_id":0,"screen_key":"","screen_title":"","timestamp_us":0,"cells":""}"#,
         );
         Self {
-            prev_bytes: Vec::new(),
-            curr_bytes: Vec::new(),
+            published_bytes: Vec::new(),
+            scratch_bytes: Vec::new(),
             cols: 0,
             rows: 0,
             screen_id: 0,
@@ -86,6 +157,11 @@ impl Default for FrameState {
             cached_snapshot: Arc::clone(&empty),
             cached_delta: empty,
             snapshot_seq: 0,
+            journal: VecDeque::with_capacity(MAX_DELTA_JOURNAL),
+            viewers: HashMap::new(),
+            last_viewer_seen_us: 0,
+            last_idle_publish_us: 0,
+            idle_skip_total: 0,
         }
     }
 }
@@ -94,6 +170,7 @@ impl Default for FrameState {
 #[derive(Debug)]
 pub struct WebDashboardFrameStore {
     state: Mutex<FrameState>,
+    publish_cv: Condvar,
     seq: AtomicU64,
 }
 
@@ -103,7 +180,9 @@ impl std::fmt::Debug for FrameState {
             .field("cols", &self.cols)
             .field("rows", &self.rows)
             .field("snapshot_seq", &self.snapshot_seq)
-            .field("curr_bytes_len", &self.curr_bytes.len())
+            .field("published_bytes_len", &self.published_bytes.len())
+            .field("journal_depth", &self.journal.len())
+            .field("viewer_count", &self.viewers.len())
             .finish()
     }
 }
@@ -112,8 +191,143 @@ impl WebDashboardFrameStore {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(FrameState::default()),
+            publish_cv: Condvar::new(),
             seq: AtomicU64::new(0),
         }
+    }
+
+    fn append_runtime_metadata(
+        active_viewers: usize,
+        journal_depth: usize,
+        idle_skip_total: u64,
+        out: &mut String,
+    ) {
+        write!(
+            out,
+            ",\"active_viewers\":{},\"journal_depth\":{},\"idle_skip_total\":{}",
+            active_viewers, journal_depth, idle_skip_total
+        )
+        .unwrap();
+    }
+
+    fn prune_stale_viewers(state: &mut FrameState, now_us: i64) {
+        state.viewers.retain(|_, last_seen_us| {
+            now_us.saturating_sub(*last_seen_us) <= VIEWER_STALE_AFTER_US
+        });
+    }
+
+    fn touch_viewer_locked(state: &mut FrameState, client_id: Option<&str>, now_us: i64) {
+        Self::prune_stale_viewers(state, now_us);
+        let Some(client_id) = client_id.filter(|client_id| !client_id.is_empty()) else {
+            return;
+        };
+
+        if !state.viewers.contains_key(client_id) && state.viewers.len() >= MAX_TRACKED_VIEWERS {
+            let oldest_key = state
+                .viewers
+                .iter()
+                .min_by_key(|(_, last_seen_us)| *last_seen_us)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest_key) = oldest_key {
+                state.viewers.remove(&oldest_key);
+            }
+        }
+
+        state.viewers.insert(client_id.to_string(), now_us);
+        state.last_viewer_seen_us = now_us;
+    }
+
+    pub fn touch_viewer(&self, client_id: Option<&str>) {
+        let now_us = now_micros();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::touch_viewer_locked(&mut guard, client_id, now_us);
+    }
+
+    fn should_skip_idle_capture(state: &mut FrameState, now_us: i64) -> bool {
+        Self::prune_stale_viewers(state, now_us);
+        if !state.viewers.is_empty() {
+            return false;
+        }
+        if now_us.saturating_sub(state.last_idle_publish_us) >= IDLE_CAPTURE_INTERVAL_US {
+            state.last_idle_publish_us = now_us;
+            return false;
+        }
+        state.idle_skip_total = state.idle_skip_total.saturating_add(1);
+        true
+    }
+
+    fn replay_response(state: &FrameState, since_seq: u64) -> Option<String> {
+        let current_seq = state.snapshot_seq;
+        let first_needed = since_seq.saturating_add(1);
+        let first_available = state.journal.front()?.seq;
+        if first_needed < first_available {
+            return None;
+        }
+
+        let mut entries = Vec::new();
+        let mut expected = first_needed;
+        for entry in state
+            .journal
+            .iter()
+            .filter(|entry| entry.seq >= first_needed)
+        {
+            if entry.seq != expected {
+                return None;
+            }
+            entries.push(entry);
+            if entry.seq == current_seq {
+                break;
+            }
+            expected = expected.saturating_add(1);
+        }
+
+        if entries
+            .last()
+            .map_or(true, |entry| entry.seq != current_seq)
+        {
+            return None;
+        }
+
+        if entries.len() == 1 {
+            return Some(entries[0].payload.to_string());
+        }
+
+        let payload_len = entries
+            .iter()
+            .map(|entry| entry.payload.len())
+            .sum::<usize>();
+        let mut replay = String::with_capacity(payload_len + 160);
+        write!(
+            replay,
+            "{{\"mode\":\"replay\",\"from_seq\":{since_seq},\"to_seq\":{current_seq},\"active_viewers\":{},\"journal_depth\":{},\"events\":[",
+            state.viewers.len(),
+            state.journal.len()
+        )
+        .unwrap();
+        let mut first = true;
+        for entry in entries {
+            if !first {
+                replay.push(',');
+            }
+            first = false;
+            replay.push_str(entry.payload.as_ref());
+        }
+        replay.push_str("]}");
+        Some(replay)
+    }
+
+    fn response_for_since_locked(state: &FrameState, since_seq: Option<u64>) -> String {
+        let current_seq = state.snapshot_seq;
+        if let Some(since) = since_seq {
+            if since >= current_seq {
+                return unchanged_response(current_seq, state.viewers.len(), state.journal.len());
+            }
+            if let Some(replay) = Self::replay_response(state, since) {
+                return replay;
+            }
+        }
+
+        state.cached_snapshot.to_string()
     }
 
     /// Capture a rendered buffer into the store.  Called from the TUI render
@@ -141,29 +355,44 @@ impl WebDashboardFrameStore {
         let ts = now_micros();
 
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let new_seq = guard.snapshot_seq.saturating_add(1);
+        if Self::should_skip_idle_capture(&mut guard, ts) {
+            return;
+        }
 
-        // Swap prev ← curr, then reuse curr's allocation for the new frame.
-        // Take curr out, swap, put back — avoids double-borrow on guard fields.
-        let mut new_curr = std::mem::take(&mut guard.prev_bytes);
-        guard.prev_bytes = std::mem::take(&mut guard.curr_bytes);
-        new_curr.clear();
-        if new_curr.capacity() < byte_len {
-            new_curr.reserve(byte_len - new_curr.capacity());
+        let mut next_bytes = std::mem::take(&mut guard.scratch_bytes);
+        next_bytes.clear();
+        if next_bytes.capacity() < byte_len {
+            next_bytes.reserve(byte_len - next_bytes.capacity());
         }
 
         // Copy raw cell data: Cell is #[repr(C, align(16))] = [content:u32, fg:u32, bg:u32, attrs:u32].
         // We extract fields individually because the Cell's alignment padding
         // makes a raw memcpy incorrect (padding bytes are undefined).
         for cell in cells {
-            new_curr.extend_from_slice(&cell.content.raw().to_le_bytes());
-            new_curr.extend_from_slice(&cell.fg.0.to_le_bytes());
-            new_curr.extend_from_slice(&cell.bg.0.to_le_bytes());
-            new_curr.extend_from_slice(&cell_attrs_raw(&cell.attrs).to_le_bytes());
+            next_bytes.extend_from_slice(&cell.content.raw().to_le_bytes());
+            next_bytes.extend_from_slice(&cell.fg.0.to_le_bytes());
+            next_bytes.extend_from_slice(&cell.bg.0.to_le_bytes());
+            next_bytes.extend_from_slice(&cell_attrs_raw(&cell.attrs).to_le_bytes());
         }
 
+        let same_dims = guard.published_bytes.len() == next_bytes.len()
+            && guard.cols == cols
+            && guard.rows == rows;
+        let same_screen = guard.screen_id == screen_id
+            && guard.screen_key == screen_key
+            && guard.screen_title == screen_title;
+        if same_dims && same_screen && guard.published_bytes == next_bytes {
+            guard.scratch_bytes = next_bytes;
+            return;
+        }
+
+        let new_seq = guard.snapshot_seq.saturating_add(1);
+        let next_journal_depth = guard.journal.len().min(MAX_DELTA_JOURNAL.saturating_sub(1)) + 1;
+        let active_viewers = guard.viewers.len();
+        let idle_skip_total = guard.idle_skip_total;
+
         // ── Build snapshot response (base64-encoded raw bytes) ──────
-        let b64_len = (new_curr.len() + 2) / 3 * 4;
+        let b64_len = (next_bytes.len() + 2) / 3 * 4;
         // Pre-size: ~130 chars header + b64 + ~2 chars footer
         let mut snap = String::with_capacity(140 + b64_len);
         write!(
@@ -175,15 +404,19 @@ impl WebDashboardFrameStore {
         snap.push_str(",\"screen_title\":");
         push_json_string(&mut snap, screen_title);
         write!(snap, ",\"timestamp_us\":{ts},\"cells\":\"").unwrap();
-        base64_encode_into(&new_curr, &mut snap);
-        snap.push_str("\"}");
-        guard.cached_snapshot = Arc::from(snap.as_str());
+        base64_encode_into(&next_bytes, &mut snap);
+        snap.push('"');
+        Self::append_runtime_metadata(
+            active_viewers,
+            next_journal_depth,
+            idle_skip_total,
+            &mut snap,
+        );
+        write!(snap, ",\"changed_cells\":{n_cells}}}").unwrap();
+        let snapshot_payload: Arc<str> = Arc::from(snap.as_str());
 
         // ── Build delta response (only changed cell indices) ────────
-        let same_dims =
-            guard.prev_bytes.len() == new_curr.len() && guard.cols == cols && guard.rows == rows;
-
-        if same_dims {
+        let delta_payload = if same_dims {
             // Compare 16-byte chunks, collect indices of changed cells.
             let mut delta = String::with_capacity(256);
             write!(
@@ -196,50 +429,70 @@ impl WebDashboardFrameStore {
             push_json_string(&mut delta, screen_title);
             write!(delta, ",\"timestamp_us\":{ts},\"changed\":[").unwrap();
             let mut first = true;
-            let prev = &guard.prev_bytes;
+            let mut changed_cells = 0_usize;
+            let prev = &guard.published_bytes;
             for i in 0..n_cells {
                 let off = i * 16;
-                if prev[off..off + 16] != new_curr[off..off + 16] {
+                if prev[off..off + 16] != next_bytes[off..off + 16] {
                     if !first {
                         delta.push(',');
                     }
                     first = false;
+                    changed_cells = changed_cells.saturating_add(1);
                     // Emit: [idx, content, fg, bg, attrs]
                     let c = u32::from_le_bytes([
-                        new_curr[off],
-                        new_curr[off + 1],
-                        new_curr[off + 2],
-                        new_curr[off + 3],
+                        next_bytes[off],
+                        next_bytes[off + 1],
+                        next_bytes[off + 2],
+                        next_bytes[off + 3],
                     ]);
                     let f = u32::from_le_bytes([
-                        new_curr[off + 4],
-                        new_curr[off + 5],
-                        new_curr[off + 6],
-                        new_curr[off + 7],
+                        next_bytes[off + 4],
+                        next_bytes[off + 5],
+                        next_bytes[off + 6],
+                        next_bytes[off + 7],
                     ]);
                     let b = u32::from_le_bytes([
-                        new_curr[off + 8],
-                        new_curr[off + 9],
-                        new_curr[off + 10],
-                        new_curr[off + 11],
+                        next_bytes[off + 8],
+                        next_bytes[off + 9],
+                        next_bytes[off + 10],
+                        next_bytes[off + 11],
                     ]);
                     let a = u32::from_le_bytes([
-                        new_curr[off + 12],
-                        new_curr[off + 13],
-                        new_curr[off + 14],
-                        new_curr[off + 15],
+                        next_bytes[off + 12],
+                        next_bytes[off + 13],
+                        next_bytes[off + 14],
+                        next_bytes[off + 15],
                     ]);
                     write!(delta, "[{i},{c},{f},{b},{a}]").unwrap();
                 }
             }
-            delta.push_str("]}");
-            guard.cached_delta = Arc::from(delta.as_str());
+            delta.push(']');
+            Self::append_runtime_metadata(
+                active_viewers,
+                next_journal_depth,
+                idle_skip_total,
+                &mut delta,
+            );
+            write!(delta, ",\"changed_cells\":{changed_cells}}}").unwrap();
+            Arc::from(delta.as_str())
         } else {
             // Dimensions changed — no valid delta, use snapshot.
-            guard.cached_delta = Arc::clone(&guard.cached_snapshot);
-        }
+            Arc::clone(&snapshot_payload)
+        };
 
-        guard.curr_bytes = new_curr;
+        guard.cached_snapshot = Arc::clone(&snapshot_payload);
+        guard.cached_delta = Arc::clone(&delta_payload);
+        if guard.journal.len() == MAX_DELTA_JOURNAL {
+            guard.journal.pop_front();
+        }
+        guard.journal.push_back(JournalEntry {
+            seq: new_seq,
+            payload: Arc::clone(&delta_payload),
+        });
+
+        let previous_bytes = std::mem::replace(&mut guard.published_bytes, next_bytes);
+        guard.scratch_bytes = previous_bytes;
         guard.cols = cols;
         guard.rows = rows;
         guard.screen_id = screen_id;
@@ -247,6 +500,7 @@ impl WebDashboardFrameStore {
         guard.screen_title = screen_title;
         guard.snapshot_seq = new_seq;
         self.seq.store(new_seq, Ordering::Relaxed);
+        self.publish_cv.notify_all();
     }
 
     /// Read the latest fully published sequence number without locking.
@@ -288,18 +542,21 @@ impl WebDashboardFrameStore {
     /// using one coherent view of the frame store state.
     fn response_for_since(&self, since_seq: Option<u64>) -> String {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let current_seq = guard.snapshot_seq;
+        Self::response_for_since_locked(&guard, since_seq)
+    }
 
-        if let Some(since) = since_seq {
-            if since >= current_seq {
-                return unchanged_response(current_seq);
-            }
-            if since + 1 >= current_seq {
-                return guard.cached_delta.to_string();
-            }
+    fn wait_response_for_since(&self, since_seq: Option<u64>, timeout: Duration) -> String {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(since) = since_seq
+            && since >= guard.snapshot_seq
+        {
+            let (next_guard, _) = self
+                .publish_cv
+                .wait_timeout_while(guard, timeout, |state| state.snapshot_seq <= since)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next_guard;
         }
-
-        guard.cached_snapshot.to_string()
+        Self::response_for_since_locked(&guard, since_seq)
     }
 }
 
@@ -372,15 +629,31 @@ fn push_json_string(out: &mut String, value: &str) {
 ///
 /// This avoids re-serializing frame data and returns a cached pre-built payload.
 pub fn handle_state(state: &TuiSharedState, query: Option<&str>) -> String {
-    let since_seq = query.and_then(|q| {
-        q.split('&')
-            .find_map(|kv| kv.strip_prefix("since="))
-            .and_then(|v| v.parse::<u64>().ok())
-    });
+    let query = parse_dashboard_query(query);
+    state
+        .web_dashboard_frame_store()
+        .touch_viewer(query.client_id.as_deref());
 
     state
         .web_dashboard_frame_store()
-        .response_for_since(since_seq)
+        .response_for_since(query.since_seq)
+}
+
+/// GET `/web-dashboard/stream` — long-poll until a new frame is published or the wait expires.
+///
+/// Query params:
+///   `since=<seq>` — wait for a frame newer than this sequence if possible.
+///   `wait_ms=<ms>` — maximum server-side wait before returning.
+///   `client=<id>` — ephemeral browser session id used for viewer tracking.
+pub fn handle_stream(state: &TuiSharedState, query: Option<&str>) -> String {
+    let query = parse_dashboard_query(query);
+    state
+        .web_dashboard_frame_store()
+        .touch_viewer(query.client_id.as_deref());
+    state.web_dashboard_frame_store().wait_response_for_since(
+        query.since_seq,
+        Duration::from_millis(query.wait_ms.unwrap_or(DEFAULT_STREAM_WAIT_MS)),
+    )
 }
 
 fn warming_response(state: &TuiSharedState, query: Option<&str>) -> String {
@@ -414,11 +687,51 @@ pub fn handle_state_response(
     fallback_state: &TuiSharedState,
     query: Option<&str>,
 ) -> (u16, String) {
+    let parsed = parse_dashboard_query(query);
     match live_state {
-        Some(state) if state.web_dashboard_frame_store().current_seq() > 0 => {
-            (200, handle_state(state, query))
+        Some(state) => {
+            state
+                .web_dashboard_frame_store()
+                .touch_viewer(parsed.client_id.as_deref());
+            if state.web_dashboard_frame_store().current_seq() > 0 {
+                (
+                    200,
+                    state
+                        .web_dashboard_frame_store()
+                        .response_for_since(parsed.since_seq),
+                )
+            } else {
+                (200, warming_response(state, query))
+            }
         }
-        Some(state) => (200, warming_response(state, query)),
+        None => (200, inactive_response(fallback_state, query)),
+    }
+}
+
+/// GET `/web-dashboard/stream` — long-poll live dashboard frames when available.
+pub fn handle_stream_response(
+    live_state: Option<&TuiSharedState>,
+    fallback_state: &TuiSharedState,
+    query: Option<&str>,
+) -> (u16, String) {
+    let parsed = parse_dashboard_query(query);
+    match live_state {
+        Some(state) => {
+            state
+                .web_dashboard_frame_store()
+                .touch_viewer(parsed.client_id.as_deref());
+            if state.web_dashboard_frame_store().current_seq() > 0 {
+                (
+                    200,
+                    state.web_dashboard_frame_store().wait_response_for_since(
+                        parsed.since_seq,
+                        Duration::from_millis(parsed.wait_ms.unwrap_or(DEFAULT_STREAM_WAIT_MS)),
+                    ),
+                )
+            } else {
+                (200, warming_response(state, query))
+            }
+        }
         None => (200, inactive_response(fallback_state, query)),
     }
 }
@@ -753,7 +1066,7 @@ button:focus-visible, a.btn:focus-visible {
       <p id="placeholder-detail">The dashboard is waiting for its first response.</p>
       <div class="controls">
         <button type="button" id="reset-btn">Force Snapshot</button>
-        <button type="button" id="pause-btn">Pause Polling</button>
+        <button type="button" id="pause-btn">Pause Updates</button>
         <button type="button" id="help-btn">Toggle Help</button>
         <a class="btn" id="mail-link" href="/mail">Open Mail UI</a>
       </div>
@@ -772,6 +1085,16 @@ button:focus-visible, a.btn:focus-visible {
     </section>
 
     <section class="card">
+      <h2>Quick Actions</h2>
+      <div class="controls" id="quick-actions">
+        <button type="button" data-key="1">Dashboard</button>
+        <button type="button" data-key="2">Messages</button>
+        <button type="button" data-key="3">Threads</button>
+        <button type="button" data-key="5">Search</button>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>Recent Events</h2>
       <div id="events">
         <div class="event event-empty">No recent events yet.</div>
@@ -781,9 +1104,10 @@ button:focus-visible, a.btn:focus-visible {
     <section class="card hidden" id="help-card">
       <h2>How To Use It</h2>
       <p>Live mode mirrors the terminal TUI into the browser and forwards keyboard input back to the server.</p>
+      <p>The browser prefers the live stream endpoint so updates arrive as soon as the server publishes a real frame, then falls back to ordinary polling if that transport fails.</p>
       <p>Warming mode means the live TUI exists but has not emitted its first browser frame yet.</p>
       <p>Inactive mode means the server is running headless or without a live terminal UI. In that case this page falls back to passive telemetry instead of pretending the mirror is working.</p>
-      <p>Use Force Snapshot if the browser falls behind. Pause Polling is useful when inspecting a static screen or reducing noise during debugging.</p>
+      <p>Use the quick-action buttons for common screen jumps. Force Snapshot resets the cursor if the browser falls behind. Pause Updates is useful when inspecting a static screen or reducing noise during debugging.</p>
     </section>
   </aside>
 </div>
@@ -796,11 +1120,14 @@ button:focus-visible, a.btn:focus-visible {
 "use strict";
 
 const STATE_BASE_URL = "/web-dashboard/state";
+const STREAM_BASE_URL = "/web-dashboard/stream";
 const INPUT_BASE_URL = "/web-dashboard/input";
 const ACTIVE_POLL_MS = 100;
 const WARMING_POLL_MS = 250;
 const INACTIVE_POLL_MS = 1000;
 const HIDDEN_POLL_MS = 2000;
+const STREAM_WAIT_MS = 15000;
+const INPUT_BATCH_WINDOW_MS = 12;
 const CW = 8;
 const CH = 16;
 const FONT = "14px monospace";
@@ -809,6 +1136,15 @@ const MAX_EVENT_RENDER = 10;
 const searchParams = new URLSearchParams(window.location.search);
 const authToken = searchParams.get("token");
 
+function createClientId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID().replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32);
+  }
+  return `dash${Math.random().toString(16).slice(2, 10)}${Date.now().toString(16).slice(-8)}`;
+}
+
+const dashboardClientId = createClientId();
+
 function withToken(url) {
   if (!authToken) {
     return url;
@@ -816,8 +1152,23 @@ function withToken(url) {
   return `${url}${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(authToken)}`;
 }
 
-const STATE_URL = withToken(STATE_BASE_URL);
-const INPUT_URL = withToken(INPUT_BASE_URL);
+function buildDashboardUrl(baseUrl, extraParams) {
+  const url = new URL(withToken(baseUrl), window.location.origin);
+  url.searchParams.set("client", dashboardClientId);
+  if (extraParams) {
+    for (const [key, value] of Object.entries(extraParams)) {
+      if (value == null || value === "") {
+        continue;
+      }
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return `${url.pathname}${url.search}`;
+}
+
+const STATE_URL = buildDashboardUrl(STATE_BASE_URL);
+const STREAM_URL = buildDashboardUrl(STREAM_BASE_URL);
+const INPUT_URL = buildDashboardUrl(INPUT_BASE_URL);
 const MAIL_UI_URL = withToken("/mail");
 
 const canvas = document.getElementById("terminal");
@@ -839,6 +1190,7 @@ const helpBtn = document.getElementById("help-btn");
 const pauseBtn = document.getElementById("pause-btn");
 const resetBtn = document.getElementById("reset-btn");
 const mailLink = document.getElementById("mail-link");
+const quickActions = document.getElementById("quick-actions");
 const stage = document.getElementById("stage");
 
 mailLink.setAttribute("href", MAIL_UI_URL);
@@ -851,6 +1203,12 @@ let lastScreenKey = "";
 let lastScreenTitle = "";
 let lastTimestampUs = 0;
 let lastPayloadSummary = "Waiting for state...";
+let lastTransportRttMs = 0;
+let lastFrameAgeMs = 0;
+let lastInputFlushAt = 0;
+let activeViewerCount = 0;
+let journalDepth = 0;
+let idleSkipTotal = 0;
 let frameCount = 0;
 let lastStatsTime = performance.now();
 let pollDelayMs = ACTIVE_POLL_MS;
@@ -859,6 +1217,15 @@ let pollPaused = false;
 let inputEnabled = false;
 let currentMode = "booting";
 let consecutiveFailures = 0;
+let transportMode = "booting";
+let streamHealthy = true;
+let streamLoopRunning = false;
+let inputFlushTimer = null;
+let inputBatchInFlight = false;
+let inputSendState = "idle";
+let pendingInputEvents = [];
+let inputServerQueueDepth = 0;
+let inputServerDroppedOldest = 0;
 
 let cellBuf = null;
 let imgData = null;
@@ -1096,11 +1463,11 @@ function renderSnapshot(data) {
 function applyDelta(data) {
   if (!cellBuf || data.cols !== lastCols || data.rows !== lastRows) {
     lastSeq = 0;
-    return;
+    return false;
   }
   const changed = Array.isArray(data.changed) ? data.changed : [];
   if (!changed.length) {
-    return;
+    return true;
   }
   const cols = data.cols;
   const width = cols * CW;
@@ -1166,6 +1533,7 @@ function applyDelta(data) {
     const row = (idx / lastCols) | 0;
     ctx.fillText(String.fromCodePoint(content), col * CW + 1, row * CH + 1);
   }
+  return true;
 }
 
 function formatActiveScreenLabel() {
@@ -1181,14 +1549,49 @@ function formatActiveScreenLabel() {
   return "-";
 }
 
+function updateFrameAge() {
+  if (!lastTimestampUs) {
+    lastFrameAgeMs = 0;
+    return;
+  }
+  lastFrameAgeMs = Math.max(0, Math.round((Date.now() * 1000 - lastTimestampUs) / 1000));
+}
+
+function consumeFrameMetadata(data) {
+  if (data.screen_id !== undefined) {
+    lastScreenId = data.screen_id;
+  }
+  if (data.screen_key) {
+    lastScreenKey = data.screen_key;
+  }
+  if (data.screen_title) {
+    lastScreenTitle = data.screen_title;
+  }
+  if (data.timestamp_us) {
+    lastTimestampUs = data.timestamp_us;
+  }
+  if (data.active_viewers != null) {
+    activeViewerCount = data.active_viewers;
+  }
+  if (data.journal_depth != null) {
+    journalDepth = data.journal_depth;
+  }
+  if (data.idle_skip_total != null) {
+    idleSkipTotal = data.idle_skip_total;
+  }
+  updateFrameAge();
+}
+
 function activeSessionPairs() {
   return [
     ["Mode", "Live mirror"],
+    ["Transport", transportMode],
     ["Screen", formatActiveScreenLabel()],
     ["Screen key", lastScreenKey || "-"],
     ["Sequence", lastSeq || 0],
     ["Grid", `${lastCols || 0} x ${lastRows || 0}`],
-    ["Input", inputEnabled ? "enabled" : "disabled"],
+    ["Viewers", activeViewerCount || 0],
+    ["Input", inputEnabled ? inputSendState : "disabled"],
     ["Mail UI", MAIL_UI_URL],
   ];
 }
@@ -1197,7 +1600,11 @@ function activeTelemetryPairs() {
   const timestamp = lastTimestampUs ? formatEventTimeMicros(lastTimestampUs) : "-";
   return [
     ["Last frame", timestamp],
-    ["Polling", `${pollDelayMs} ms`],
+    ["Frame age", lastTimestampUs ? `${lastFrameAgeMs} ms` : "-"],
+    ["Transport RTT", lastTransportRttMs ? `${lastTransportRttMs} ms` : "-"],
+    ["Server queue", inputEnabled ? inputServerQueueDepth : "-"],
+    ["Journal", journalDepth],
+    ["Idle skips", idleSkipTotal],
     ["Canvas", `${canvas.width || 0} x ${canvas.height || 0}`],
     ["Summary", truncateText(lastPayloadSummary, 120)],
   ];
@@ -1247,18 +1654,19 @@ function renderActiveSummary() {
       severity: "info",
       seq: lastSeq || 0,
       timestamp_micros: lastTimestampUs || 0,
-      message: `Live browser mirror active on ${formatActiveScreenLabel()}. Passive request/event telemetry appears when the dashboard is in warming or inactive mode.`,
+      message: `Live browser mirror active on ${formatActiveScreenLabel()} via ${transportMode}. Pending input batch=${pendingInputEvents.length}, server queue=${inputServerQueueDepth}, viewers=${activeViewerCount}.`,
     },
   ]);
 }
 
 function updateStats() {
+  updateFrameAge();
   const now = performance.now();
   if (now - lastStatsTime < 1000) {
     return;
   }
   if (currentMode === "live") {
-    statsEl.textContent = `${frameCount} polls/s | ${formatActiveScreenLabel()} | seq ${lastSeq} | ${lastCols} x ${lastRows}`;
+    statsEl.textContent = `${frameCount} updates/s | ${transportMode} | ${formatActiveScreenLabel()} | seq ${lastSeq} | ${lastCols} x ${lastRows} | viewers ${activeViewerCount}`;
   } else {
     statsEl.textContent = lastPayloadSummary;
   }
@@ -1267,10 +1675,20 @@ function updateStats() {
 }
 
 function buildStateUrl() {
-  if (lastSeq <= 0) {
-    return STATE_URL;
-  }
-  return `${STATE_URL}${STATE_URL.includes("?") ? "&" : "?"}since=${encodeURIComponent(String(lastSeq))}`;
+  return buildDashboardUrl(STATE_BASE_URL, {
+    since: lastSeq > 0 ? lastSeq : null,
+  });
+}
+
+function buildStreamUrl() {
+  return buildDashboardUrl(STREAM_BASE_URL, {
+    since: lastSeq > 0 ? lastSeq : null,
+    wait_ms: document.hidden ? Math.max(STREAM_WAIT_MS, 20000) : STREAM_WAIT_MS,
+  });
+}
+
+function buildInputUrl() {
+  return INPUT_URL;
 }
 
 function pollDelayForMode(mode, overrideMs) {
@@ -1299,31 +1717,37 @@ function schedulePoll(delayMs) {
   }, Math.max(0, delayMs));
 }
 
+function cancelInFlightStreamRequest() {
+  if (window.__dashboardStreamAbortController) {
+    window.__dashboardStreamAbortController.abort();
+    window.__dashboardStreamAbortController = null;
+  }
+}
+
 function forceSnapshotAndPoll() {
   lastSeq = 0;
+  streamHealthy = true;
+  cancelInFlightStreamRequest();
   schedulePoll(0);
 }
 
-function applyActivePayload(data) {
+function applyActivePayload(data, source, fromReplay) {
   currentMode = "live";
+  transportMode = source;
   inputEnabled = true;
-  lastScreenId = data.screen_id ?? lastScreenId;
-  lastScreenKey = data.screen_key || lastScreenKey;
-  lastScreenTitle = data.screen_title || lastScreenTitle;
-  if (data.timestamp_us) {
-    lastTimestampUs = data.timestamp_us;
-  }
+  consumeFrameMetadata(data);
 
   if (data.mode === "snapshot") {
     renderSnapshot(data);
     lastSeq = data.seq;
     lastPayloadSummary = `Live mirror on ${formatActiveScreenLabel()} (${data.cols} x ${data.rows})`;
   } else if (data.mode === "delta") {
-    applyDelta(data);
-    lastSeq = data.seq;
-    if (data.timestamp_us) {
-      lastTimestampUs = data.timestamp_us;
+    if (!applyDelta(data)) {
+      lastPayloadSummary = "Delta could not be applied locally; forcing a full snapshot.";
+      forceSnapshotAndPoll();
+      return false;
     }
+    lastSeq = data.seq;
     lastPayloadSummary = `Live mirror delta applied on ${formatActiveScreenLabel()}`;
   } else if (data.mode === "unchanged") {
     lastSeq = data.seq;
@@ -1332,12 +1756,39 @@ function applyActivePayload(data) {
 
   setStatus("ok", "Connected to live TUI mirror", "Live");
   showTerminal();
-  renderActiveSummary();
+  if (!fromReplay) {
+    renderActiveSummary();
+  }
   pollDelayMs = pollDelayForMode("live");
+  return true;
 }
 
-function applyFallbackPayload(data, modeLabel, eyebrow, title) {
+function applyReplayPayload(data, source) {
+  const events = Array.isArray(data.events) ? data.events : [];
+  if (!events.length) {
+    lastPayloadSummary = "Replay payload arrived without any frame events; forcing a snapshot.";
+    forceSnapshotAndPoll();
+    return false;
+  }
+  if (data.active_viewers != null) {
+    activeViewerCount = data.active_viewers;
+  }
+  if (data.journal_depth != null) {
+    journalDepth = data.journal_depth;
+  }
+  for (const event of events) {
+    if (!applyActivePayload(event, source, true)) {
+      return false;
+    }
+  }
+  lastPayloadSummary = `Replayed ${events.length} published updates on ${formatActiveScreenLabel()}`;
+  renderActiveSummary();
+  return true;
+}
+
+function applyFallbackPayload(data, modeLabel, eyebrow, title, source) {
   currentMode = data.mode;
+  transportMode = source;
   inputEnabled = false;
   lastSeq = 0;
   const pollState = data.poll_state || {};
@@ -1348,70 +1799,164 @@ function applyFallbackPayload(data, modeLabel, eyebrow, title) {
   pollDelayMs = pollDelayForMode(data.mode, data.retry_ms);
 }
 
+function handleDashboardPayload(data, source) {
+  if (data.mode === "snapshot" || data.mode === "delta" || data.mode === "unchanged") {
+    return applyActivePayload(data, source, false);
+  }
+  if (data.mode === "replay") {
+    return applyReplayPayload(data, source);
+  }
+  if (data.mode === "warming") {
+    applyFallbackPayload(data, "Warming", "Browser TUI Mirror", "Live TUI is starting", source);
+    return false;
+  }
+  if (data.mode === "inactive") {
+    applyFallbackPayload(
+      data,
+      "Passive telemetry",
+      "Passive Observability",
+      "Live TUI mirror unavailable",
+      source
+    );
+    return false;
+  }
+  throw new Error(`Unexpected dashboard mode: ${data.mode}`);
+}
+
+function handleRequestFailure(error, source) {
+  consecutiveFailures += 1;
+  inputEnabled = false;
+  currentMode = "error";
+  transportMode = source;
+  const detail = error && error.message ? error.message : String(error);
+  lastPayloadSummary = `Connection error: ${detail}`;
+  setStatus("err", `Connection error: ${detail}`, "Disconnected");
+  showPlaceholder(
+    "Connection Problem",
+    "Dashboard request failed",
+    "The browser could not fetch dashboard state. Check auth, server reachability, and whether the process is still running."
+  );
+  renderGrid(sessionGrid, [
+    ["Mode", "Disconnected"],
+    ["State URL", STATE_URL],
+    ["Transport", source],
+    ["Input", "disabled"],
+    ["Mail UI", MAIL_UI_URL],
+  ]);
+  renderGrid(telemetryGrid, [
+    ["Error", truncateText(detail, 160)],
+    ["Retries", consecutiveFailures],
+    ["Next poll", `${Math.min(5000, INACTIVE_POLL_MS * consecutiveFailures)} ms`],
+    ["Last seq", lastSeq || 0],
+  ]);
+  renderEvents([]);
+  pollDelayMs = pollDelayForMode("inactive", Math.min(5000, INACTIVE_POLL_MS * consecutiveFailures));
+}
+
+async function fetchDashboardPayload(url) {
+  const startedAt = performance.now();
+  const resp = await fetch(url, {
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+    signal: window.__dashboardStreamAbortController ? window.__dashboardStreamAbortController.signal : undefined,
+  });
+  lastTransportRttMs = Math.round(performance.now() - startedAt);
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+async function runStreamLoop() {
+  if (streamLoopRunning || pollPaused || !streamHealthy) {
+    return;
+  }
+  streamLoopRunning = true;
+  try {
+    while (!pollPaused && streamHealthy) {
+      window.__dashboardStreamAbortController = new AbortController();
+      const startedAt = performance.now();
+      const resp = await fetch(buildStreamUrl(), {
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        signal: window.__dashboardStreamAbortController.signal,
+      });
+      lastTransportRttMs = Math.round(performance.now() - startedAt);
+      window.__dashboardStreamAbortController = null;
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      consecutiveFailures = 0;
+      frameCount += 1;
+      const keepStreaming = handleDashboardPayload(data, "stream");
+      updateStats();
+      if (!keepStreaming) {
+        schedulePoll(pollDelayMs);
+        return;
+      }
+    }
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      return;
+    }
+    streamHealthy = false;
+    handleRequestFailure(error, "stream");
+    schedulePoll(pollDelayMs);
+  } finally {
+    window.__dashboardStreamAbortController = null;
+    streamLoopRunning = false;
+  }
+}
+
 async function poll() {
   if (pollPaused) {
-    statsEl.textContent = "Polling paused";
+    statsEl.textContent = "Updates paused";
     schedulePoll(pollDelayForMode(currentMode || "inactive", INACTIVE_POLL_MS));
     return;
   }
 
   try {
-    const resp = await fetch(buildStateUrl(), { cache: "no-store" });
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
-    const data = await resp.json();
+    const data = await fetchDashboardPayload(buildStateUrl());
     consecutiveFailures = 0;
     frameCount += 1;
-
-    if (data.mode === "snapshot" || data.mode === "delta" || data.mode === "unchanged") {
-      applyActivePayload(data);
-    } else if (data.mode === "warming") {
-      applyFallbackPayload(data, "Warming", "Browser TUI Mirror", "Live TUI is starting");
-    } else if (data.mode === "inactive") {
-      applyFallbackPayload(data, "Passive telemetry", "Passive Observability", "Live TUI mirror unavailable");
-    } else {
-      throw new Error(`Unexpected dashboard mode: ${data.mode}`);
+    const keepStreaming = handleDashboardPayload(data, "poll");
+    if (keepStreaming) {
+      streamHealthy = true;
+      cancelInFlightStreamRequest();
+      void runStreamLoop();
+      updateStats();
+      return;
     }
   } catch (error) {
-    consecutiveFailures += 1;
-    inputEnabled = false;
-    currentMode = "error";
-    const detail = error && error.message ? error.message : String(error);
-    lastPayloadSummary = `Connection error: ${detail}`;
-    setStatus("err", `Connection error: ${detail}`, "Disconnected");
-    showPlaceholder(
-      "Connection Problem",
-      "Dashboard request failed",
-      "The browser could not fetch dashboard state. Check auth, server reachability, and whether the process is still running."
-    );
-    renderGrid(sessionGrid, [
-      ["Mode", "Disconnected"],
-      ["State URL", STATE_URL],
-      ["Input", "disabled"],
-      ["Mail UI", MAIL_UI_URL],
-    ]);
-    renderGrid(telemetryGrid, [
-      ["Error", truncateText(detail, 160)],
-      ["Retries", consecutiveFailures],
-      ["Next poll", `${Math.min(5000, INACTIVE_POLL_MS * consecutiveFailures)} ms`],
-      ["Last seq", lastSeq || 0],
-    ]);
-    renderEvents([]);
-    pollDelayMs = pollDelayForMode("inactive", Math.min(5000, INACTIVE_POLL_MS * consecutiveFailures));
+    handleRequestFailure(error, "poll");
   }
 
   updateStats();
   schedulePoll(pollDelayMs);
 }
 
-function sendInputEvent(key, modifiers) {
-  return fetch(INPUT_URL, {
+function queueInputEvent(key, modifiers) {
+  pendingInputEvents.push({
+    type: "Input",
+    data: { kind: "Key", key, modifiers },
+  });
+  inputSendState = inputBatchInFlight ? "sending" : "queued";
+  renderActiveSummary();
+  if (inputFlushTimer) {
+    return;
+  }
+  inputFlushTimer = window.setTimeout(() => {
+    void flushInputEvents();
+  }, INPUT_BATCH_WINDOW_MS);
+}
+
+function sendInputBatch(events) {
+  return fetch(buildInputUrl(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      type: "Input",
-      data: { kind: "Key", key, modifiers },
+      events,
     }),
   }).then(async (resp) => {
     const payload = await resp.json().catch(() => ({}));
@@ -1420,6 +1965,65 @@ function sendInputEvent(key, modifiers) {
     }
     return payload;
   });
+}
+
+function handleInputFailure(error) {
+  inputEnabled = false;
+  currentMode = "error";
+  const detail = error && error.message ? error.message : String(error);
+  lastPayloadSummary = `Input unavailable: ${detail}`;
+  setStatus("err", `Input unavailable: ${detail}`, "Disconnected");
+  showPlaceholder(
+    "Input Unavailable",
+    "Keyboard forwarding stopped",
+    "The server rejected browser input. The dashboard will fall back to passive telemetry until a live TUI becomes available again."
+  );
+  renderGrid(sessionGrid, [
+    ["Mode", "Disconnected"],
+    ["Input", "disabled"],
+    ["Last seq", lastSeq || 0],
+    ["Mail UI", MAIL_UI_URL],
+  ]);
+  renderGrid(telemetryGrid, [
+    ["Error", truncateText(detail, 160)],
+    ["Transport", transportMode],
+    ["Screen", formatActiveScreenLabel()],
+    ["Grid", `${lastCols || 0} x ${lastRows || 0}`],
+  ]);
+  renderEvents([]);
+  forceSnapshotAndPoll();
+}
+
+async function flushInputEvents() {
+  if (inputFlushTimer) {
+    clearTimeout(inputFlushTimer);
+    inputFlushTimer = null;
+  }
+  if (inputBatchInFlight || !pendingInputEvents.length) {
+    return;
+  }
+
+  const batch = pendingInputEvents.splice(0, pendingInputEvents.length);
+  inputBatchInFlight = true;
+  inputSendState = "sending";
+  renderActiveSummary();
+  try {
+    const payload = await sendInputBatch(batch);
+    inputServerQueueDepth = payload.queue_depth ?? inputServerQueueDepth;
+    inputServerDroppedOldest = payload.dropped_oldest ?? inputServerDroppedOldest;
+    lastInputFlushAt = Date.now();
+    inputSendState = pendingInputEvents.length ? "queued" : "idle";
+    lastPayloadSummary = `Sent ${batch.length} input event${batch.length === 1 ? "" : "s"} to ${formatActiveScreenLabel()}`;
+    renderActiveSummary();
+  } catch (error) {
+    inputSendState = "error";
+    handleInputFailure(error);
+  } finally {
+    inputBatchInFlight = false;
+    if (!pollPaused && pendingInputEvents.length) {
+      void flushInputEvents();
+    }
+  }
 }
 
 function toggleHelp() {
@@ -1432,7 +2036,8 @@ helpBtn.addEventListener("click", () => {
 
 pauseBtn.addEventListener("click", () => {
   pollPaused = !pollPaused;
-  pauseBtn.textContent = pollPaused ? "Resume Polling" : "Pause Polling";
+  pauseBtn.textContent = pollPaused ? "Resume Updates" : "Pause Updates";
+  cancelInFlightStreamRequest();
   if (!pollPaused) {
     schedulePoll(0);
   }
@@ -1448,10 +2053,22 @@ window.addEventListener("resize", () => {
 
 document.addEventListener("visibilitychange", () => {
   pollDelayMs = pollDelayForMode(currentMode);
+  cancelInFlightStreamRequest();
   if (!pollPaused) {
     schedulePoll(0);
   }
 });
+
+if (quickActions) {
+  quickActions.addEventListener("click", (event) => {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const key = target && target.dataset ? target.dataset.key : "";
+    if (!key || !inputEnabled) {
+      return;
+    }
+    queueInputEvent(key, 0);
+  });
+}
 
 document.addEventListener("keydown", (event) => {
   const isBrowserShortcut = event.key === "F5"
@@ -1467,42 +2084,19 @@ document.addEventListener("keydown", (event) => {
     (event.shiftKey ? 2 : 0) |
     (event.altKey ? 4 : 0) |
     (event.metaKey ? 8 : 0);
-  sendInputEvent(event.key, modifiers).catch((error) => {
-    inputEnabled = false;
-    currentMode = "error";
-    const detail = error && error.message ? error.message : String(error);
-    lastPayloadSummary = `Input unavailable: ${detail}`;
-    setStatus("err", `Input unavailable: ${detail}`, "Disconnected");
-    showPlaceholder(
-      "Input Unavailable",
-      "Keyboard forwarding stopped",
-      "The server rejected browser input. The dashboard will fall back to passive telemetry until a live TUI becomes available again."
-    );
-    renderGrid(sessionGrid, [
-      ["Mode", "Disconnected"],
-      ["Input", "disabled"],
-      ["Last seq", lastSeq || 0],
-      ["Mail UI", MAIL_UI_URL],
-    ]);
-    renderGrid(telemetryGrid, [
-      ["Error", truncateText(detail, 160)],
-      ["Polling", `${pollDelayMs} ms`],
-      ["Screen", formatActiveScreenLabel()],
-      ["Grid", `${lastCols || 0} x ${lastRows || 0}`],
-    ]);
-    renderEvents([]);
-    forceSnapshotAndPoll();
-  });
+  queueInputEvent(event.key, modifiers);
 });
 
 renderGrid(sessionGrid, [
   ["Mode", "Booting"],
+  ["Transport", "poll"],
   ["State URL", STATE_URL],
   ["Input", "disabled"],
   ["Mail UI", MAIL_UI_URL],
 ]);
 renderGrid(telemetryGrid, [
   ["Status", "Waiting for first response"],
+  ["Transport", "bootstrap"],
   ["Polling", `${ACTIVE_POLL_MS} ms`],
   ["Auth", authToken ? "query token" : "header/local policy"],
   ["Canvas", "uninitialized"],
@@ -1542,19 +2136,34 @@ mod tests {
 
     #[test]
     fn unchanged_response_format() {
-        let resp = unchanged_response(42);
+        let resp = unchanged_response(42, 3, 9);
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["mode"], "unchanged");
         assert_eq!(v["seq"], 42);
+        assert_eq!(v["active_viewers"], 3);
+        assert_eq!(v["journal_depth"], 9);
     }
 
     #[test]
     fn handle_page_uses_relative_urls() {
         let html = handle_page("evil.example");
         assert!(html.contains(r#"const STATE_BASE_URL = "/web-dashboard/state";"#));
+        assert!(html.contains(r#"const STREAM_BASE_URL = "/web-dashboard/stream";"#));
         assert!(html.contains(r#"const INPUT_BASE_URL = "/web-dashboard/input";"#));
         assert!(html.contains(r#"id="mail-link" href="/mail""#));
         assert!(!html.contains("evil.example"));
+    }
+
+    #[test]
+    fn parse_dashboard_query_clamps_wait_and_sanitizes_client_id() {
+        let parsed = parse_dashboard_query(Some("since=7&wait_ms=999999&client=viewer_123-abc"));
+        assert_eq!(parsed.since_seq, Some(7));
+        assert_eq!(parsed.wait_ms, Some(MAX_STREAM_WAIT_MS));
+        assert_eq!(parsed.client_id.as_deref(), Some("viewer_123-abc"));
+
+        let rejected = parse_dashboard_query(Some("client=../../oops&wait_ms=1"));
+        assert_eq!(rejected.wait_ms, Some(MIN_STREAM_WAIT_MS));
+        assert!(rejected.client_id.is_none());
     }
 
     #[test]
@@ -1602,6 +2211,20 @@ mod tests {
     }
 
     #[test]
+    fn capture_does_not_advance_seq_for_semantically_unchanged_frame() {
+        let store = WebDashboardFrameStore::new();
+        store.touch_viewer(Some("viewer1"));
+        let mut buffer = Buffer::new(1, 1);
+        buffer.set(0, 0, ftui::Cell::from_char('A'));
+
+        store.capture(&buffer, 0, "dashboard", "Dashboard");
+        store.capture(&buffer, 0, "dashboard", "Dashboard");
+
+        assert_eq!(store.current_seq(), 1);
+        assert_eq!(store.snapshot_seq(), 1);
+    }
+
+    #[test]
     fn capture_escapes_screen_metadata_for_json() {
         let store = WebDashboardFrameStore::new();
         let mut buffer = Buffer::new(1, 1);
@@ -1620,6 +2243,7 @@ mod tests {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);
         let store = state.web_dashboard_frame_store();
+        store.touch_viewer(Some("viewer1"));
 
         let mut first = Buffer::new(1, 1);
         first.set(0, 0, ftui::Cell::from_char('A'));
@@ -1640,6 +2264,57 @@ mod tests {
             1,
             "single-cell change should yield one delta entry"
         );
+    }
+
+    #[test]
+    fn handle_state_replays_multiple_contiguous_updates() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let store = state.web_dashboard_frame_store();
+        store.touch_viewer(Some("viewer1"));
+
+        let mut first = Buffer::new(1, 1);
+        first.set(0, 0, ftui::Cell::from_char('A'));
+        store.capture(&first, 0, "dashboard", "Dashboard");
+
+        let mut second = Buffer::new(1, 1);
+        second.set(0, 0, ftui::Cell::from_char('B'));
+        store.capture(&second, 1, "messages", "Messages");
+
+        let mut third = Buffer::new(1, 1);
+        third.set(0, 0, ftui::Cell::from_char('C'));
+        store.capture(&third, 2, "threads", "Threads");
+
+        let payload = handle_state(&state, Some("since=1"));
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["mode"], "replay");
+        assert_eq!(v["from_seq"], 1);
+        assert_eq!(v["to_seq"], 3);
+        assert_eq!(v["events"].as_array().map_or(0, std::vec::Vec::len), 2);
+    }
+
+    #[test]
+    fn wait_response_for_since_unblocks_on_new_publish() {
+        let store = Arc::new(WebDashboardFrameStore::new());
+        store.touch_viewer(Some("viewer1"));
+        let mut first = Buffer::new(1, 1);
+        first.set(0, 0, ftui::Cell::from_char('A'));
+        store.capture(&first, 0, "dashboard", "Dashboard");
+
+        let waiter = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            waiter.wait_response_for_since(Some(1), Duration::from_millis(250))
+        });
+
+        std::thread::sleep(Duration::from_millis(25));
+        let mut second = Buffer::new(1, 1);
+        second.set(0, 0, ftui::Cell::from_char('B'));
+        store.capture(&second, 1, "messages", "Messages");
+
+        let payload = handle.join().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["seq"], 2);
+        assert_eq!(v["screen_key"], "messages");
     }
 
     #[test]

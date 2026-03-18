@@ -5897,8 +5897,10 @@ impl HttpState {
 
         let dashboard = dashboard_handle();
         let tui = tui_state_handle();
-        let needs_request_log =
-            self.config.http_request_log_enabled || dashboard.is_some() || tui.is_some();
+        // Passive browser observability remains useful even when no live TUI or
+        // explicit request-log sink is active, so we always capture enough
+        // request metadata to feed the fallback web-dashboard state.
+        let needs_request_log = true;
         let method_name = req.method.as_str().to_string();
         let (path_for_diag, _query) = split_path_query(&req.uri);
         self.request_diagnostics
@@ -6280,6 +6282,20 @@ impl HttpState {
             return Some(self.raw_response(req, status, "application/json", payload.into_bytes()));
         }
 
+        if path == "/web-dashboard/stream" {
+            if !matches!(req.method, Http1Method::Get) {
+                return Some(self.error_response(req, 405, "Method Not Allowed"));
+            }
+            let (_path_part, query_part) = split_path_query(&req.uri);
+            let live_state = tui_state_handle();
+            let (status, payload) = tui_web_dashboard::handle_stream_response(
+                live_state.as_deref(),
+                &self.ws_state_fallback,
+                query_part.as_deref(),
+            );
+            return Some(self.raw_response(req, status, "application/json", payload.into_bytes()));
+        }
+
         if path == "/web-dashboard/input" {
             if !matches!(req.method, Http1Method::Post) {
                 return Some(self.error_response(req, 405, "Method Not Allowed"));
@@ -6435,6 +6451,7 @@ impl HttpState {
         let is_web_dashboard_route = path == "/web-dashboard"
             || path == "/web-dashboard/"
             || path == "/web-dashboard/state"
+            || path == "/web-dashboard/stream"
             || path == "/web-dashboard/input";
         let is_browser_route = is_mail_route || is_web_dashboard_route;
 
@@ -6471,6 +6488,7 @@ impl HttpState {
             };
             let is_browser_json_route = Self::is_mail_json_route(&path, method_str)
                 || path == "/web-dashboard/state"
+                || path == "/web-dashboard/stream"
                 || path == "/web-dashboard/input";
             if is_browser_json_route {
                 return Some(self.error_response(req, 401, "Unauthorized"));
@@ -8991,6 +9009,7 @@ fn should_suppress_tui_http_event(path: &str) -> bool {
         || path == "/mail/ws-state"
         || path == "/mail/ws-input"
         || path == "/web-dashboard/state"
+        || path == "/web-dashboard/stream"
         || path == "/web-dashboard/input"
 }
 
@@ -19004,6 +19023,27 @@ mod tests {
     }
 
     #[test]
+    fn web_dashboard_stream_route_accepts_query_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("dash-secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(
+            Http1Method::Get,
+            "/web-dashboard/stream?token=dash-secret",
+            &[],
+        );
+        let resp = block_on(state.handle(req));
+        assert_ne!(
+            resp.status, 401,
+            "/web-dashboard/stream query token must authenticate"
+        );
+    }
+
+    #[test]
     fn build_web_ui_url_percent_encodes_token() {
         let url = build_web_ui_url("100.64.0.1", 8765, Some("a+b/c?d=e&f"));
         assert_eq!(
@@ -19134,6 +19174,29 @@ mod tests {
         assert!(
             content_type.contains("application/json"),
             "unauthorized /web-dashboard/state must return JSON, got: {content_type}"
+        );
+    }
+
+    #[test]
+    fn web_dashboard_stream_route_unauthorized_returns_json() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/web-dashboard/stream", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map_or("", |(_, v)| v.as_str());
+        assert!(
+            content_type.contains("application/json"),
+            "unauthorized /web-dashboard/stream must return JSON, got: {content_type}"
         );
     }
 
