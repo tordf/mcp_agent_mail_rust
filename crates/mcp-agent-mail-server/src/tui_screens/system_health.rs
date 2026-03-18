@@ -582,8 +582,14 @@ impl SystemHealthScreen {
                 Span::styled("Execution: ", label_style),
                 Span::styled(
                     format!(
-                        "{} {} [{}]",
-                        execution.agent, execution.kind, execution.status
+                        "{} {} [{}{}]",
+                        execution.agent,
+                        execution.kind,
+                        execution.status,
+                        execution
+                            .status_detail
+                            .as_deref()
+                            .map_or(String::new(), |detail| format!(": {detail}"))
                     ),
                     value_style,
                 ),
@@ -1863,17 +1869,19 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
     }
 
     if let Some(execution) = out.atc.recent_executions.last() {
-        let failed = matches!(
-            execution.status.as_str(),
-            "missing_project" | "executor_unavailable"
-        ) || execution.status.starts_with("failed:");
-        if failed {
+        if execution.status == "failed" {
             out.lines.push(ProbeLine {
                 level: Level::Fail,
                 name: "atc-executor",
                 detail: format!(
-                    "ATC effect execution failed for {} {} ({})",
-                    execution.agent, execution.kind, execution.status
+                    "ATC effect execution failed for {} {} ({}{})",
+                    execution.agent,
+                    execution.kind,
+                    execution.status,
+                    execution
+                        .status_detail
+                        .as_deref()
+                        .map_or(String::new(), |detail| format!(": {detail}"))
                 ),
                 remediation: Some(
                     "Inspect project registration, executor mode, and downstream tool errors before trusting live ATC effects."
@@ -3013,6 +3021,8 @@ mod tests {
                 executor_pending_effects: 2,
                 recent_executions: vec![crate::AtcOperatorExecutionSnapshot {
                     timestamp_micros: 1_500_000,
+                    decision_id: 11,
+                    experience_id: Some(29),
                     effect_id: "atc-effect-1".to_string(),
                     claim_id: "atc-claim-1".to_string(),
                     evidence_id: "atc-evidence-1".to_string(),
@@ -3022,8 +3032,10 @@ mod tests {
                     agent: "BetaAgent".to_string(),
                     project_key: Some("/tmp/project".to_string()),
                     policy_id: Some("liveness-incumbent-r1".to_string()),
+                    policy_revision: 4,
                     execution_mode: "live".to_string(),
-                    status: "failed:executor".to_string(),
+                    status: "failed".to_string(),
+                    status_detail: Some("executor".to_string()),
                     message: Some("operator send failed".to_string()),
                 }],
                 budget: crate::atc::AtcBudgetTelemetry {

@@ -108,8 +108,13 @@ use ftui::widgets::table::{Row, Table};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
 use mcp_agent_mail_core::config::{ConsoleSplitMode, ConsoleUiAnchor};
+use mcp_agent_mail_core::{
+    EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow, ExperienceState,
+    ExperienceSubsystem, FeatureVector, NonExecutionReason, loss_to_bp, prob_to_bp,
+};
 use mcp_agent_mail_db::{
-    DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
+    DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, get_or_create_pool,
+    set_active_tracker,
 };
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CleanupPaneIdentities,
@@ -3033,6 +3038,9 @@ pub(crate) struct AtcOperatorActionSnapshot {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct AtcOperatorExecutionSnapshot {
     pub(crate) timestamp_micros: i64,
+    pub(crate) decision_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) experience_id: Option<u64>,
     pub(crate) effect_id: String,
     pub(crate) claim_id: String,
     pub(crate) evidence_id: String,
@@ -3044,8 +3052,11 @@ pub(crate) struct AtcOperatorExecutionSnapshot {
     pub(crate) project_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) policy_id: Option<String>,
+    pub(crate) policy_revision: u64,
     pub(crate) execution_mode: String,
     pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) status_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) message: Option<String>,
 }
@@ -3065,10 +3076,11 @@ impl AtcExecutorMode {
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
+            Some("shadow") => Self::Shadow,
             Some("dry-run" | "dry_run" | "dryrun") => Self::DryRun,
             Some("canary") => Self::Canary,
             Some("live") => Self::Live,
-            _ => Self::Shadow,
+            _ => Self::Live,
         }
     }
 
@@ -3086,6 +3098,10 @@ impl AtcExecutorMode {
     }
 
     const fn executes_advisories(self) -> bool {
+        matches!(self, Self::Canary | Self::Live)
+    }
+
+    const fn executes_probes(self) -> bool {
         matches!(self, Self::Canary | Self::Live)
     }
 
@@ -3155,8 +3171,11 @@ fn atc_execution_snapshot(
     execution_mode: &str,
     status: &str,
 ) -> AtcOperatorExecutionSnapshot {
+    let capture = atc_execution_capture(status);
     AtcOperatorExecutionSnapshot {
         timestamp_micros: now_micros,
+        decision_id: effect.decision_id,
+        experience_id: effect.experience_id,
         effect_id: effect.effect_id.clone(),
         claim_id: effect.claim_id.clone(),
         evidence_id: effect.evidence_id.clone(),
@@ -3166,9 +3185,11 @@ fn atc_execution_snapshot(
         agent: effect.agent.clone(),
         project_key: effect.project_key.clone(),
         policy_id: effect.policy_id.clone(),
+        policy_revision: effect.policy_revision,
         execution_mode: execution_mode.to_string(),
-        status: status.to_string(),
-        message: effect.message.clone(),
+        status: capture.snapshot_status.to_string(),
+        status_detail: capture.detail.clone(),
+        message: atc_effect_operator_message(effect),
     }
 }
 
@@ -3188,24 +3209,578 @@ fn atc_effect_subject(effect: &atc::AtcEffectPlan) -> String {
     match effect.kind.as_str() {
         "send_advisory" => format!("[ATC] {} advisory for {}", effect.category, effect.agent),
         "release_reservations_requested" => format!("[ATC] release request for {}", effect.agent),
-        "probe_agent" => format!("[ATC] probe intent for {}", effect.agent),
+        "probe_agent" => format!("[ATC] probe request for {}", effect.agent),
         _ => format!("[ATC] {} for {}", effect.kind, effect.agent),
     }
+}
+
+fn atc_effect_default_headline(effect: &atc::AtcEffectPlan) -> String {
+    match effect.kind.as_str() {
+        "probe_agent" => format!(
+            "ATC liveness probe for {}. Please acknowledge or reply if you are still active.",
+            effect.agent
+        ),
+        _ => format!("ATC generated effect '{}'.", effect.kind),
+    }
+}
+
+fn atc_effect_operator_message(effect: &atc::AtcEffectPlan) -> Option<String> {
+    effect
+        .message
+        .clone()
+        .or_else(|| (effect.kind == "probe_agent").then(|| atc_effect_default_headline(effect)))
 }
 
 fn atc_effect_body(effect: &atc::AtcEffectPlan) -> String {
     let headline = effect
         .message
         .clone()
-        .unwrap_or_else(|| format!("ATC generated effect '{}'.", effect.kind));
+        .unwrap_or_else(|| atc_effect_default_headline(effect));
     let expected_loss = effect
         .expected_loss
         .map(|value| format!("{value:.4}"))
         .unwrap_or_else(|| "n/a".to_string());
+    let experience_id = effect
+        .experience_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "pending".to_string());
     format!(
-        "{headline}\n\ntrace_id: {}\nclaim_id: {}\nevidence_id: {}\neffect_id: {}\nexpected_loss: {}\nmode: automated-atc",
-        effect.trace_id, effect.claim_id, effect.evidence_id, effect.effect_id, expected_loss
+        "{headline}\n\ndecision_id: {}\nexperience_id: {}\ntrace_id: {}\nclaim_id: {}\nevidence_id: {}\neffect_id: {}\npolicy_revision: {}\nexpected_loss: {}\nmode: automated-atc",
+        effect.decision_id,
+        experience_id,
+        effect.trace_id,
+        effect.claim_id,
+        effect.evidence_id,
+        effect.effect_id,
+        effect.policy_revision,
+        expected_loss
     )
+}
+
+fn stable_fnv1a64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn atc_effect_numeric_id(effect_id: &str) -> u64 {
+    let parsed = effect_id
+        .strip_prefix("atc-effect-")
+        .and_then(|suffix| u64::from_str_radix(suffix, 16).ok())
+        .unwrap_or_else(|| stable_fnv1a64(effect_id.as_bytes()));
+    parsed & (i64::MAX as u64)
+}
+
+fn atc_effect_kind(effect: &atc::AtcEffectPlan) -> Result<EffectKind, String> {
+    match effect.kind.as_str() {
+        "send_advisory" => Ok(EffectKind::Advisory),
+        "release_reservations_requested" => Ok(EffectKind::Release),
+        "probe_agent" => Ok(EffectKind::Probe),
+        "routing_suggestion" => Ok(EffectKind::RoutingSuggestion),
+        "backpressure" => Ok(EffectKind::Backpressure),
+        "no_action" => Ok(EffectKind::NoAction),
+        other => Err(format!(
+            "unsupported ATC effect kind for experience append: {other}"
+        )),
+    }
+}
+
+fn atc_experience_subsystem(subsystem: atc::AtcSubsystem) -> ExperienceSubsystem {
+    match subsystem {
+        atc::AtcSubsystem::Liveness => ExperienceSubsystem::Liveness,
+        atc::AtcSubsystem::Conflict => ExperienceSubsystem::Conflict,
+        atc::AtcSubsystem::LoadRouting => ExperienceSubsystem::LoadRouting,
+        atc::AtcSubsystem::Synthesis => ExperienceSubsystem::Synthesis,
+        atc::AtcSubsystem::Calibration => ExperienceSubsystem::Calibration,
+    }
+}
+
+fn atc_posterior_probability(posterior: &[(String, f64)], label: &str) -> f64 {
+    posterior
+        .iter()
+        .find_map(|(state, probability)| state.eq_ignore_ascii_case(label).then_some(*probability))
+        .unwrap_or(0.0)
+}
+
+fn atc_runner_up_action(record: &atc::AtcDecisionRecord) -> Option<(String, f64)> {
+    record
+        .loss_table
+        .iter()
+        .filter(|entry| entry.action != record.action)
+        .min_by(|left, right| {
+            left.expected_loss
+                .partial_cmp(&right.expected_loss)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|entry| (entry.action.clone(), entry.expected_loss))
+}
+
+fn build_atc_feature_vector(
+    record: &atc::AtcDecisionRecord,
+    effect_kind: EffectKind,
+) -> FeatureVector {
+    let mut features = FeatureVector::zeroed();
+    features.posterior_alive_bp = prob_to_bp(atc_posterior_probability(&record.posterior, "alive"));
+    features.posterior_flaky_bp = prob_to_bp(atc_posterior_probability(&record.posterior, "flaky"));
+    features.expected_loss_bp = loss_to_bp(record.expected_loss);
+    features.loss_gap_bp = loss_to_bp((record.runner_up_loss - record.expected_loss).max(0.0));
+    features.calibration_healthy = record.calibration_healthy;
+    features.safe_mode_active = record.safe_mode_active;
+    features.risk_tier = FeatureVector::risk_tier_for(effect_kind);
+    features
+}
+
+fn build_atc_experience_row(effect: &atc::AtcEffectPlan) -> Result<ExperienceRow, String> {
+    let decision = atc::atc_decision_record(effect.decision_id)
+        .ok_or_else(|| format!("missing ATC decision record {}", effect.decision_id))?;
+    let effect_kind = atc_effect_kind(effect)?;
+    let mut builder = ExperienceBuilder::new(
+        decision.id,
+        atc_effect_numeric_id(&effect.effect_id),
+        decision.trace_id.clone(),
+        decision.claim_id.clone(),
+        decision.evidence_id.clone(),
+        atc_experience_subsystem(decision.subsystem),
+        decision.decision_class.clone(),
+        decision.subject.clone(),
+        effect_kind,
+        decision.action.clone(),
+        decision.posterior.clone(),
+        decision.expected_loss,
+        decision.evidence_summary.clone(),
+        decision.calibration_healthy,
+        decision.safe_mode_active,
+    )
+    .features(build_atc_feature_vector(&decision, effect_kind))
+    .context(serde_json::json!({
+        "action_family": {
+            "kind": effect.kind.clone(),
+            "category": effect.category.clone(),
+        },
+        "decision_timestamp_micros": decision.timestamp_micros,
+        "effect_id_raw": effect.effect_id.clone(),
+        "policy_revision": effect.policy_revision,
+        "message_present": effect.message.is_some(),
+        "fallback_reason": decision.fallback_reason.clone(),
+    }));
+    if let Some(project_key) = effect.project_key.as_ref() {
+        builder = builder.project_key(project_key.clone());
+    }
+    if let Some(policy_id) = effect
+        .policy_id
+        .clone()
+        .or_else(|| decision.policy_id.clone())
+    {
+        builder = builder.policy_id(policy_id);
+    }
+    if let Some((runner_up_action, runner_up_loss)) = atc_runner_up_action(&decision) {
+        builder = builder.runner_up(runner_up_action, runner_up_loss);
+    }
+    Ok(builder.build(0, effect.timestamp_micros))
+}
+
+fn append_atc_experience_for_effect(
+    pool: &mcp_agent_mail_db::DbPool,
+    effect: &atc::AtcEffectPlan,
+) -> Result<ExperienceRow, String> {
+    let row = build_atc_experience_row(effect)?;
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    match block_on(mcp_agent_mail_db::queries::append_atc_experience(
+        &cx, pool, &row,
+    )) {
+        asupersync::Outcome::Ok(value) => Ok(value),
+        asupersync::Outcome::Err(error) => Err(error.to_string()),
+        asupersync::Outcome::Cancelled(reason) => Err(format!("cancelled: {reason:?}")),
+        asupersync::Outcome::Panicked(payload) => Err(format!("panicked: {}", payload.message())),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AtcExecutionCapture {
+    snapshot_status: &'static str,
+    state: ExperienceState,
+    classification: &'static str,
+    detail: Option<String>,
+    non_execution_reason: Option<NonExecutionReason>,
+}
+
+fn bounded_atc_execution_detail(detail: &str) -> String {
+    const MAX_CHARS: usize = 160;
+
+    let normalized = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let bounded: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}...")
+    } else {
+        bounded
+    }
+}
+
+fn atc_execution_capture(raw_status: &str) -> AtcExecutionCapture {
+    if raw_status == "executed" {
+        return AtcExecutionCapture {
+            snapshot_status: "executed",
+            state: ExperienceState::Executed,
+            classification: "success",
+            detail: None,
+            non_execution_reason: None,
+        };
+    }
+
+    if let Some(detail) = raw_status.strip_prefix("failed:") {
+        return AtcExecutionCapture {
+            snapshot_status: "failed",
+            state: ExperienceState::Failed,
+            classification: "runtime_failure",
+            detail: Some(bounded_atc_execution_detail(detail)),
+            non_execution_reason: None,
+        };
+    }
+
+    if let Some(detail) = raw_status.strip_prefix("suppressed:") {
+        let detail = bounded_atc_execution_detail(detail);
+        return AtcExecutionCapture {
+            snapshot_status: "suppressed",
+            state: ExperienceState::Suppressed,
+            classification: "policy_suppression",
+            detail: Some(detail.clone()),
+            non_execution_reason: Some(NonExecutionReason::SafetyGate {
+                gate_name: detail,
+                risk_score: 0.0,
+                gate_threshold: 0.0,
+            }),
+        };
+    }
+
+    if let Some(detail) = raw_status.strip_prefix("skipped:") {
+        return AtcExecutionCapture {
+            snapshot_status: "skipped",
+            state: ExperienceState::Skipped,
+            classification: "deliberate_inaction",
+            detail: Some(bounded_atc_execution_detail(detail)),
+            non_execution_reason: Some(NonExecutionReason::DeliberateInaction {
+                no_action_loss: 0.0,
+                best_action_loss: 0.0,
+            }),
+        };
+    }
+
+    if let Some(detail) = raw_status.strip_prefix("throttled:") {
+        let detail = bounded_atc_execution_detail(detail);
+        return AtcExecutionCapture {
+            snapshot_status: "throttled",
+            state: ExperienceState::Throttled,
+            classification: "budget_throttle",
+            detail: Some(detail.clone()),
+            non_execution_reason: Some(NonExecutionReason::BudgetExhausted {
+                budget_name: detail,
+                current: 0.0,
+                threshold: 0.0,
+            }),
+        };
+    }
+
+    if raw_status == "dry_run" || raw_status == "shadowed" || raw_status.starts_with("shadowed_") {
+        let detail = match raw_status {
+            "dry_run" => "executor_mode_dry_run",
+            "shadowed" => "executor_mode_shadow",
+            other => other,
+        };
+        let detail = bounded_atc_execution_detail(detail);
+        return AtcExecutionCapture {
+            snapshot_status: "suppressed",
+            state: ExperienceState::Suppressed,
+            classification: "policy_suppression",
+            detail: Some(detail.clone()),
+            non_execution_reason: Some(NonExecutionReason::SafetyGate {
+                gate_name: detail,
+                risk_score: 0.0,
+                gate_threshold: 0.0,
+            }),
+        };
+    }
+
+    if raw_status == "executor_unavailable" || raw_status.starts_with("missing_") {
+        return AtcExecutionCapture {
+            snapshot_status: "failed",
+            state: ExperienceState::Failed,
+            classification: "runtime_failure",
+            detail: Some(bounded_atc_execution_detail(raw_status)),
+            non_execution_reason: None,
+        };
+    }
+
+    AtcExecutionCapture {
+        snapshot_status: "failed",
+        state: ExperienceState::Failed,
+        classification: "runtime_failure",
+        detail: Some(bounded_atc_execution_detail(raw_status)),
+        non_execution_reason: None,
+    }
+}
+
+/// Capture the execution result for an ATC experience row by transitioning
+/// its lifecycle state in the database.
+fn capture_atc_execution_result(
+    pool: &mcp_agent_mail_db::DbPool,
+    experience_id: Option<u64>,
+    execution_mode: &str,
+    status: &str,
+    ts_micros: i64,
+) {
+    let Some(exp_id) = experience_id else {
+        return;
+    };
+
+    let capture = atc_execution_capture(status);
+
+    // Transition: Planned → Dispatched (effect was handed to executor).
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+        &cx,
+        pool,
+        exp_id,
+        ExperienceState::Dispatched,
+        ts_micros,
+        None,
+        None,
+    )) {
+        asupersync::Outcome::Ok(()) => {}
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
+            field: "state",
+            ..
+        }) => {}
+        asupersync::Outcome::Err(error) => {
+            tracing::warn!(experience_id = exp_id, %error, "failed to mark experience dispatched");
+            return;
+        }
+        _ => return,
+    }
+
+    // Transition: Dispatched → Executed/Failed/Throttled/Suppressed/Skipped.
+    let context_patch = serde_json::json!({
+        "execution": {
+            "status": capture.snapshot_status,
+            "classification": capture.classification,
+            "mode": execution_mode,
+            "raw_status": bounded_atc_execution_detail(status),
+            "detail": capture.detail.clone(),
+            "captured_ts_micros": ts_micros
+        }
+    });
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+        &cx,
+        pool,
+        exp_id,
+        capture.state,
+        ts_micros,
+        capture.non_execution_reason.as_ref(),
+        Some(&context_patch),
+    )) {
+        asupersync::Outcome::Ok(()) => {}
+        asupersync::Outcome::Err(error) => {
+            tracing::warn!(
+                experience_id = exp_id,
+                ?capture.state,
+                %error,
+                "failed to transition experience after execution"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Sweep open ATC experiences for resolution signals (br-0qt6e.2.3).
+///
+/// Checks experiences in `executed` or `open` state and resolves them based on
+/// messaging signals: later agent activity, acknowledgements, or elapsed
+/// resolution windows.
+///
+/// **Resolution rules:**
+/// - Advisory/Probe to agent X, and agent X was active after the effect →
+///   Resolved with label "later_activity", correct = true.
+/// - Advisory/Probe with no agent activity and resolution window elapsed →
+///   Expired (outcome unobservable within window).
+/// - Experience for departed agent (no project registration) → Censored.
+///
+/// This function is designed to run periodically (every N ticks) to amortize
+/// the query cost across tick budgets.
+fn sweep_open_experiences_for_resolution(
+    pool: &mcp_agent_mail_db::DbPool,
+    now_micros: i64,
+    resolution_window_micros: i64,
+) {
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+
+    // Fetch up to 50 open experiences per sweep to bound query cost.
+    let open_experiences = match block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+        &cx, pool, None, 50,
+    )) {
+        asupersync::Outcome::Ok(rows) => rows,
+        asupersync::Outcome::Err(error) => {
+            tracing::debug!(%error, "failed to fetch open experiences for resolution sweep");
+            return;
+        }
+        _ => return,
+    };
+
+    for experience in &open_experiences {
+        let age_micros = now_micros.saturating_sub(experience.created_ts_micros);
+
+        // Check if the subject agent has been active since this experience
+        // was created. Agent activity is tracked by the ATC engine.
+        let agent_active_since = atc::atc_agent_last_activity(&experience.subject).unwrap_or(0);
+        let agent_was_active = agent_active_since > experience.created_ts_micros;
+
+        if agent_was_active {
+            // Positive resolution: the agent showed activity after the
+            // advisory/probe, indicating the decision was correct.
+            let outcome = ExperienceOutcome {
+                observed_ts_micros: now_micros,
+                label: "later_activity".to_string(),
+                correct: true,
+                actual_loss: Some(0.0),
+                regret: Some(0.0),
+                evidence: Some(serde_json::json!({
+                    "resolution_signal": "agent_activity",
+                    "agent": experience.subject,
+                    "activity_ts_micros": agent_active_since,
+                    "latency_micros": agent_active_since - experience.created_ts_micros,
+                })),
+            };
+
+            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            if let asupersync::Outcome::Err(error) =
+                block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
+                    &cx,
+                    pool,
+                    experience.experience_id,
+                    &outcome,
+                ))
+            {
+                tracing::warn!(
+                    experience_id = experience.experience_id,
+                    %error,
+                    "failed to resolve experience via later_activity"
+                );
+            }
+        } else if age_micros > resolution_window_micros {
+            // Resolution window elapsed without activity signal → expire.
+            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            if let asupersync::Outcome::Err(error) =
+                block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+                    &cx,
+                    pool,
+                    experience.experience_id,
+                    ExperienceState::Expired,
+                    now_micros,
+                    None,
+                    None,
+                ))
+            {
+                tracing::warn!(
+                    experience_id = experience.experience_id,
+                    %error,
+                    "failed to expire experience after resolution window"
+                );
+            }
+        }
+        // Otherwise: still within resolution window, leave as open.
+    }
+}
+
+/// Resolve open conflict-subsystem experiences when reservation events arrive (br-0qt6e.2.4).
+///
+/// Called from domain event derivers after reservation grants, releases, or conflict detections.
+/// Finds open experiences for the relevant agent(s) in the Conflict subsystem and resolves them
+/// with the appropriate outcome label.
+///
+/// **Resolution rules:**
+/// - Reservation grant clears conflicts → Resolve ForceReservation/Advisory experiences as correct.
+/// - Reservation release clears conflicts → Resolve Release experiences as correct.
+/// - New conflict detected → Resolve no-action experiences as needing action (not-correct but
+///   expected, since the system intentionally did not intervene).
+///
+/// This function is called inline from domain event derivers (not periodically),
+/// so it must remain cheap: bounded at 20 open experiences per call.
+fn resolve_conflict_experiences_on_reservation_event(
+    pool: &mcp_agent_mail_db::DbPool,
+    agent: &str,
+    project: &str,
+    label: &str,
+    correct: bool,
+    evidence: serde_json::Value,
+) {
+    let now_micros = mcp_agent_mail_db::now_micros();
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+
+    // Fetch up to 20 open conflict experiences for this agent.
+    let open_experiences = match block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+        &cx,
+        pool,
+        Some(agent),
+        20,
+    )) {
+        asupersync::Outcome::Ok(rows) => rows,
+        asupersync::Outcome::Err(error) => {
+            tracing::debug!(
+                %error,
+                agent,
+                project,
+                "failed to fetch open experiences for reservation-event resolution"
+            );
+            return;
+        }
+        _ => return,
+    };
+
+    // Only resolve Conflict-subsystem experiences.
+    for experience in &open_experiences {
+        if experience.subsystem != ExperienceSubsystem::Conflict {
+            continue;
+        }
+        // Skip experiences from a different project if project scoping is available.
+        if let Some(ref exp_project) = experience.project_key {
+            if !exp_project.is_empty() && exp_project != project {
+                continue;
+            }
+        }
+
+        let outcome = ExperienceOutcome {
+            observed_ts_micros: now_micros,
+            label: label.to_string(),
+            correct,
+            actual_loss: None,
+            regret: None,
+            evidence: Some(evidence.clone()),
+        };
+
+        let cx2 = Cx::for_request_with_budget(Budget::INFINITE);
+        if let asupersync::Outcome::Err(error) =
+            block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
+                &cx2,
+                pool,
+                experience.experience_id,
+                &outcome,
+            ))
+        {
+            tracing::warn!(
+                experience_id = experience.experience_id,
+                %error,
+                label,
+                agent,
+                "failed to resolve conflict experience on reservation event"
+            );
+        }
+    }
 }
 
 fn ensure_atc_executor_identity(
@@ -3272,6 +3847,41 @@ fn execute_atc_advisory_effect(
         .map_err(|error| error.to_string())
 }
 
+fn execute_atc_probe_effect(
+    runtime: &Runtime,
+    ensured_projects: &mut HashSet<String>,
+    effect: &atc::AtcEffectPlan,
+    project_key: &str,
+) -> Result<(), String> {
+    ensure_atc_executor_identity(runtime, ensured_projects, project_key)?;
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let ctx = McpContext::new(cx, 1);
+    runtime
+        .block_on(async {
+            mcp_agent_mail_tools::messaging::send_message(
+                &ctx,
+                project_key.to_string(),
+                atc::ATC_AGENT_NAME.to_string(),
+                vec![effect.agent.clone()],
+                atc_effect_subject(effect),
+                atc_effect_body(effect),
+                None,
+                None,
+                None,
+                None,
+                Some("normal".to_string()),
+                Some(true),
+                Some(effect.trace_id.clone()),
+                None,
+                Some(false),
+                Some(true),
+            )
+            .await
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn execute_atc_release_effect(
     runtime: &Runtime,
     effect: &atc::AtcEffectPlan,
@@ -3301,15 +3911,15 @@ fn execute_atc_effect(
     effect: &atc::AtcEffectPlan,
 ) -> String {
     match executor_mode {
-        AtcExecutorMode::Shadow => "shadowed".to_string(),
-        AtcExecutorMode::DryRun => "dry_run".to_string(),
+        AtcExecutorMode::Shadow => "suppressed:executor_mode_shadow".to_string(),
+        AtcExecutorMode::DryRun => "suppressed:executor_mode_dry_run".to_string(),
         AtcExecutorMode::Canary | AtcExecutorMode::Live => match effect.kind.as_str() {
             "send_advisory" if executor_mode.executes_advisories() => {
                 let Some(project_key) = effect.project_key.as_deref() else {
-                    return "missing_project".to_string();
+                    return "failed:missing_project".to_string();
                 };
                 let Some(runtime) = runtime else {
-                    return "executor_unavailable".to_string();
+                    return "failed:executor_unavailable".to_string();
                 };
                 execute_atc_advisory_effect(runtime, ensured_projects, effect, project_key)
                     .map(|_| "executed".to_string())
@@ -3317,18 +3927,32 @@ fn execute_atc_effect(
             }
             "release_reservations_requested" if executor_mode.executes_releases() => {
                 let Some(project_key) = effect.project_key.as_deref() else {
-                    return "missing_project".to_string();
+                    return "failed:missing_project".to_string();
                 };
                 let Some(runtime) = runtime else {
-                    return "executor_unavailable".to_string();
+                    return "failed:executor_unavailable".to_string();
                 };
                 execute_atc_release_effect(runtime, effect, project_key)
                     .map(|_| "executed".to_string())
                     .unwrap_or_else(|error| format!("failed:{error}"))
             }
-            "release_reservations_requested" => "shadowed_release".to_string(),
-            "probe_agent" => "probe_intent".to_string(),
-            _ => "shadowed".to_string(),
+            "probe_agent" if executor_mode.executes_probes() => {
+                let Some(project_key) = effect.project_key.as_deref() else {
+                    return "failed:missing_project".to_string();
+                };
+                let Some(runtime) = runtime else {
+                    return "failed:executor_unavailable".to_string();
+                };
+                execute_atc_probe_effect(runtime, ensured_projects, effect, project_key)
+                    .map(|_| "executed".to_string())
+                    .unwrap_or_else(|error| format!("failed:{error}"))
+            }
+            "no_action" => "skipped:deliberate_no_action".to_string(),
+            "release_reservations_requested" => {
+                "suppressed:executor_mode_canary_release".to_string()
+            }
+            "probe_agent" => "suppressed:executor_mode_probe_disabled".to_string(),
+            _ => "suppressed:unsupported_effect_kind".to_string(),
         },
     }
 }
@@ -3489,6 +4113,10 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         .transpose()
         .ok()
         .flatten();
+    let atc_db_pool = get_or_create_pool(&DbPoolConfig::from_env()).ok();
+    if atc_db_pool.is_none() {
+        tracing::warn!("ATC durable experience append disabled: failed to acquire DB pool");
+    }
 
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
@@ -3496,6 +4124,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     let mut last_summary_log_micros = 0_i64;
     let mut pending_effects: VecDeque<atc::AtcEffectPlan> = VecDeque::new();
     let mut pending_effect_keys: HashSet<String> = HashSet::new();
+    let mut atc_resolution_tick_counter: u64 = 0;
     let mut executor_registered_projects: HashSet<String> = HashSet::new();
 
     set_atc_operator_snapshot(AtcOperatorSnapshot::warming_up(true));
@@ -3513,7 +4142,22 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 summary.budget.tick_budget_micros
             });
 
-        for effect in new_effects {
+        for mut effect in new_effects {
+            if let Some(pool) = atc_db_pool.as_ref() {
+                match append_atc_experience_for_effect(pool, &effect) {
+                    Ok(experience) => {
+                        effect.experience_id = Some(experience.experience_id);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            decision_id = effect.decision_id,
+                            effect_id = %effect.effect_id,
+                            %error,
+                            "failed to append ATC experience"
+                        );
+                    }
+                }
+            }
             let effect_key = atc_effect_semantic_key(&effect);
             if pending_effect_keys.insert(effect_key) {
                 pending_effects.push_back(effect);
@@ -3548,6 +4192,16 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 &mut executor_registered_projects,
                 &effect,
             );
+            // Capture execution result into durable experience store (br-0qt6e.2.2).
+            if let Some(pool) = atc_db_pool.as_ref() {
+                capture_atc_execution_result(
+                    pool,
+                    effect.experience_id,
+                    executor_mode.as_str(),
+                    &status,
+                    now_micros,
+                );
+            }
             let execution =
                 atc_execution_snapshot(now_micros, &effect, executor_mode.as_str(), &status);
             if recent_executions.len() >= ATC_OPERATOR_EXECUTION_CAPACITY {
@@ -3561,6 +4215,16 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             }
             recent_actions.push_back(action_snapshot);
             executed_this_tick = executed_this_tick.saturating_add(1);
+        }
+
+        // Periodic resolution sweep for open experiences (br-0qt6e.2.3).
+        // Runs every 10 ticks to amortize query cost across tick budgets.
+        // Resolution window: 10 minutes (600_000_000 microseconds).
+        atc_resolution_tick_counter = atc_resolution_tick_counter.wrapping_add(1);
+        if atc_resolution_tick_counter % 10 == 0 {
+            if let Some(pool) = atc_db_pool.as_ref() {
+                sweep_open_experiences_for_resolution(pool, now_micros, 600_000_000);
+            }
         }
 
         let tick_duration_micros =
@@ -7898,6 +8562,47 @@ fn derive_reservation_granted_domain_events(
         return Vec::new();
     };
     let agent_value = ctx.agent.clone().unwrap_or_else(|| "unknown".to_string());
+    // Wire reservation grants into ATC conflict graph (br-0qt6e.2.9)
+    atc::atc_note_reservation_granted(
+        &agent_value,
+        &paths,
+        exclusive,
+        project_value,
+        mcp_agent_mail_db::now_micros(),
+    );
+
+    // Wire any conflicts into ATC conflict graph (br-0qt6e.2.9)
+    if let Some(conflicts_arr) = payload
+        .get("conflicts")
+        .and_then(serde_json::Value::as_array)
+    {
+        if !conflicts_arr.is_empty() {
+            let observations: Vec<atc::AtcConflictObservation> = conflicts_arr
+                .iter()
+                .filter_map(|c| {
+                    let requested = c.get("path")?.as_str()?;
+                    let holders = c.get("holders")?.as_array()?;
+                    Some(holders.iter().filter_map(move |h| {
+                        Some(atc::AtcConflictObservation {
+                            holder: h.get("agent")?.as_str()?.to_string(),
+                            requested_path: requested.to_string(),
+                            holder_path_pattern: h.get("path_pattern")?.as_str()?.to_string(),
+                        })
+                    }))
+                })
+                .flatten()
+                .collect();
+            if !observations.is_empty() {
+                atc::atc_note_reservation_conflicts(
+                    &agent_value,
+                    project_value,
+                    &observations,
+                    mcp_agent_mail_db::now_micros(),
+                );
+            }
+        }
+    }
+
     vec![tui_events::MailEvent::reservation_granted(
         agent_value,
         paths,
@@ -7929,6 +8634,14 @@ fn derive_release_domain_events(
     if paths.is_empty() {
         paths.push("<all-active>".to_string());
     }
+    // Wire reservation releases into ATC conflict graph (br-0qt6e.2.9)
+    atc::atc_note_reservation_released(
+        &agent_value,
+        &paths,
+        project_value,
+        mcp_agent_mail_db::now_micros(),
+    );
+
     vec![tui_events::MailEvent::reservation_released(
         agent_value,
         paths,
@@ -7967,6 +8680,14 @@ fn derive_force_release_domain_events(
         .map(str::to_string)
         .or_else(|| ctx.agent.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    // Wire force-release into ATC conflict graph (br-0qt6e.2.9)
+    atc::atc_note_reservation_released(
+        &agent_value,
+        &paths,
+        project_value,
+        mcp_agent_mail_db::now_micros(),
+    );
+
     vec![tui_events::MailEvent::reservation_released(
         agent_value,
         paths,
@@ -10341,6 +11062,135 @@ mod tests {
             atc_action_cooldown_key(&base),
             atc_action_cooldown_key(&probe),
             "probe actions and advisories must not share a cooldown key"
+        );
+    }
+
+    fn sample_probe_effect() -> atc::AtcEffectPlan {
+        atc::AtcEffectPlan {
+            decision_id: 7,
+            effect_id: "atc-effect-probe".to_string(),
+            experience_id: Some(17),
+            claim_id: "clm-7".to_string(),
+            evidence_id: "evi-7".to_string(),
+            trace_id: "trc-7".to_string(),
+            timestamp_micros: 1_700_000_000_000_000,
+            kind: "probe_agent".to_string(),
+            category: "probe".to_string(),
+            agent: "AlphaAgent".to_string(),
+            project_key: Some("/tmp/project-a".to_string()),
+            policy_id: Some("policy-a".to_string()),
+            policy_revision: 3,
+            message: None,
+            expected_loss: Some(0.2),
+        }
+    }
+
+    #[test]
+    fn atc_executor_mode_defaults_to_live_for_unknown_values() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXECUTOR_MODE", "")],
+            || {
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Live);
+            },
+        );
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXECUTOR_MODE", "mystery-mode")],
+            || {
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Live);
+            },
+        );
+    }
+
+    #[test]
+    fn atc_executor_mode_respects_explicit_shadow_override() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXECUTOR_MODE", "shadow")],
+            || {
+                assert_eq!(AtcExecutorMode::from_env(), AtcExecutorMode::Shadow);
+            },
+        );
+    }
+
+    #[test]
+    fn atc_probe_effect_uses_probe_request_language() {
+        let effect = sample_probe_effect();
+        assert_eq!(
+            atc_effect_subject(&effect),
+            "[ATC] probe request for AlphaAgent"
+        );
+        let body = atc_effect_body(&effect);
+        assert!(body.contains("ATC liveness probe for AlphaAgent."));
+        assert!(body.contains("Please acknowledge or reply if you are still active."));
+        assert!(body.contains("decision_id: 7"));
+        assert!(body.contains("experience_id: 17"));
+    }
+
+    #[test]
+    fn execute_atc_effect_live_probe_requires_runtime_instead_of_probe_intent() {
+        let effect = sample_probe_effect();
+        let mut ensured_projects = HashSet::new();
+        assert_eq!(
+            execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect),
+            "failed:executor_unavailable"
+        );
+    }
+
+    #[test]
+    fn atc_execution_capture_distinguishes_runtime_from_policy_results() {
+        let suppressed = atc_execution_capture("suppressed:executor_mode_dry_run");
+        assert_eq!(suppressed.snapshot_status, "suppressed");
+        assert_eq!(suppressed.state, ExperienceState::Suppressed);
+        assert_eq!(suppressed.classification, "policy_suppression");
+        assert_eq!(suppressed.detail.as_deref(), Some("executor_mode_dry_run"));
+        assert!(matches!(
+            suppressed.non_execution_reason,
+            Some(NonExecutionReason::SafetyGate { ref gate_name, .. })
+                if gate_name == "executor_mode_dry_run"
+        ));
+
+        let failed = atc_execution_capture("failed:executor_unavailable");
+        assert_eq!(failed.snapshot_status, "failed");
+        assert_eq!(failed.state, ExperienceState::Failed);
+        assert_eq!(failed.classification, "runtime_failure");
+        assert_eq!(failed.detail.as_deref(), Some("executor_unavailable"));
+        assert!(failed.non_execution_reason.is_none());
+    }
+
+    #[test]
+    fn atc_execution_snapshot_exposes_canonical_status_and_detail() {
+        let effect = sample_probe_effect();
+        let snapshot = atc_execution_snapshot(
+            1_700_000_000_000_111,
+            &effect,
+            "dry_run",
+            "suppressed:executor_mode_dry_run",
+        );
+
+        assert_eq!(snapshot.status, "suppressed");
+        assert_eq!(
+            snapshot.status_detail.as_deref(),
+            Some("executor_mode_dry_run")
+        );
+        assert_eq!(snapshot.execution_mode, "dry_run");
+    }
+
+    #[test]
+    fn atc_execution_snapshot_includes_probe_display_message_when_effect_message_missing() {
+        let effect = sample_probe_effect();
+        let snapshot = atc_execution_snapshot(1_700_000_000_000_111, &effect, "live", "executed");
+
+        assert_eq!(
+            snapshot.message.as_deref(),
+            Some(
+                "ATC liveness probe for AlphaAgent. Please acknowledge or reply if you are still active."
+            )
+        );
+
+        let action = atc_action_snapshot_from_execution(&snapshot);
+        assert!(
+            action
+                .console_line()
+                .contains("ATC liveness probe for AlphaAgent.")
         );
     }
 
@@ -20537,7 +21387,9 @@ mod tests {
     #[test]
     fn atc_effect_semantic_key_is_project_scoped() {
         let left = atc::AtcEffectPlan {
+            decision_id: 7,
             effect_id: "atc-effect-left".to_string(),
+            experience_id: Some(17),
             claim_id: "atc-claim-left".to_string(),
             evidence_id: "atc-evidence-left".to_string(),
             trace_id: "atc-trace-left".to_string(),
@@ -20547,6 +21399,7 @@ mod tests {
             agent: "AgentAlpha".to_string(),
             project_key: Some("/tmp/project-a".to_string()),
             policy_id: Some("policy-a".to_string()),
+            policy_revision: 3,
             message: Some("same message".to_string()),
             expected_loss: Some(0.2),
         };
@@ -20557,6 +21410,56 @@ mod tests {
             atc_effect_semantic_key(&left),
             atc_effect_semantic_key(&right)
         );
+    }
+
+    #[test]
+    fn build_atc_feature_vector_captures_decision_quality_and_risk_tier() {
+        let record = atc::AtcDecisionRecord {
+            id: 42,
+            claim_id: "clm-42".to_string(),
+            evidence_id: "evi-42".to_string(),
+            trace_id: "trc-42".to_string(),
+            timestamp_micros: 1_700_000_000_000_000,
+            subsystem: atc::AtcSubsystem::Liveness,
+            decision_class: "liveness_transition".to_string(),
+            subject: "BlueLake".to_string(),
+            policy_id: Some("liveness-incumbent-r1".to_string()),
+            posterior: vec![
+                ("Alive".to_string(), 0.2),
+                ("Flaky".to_string(), 0.7),
+                ("Dead".to_string(), 0.1),
+            ],
+            action: "ReleaseReservations".to_string(),
+            expected_loss: 1.5,
+            runner_up_loss: 3.0,
+            loss_table: vec![
+                atc::AtcLossTableEntry {
+                    action: "ReleaseReservations".to_string(),
+                    expected_loss: 1.5,
+                },
+                atc::AtcLossTableEntry {
+                    action: "Suspect".to_string(),
+                    expected_loss: 3.0,
+                },
+            ],
+            evidence_summary: "agent declared dead".to_string(),
+            calibration_healthy: false,
+            safe_mode_active: true,
+            fallback_reason: Some("budget_pressure".to_string()),
+        };
+
+        let features = build_atc_feature_vector(&record, EffectKind::Release);
+
+        assert_eq!(features.posterior_alive_bp, 2000);
+        assert_eq!(features.posterior_flaky_bp, 7000);
+        assert_eq!(features.expected_loss_bp, 150);
+        assert_eq!(features.loss_gap_bp, 150);
+        assert_eq!(
+            features.risk_tier,
+            FeatureVector::risk_tier_for(EffectKind::Release)
+        );
+        assert!(!features.calibration_healthy);
+        assert!(features.safe_mode_active);
     }
 
     #[test]

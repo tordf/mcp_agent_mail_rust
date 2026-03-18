@@ -1241,6 +1241,15 @@ pub fn schema_migrations() -> Vec<Migration> {
     ));
 
     migrations.push(Migration::new(
+        "v17_idx_atc_experiences_decision_effect_unique".to_string(),
+        "unique index for idempotent ATC experience append".to_string(),
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_atc_exp_decision_effect \
+         ON atc_experiences(decision_id, effect_id)"
+            .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
         "v16_idx_atc_experiences_stratum".to_string(),
         "index for stratum queries (conformal risk control)".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_atc_exp_stratum \
@@ -1295,6 +1304,23 @@ pub fn schema_migrations() -> Vec<Migration> {
         "v16_analyze_atc_experiences".to_string(),
         "update query planner stats after experience indexes".to_string(),
         "ANALYZE atc_experiences".to_string(),
+        String::new(),
+    ));
+
+    // ── v18: EWMA and delay columns for rollups (br-0qt6e.3.2) ────────
+    //
+    // Adds EWMA-smoothed loss, EWMA count weight, and delay histogram
+    // bins to the rollup table. These are computed incrementally on
+    // resolution and never require raw-history rescans.
+    migrations.push(Migration::new(
+        "v18_rollup_ewma_columns".to_string(),
+        "add EWMA and delay columns to experience rollups".to_string(),
+        "ALTER TABLE atc_experience_rollups ADD COLUMN ewma_loss REAL NOT NULL DEFAULT 0.0;\
+         ALTER TABLE atc_experience_rollups ADD COLUMN ewma_weight REAL NOT NULL DEFAULT 0.0;\
+         ALTER TABLE atc_experience_rollups ADD COLUMN delay_sum_micros INTEGER NOT NULL DEFAULT 0;\
+         ALTER TABLE atc_experience_rollups ADD COLUMN delay_count INTEGER NOT NULL DEFAULT 0;\
+         ALTER TABLE atc_experience_rollups ADD COLUMN delay_max_micros INTEGER NOT NULL DEFAULT 0"
+            .to_string(),
         String::new(),
     ));
 

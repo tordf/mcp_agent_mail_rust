@@ -53,6 +53,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Deployment Validation](#deployment-validation)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
+- [ATC Learning Implementation Map](#atc-learning-implementation-map)
 - [Core Data Model](#core-data-model)
 - [How the System Works](#how-the-system-works)
 - [Search Architecture](#search-architecture)
@@ -992,6 +993,55 @@ mcp_agent_mail_rust/
 - **Advisory file reservations** with symmetric fnmatch, archive reading, and rename handling
 - **`#![forbid(unsafe_code)]`** across all crates
 - **asupersync exclusively** for all async operations (no Tokio, reqwest, hyper, or axum)
+
+---
+
+## ATC Learning Implementation Map
+
+The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should not be cross-owned. The codebase already has the right seams; future implementation should deepen those seams instead of spreading ATC state across tools, UI layers, or ad-hoc SQL in random crates.
+
+### Ownership by crate and module
+
+| Area | Current modules | Owns | Must not own |
+|------|------------------|------|--------------|
+| Core contract | `crates/mcp-agent-mail-core/src/experience.rs`, `evidence_ledger.rs`, `atc_baseline.rs`, `config.rs` | Canonical `ExperienceRow` shape, lifecycle transitions, feature vector/extension schema, decision/evidence identifiers, frozen pre-learning baseline, env/config surface | SQL persistence, archive writes, UI-specific formatting |
+| SQLite persistence | `crates/mcp-agent-mail-db/src/schema.rs` (v16 `atc_experiences`, `atc_experience_rollups`) | Durable raw experience rows, open-resolution lookup indexes, stratum rollups, retention/compaction mechanics, future insert/resolve/query APIs | Decision policy, ATC tick logic, web/TUI rendering |
+| Git/archive boundary | `crates/mcp-agent-mail-storage/src/lib.rs` | Human-auditable artifact writes, WBQ/commit coalescing, selected policy/audit artifacts when explicitly promoted | Raw ATC experience exhaust; the current `WriteOp` surface intentionally handles message, reservation, profile, and notification artifacts, not learning-row mirroring |
+| ATC runtime | `crates/mcp-agent-mail-server/src/atc.rs` | Decision engine, liveness/conflict/routing/calibration math, policy bundle loading, global ATC singletons, tick loop, outcome feedback, summary snapshots | Direct SQLite schema ownership, long-lived CLI state, alternate UI-specific models |
+| Runtime wiring | `crates/mcp-agent-mail-server/src/lib.rs` | Bootstrapping via `init_global_atc()` and `start_atc_operator_runtime()`, tool-dispatch liveness hooks via `atc_register_agent_with_project()` and `atc_observe_activity_with_project()`, shared ATC operator snapshot publication | Per-tool bespoke learning persistence; tool handlers should emit domain facts, not become the learning store |
+| Agent/operator surfaces | `crates/mcp-agent-mail-cli/src/robot.rs`, `crates/mcp-agent-mail-server/src/tui_screens/system_health.rs`, `tui_ws_state.rs`, `tui_web_dashboard.rs`, `/mail/ws-state`, `/web-dashboard/*` | Rendering the shared ATC/operator snapshot for robot, TUI, and browser consumers; local fallback heuristics only when live server state is unavailable | Independent ATC truth, separate persistence, or duplicate learning logic |
+| Tool/resource layer | `crates/mcp-agent-mail-tools/src/*`, `crates/mcp-agent-mail-tools/src/resources.rs` | Normal tool/resource contracts for mailbox coordination; ATC-adjacent work should surface through existing runtime hooks and shared snapshots | Owning ATC learning state machines or experience-row lifecycle rules |
+
+### Append and resolution hooks
+
+- Session/bootstrap and liveness hooks already land at the server dispatch boundary: successful `register_agent` and `macro_start_session` calls register agents with ATC, and tool execution updates ATC activity timestamps.
+- The next durable append path belongs in the same server/runtime seam, not inside individual UIs. Message and reservation learning hooks should flow from the tool-result/event boundary in `mcp-agent-mail-server/src/lib.rs` into the ATC-facing note functions already defined in `mcp-agent-mail-server/src/atc.rs`: `atc_note_message_sent()`, `atc_note_message_received()`, `atc_note_reservation_granted()`, `atc_note_reservation_released()`, and `atc_note_reservation_conflicts()`.
+- Outcome resolution likewise belongs in the server ATC runtime via `atc_record_outcome()`, with the DB crate owning the actual row mutation and rollup updates once the dedicated persistence/query surface is added.
+- `/mail/ws-state`, `/web-dashboard/state`, `am robot atc`, and the System Health screen should stay snapshot-driven consumers of `atc_operator_snapshot()` / `atc_summary()`, not alternate sources of learning state.
+
+### Hot path vs. cold path boundaries
+
+- Hot path: `mcp-agent-mail-server/src/atc.rs`, the tool-dispatch hook in `mcp-agent-mail-server/src/lib.rs`, and the future DB append/resolve calls. This path must stay append-friendly, bounded, and free of Git write amplification.
+- Warm path: ATC operator snapshots, `am robot atc`, System Health, `/mail/ws-state`, and `/web-dashboard/*`. These surfaces should read already-computed ATC state and only fall back to local heuristics when the live server snapshot is unavailable.
+- Cold path: promoted policy bundles, transparency cards, replay artifacts, and operator-facing audit bundles. These may be written through `mcp-agent-mail-storage`, but only after they are intentionally compacted and selected.
+- Explicit non-owner boundary: `mcp-agent-mail-search-core`, share/export, and the WASM/browser mirror are consumers or transport layers. They should not become the canonical home of ATC learning policy, persistence, or attribution logic.
+
+### Verification ownership
+
+- `crates/mcp-agent-mail-core/src/experience.rs`: unit/property coverage for lifecycle validity, feature-vector stability, serialization, and idempotent resolution transitions.
+- `crates/mcp-agent-mail-db/src/schema.rs` plus future ATC DB query modules: migration coverage, insert/resolve semantics, rollup correctness, retention/compaction tests, and replay/reconstruct safety.
+- `crates/mcp-agent-mail-server/src/atc.rs`: decision math, policy-bundle loading, safe-mode transitions, tick budgeting, and feedback/calibration tests.
+- `crates/mcp-agent-mail-server/src/lib.rs`, `tui_ws_state.rs`, `tui_screens/system_health.rs`, and `crates/mcp-agent-mail-cli/src/robot.rs`: snapshot publication, route contracts, robot fallback behavior, and operator-surface rendering tests.
+- `tests/e2e/` and performance harnesses: once append/resolve wiring exists, live-server E2E and soak/perf coverage should validate that ATC learning stays low-write-amplification and does not regress request/tick budgets.
+
+### Recommended implementation order
+
+1. Keep `mcp-agent-mail-core` as the schema-and-policy contract: finalize any remaining experience/evidence/baseline/config details there first.
+2. Add the dedicated ATC persistence/query surface in `mcp-agent-mail-db` on top of the existing v16 schema, including append, resolve, rollup, and retention APIs.
+3. Wire `mcp-agent-mail-server` to append experience rows from real dispatch events and to resolve them from real execution/outcome signals, using the existing ATC note and outcome entrypoints instead of inventing parallel paths.
+4. Expose the resulting state consistently through the existing snapshot surfaces: `atc_summary()`, `atc_operator_snapshot()`, `am robot atc`, System Health, `/mail/ws-state`, and `/web-dashboard/*`.
+5. Only after the core/runtime path is real should additional operator artifacts, Git-promoted transparency bundles, or richer UI affordances be added.
+6. Land replay, E2E, and perf verification last, once the append/resolve boundaries are stable enough to benchmark and audit.
 
 ---
 

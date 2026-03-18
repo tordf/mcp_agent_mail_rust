@@ -3749,7 +3749,10 @@ impl AtcShadowPolicyState {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AtcEffectPlan {
+    pub decision_id: u64,
     pub effect_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experience_id: Option<u64>,
     pub claim_id: String,
     pub evidence_id: String,
     pub trace_id: String,
@@ -3761,6 +3764,7 @@ pub struct AtcEffectPlan {
     pub project_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_id: Option<String>,
+    pub policy_revision: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4961,7 +4965,9 @@ impl AtcEngine {
             effect_seed.push_str(message);
         }
         AtcEffectPlan {
+            decision_id: record.id,
             effect_id: format!("atc-effect-{:016x}", stable_fnv1a64(effect_seed.as_bytes())),
+            experience_id: None,
             claim_id: record.claim_id.clone(),
             evidence_id: record.evidence_id.clone(),
             trace_id: record.trace_id.clone(),
@@ -4971,6 +4977,7 @@ impl AtcEngine {
             agent,
             project_key,
             policy_id: record.policy_id.clone(),
+            policy_revision: self.policy_revision,
             message,
             expected_loss: record
                 .loss_table
@@ -8494,6 +8501,29 @@ pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     report.summary.kernel.lock_wait_micros = lock_wait_micros;
     engine.last_kernel_telemetry.lock_wait_micros = lock_wait_micros;
     Some(report)
+}
+
+/// Fetch a cloned ATC decision record by ID from the in-memory evidence ledger.
+#[must_use]
+pub fn atc_decision_record(decision_id: u64) -> Option<AtcDecisionRecord> {
+    let engine_lock = ATC_ENGINE.get()?;
+    let engine = engine_lock.lock().ok()?;
+    engine.ledger.get(decision_id).cloned()
+}
+
+/// Query the last observed activity timestamp for an agent.
+///
+/// Returns `Some(timestamp_micros)` if the agent has been observed,
+/// or `None` if the agent is unknown to the ATC engine.
+#[must_use]
+pub fn atc_agent_last_activity(agent: &str) -> Option<i64> {
+    let engine_lock = ATC_ENGINE.get()?;
+    let engine = engine_lock.lock().ok()?;
+    engine
+        .agents
+        .get(&agent.to_ascii_lowercase())
+        .map(|entry| entry.rhythm.last_activity_ts)
+        .filter(|ts| *ts > 0)
 }
 
 /// Record the outcome of an ATC decision for calibration feedback.
