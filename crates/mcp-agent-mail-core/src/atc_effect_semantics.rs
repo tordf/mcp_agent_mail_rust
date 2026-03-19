@@ -192,14 +192,13 @@ pub fn validate_preconditions(family: &str, context: &PreconditionContext) -> Pr
 
     // Gate: safe mode blocks high-risk interventions.
     let risk_class = EffectRiskClass::for_family(family);
+    total += 1;
     if risk_class.suppressed_in_safe_mode() && context.safe_mode_active {
-        total += 1;
         failures.push(PreconditionFailure {
             precondition: "safe_mode_inactive".to_string(),
             reason: "safe mode blocks high-risk interventions".to_string(),
         });
     } else {
-        total += 1;
         passed += 1;
     }
 

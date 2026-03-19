@@ -4541,7 +4541,7 @@ impl AtcEngine {
 
         let mut rebuilt = BinaryHeap::new();
         for entry in self.agents.values() {
-            if entry.next_review_micros >= i64::MAX {
+            if entry.next_review_micros == i64::MAX {
                 continue;
             }
             rebuilt.push(Reverse(ScheduledAgentReview {

@@ -288,6 +288,7 @@ pub fn attribute_outcome(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     fn make_cause(id: u64, kind: &str, subsystem: &str, delay: i64) -> CandidateCause {

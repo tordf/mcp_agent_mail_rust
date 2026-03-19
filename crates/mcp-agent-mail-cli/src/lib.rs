@@ -4558,7 +4558,19 @@ fn sqlite_conn_supports_robot_attachment_reads(
 }
 
 fn is_resource_busy_cli_error(error: &CliError) -> bool {
-    matches!(error, CliError::Other(message) if message.contains("Resource is temporarily busy"))
+    matches!(error, CliError::Other(message) if {
+        let lower = message.to_ascii_lowercase();
+        message.contains("Resource is temporarily busy")
+            || message.contains("Resource temporarily busy")
+            || lower.contains("database is busy")
+            || lower.contains("database is locked")
+            || lower.contains("database table is locked")
+            || lower.contains("database schema is locked")
+            || lower.contains("locked by another process")
+            || lower.contains("snapshot conflict on pages")
+            || lower.contains("busy_snapshot")
+            || lower.contains("write conflict on page")
+    })
 }
 
 fn sqlite_conn_quick_check_ok_canonical(
@@ -15443,12 +15455,13 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            let validated_limit = validate_mail_inbox_limit(limit)?;
             let mut server_args = serde_json::json!({
                 "project_key": &project_key,
                 "agent_name": &agent_name,
                 "urgent_only": urgent_only,
                 "since_ts": since.as_deref(),
-                "limit": limit.max(0),
+                "limit": validated_limit,
                 "include_bodies": include_bodies,
             });
             if since.is_none()
@@ -15518,7 +15531,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                         agent.id.unwrap_or(0),
                         urgent_only,
                         since_ts,
-                        limit.max(0) as usize,
+                        validated_limit,
                     )
                     .await,
                 )?;
@@ -15545,7 +15558,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                         &agent_name,
                         urgent_only,
                         since_ts,
-                        limit.max(0),
+                        i64::try_from(validated_limit).expect("validated mail inbox limit fits i64"),
                         include_bodies,
                     )?
                 }
@@ -17064,7 +17077,7 @@ mod mail_server_cli_bridge_tests {
         build_server_reply_message_arguments, build_server_send_message_arguments,
         classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
         ensure_message_in_project, fetch_inbox_server_rejection_allows_local_fallback,
-        mail_server_rejection_allows_local_fallback, product_inbox_row_to_json,
+        is_resource_busy_cli_error, mail_server_rejection_allows_local_fallback, product_inbox_row_to_json,
         server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc,
     };
@@ -17114,6 +17127,28 @@ mod mail_server_cli_bridge_tests {
             object.get("thread_id").and_then(serde_json::Value::as_str),
             Some("br-123")
         );
+    }
+
+    #[test]
+    fn resource_busy_cli_error_matches_db_and_cli_lock_variants() {
+        assert!(is_resource_busy_cli_error(&CliError::Other(
+            "Resource is temporarily busy. Wait a moment and try again. (database is busy)"
+                .to_string(),
+        )));
+        assert!(is_resource_busy_cli_error(&CliError::Other(
+            "database error: Resource temporarily busy: sqlite init stage=migrate_to_latest_base failed: Query error: database is busy"
+                .to_string(),
+        )));
+        assert!(is_resource_busy_cli_error(&CliError::Other(
+            "sqlite init stage=migrate_to_latest_base failed: Query error: database is busy"
+                .to_string(),
+        )));
+        assert!(!is_resource_busy_cli_error(&CliError::Other(
+            "project not found: /tmp/example".to_string(),
+        )));
+        assert!(!is_resource_busy_cli_error(&CliError::Other(
+            "disk i/o error while opening sqlite file".to_string(),
+        )));
     }
 
     #[test]
@@ -17346,6 +17381,28 @@ mod mail_server_cli_bridge_tests {
     }
 
     #[test]
+    fn classify_server_tool_call_treats_http_5xx_as_unavailable() {
+        let result = classify_server_tool_call(
+            "fetch_inbox",
+            Err(CliError::Other(
+                "unexpected HTTP status 503 from http://127.0.0.1:8765/mcp/".to_string(),
+            )),
+        );
+        assert!(matches!(result, ServerToolCall::Unavailable(_)));
+    }
+
+    #[test]
+    fn classify_server_tool_call_keeps_http_4xx_as_rejected() {
+        let result = classify_server_tool_call(
+            "fetch_inbox",
+            Err(CliError::Other(
+                "unexpected HTTP status 404 from http://127.0.0.1:8765/mcp/".to_string(),
+            )),
+        );
+        assert!(matches!(result, ServerToolCall::Rejected(_)));
+    }
+
+    #[test]
     fn classify_server_tool_call_treats_jsonrpc_errors_as_rejected() {
         let result = classify_server_tool_call(
             "send_message",
@@ -17400,6 +17457,9 @@ mod mail_server_cli_bridge_tests {
         assert!(fetch_inbox_server_rejection_allows_local_fallback(
             "project not found: /tmp/legacy-project"
         ));
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "JSON-RPC error -32602: Agent 'LegacyReceiver' not found. Project '/tmp/legacy-project' has no registered agents yet.; data=null"
+        ));
     }
 
     #[test]
@@ -17425,6 +17485,9 @@ mod mail_server_cli_bridge_tests {
         ));
         assert!(mail_server_rejection_allows_local_fallback(
             "project not found: /tmp/legacy-project"
+        ));
+        assert!(mail_server_rejection_allows_local_fallback(
+            "JSON-RPC error -32602: Agent 'LegacyReceiver' not found. Project '/tmp/legacy-project' has no registered agents yet.; data=null"
         ));
     }
 
@@ -18924,6 +18987,17 @@ command = "mcp-agent-mail"
         assert_eq!(config.project_key, "/tmp/test-project");
         assert_eq!(config.agent_name, "TestAgent");
         assert_eq!(config.limit, 10);
+    }
+
+    #[test]
+    fn validate_mail_inbox_limit_accepts_positive_values() {
+        assert_eq!(validate_mail_inbox_limit(20).expect("positive limit"), 20);
+    }
+
+    #[test]
+    fn validate_mail_inbox_limit_rejects_non_positive_values() {
+        let error = validate_mail_inbox_limit(0).expect_err("limit=0 should be rejected");
+        assert!(matches!(error, CliError::InvalidArgument(_)));
     }
 
     #[test]
@@ -35538,6 +35612,17 @@ fn resolve_agent_id_for_inbox_check(
     crate::context::resolve_agent(conn, project_id, agent_name).map(|agent| agent.id)
 }
 
+fn validate_mail_inbox_limit(limit: i64) -> CliResult<usize> {
+    if limit < 1 {
+        return Err(CliError::InvalidArgument(
+            "mail inbox limit must be at least 1".to_string(),
+        ));
+    }
+    usize::try_from(limit).map_err(|_| {
+        CliError::InvalidArgument(format!("mail inbox limit exceeds supported range: {limit}"))
+    })
+}
+
 /// Check inbox via direct SQLite query (for co-located setups).
 ///
 /// This bypasses the HTTP/MCP server and queries the database directly,
@@ -35552,22 +35637,7 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
     }
 
     let conn = open_db_sync_mail_inbox()?;
-
-    // Resolve project ID from project_key (try slug first, then human_key)
-    let project_rows = conn
-        .query_sync(
-            "SELECT id FROM projects WHERE slug = ? OR human_key = ? LIMIT 1",
-            &[
-                Value::Text(config.project_key.clone()),
-                Value::Text(config.project_key.clone()),
-            ],
-        )
-        .map_err(|e| CliError::Other(format!("project lookup failed: {e}")))?;
-
-    let project_id: i64 = project_rows
-        .first()
-        .and_then(|row| row.get_named("id").ok())
-        .ok_or_else(|| CliError::Other(format!("project not found: {}", config.project_key)))?;
+    let project_id = crate::context::resolve_project(&conn, &config.project_key)?.id;
 
     let agent_id = resolve_agent_id_for_inbox_check(&conn, project_id, &config.agent_name)?;
 
@@ -35646,6 +35716,7 @@ fn fetch_mail_inbox_direct_with_database_url(
 ) -> CliResult<Vec<serde_json::Value>> {
     use sqlmodel_core::Value;
 
+    let validated_limit = validate_mail_inbox_limit(limit)?;
     let conn = open_db_sync_mail_inbox_with_database_url(database_url)?;
     let project = crate::context::resolve_project(&conn, project_key)?;
     let agent = crate::context::resolve_agent(&conn, project.id, agent_name)?;
@@ -35668,7 +35739,9 @@ fn fetch_mail_inbox_direct_with_database_url(
         params.push(Value::BigInt(ts));
     }
     sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
-    params.push(Value::BigInt(limit.max(0)));
+    params.push(Value::BigInt(
+        i64::try_from(validated_limit).expect("validated mail inbox limit fits i64"),
+    ));
 
     let rows = conn
         .query_sync(&sql, &params)
@@ -35897,6 +35970,11 @@ fn server_tool_error_is_unavailable(error: &CliError) -> bool {
         CliError::Io(_) => true,
         CliError::Other(message) => {
             message.starts_with("transport failure calling ")
+                || message
+                    .strip_prefix("unexpected HTTP status ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|status| status.parse::<u16>().ok())
+                    .is_some_and(|status| (500..=599).contains(&status))
                 || (message.starts_with("request to ") && message.contains(" timed out after "))
         }
         _ => false,
@@ -35906,18 +35984,23 @@ fn server_tool_error_is_unavailable(error: &CliError) -> bool {
 fn mail_server_rejection_allows_local_fallback(message: &str) -> bool {
     let lower = message.trim().to_ascii_lowercase();
     if lower.is_empty()
-        || lower.starts_with("json-rpc error")
         || lower.starts_with("authentication failed")
         || lower.starts_with("server returned http ")
     {
         return false;
     }
 
-    (lower.starts_with("project '") && lower.contains(" not found"))
+    let scope_missing = (lower.starts_with("project '") && lower.contains(" not found"))
         || (lower.starts_with("agent '") && lower.contains(" not found"))
         || lower.starts_with("project not found:")
         || lower.starts_with("agent not found:")
-        || lower.contains("has no registered agents yet")
+        || lower.contains("has no registered agents yet");
+
+    if lower.starts_with("json-rpc error") {
+        return scope_missing;
+    }
+
+    scope_missing
 }
 
 fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {

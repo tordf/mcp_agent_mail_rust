@@ -417,6 +417,7 @@ impl BaselineComparator {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp, clippy::unnecessary_cast)]
     use super::*;
 
     #[test]

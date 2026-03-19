@@ -349,6 +349,8 @@ Dedicated `tests/*.rs` harness count by crate:
 
 ## Obvious Follow-On Targets
 
+- `br-aazao.3`: replace the biggest fake-binary, stub-encoder, and mock-release lanes with real-path inputs where that confidence claim matters.
+- `br-aazao.4`: isolate or replace the search/embedder/LLM substitute lanes so ranking and summarization realism claims stay honest.
 - `br-aazao.8.1`: add the missing per-suite `manifest.json` contract so the current rich artifact set becomes uniformly machine-readable at the case level.
 - `br-aazao.5` / `6` / `7`: use the per-crate laggards above to drive concrete closure work instead of broad “add more tests” efforts.
 

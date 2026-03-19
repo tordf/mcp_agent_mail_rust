@@ -640,6 +640,7 @@ pub fn build_surface_card(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp, clippy::assertions_on_constants)]
     use super::*;
 
     // ── Surface state ──

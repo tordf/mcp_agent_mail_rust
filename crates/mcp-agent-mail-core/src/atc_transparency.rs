@@ -525,7 +525,7 @@ pub const METHOD_LEDGER: &[MethodLedgerEntry] = &[
         complexity_cost: "~300 lines (conformal.rs). Requires calibration sample buffer. \
                           Tests must verify coverage under distribution shift.",
         sunset_criteria: "If the posterior (Bayesian updates) proves consistently well-calibrated \
-                          (e-process never fires after initial 1,000 observations across all strata), \
+                          (e-process never fires after initial 10,000 observations across all strata), \
                           conformal gating can be relaxed to advisory-only mode. Do NOT remove it — \
                           degrade gracefully.",
         depends_on: &[
@@ -1105,6 +1105,7 @@ pub fn check_ev_gate(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::assertions_on_constants)]
     use super::*;
 
     #[test]

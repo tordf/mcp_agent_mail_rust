@@ -290,6 +290,7 @@ pub fn compute_cohort_stats(estimates: &[StratumEstimate]) -> CohortStats {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     fn make_estimate(key: &str, mean: f64, count: u64) -> StratumEstimate {

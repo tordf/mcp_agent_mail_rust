@@ -227,7 +227,7 @@ impl AgentContaminationTracker {
         }
 
         self.last_event_micros = ts_micros;
-        self.total_signals += signals.len() as u32;
+        self.total_signals = self.total_signals.saturating_add(u32::try_from(signals.len()).unwrap_or(u32::MAX));
 
         // Update quality based on signal count.
         self.quality = if self.total_signals == 0 {
@@ -396,9 +396,11 @@ mod tests {
 
     #[test]
     fn reset_restores_trusted() {
-        let mut tracker = AgentContaminationTracker::default();
-        tracker.total_signals = 5;
-        tracker.quality = EvidenceQuality::Capped;
+        let mut tracker = AgentContaminationTracker {
+            total_signals: 5,
+            quality: EvidenceQuality::Capped,
+            ..Default::default()
+        };
         tracker.reset();
         assert_eq!(tracker.quality, EvidenceQuality::Trusted);
         assert_eq!(tracker.total_signals, 0);

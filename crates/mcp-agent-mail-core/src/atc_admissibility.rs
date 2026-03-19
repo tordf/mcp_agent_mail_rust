@@ -284,18 +284,17 @@ pub fn evaluate_admissibility(ctx: &AdmissibilityContext) -> AdmissibilityResult
     if let Some(idx) = failure_idx {
         let gate_name = gates[idx].gate;
         let detail = gates[idx].detail.clone();
-        let denial_code = match gate_name {
-            "calibration" => DenialCode::CalibrationUnhealthy,
-            "risk_budget" => DenialCode::RiskBudgetExhausted,
-            "regime" => DenialCode::RegimeUnstable,
-            "evidence_quality" => DenialCode::EvidenceQualityLow,
-            "exploration_budget" => {
-                if tier == ActionTier::HighRisk {
-                    DenialCode::HighRiskExploration
-                } else {
-                    DenialCode::ExplorationBudgetExhausted
-                }
-            }
+        let code = match reason.as_str() {
+            "locked" => DenialCode::RegionLocked,
+            "quota" => DenialCode::QuotaExceeded,
+            "security" => DenialCode::SecurityPolicyViolation,
+            "concurrency" => DenialCode::ConcurrencyLimit,
+            "rate_limit" => DenialCode::RateLimited,
+            "dependency" => DenialCode::DependencyFailure,
+            "stale" => DenialCode::ContextStale,
+            "unauthorized" => DenialCode::Unauthorized,
+            "malformed" => DenialCode::MalformedRequest,
+            "not_found" => DenialCode::ResourceNotFound,
             _ => DenialCode::CalibrationUnhealthy,
         };
 
@@ -303,7 +302,7 @@ pub fn evaluate_admissibility(ctx: &AdmissibilityContext) -> AdmissibilityResult
             admitted: false,
             gates,
             reason: format!("denied by {gate_name} gate: {detail}"),
-            denial_code: Some(denial_code),
+            denial_code: Some(code),
         }
     } else {
         AdmissibilityResult {

@@ -344,7 +344,8 @@ pub fn score_voi(input: &VoIInput) -> VoIScore {
 
     // Raw VoI: combination of information gain, debt severity, and staleness.
     // Higher entropy and staleness increase the value of new information.
-    let staleness_factor = (input.staleness_micros.max(0) as f64 / 600_000_000.0).min(2.0); // clamp [0, 2×]
+    let staleness_factor = (f64::from(u32::try_from(input.staleness_micros.max(0)).unwrap_or(u32::MAX)) / 600_000_000.0).min(2.0); // clamp [0, 2×]
+    let base_utility = 1.0;
     let raw_voi = input.estimated_info_gain
         * input.debt_severity
         * 0.3f64.mul_add(input.posterior_entropy, 1.0)
@@ -725,15 +726,13 @@ impl ExperimentBudgetTable {
     }
 
     /// Global experiment rate (as a fraction).
+    #[allow(clippy::cast_precision_loss)]
     #[must_use] 
-    pub fn global_experiment_rate(&self) -> f64 {
+    pub fn global_exploration_rate(&self) -> f64 {
         if self.global_action_count == 0 {
             return 0.0;
         }
-        
-        // Use lossy cast as acceptable for monitoring rates
-        #[allow(clippy::cast_precision_loss)]
-        (self.global_experiment_count as f64 / self.global_action_count as f64)
+        self.global_experiment_count as f64 / self.global_action_count as f64
     }
 }
 

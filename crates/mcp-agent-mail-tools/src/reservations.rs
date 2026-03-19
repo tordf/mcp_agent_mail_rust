@@ -114,14 +114,17 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
         ));
     }
 
-    if pattern == "*"
-        || pattern == "**"
-        || pattern == "**/*"
-        || pattern == "**/**"
-        || pattern == "."
+    let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern);
+    let norm = compiled.normalized();
+
+    if norm == "*"
+        || norm == "**"
+        || norm == "**/*"
+        || norm == "**/**"
+        || norm.is_empty()
     {
         return Some(format!(
-            "Pattern '{pattern}' is too broad. It will block all other agents from editing any files."
+            "Pattern '{pattern}' is too broad (normalizes to '{norm}'). It will block all other agents from editing any files."
         ));
     }
 
@@ -129,14 +132,6 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
         return Some(format!(
             "Pattern '{pattern}' is very short and likely too broad."
         ));
-    }
-
-    let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern);
-    if compiled.normalized().is_empty() {
-        return Some(
-            "Pattern normalizes to the project root. Reserving the root overlaps with everything."
-                .to_string(),
-        );
     }
 
     None
