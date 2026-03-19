@@ -571,6 +571,61 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // message_recipients.read_ts + ack_ts (both nullable)
+    // Uses a composite WHERE so a single UPDATE handles both nullable columns.
+    migrations.push(Migration::new(
+        "v3_fix_message_recipients_text_timestamps".to_string(),
+        "convert legacy TEXT timestamps to INTEGER microseconds in message_recipients".to_string(),
+        format!(
+            "UPDATE message_recipients SET \
+             read_ts = CASE WHEN typeof(read_ts) = 'text' THEN ({}) ELSE read_ts END, \
+             ack_ts  = CASE WHEN typeof(ack_ts)  = 'text' THEN ({}) ELSE ack_ts  END \
+             WHERE typeof(read_ts) = 'text' OR typeof(ack_ts) = 'text'",
+            ts_conversion("read_ts"),
+            ts_conversion("ack_ts")
+        ),
+        String::new(),
+    ));
+
+    // agent_links.created_ts + updated_ts + expires_ts
+    migrations.push(Migration::new(
+        "v3_fix_agent_links_text_timestamps".to_string(),
+        "convert legacy TEXT timestamps to INTEGER microseconds in agent_links".to_string(),
+        format!(
+            "UPDATE agent_links SET \
+             created_ts = CASE WHEN typeof(created_ts) = 'text' THEN ({}) ELSE created_ts END, \
+             updated_ts = CASE WHEN typeof(updated_ts) = 'text' THEN ({}) ELSE updated_ts END, \
+             expires_ts = CASE WHEN typeof(expires_ts) = 'text' THEN ({}) ELSE expires_ts END \
+             WHERE typeof(created_ts) = 'text' OR typeof(updated_ts) = 'text' OR typeof(expires_ts) = 'text'",
+            ts_conversion("created_ts"),
+            ts_conversion("updated_ts"),
+            ts_conversion("expires_ts")
+        ),
+        String::new(),
+    ));
+
+    // project_sibling_suggestions: created_ts + evaluated_ts (required) +
+    // confirmed_ts + dismissed_ts (nullable)
+    migrations.push(Migration::new(
+        "v3_fix_project_sibling_suggestions_text_timestamps".to_string(),
+        "convert legacy TEXT timestamps to INTEGER microseconds in project_sibling_suggestions"
+            .to_string(),
+        format!(
+            "UPDATE project_sibling_suggestions SET \
+             created_ts   = CASE WHEN typeof(created_ts)   = 'text' THEN ({}) ELSE created_ts   END, \
+             evaluated_ts = CASE WHEN typeof(evaluated_ts) = 'text' THEN ({}) ELSE evaluated_ts END, \
+             confirmed_ts = CASE WHEN typeof(confirmed_ts) = 'text' THEN ({}) ELSE confirmed_ts END, \
+             dismissed_ts = CASE WHEN typeof(dismissed_ts) = 'text' THEN ({}) ELSE dismissed_ts END \
+             WHERE typeof(created_ts) = 'text' OR typeof(evaluated_ts) = 'text' \
+               OR typeof(confirmed_ts) = 'text' OR typeof(dismissed_ts) = 'text'",
+            ts_conversion("created_ts"),
+            ts_conversion("evaluated_ts"),
+            ts_conversion("confirmed_ts"),
+            ts_conversion("dismissed_ts")
+        ),
+        String::new(),
+    ));
+
     // ── v4: composite indexes for hot-path queries ──────────────────────
     // These cover the most frequent query patterns that previously required
     // full table scans or suboptimal single-column index usage.
