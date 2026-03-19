@@ -347,10 +347,18 @@ def get_staged_files():
                 seen.add(f)
                 out.append(f)
         return out
-    except subprocess.CalledProcessError:
-        return []
-    except Exception:
-        return []
+    except subprocess.CalledProcessError as exc:
+        print(
+            "mcp-agent-mail: guard failed to inspect staged files: " + str(exc),
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except Exception as exc:
+        print(
+            "mcp-agent-mail: guard failed to inspect staged files: " + str(exc),
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 def get_push_files():
     """Get list of files modified in the push (for pre-push)."""
@@ -387,7 +395,14 @@ def get_push_files():
                 capture_output=True, text=True
             )
             if res.returncode != 0:
-                continue
+                detail = (res.stderr or "").strip()
+                if not detail:
+                    detail = f"git rev-list exited with status {res.returncode}"
+                print(
+                    "mcp-agent-mail: guard failed to enumerate pushed commits: " + detail,
+                    file=sys.stderr,
+                )
+                sys.exit(2)
 
             commits = [c.strip() for c in res.stdout.splitlines() if c.strip()]
 
@@ -397,30 +412,42 @@ def get_push_files():
                      "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "-m", sha],
                     capture_output=True
                 )
-                if diff_res.returncode == 0:
-                    data = diff_res.stdout
-                    parts = data.split(b'\0')
-                    i = 0
-                    while i < len(parts):
-                        status = parts[i].decode('utf-8', 'ignore').strip()
-                        if not status:
-                            i += 1
-                            continue
+                if diff_res.returncode != 0:
+                    detail = diff_res.stderr.decode("utf-8", "ignore").strip()
+                    if not detail:
+                        detail = f"git diff-tree exited with status {diff_res.returncode}"
+                    print(
+                        "mcp-agent-mail: guard failed to inspect pushed commit paths: " + detail,
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
+                data = diff_res.stdout
+                parts = data.split(b'\0')
+                i = 0
+                while i < len(parts):
+                    status = parts[i].decode('utf-8', 'ignore').strip()
+                    if not status:
                         i += 1
-                        if status.startswith(('R', 'C')):
-                            if i + 1 < len(parts):
-                                oldp = parts[i].decode('utf-8', 'ignore')
-                                newp = parts[i+1].decode('utf-8', 'ignore')
-                                if oldp: files.add(oldp)
-                                if newp: files.add(newp)
-                                i += 2
-                        else:
-                            if i < len(parts):
-                                p = parts[i].decode('utf-8', 'ignore')
-                                if p: files.add(p)
-                                i += 1
-    except Exception:
-        pass
+                        continue
+                    i += 1
+                    if status.startswith(('R', 'C')):
+                        if i + 1 < len(parts):
+                            oldp = parts[i].decode('utf-8', 'ignore')
+                            newp = parts[i+1].decode('utf-8', 'ignore')
+                            if oldp: files.add(oldp)
+                            if newp: files.add(newp)
+                            i += 2
+                    else:
+                        if i < len(parts):
+                            p = parts[i].decode('utf-8', 'ignore')
+                            if p: files.add(p)
+                            i += 1
+    except Exception as exc:
+        print(
+            "mcp-agent-mail: guard failed to inspect push files: " + str(exc),
+            file=sys.stderr,
+        )
+        sys.exit(2)
     return sorted(list(files))
 
 def is_real_directory(path):
@@ -1685,6 +1712,7 @@ fn parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     /// Simple fnmatch-style glob matching (like Python's `fnmatch.fnmatch`).
     /// `*` matches within a single directory, `**` matches across directories.
@@ -3161,6 +3189,25 @@ mod tests {
 
     // -----------------------------------------------------------------------
 
+    fn python_executable() -> Option<String> {
+        for candidate in ["python3", "python"] {
+            let Ok(output) = Command::new(candidate)
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+            else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+            let executable = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !executable.is_empty() {
+                return Some(executable);
+            }
+        }
+        None
+    }
+
     #[test]
     fn guard_plugin_script_contains_project() {
         let script = render_guard_plugin_script("/my/project", "pre-commit");
@@ -3186,11 +3233,7 @@ mod tests {
 
     #[test]
     fn guard_plugin_slug_collision_fails_closed_instead_of_loading_wrong_archive() {
-        let python = if Command::new("python3").arg("--version").output().is_ok() {
-            "python3"
-        } else if Command::new("python").arg("--version").output().is_ok() {
-            "python"
-        } else {
+        let Some(python) = python_executable() else {
             return;
         };
 
@@ -3248,7 +3291,7 @@ mod tests {
         )
         .expect("write guard script");
 
-        let output = Command::new(python)
+        let output = Command::new(&python)
             .current_dir(&repo_dir)
             .env("AGENT_NAME", "PinkStone")
             .env("STORAGE_ROOT", &storage_root)
@@ -3266,6 +3309,113 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("could not locate archive"),
             "expected archive lookup failure, got stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn guard_plugin_pre_commit_fails_closed_when_git_is_unavailable() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        std::fs::write(repo_dir.join("tracked.rs"), "fn main() {}\n").expect("write tracked");
+        run_git(&repo_dir, &["add", "tracked.rs"]);
+
+        let script_path = td.path().join("guard_pre_commit.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+        )
+        .expect("write guard script");
+
+        let output = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .env("PATH", "")
+            .arg(&script_path)
+            .output()
+            .expect("run guard script");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "guard should fail closed when git is unavailable for staged-file inspection: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("failed to inspect staged files"),
+            "expected staged-file inspection failure, got stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn guard_plugin_pre_push_fails_closed_when_git_is_unavailable() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+        std::fs::write(repo_dir.join("tracked.rs"), "fn main() {}\n").expect("write tracked");
+        run_git(&repo_dir, &["add", "tracked.rs"]);
+        run_git(&repo_dir, &["commit", "-qm", "init"]);
+        let head = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let script_path = td.path().join("guard_pre_push.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-push"),
+        )
+        .expect("write guard script");
+
+        let mut child = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .env("PATH", "")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn guard script");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(
+                format!(
+                    "refs/heads/main {head} refs/heads/main 0000000000000000000000000000000000000000\n"
+                )
+                .as_bytes(),
+            )
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("wait output");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "guard should fail closed when git is unavailable for push inspection: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("failed to inspect push files")
+                || String::from_utf8_lossy(&output.stderr)
+                    .contains("failed to enumerate pushed commits"),
+            "expected push inspection failure, got stdout={}, stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );

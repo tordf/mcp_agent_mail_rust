@@ -368,7 +368,11 @@ fn probe_single_get(
     if ip.is_loopback()
         || ip.is_unspecified()
         || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_private() || v4.is_link_local())
-        || matches!(ip, std::net::IpAddr::V6(v6) if v6.segments()[0] & 0xfe00 == 0xfc00)
+        || matches!(ip, std::net::IpAddr::V6(v6) if {
+            let s0 = v6.segments()[0];
+            // ULA (fc00::/7) or link-local (fe80::/10)
+            (s0 & 0xfe00 == 0xfc00) || (s0 & 0xffc0 == 0xfe80)
+        })
     {
         return Err(ProbeError::ConnectionError {
             detail: format!(

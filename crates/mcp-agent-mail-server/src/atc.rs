@@ -265,6 +265,15 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
         &self.posterior
     }
 
+    /// Return the maximum possible loss value in the loss matrix.
+    #[must_use]
+    pub fn max_possible_loss(&self) -> f64 {
+        self.loss_matrix
+            .iter()
+            .copied()
+            .fold(0.0, |a: f64, b: f64| a.max(b))
+    }
+
     /// Get the current posterior formatted for the evidence ledger.
     #[must_use]
     pub fn posterior_summary(&self) -> Vec<(String, f64)> {
@@ -1589,6 +1598,8 @@ pub struct AgentRhythm {
     pub avg_interval: f64,
     /// EWMA of squared deviations (variance estimate).
     pub var_interval: f64,
+    /// Ring buffer of recent intervals for Hill Estimator (tail risk).
+    pub recent_intervals: std::collections::VecDeque<f64>,
     /// Number of observations.
     pub observation_count: u64,
     /// EWMA decay factor (default 0.1 = ~10 sample half-life).
@@ -1610,6 +1621,7 @@ impl AgentRhythm {
         Self {
             avg_interval: prior_micros,
             var_interval: (prior_micros * 0.5).powi(2), // initial variance = (half the mean)²
+            recent_intervals: std::collections::VecDeque::with_capacity(50),
             observation_count: 0,
             alpha: 0.1,
             prior_interval: prior_micros,
@@ -1630,6 +1642,10 @@ impl AgentRhythm {
                 (delta - old_avg).powi(2),
                 (1.0 - self.alpha) * self.var_interval,
             );
+            if self.recent_intervals.len() >= 50 {
+                self.recent_intervals.pop_front();
+            }
+            self.recent_intervals.push_back(delta);
             self.observation_count = self.observation_count.saturating_add(1);
         }
         self.last_activity_ts = self.last_activity_ts.max(timestamp_micros);
@@ -1652,13 +1668,49 @@ impl AgentRhythm {
         self.var_interval.max(0.0).sqrt()
     }
 
-    /// Suspicion threshold: `avg + k * std_dev`.
-    ///
-    /// `k` controls the false-positive rate (k≈3 → ~0.3% false positive
-    /// under Gaussian assumption).
+    /// Suspicion threshold using Tail-Risk DRO (Conditional Value at Risk) 
+    /// via a Hill Estimator for the Pareto tail index.
     #[must_use]
     pub fn suspicion_threshold(&self, k: f64) -> f64 {
-        k.mul_add(self.std_dev(), self.effective_avg())
+        if self.recent_intervals.len() < 10 {
+            return self.effective_avg() + k * self.std_dev();
+        }
+
+        let mut sorted: Vec<f64> = self.recent_intervals.iter().copied().collect();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // Descending
+
+        // Top 20% for tail estimation
+        let tail_count = (sorted.len() / 5).max(3);
+        let threshold_val = sorted[tail_count].max(1.0); 
+
+        let mut sum_log_ratio = 0.0;
+        for i in 0..tail_count {
+            sum_log_ratio += (sorted[i] / threshold_val).ln();
+        }
+
+        let tail_index = if sum_log_ratio > 0.0 {
+            (tail_count as f64) / sum_log_ratio
+        } else {
+            2.0 
+        };
+
+        // Ensure alpha > 1.0 for valid CVaR
+        let alpha = tail_index.max(1.05);
+
+        // Map k to a quantile q (e.g. k=3 -> 0.99)
+        let q = 1.0 - (0.03 / k.max(1.0)); 
+
+        let tail_prob = (tail_count as f64) / (sorted.len() as f64);
+
+        let cvar = if q >= 1.0 - tail_prob {
+            let tail_q = 1.0 - (1.0 - q) / tail_prob;
+            let var = threshold_val * (1.0 - tail_q).powf(-1.0 / alpha);
+            var * alpha / (alpha - 1.0)
+        } else {
+            self.effective_avg() + k * self.std_dev()
+        };
+
+        cvar.max(self.effective_avg() + k * self.std_dev())
     }
 
     /// How long since the last activity (microseconds).
@@ -1915,6 +1967,25 @@ impl ProjectConflictGraph {
         self.hard_edges.retain(|_, edges| {
             let before = edges.len();
             edges.retain(|edge| edge.since == 0 || edge.since >= cutoff_micros);
+            removed = removed.saturating_add(before.saturating_sub(edges.len()));
+            !edges.is_empty()
+        });
+        if removed > 0 {
+            self.bump_generation();
+        }
+        removed
+    }
+
+    fn remove_agent(&mut self, agent: &str) -> usize {
+        let mut removed = 0_usize;
+        // Remove edges where agent is the holder
+        if let Some(edges) = self.hard_edges.remove(agent) {
+            removed = removed.saturating_add(edges.len());
+        }
+        // Remove edges where agent is blocked
+        self.hard_edges.retain(|_, edges| {
+            let before = edges.len();
+            edges.retain(|edge| edge.blocked != agent);
             removed = removed.saturating_add(before.saturating_sub(edges.len()));
             !edges.is_empty()
         });
@@ -3608,25 +3679,27 @@ impl AtcCostModel {
 
 #[derive(Debug, Clone)]
 struct AtcSlowControllerState {
-    mode: AtcBudgetMode,
-    probe_limit: usize,
+    pub probe_budget_fraction: f64,
+    pub probe_limit: usize,
     budget_debt_micros: f64,
-    window_tick_count: u64,
-    window_total_utilization: f64,
-    window_budget_exceeded: u64,
-    adaptation_interval_ticks: u64,
+    integral_error: f64,
+    prev_error: f64,
+    kp: f64,
+    ki: f64,
+    last_utilization_ratio: f64,
 }
 
 impl Default for AtcSlowControllerState {
     fn default() -> Self {
         Self {
-            mode: AtcBudgetMode::Nominal,
+            probe_budget_fraction: 0.5,
             probe_limit: 3,
             budget_debt_micros: 0.0,
-            window_tick_count: 0,
-            window_total_utilization: 0.0,
-            window_budget_exceeded: 0,
-            adaptation_interval_ticks: 16,
+            integral_error: 0.0,
+            prev_error: 0.0,
+            kp: 0.1,
+            ki: 0.05,
+            last_utilization_ratio: 0.0,
         }
     }
 }
@@ -3640,6 +3713,7 @@ impl AtcSlowControllerState {
         budget_exceeded: bool,
         baseline_probe_limit: usize,
     ) {
+        self.last_utilization_ratio = utilization_ratio;
         let debt_delta = i64::try_from(total_micros).unwrap_or(i64::MAX)
             - i64::try_from(tick_budget_micros).unwrap_or(i64::MAX);
         let next_debt = self.budget_debt_micros + nonnegative_i64_to_f64(debt_delta);
@@ -3648,41 +3722,35 @@ impl AtcSlowControllerState {
         } else {
             next_debt
         };
-        self.window_tick_count = self.window_tick_count.saturating_add(1);
-        self.window_total_utilization += utilization_ratio;
-        if budget_exceeded {
-            self.window_budget_exceeded = self.window_budget_exceeded.saturating_add(1);
-        }
-        if self.window_tick_count < self.adaptation_interval_ticks {
-            return;
-        }
 
-        let average_utilization =
-            self.window_total_utilization / u64_to_f64(self.window_tick_count);
+        // PI Controller logic
+        // Target: utilization < 0.75 and minimal debt
+        let target_utilization = 0.75;
         let debt_ratio = self.budget_debt_micros / u64_to_f64(tick_budget_micros.max(1));
-        if self.window_budget_exceeded > 0 || average_utilization > 0.9 || debt_ratio > 1.5 {
-            self.mode = AtcBudgetMode::Conservative;
-            self.probe_limit = self.probe_limit.saturating_sub(1).max(1);
-        } else if average_utilization > 0.75 || debt_ratio > 0.5 {
-            self.mode = AtcBudgetMode::Pressure;
-            self.probe_limit = self.probe_limit.min(baseline_probe_limit.max(1));
-        } else {
-            self.mode = AtcBudgetMode::Nominal;
-            self.probe_limit = (self.probe_limit + 1).min(baseline_probe_limit.max(1));
+        
+        // Error is positive when we have slack (under-utilized, no debt)
+        // Error is negative when overloaded (over-utilized, high debt)
+        let mut error = target_utilization - utilization_ratio - (0.5 * debt_ratio);
+        if budget_exceeded {
+            error -= 0.5; // Strong penalty for exceeding hard budget
         }
 
-        self.window_tick_count = 0;
-        self.window_total_utilization = 0.0;
-        self.window_budget_exceeded = 0;
-    }
+        self.integral_error = (self.integral_error + error).clamp(-10.0, 10.0);
 
-    #[must_use]
-    fn average_window_utilization(&self) -> f64 {
-        if self.window_tick_count == 0 {
-            0.0
-        } else {
-            self.window_total_utilization / u64_to_f64(self.window_tick_count)
+        let p_term = self.kp * error;
+        let i_term = self.ki * self.integral_error;
+        let nominal_bias = 0.5;
+
+        // Update fraction with PI output (position form)
+        self.probe_budget_fraction = (nominal_bias + p_term + i_term).clamp(0.05, 1.0);        
+        // Map fraction to discrete probe limit
+        let float_limit = (self.probe_budget_fraction * usize_to_f64(baseline_probe_limit)).round();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            self.probe_limit = (float_limit as usize).clamp(1, baseline_probe_limit.max(1));
         }
+
+        self.prev_error = error;
     }
 
     #[must_use]
@@ -4357,12 +4425,30 @@ impl AtcEngine {
         }
     }
 
+    fn prune_agent_from_conflict_graphs(&mut self, agent_name: &str) {
+        let dirty_projects: Vec<String> = self.conflict_graphs.keys().cloned().collect();
+        for project in dirty_projects {
+            let removed = self
+                .conflict_graphs
+                .get_mut(&project)
+                .map_or(0, |graph| graph.remove_agent(agent_name));
+            if removed > 0 {
+                self.dirty_projects.insert(project);
+                // Also note conflict resolved so UI updates
+                self.session_summary
+                    .absorb(&SynthesisEvent::ConflictResolved {
+                        timestamp_micros: mcp_agent_mail_core::timestamps::now_micros(),
+                    });
+            }
+        }
+    }
+
     fn current_release_guard_reason(&self) -> Option<String> {
         if self.policy_bundle.validate().is_err() {
             Some("policy_bundle_invalid".to_string())
         } else if self.calibration.is_safe_mode() {
             Some("calibration_safe_mode".to_string())
-        } else if self.slow_controller.mode == AtcBudgetMode::Conservative {
+        } else if self.slow_controller.probe_budget_fraction < 0.2 {
             Some("budget_pressure".to_string())
         } else {
             None
@@ -4597,8 +4683,12 @@ impl AtcEngine {
     fn budget_mode(&self) -> AtcBudgetMode {
         if self.calibration.is_safe_mode() {
             AtcBudgetMode::Conservative
+        } else if self.slow_controller.probe_budget_fraction > 0.6 {
+            AtcBudgetMode::Nominal
+        } else if self.slow_controller.probe_budget_fraction > 0.2 {
+            AtcBudgetMode::Pressure
         } else {
-            self.slow_controller.mode
+            AtcBudgetMode::Conservative
         }
     }
 
@@ -4741,6 +4831,7 @@ impl AtcEngine {
             let mut shadow_pair: Option<(LivenessAction, LivenessAction, f64, f64)> = None;
             let mut decision_log: Option<(String, LivenessAction, f64, f64, String)> = None;
             let mut action_to_emit: Option<(String, LivenessAction)> = None;
+            let mut newly_dead = false;
 
             if let Some(entry) = self.agents.get_mut(&agent_name) {
                 if entry.state == LivenessState::Dead {
@@ -4819,6 +4910,7 @@ impl AtcEngine {
                             }
                             LivenessAction::ReleaseReservations => {
                                 entry.state = LivenessState::Dead;
+                                newly_dead = true;
                             }
                             LivenessAction::DeclareAlive => {}
                         }
@@ -4882,6 +4974,10 @@ impl AtcEngine {
 
             if let Some(action) = action_to_emit {
                 evaluation.actions.push(action);
+            }
+
+            if newly_dead {
+                self.prune_agent_from_conflict_graphs(&agent_name);
             }
 
             self.reschedule_agent(&agent_name, now_micros, incumbent_k);
@@ -5271,13 +5367,37 @@ impl AtcEngine {
                 let subject = cycle.join(" → ");
                 let evidence_summary =
                     format!("deterministic deadlock cycle in {project}: {subject}");
+                    
+                // Causal Bottleneck Analysis
+                let mut best_target = cycle[0].clone();
+                let mut max_score = -1.0;
+                let graph = self.conflict_graphs.get(project);
+
+                for agent in cycle {
+                    let survival_rate = self.agents.get(agent)
+                        .map(|e| e.core.posterior_probability(LivenessState::Alive))
+                        .unwrap_or(1.0);
+                        
+                    let vcg_priority = graph
+                        .and_then(|g| g.hard_edges.get(agent))
+                        .map(|edges| edges.len() as f64)
+                        .unwrap_or(1.0);
+                        
+                    // Score = Expected wait reduction weighted by probability they are already stuck/dead
+                    let score = vcg_priority * (1.0 - survival_rate + 0.01);
+                    if score > max_score {
+                        max_score = score;
+                        best_target = agent.clone();
+                    }
+                }
+
                 let decision_id = self.ledger.record_event(&EventDecisionBuilder {
                     subsystem: AtcSubsystem::Conflict,
                     decision_class: "deadlock_cycle",
                     subject: &subject,
                     policy_id: None,
                     posterior: Vec::new(),
-                    action: "AdvisoryMessage",
+                    action: "ForceRelease",
                     expected_loss: 0.0,
                     runner_up_loss: 0.0,
                     loss_table: Vec::new(),
@@ -5287,24 +5407,44 @@ impl AtcEngine {
                     fallback_reason: decision_fallback_reason.as_deref(),
                     timestamp_micros: now_micros,
                 });
-                let message = format!(
-                    "[ATC] Deadlock in {project}: {subject}. Inspect the contested reservations and release only the stale holder if safe."
-                );
-                actions.push(AtcTickAction::SendAdvisory {
-                    agent: cycle[0].clone(),
-                    message: message.clone(),
-                });
-                if let Some(effect) = self.effect_plan_for_decision_id(
-                    decision_id,
-                    now_micros,
-                    "send_advisory",
-                    "conflict",
-                    "deadlock_remediation",
-                    cycle[0].clone(),
-                    Some(project.clone()),
-                    Some(message),
-                ) {
-                    effects.push(effect);
+                
+                if !decision_fallback_active {
+                    actions.push(AtcTickAction::ReleaseReservations {
+                        agent: best_target.clone(),
+                    });
+                    if let Some(effect) = self.effect_plan_for_decision_id(
+                        decision_id,
+                        now_micros,
+                        "release_reservations_requested",
+                        "conflict",
+                        "deadlock_remediation",
+                        best_target,
+                        Some(project.clone()),
+                        Some(format!("[ATC] Causal bottleneck released to break cycle: {subject}")),
+                    ) {
+                        effects.push(effect);
+                    }
+                } else {
+                    let message = format!(
+                        "[ATC] Deadlock in {project}: {subject}. Targeted {} for release, but safe mode is active.",
+                        best_target
+                    );
+                    actions.push(AtcTickAction::SendAdvisory {
+                        agent: best_target.clone(),
+                        message: message.clone(),
+                    });
+                    if let Some(effect) = self.effect_plan_for_decision_id(
+                        decision_id,
+                        now_micros,
+                        "send_advisory",
+                        "conflict",
+                        "deadlock_remediation",
+                        best_target,
+                        Some(project.clone()),
+                        Some(message),
+                    ) {
+                        effects.push(effect);
+                    }
                 }
             }
         }
@@ -5448,7 +5588,7 @@ impl AtcEngine {
         let mut withheld_releases = Vec::new();
         if let Some(conformal_lock) = ATC_CONFORMAL.get()
             && let Ok(conformal) = conformal_lock.lock()
-            && conformal.is_uncertain(AtcSubsystem::Liveness)
+            && conformal.is_uncertain(AtcSubsystem::Liveness, self.liveness_core.max_possible_loss())
         {
             actions.retain(|action| match action {
                 AtcTickAction::ReleaseReservations { agent } => {
@@ -5623,7 +5763,7 @@ impl AtcEngine {
                 .min(self.incumbent_policy.max_probes(reported_mode)),
             budget_debt_micros: self.slow_controller.budget_debt_micros(),
             utilization_ratio,
-            slow_window_utilization: self.slow_controller.average_window_utilization(),
+            slow_window_utilization: self.slow_controller.last_utilization_ratio,
             kernel_total_micros: pre_summary_total_micros,
         };
         let policy = AtcPolicyTelemetry {
@@ -7985,8 +8125,9 @@ impl SubsystemConformal {
     }
 
     #[must_use]
-    pub fn is_uncertain(&self) -> bool {
-        self.interval_width().is_some_and(|w| w > 10.0)
+    pub fn is_uncertain(&self, max_possible_loss: f64) -> bool {
+        // Uncertainty threshold is 20% of the maximum possible loss
+        self.interval_width().is_some_and(|w| w > max_possible_loss * 0.20)
     }
 }
 
@@ -8013,10 +8154,10 @@ impl AtcConformalSet {
     }
 
     #[must_use]
-    pub fn is_uncertain(&self, subsystem: AtcSubsystem) -> bool {
+    pub fn is_uncertain(&self, subsystem: AtcSubsystem, max_possible_loss: f64) -> bool {
         self.sets
             .get(&subsystem)
-            .is_some_and(SubsystemConformal::is_uncertain)
+            .is_some_and(|sc| sc.is_uncertain(max_possible_loss))
     }
 }
 
@@ -8250,20 +8391,7 @@ pub fn submodular_probe_schedule<S: BuildHasher>(
         }
     }
 
-    let mut selected = Vec::with_capacity(candidates.len());
-    let mut total_gain = 0.0;
-    for (name, gain) in candidates {
-        if selected.len() >= max_probes {
-            break;
-        }
-        let marginal = gain * (1.0 - total_gain / (total_gain + gain + 1.0));
-        if marginal < 0.001 {
-            break;
-        }
-        total_gain += marginal;
-        selected.push((name, marginal));
-    }
-    selected
+    candidates
 }
 
 #[derive(Debug, Clone)]
@@ -8419,7 +8547,71 @@ fn current_adaptive_threshold_k(agent_name: &str) -> Option<f64> {
         })
 }
 
+#[derive(Debug, Clone)]
+pub enum ReplayEvent {
+    Decision(AtcDecisionRecord),
+    Feedback {
+        decision_id: u64,
+        actual_loss: f64,
+    },
+    Activity(SynthesisEvent),
+    Tick {
+        total_micros: u64,
+        tick_budget_micros: u64,
+        utilization_ratio: f64,
+        budget_exceeded: bool,
+        baseline_probe_limit: usize,
+    },
+}
+
 impl AtcEngine {
+    /// Replay historical events to seamlessly reconstruct Bayesian posteriors, Conformal bounds,
+    /// and PI Control Theory states without amnesia after a server restart.
+    pub fn replay_from_ledger(&mut self, events: impl IntoIterator<Item = ReplayEvent>) {
+        for event in events {
+            match event {
+                ReplayEvent::Decision(record) => {
+                    if record.subsystem == AtcSubsystem::Liveness {
+                        if let Some(entry) = self.agents.get_mut(&record.subject) {
+                            entry.core.posterior = record.posterior.clone();
+                        }
+                    }
+                    self.ledger.insert_raw(record);
+                }
+                ReplayEvent::Feedback { decision_id, actual_loss } => {
+                    if let Some(record) = self.ledger.get_by_id(decision_id).cloned() {
+                        if let Some(conformal_lock) = ATC_CONFORMAL.get() {
+                            if let Ok(mut conformal) = conformal_lock.lock() {
+                                conformal.observe(record.subsystem, record.expected_loss, actual_loss);
+                            }
+                        }
+                    }
+                }
+                ReplayEvent::Activity(synthesis_event) => {
+                    self.session_summary.absorb(&synthesis_event);
+                    match synthesis_event {
+                        SynthesisEvent::MessageSent { ref from, timestamp_micros, .. } => {
+                            self.observe_agent_activity(from, timestamp_micros);
+                        }
+                        SynthesisEvent::MessageReceived { ref agent, timestamp_micros } => {
+                            self.observe_agent_activity(agent, timestamp_micros);
+                        }
+                        SynthesisEvent::ReservationGranted { ref agent, timestamp_micros } => {
+                            self.observe_agent_activity(agent, timestamp_micros);
+                        }
+                        SynthesisEvent::ReservationReleased { ref agent, timestamp_micros } => {
+                            self.observe_agent_activity(agent, timestamp_micros);
+                        }
+                        _ => {}
+                    }
+                }
+                ReplayEvent::Tick { total_micros, tick_budget_micros, utilization_ratio, budget_exceeded, baseline_probe_limit } => {
+                    self.slow_controller.note_tick(total_micros, tick_budget_micros, utilization_ratio, budget_exceeded, baseline_probe_limit);
+                }
+            }
+        }
+    }
+
     /// Build an `AtcConfig` from the core `Config` env vars.
     #[must_use]
     pub fn config_from_env(config: &mcp_agent_mail_core::Config) -> AtcConfig {

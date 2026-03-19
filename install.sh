@@ -4443,7 +4443,11 @@ migration_core_counts_preserved() {
   for table in "${core_tables[@]}"; do
     before=$(migration_count_value_from_summary "$before_summary" "$table")
     after=$(migration_count_value_from_summary "$after_summary" "$table")
-    if [[ "$before" =~ ^[0-9]+$ ]] && [[ "$after" =~ ^[0-9]+$ ]]; then
+    if [[ "$before" =~ ^[0-9]+$ ]]; then
+      if ! [[ "$after" =~ ^[0-9]+$ ]]; then
+        warn "Migration row count verification could not read a post-migration count for ${table}: before=${before} after=${after:-<missing>}"
+        return 1
+      fi
       if [ "$after" -lt "$before" ]; then
         warn "Migration row count regressed for ${table}: before=${before} after=${after}"
         return 1
@@ -4485,6 +4489,16 @@ extract_migration_error_line() {
       exit
     }
   '
+}
+
+migration_output_has_unresolved_warnings() {
+  local output="$1"
+  printf "%s\n" "$output" | grep -qiE "database still contains TEXT timestamps|migration completed with errors|migration needed: run|unknown timestamp format"
+}
+
+migration_output_has_schema_instability() {
+  local output="$1"
+  printf "%s\n" "$output" | grep -qiE "schema migration hit sqlite engine instability|schema migration path was skipped due to backend instability"
 }
 
 sqlite_table_exists() {
@@ -4544,6 +4558,195 @@ sqlite_text_timestamp_columns_remaining() {
   done
 
   printf '%s' "$remaining"
+}
+
+SQLITE_LAST_PRAGMA_FAILURE=""
+SQLITE_POST_MIGRATION_FAILURES=""
+SQLITE_POST_MIGRATION_REMAINING_TEXT_COLUMNS=""
+
+sqlite_pragma_reports_ok() {
+  local db_path="$1"
+  local pragma="$2"
+  local output="" line trimmed normalized
+  local seen=0
+
+  SQLITE_LAST_PRAGMA_FAILURE=""
+
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    SQLITE_LAST_PRAGMA_FAILURE="sqlite3 unavailable"
+    return 1
+  fi
+  if [ ! -f "$db_path" ]; then
+    SQLITE_LAST_PRAGMA_FAILURE="database missing: $db_path"
+    return 1
+  fi
+
+  output=$(sqlite3 "$db_path" "PRAGMA ${pragma};" 2>/dev/null || true)
+
+  while IFS= read -r line; do
+    trimmed=$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    [ -z "$trimmed" ] && continue
+    seen=1
+    normalized=$(printf '%s' "$trimmed" | tr '[:upper:]' '[:lower:]')
+    if [ "$normalized" != "ok" ]; then
+      SQLITE_LAST_PRAGMA_FAILURE="$trimmed"
+      return 1
+    fi
+  done <<< "$output"
+
+  if [ "$seen" -eq 0 ]; then
+    SQLITE_LAST_PRAGMA_FAILURE="<empty>"
+    return 1
+  fi
+
+  return 0
+}
+
+append_sqlite_verification_failure() {
+  local failure="$1"
+  if [ -z "$failure" ]; then
+    return 0
+  fi
+  if [ -n "$SQLITE_POST_MIGRATION_FAILURES" ]; then
+    SQLITE_POST_MIGRATION_FAILURES="${SQLITE_POST_MIGRATION_FAILURES}; "
+  fi
+  SQLITE_POST_MIGRATION_FAILURES="${SQLITE_POST_MIGRATION_FAILURES}${failure}"
+}
+
+sqlite_post_migration_verify() {
+  local db_path="$1"
+  local before_counts="$2"
+  local after_counts="$3"
+
+  SQLITE_POST_MIGRATION_FAILURES=""
+  SQLITE_POST_MIGRATION_REMAINING_TEXT_COLUMNS=""
+
+  if ! sqlite_pragma_reports_ok "$db_path" "quick_check"; then
+    append_sqlite_verification_failure "quick_check=${SQLITE_LAST_PRAGMA_FAILURE:-<empty>}"
+  fi
+  if ! sqlite_pragma_reports_ok "$db_path" "integrity_check"; then
+    append_sqlite_verification_failure "integrity_check=${SQLITE_LAST_PRAGMA_FAILURE:-<empty>}"
+  fi
+
+  SQLITE_POST_MIGRATION_REMAINING_TEXT_COLUMNS=$(sqlite_text_timestamp_columns_remaining "$db_path")
+  if [ -n "$SQLITE_POST_MIGRATION_REMAINING_TEXT_COLUMNS" ]; then
+    append_sqlite_verification_failure "text_timestamps=${SQLITE_POST_MIGRATION_REMAINING_TEXT_COLUMNS}"
+  fi
+
+  if ! migration_core_counts_preserved "$before_counts" "$after_counts"; then
+    append_sqlite_verification_failure "core_row_counts_regressed"
+  fi
+
+  [ -z "$SQLITE_POST_MIGRATION_FAILURES" ]
+}
+
+sqlite_lightweight_self_heal() {
+  local db_path="$1"
+  local output=""
+
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    warn "sqlite3 is unavailable; cannot run installer structural self-heal."
+    return 1
+  fi
+  if [ ! -f "$db_path" ]; then
+    warn "SQLite structural self-heal target not found: $db_path"
+    return 1
+  fi
+
+  if output=$(sqlite3 "$db_path" <<'SQL' 2>&1
+PRAGMA busy_timeout=60000;
+PRAGMA wal_checkpoint(TRUNCATE);
+REINDEX;
+PRAGMA optimize;
+SQL
+); then
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:self_heal_sqlite ${line}"
+    done <<< "$output"
+    ok "Applied SQLite checkpoint/reindex/optimize self-heal"
+    return 0
+  else
+    warn "SQLite structural self-heal failed: $(printf '%s\n' "$output" | sed -n '1p')"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:self_heal_sqlite ${line}"
+    done <<< "$output"
+    return 1
+  fi
+}
+
+installer_reconstruct_database_from_archive() {
+  local db_path="$1"
+  local storage_root="$2"
+  local output=""
+
+  if [ ! -x "$DEST/$BIN_CLI" ]; then
+    warn "Rust CLI not found at $DEST/$BIN_CLI; cannot run archive reconstruction."
+    return 1
+  fi
+
+  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor reconstruct --yes 2>&1); then
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:doctor_reconstruct ${line}"
+    done <<< "$output"
+    ok "Archive-backed database reconstruction completed"
+    return 0
+  else
+    warn "Archive reconstruction failed: $(printf '%s\n' "$output" | sed -n '1p')"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:doctor_reconstruct ${line}"
+    done <<< "$output"
+    return 1
+  fi
+}
+
+installer_apply_schema_migration() {
+  local db_path="$1"
+  local storage_root="$2"
+  local output="" output_fallback="" summary_line="" success_output="" success_label=""
+
+  if [ ! -x "$DEST/$BIN_CLI" ]; then
+    warn "Rust CLI not found at $DEST/$BIN_CLI; cannot reapply schema migration."
+    return 1
+  fi
+
+  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+    success_output="$output"
+    success_label="primary"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:schema_refresh ${line}"
+    done <<< "$output"
+  elif output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+    success_output="$output_fallback"
+    success_label="fallback"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:schema_refresh_primary ${line}"
+    done <<< "$output"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:schema_refresh_fallback ${line}"
+    done <<< "$output_fallback"
+  else
+    summary_line=$(extract_migration_error_line "$output_fallback")
+    [ -z "$summary_line" ] && summary_line=$(extract_migration_error_line "$output")
+    [ -z "$summary_line" ] && summary_line=$(printf '%s\n%s\n' "$output" "$output_fallback" | sed -n '1p')
+    warn "Schema refresh failed after database repair: ${summary_line:-<empty>}"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:schema_refresh_primary ${line}"
+    done <<< "$output"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:schema_refresh_fallback ${line}"
+    done <<< "$output_fallback"
+    return 1
+  fi
+
+  if migration_output_has_schema_instability "$success_output" || migration_output_has_unresolved_warnings "$success_output"; then
+    summary_line=$(extract_migration_error_line "$success_output")
+    [ -z "$summary_line" ] && summary_line=$(printf '%s\n' "$success_output" | sed -n '1p')
+    warn "Schema refresh reported unresolved warnings after database repair (${success_label}): ${summary_line:-<empty>}"
+    return 1
+  fi
+
+  ok "Reapplied schema migration after database repair"
+  return 0
 }
 
 sqlite_timestamp_fallback_migration() {
@@ -4631,10 +4834,8 @@ SQL
   # Ensure subsequent readers don't see stale sidecars from failed attempts.
   rm -f "${db_path}-wal" "${db_path}-shm" 2>/dev/null || true
 
-  local integrity
-  integrity=$(sqlite3 "$db_path" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
-  if [ "$integrity" != "ok" ]; then
-    warn "sqlite3 fallback migration produced integrity_check='${integrity:-<empty>}'"
+  if ! sqlite_pragma_reports_ok "$db_path" "integrity_check"; then
+    warn "sqlite3 fallback migration produced integrity_check='${SQLITE_LAST_PRAGMA_FAILURE:-<empty>}'"
     return 1
   fi
 
@@ -4661,9 +4862,9 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   migration_before_counts=""
   migration_after_counts=""
   migration_integrity=""
-  migration_remaining_text_columns=""
   migration_has_unresolved_warnings=0
   migration_requires_fallback=0
+  migration_schema_refresh_failed=0
   migration_pristine_backup=""
   SQLITE_FALLBACK_BACKUP_PATH=""
   migration_restore_ok=0
@@ -4759,13 +4960,19 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
         migration_restore_ok=1
         warn "Restored database from pristine snapshot after failed am migrate."
       else
-        warn "Failed to restore pristine snapshot after am migrate failure."
+        migration_restore_ok=1
+        warn "Failed to restore pristine snapshot after am migrate failure; attempting sqlite3 fallback in-place."
       fi
     fi
 
     if [ "$migration_restore_ok" -eq 1 ] && sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
       migration_fallback_ok=1
       migration_succeeded=1
+      if installer_apply_schema_migration "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+        migration_schema_refresh_failed=0
+      else
+        migration_schema_refresh_failed=1
+      fi
       migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
       verbose "migration:row_counts_after_fallback ${migration_after_counts}"
       if [ -n "${SQLITE_FALLBACK_BACKUP_PATH:-}" ]; then
@@ -4780,10 +4987,10 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   fi
 
   if [ "$migration_succeeded" -eq 1 ]; then
-    migration_integrity=$(sqlite3 "$PYTHON_DB_MIGRATED_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
-    if [ "$migration_integrity" != "ok" ]; then
+    if ! sqlite_pragma_reports_ok "$PYTHON_DB_MIGRATED_PATH" "integrity_check"; then
       migration_requires_fallback=1
-      warn "am migrate produced integrity_check='${migration_integrity:-<empty>}'; forcing sqlite3 fallback."
+      migration_integrity="${SQLITE_LAST_PRAGMA_FAILURE:-<empty>}"
+      warn "am migrate produced integrity_check='${migration_integrity}'; forcing sqlite3 fallback."
     fi
     if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
       migration_requires_fallback=1
@@ -4798,8 +5005,8 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
         migration_restore_ok=1
         warn "Restored pristine migration snapshot before sqlite3 fallback."
       else
-        migration_restore_ok=0
-        warn "Failed to restore pristine snapshot prior to sqlite3 fallback migration."
+        migration_restore_ok=1
+        warn "Failed to restore pristine snapshot prior to sqlite3 fallback migration; attempting sqlite3 fallback in-place."
       fi
     else
       migration_restore_ok=1
@@ -4809,6 +5016,11 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     if [ "$migration_restore_ok" -eq 1 ] && sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
       migration_fallback_ok=1
       migration_succeeded=1
+      if installer_apply_schema_migration "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+        migration_schema_refresh_failed=0
+      else
+        migration_schema_refresh_failed=1
+      fi
       migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
       verbose "migration:row_counts_after_fallback ${migration_after_counts}"
       if [ -n "${SQLITE_FALLBACK_BACKUP_PATH:-}" ]; then
@@ -4824,56 +5036,90 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   # be healthy and core legacy row counts must be preserved.
   if [ "$migration_succeeded" -eq 1 ]; then
     migration_final_verification_failed=0
-    migration_integrity=$(sqlite3 "$PYTHON_DB_MIGRATED_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
-    if [ "$migration_integrity" != "ok" ]; then
+    if [ "$migration_schema_refresh_failed" -eq 1 ]; then
       migration_final_verification_failed=1
-      warn "Final migration integrity_check failed: '${migration_integrity:-<empty>}'"
+      warn "Final migration verification detected a schema refresh failure after database repair."
     fi
-    migration_remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$PYTHON_DB_MIGRATED_PATH")
-    if [ -n "${migration_remaining_text_columns:-}" ]; then
+    if ! sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts"; then
       migration_final_verification_failed=1
-      warn "Final migration verification found remaining TEXT timestamps in: ${migration_remaining_text_columns}"
+      warn "Final migration verification failed: ${SQLITE_POST_MIGRATION_FAILURES}"
     fi
-    if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
-      migration_final_verification_failed=1
-      warn "Final migration verification detected reduced core legacy row counts."
-    fi
-    if [ "$migration_final_verification_failed" -eq 1 ] && [ "$migration_fallback_ok" -eq 0 ]; then
-      warn "Final migration verification failed; reverting to pristine snapshot and running sqlite3 fallback migration."
+
+    if [ "$migration_final_verification_failed" -eq 1 ]; then
+      warn "Attempting automatic database self-heal."
+      warn "Dual-track recovery path: restore pristine snapshot, normalize timestamps, stabilize SQLite, then reconstruct from the Git archive if needed."
+
+      migration_restore_ok=1
       if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
         if copy_sqlite_snapshot "$migration_pristine_backup" "$PYTHON_DB_MIGRATED_PATH"; then
-          migration_restore_ok=1
-          warn "Restored pristine migration snapshot before final sqlite3 fallback."
+          warn "Restored pristine migration snapshot before automatic self-heal."
         else
-          migration_restore_ok=0
-          warn "Failed to restore pristine snapshot prior to final sqlite3 fallback migration."
+          warn "Failed to restore pristine snapshot before automatic self-heal; continuing self-heal in-place."
         fi
       else
-        migration_restore_ok=1
-        warn "Pristine migration snapshot missing; running final sqlite3 fallback migration in-place."
+        warn "Pristine migration snapshot missing; continuing self-heal in-place."
       fi
 
-      if [ "$migration_restore_ok" -eq 1 ] && sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
-        migration_fallback_ok=1
-        migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
-        verbose "migration:row_counts_after_final_fallback ${migration_after_counts}"
-        migration_integrity=$(sqlite3 "$PYTHON_DB_MIGRATED_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1 || true)
-        migration_remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$PYTHON_DB_MIGRATED_PATH")
+      if [ "$migration_restore_ok" -eq 1 ]; then
+        if sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
+          migration_fallback_ok=1
+          if installer_apply_schema_migration "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+            migration_schema_refresh_failed=0
+          else
+            migration_schema_refresh_failed=1
+          fi
+          if [ -n "${SQLITE_FALLBACK_BACKUP_PATH:-}" ]; then
+            ok "Database backup created at ${SQLITE_FALLBACK_BACKUP_PATH}"
+          fi
+        else
+          warn "Timestamp-only fallback could not fully normalize the migrated database."
+        fi
+      fi
+
+      sqlite_lightweight_self_heal "$PYTHON_DB_MIGRATED_PATH" || warn "SQLite structural self-heal could not fully repair the migrated database."
+      migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+      verbose "migration:row_counts_after_self_heal ${migration_after_counts}"
+
+      if sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts"; then
         migration_final_verification_failed=0
-        if [ "$migration_integrity" != "ok" ]; then
+        if [ "$migration_schema_refresh_failed" -eq 1 ]; then
           migration_final_verification_failed=1
-          warn "Final sqlite3 fallback integrity_check failed: '${migration_integrity:-<empty>}'"
-        fi
-        if [ -n "${migration_remaining_text_columns:-}" ]; then
-          migration_final_verification_failed=1
-          warn "Final sqlite3 fallback left TEXT timestamps in: ${migration_remaining_text_columns}"
-        fi
-        if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
-          migration_final_verification_failed=1
-          warn "Final sqlite3 fallback reduced core legacy row counts."
+          warn "Post-self-heal verification passed SQLite checks, but schema refresh still failed."
         fi
       else
-        migration_final_verification_failed=1
+        warn "Post-self-heal verification still failed: ${SQLITE_POST_MIGRATION_FAILURES}"
+
+        migration_restore_ok=1
+        if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
+          if copy_sqlite_snapshot "$migration_pristine_backup" "$PYTHON_DB_MIGRATED_PATH"; then
+            warn "Restored pristine migration snapshot before archive reconstruction."
+          else
+            warn "Failed to restore pristine snapshot before archive reconstruction; continuing from the current database state."
+          fi
+        fi
+
+        if [ "$migration_restore_ok" -eq 1 ] && sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
+          migration_fallback_ok=1
+        fi
+
+        if [ "$migration_restore_ok" -eq 1 ] && installer_reconstruct_database_from_archive "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+          if installer_apply_schema_migration "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+            migration_schema_refresh_failed=0
+          else
+            migration_schema_refresh_failed=1
+          fi
+          migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+          verbose "migration:row_counts_after_reconstruct ${migration_after_counts}"
+          if sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts"; then
+            migration_final_verification_failed=0
+            if [ "$migration_schema_refresh_failed" -eq 1 ]; then
+              migration_final_verification_failed=1
+              warn "Archive reconstruction passed SQLite checks, but schema refresh still failed."
+            fi
+          else
+            warn "Archive reconstruction completed, but verification still failed: ${SQLITE_POST_MIGRATION_FAILURES}"
+          fi
+        fi
       fi
     fi
 

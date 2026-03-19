@@ -141,11 +141,33 @@ pub fn verify_bundle(
                     )),
                 });
             };
-            let file_path = resolve_sri_file_path(bundle_root, relative_path);
+            let file_path = match resolve_sri_file_path(bundle_root, relative_path) {
+                Ok(p) => p,
+                Err(traversal_err) => {
+                    return Ok(VerifyResult {
+                        bundle: bundle_root.display().to_string(),
+                        sri_checked: true,
+                        sri_valid: false,
+                        signature_checked: false,
+                        signature_verified: false,
+                        key_source: None,
+                        error: Some(traversal_err),
+                    });
+                }
+            };
             if file_path.exists() {
                 let content = std::fs::read(&file_path)?;
                 let actual_hash = format!("sha256-{}", base64_encode(&sha256_bytes(&content)));
-                if actual_hash != expected {
+                // Use constant-length comparison to avoid timing oracles.
+                // While SHA-256 makes this practically unexploitable, defense-in-depth
+                // is cheap and prevents future regret.
+                let hashes_match = actual_hash.len() == expected.len()
+                    && actual_hash
+                        .bytes()
+                        .zip(expected.bytes())
+                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                        == 0;
+                if !hashes_match {
                     return Ok(VerifyResult {
                         bundle: bundle_root.display().to_string(),
                         sri_checked: true,
@@ -154,7 +176,7 @@ pub fn verify_bundle(
                         signature_verified: false,
                         key_source: None,
                         error: Some(format!(
-                            "SRI mismatch for {relative_path}: expected {expected}, got {actual_hash}"
+                            "SRI mismatch for {relative_path}: file content does not match manifest hash"
                         )),
                     });
                 }
@@ -233,19 +255,34 @@ pub fn verify_bundle(
     })
 }
 
-fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> PathBuf {
-    // Reject path traversal attempts to prevent reading files outside the bundle.
-    if relative_path.contains("..") || std::path::Path::new(relative_path).is_absolute() {
-        return bundle_root.join("__invalid_path__");
+fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    // Reject obvious path traversal attempts.
+    if relative_path.contains("..")
+        || std::path::Path::new(relative_path).is_absolute()
+        || relative_path.contains('\0')
+    {
+        return Err(format!(
+            "path traversal blocked: '{relative_path}' contains prohibited components"
+        ));
     }
 
     // Historical manifests store SRI paths relative to `viewer/` (e.g. `vendor/foo.js`),
     // while some tooling may emit bundle-root relative paths. Accept either.
     let direct = bundle_root.join(relative_path);
     if direct.exists() {
-        return direct;
+        // Verify the resolved path is still under bundle_root (prevents symlink escape).
+        if let (Ok(canonical_root), Ok(canonical_file)) =
+            (bundle_root.canonicalize(), direct.canonicalize())
+        {
+            if !canonical_file.starts_with(&canonical_root) {
+                return Err(format!(
+                    "path traversal blocked: '{relative_path}' resolves outside bundle root"
+                ));
+            }
+        }
+        return Ok(direct);
     }
-    bundle_root.join("viewer").join(relative_path)
+    Ok(bundle_root.join("viewer").join(relative_path))
 }
 
 /// Result of bundle verification.
