@@ -193,6 +193,9 @@ impl BocpdDetector {
     ///   distribution (limits memory usage).
     #[must_use]
     pub fn new(hazard: f64, threshold: f64, max_run_length: usize) -> Self {
+        // Clamp hazard to (0, 1) exclusive — 0.0 or 1.0 produce -inf log
+        // values that silently disable change-point detection.
+        let hazard = hazard.clamp(1e-15, 1.0 - 1e-15);
         let prior = NigStats::default_prior();
         Self {
             hazard,
@@ -221,11 +224,15 @@ impl BocpdDetector {
         prior_alpha: f64,
         prior_beta: f64,
     ) -> Self {
+        // Clamp hazard to (0, 1) exclusive.
+        let hazard = hazard.clamp(1e-15, 1.0 - 1e-15);
+        // Clamp NIG prior parameters to positive values — zero or negative
+        // kappa/alpha/beta cause division-by-zero or NaN in log_predictive.
         let prior = NigStats {
             mu: prior_mu,
-            kappa: prior_kappa,
-            alpha: prior_alpha,
-            beta: prior_beta,
+            kappa: prior_kappa.max(1e-10),
+            alpha: prior_alpha.max(1e-10),
+            beta: prior_beta.max(1e-10),
         };
         Self {
             hazard,
@@ -248,6 +255,13 @@ impl BocpdDetector {
     /// Returns `Some(ChangePoint)` if a change point is detected at this
     /// step, `None` otherwise.
     pub fn observe(&mut self, x: f64) -> Option<ChangePoint> {
+        // Reject non-finite inputs — NaN/Infinity would permanently corrupt
+        // the posterior (all future change points silently missed).
+        if !x.is_finite() {
+            self.index += 1;
+            return None;
+        }
+
         let n = self.log_run_dist.len();
         let log_hazard = self.hazard.ln();
         let log_1_minus_hazard = (1.0 - self.hazard).ln();

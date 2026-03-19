@@ -179,10 +179,19 @@ pub fn evaluate_check_rows(
         })
         .collect();
 
-    // Some SQLite backends currently surface PRAGMA check success with an empty
+    // Some SQLite backends surface PRAGMA check success with an empty
     // rowset instead of a single "ok" row; normalize that to preserve semantics.
+    // But if rows were returned and ALL were non-Text (dropped by filter_map),
+    // treat that as suspicious rather than silently reporting "ok".
     if details.is_empty() {
-        details.push("ok".to_string());
+        if rows.is_empty() {
+            details.push("ok".to_string());
+        } else {
+            details.push(format!(
+                "warning: {} integrity check rows returned but none had extractable text values",
+                rows.len()
+            ));
+        }
     }
 
     // SQLite returns "ok" as the single row when no corruption is found.
@@ -231,13 +240,24 @@ pub fn attempt_vacuum_recovery(conn: &DbConn, original_path: &str) -> DbResult<S
     // Remove any leftover recovery file.
     let _ = std::fs::remove_file(&recovery_path);
 
-    // Ensure latest committed state is in the main DB file before copying.
-    conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
-        .map_err(|e| DbError::Sqlite(format!("wal checkpoint before recovery failed: {e}")))?;
-    conn.execute_raw("VACUUM")
-        .map_err(|e| DbError::Sqlite(format!("vacuum before recovery failed: {e}")))?;
+    // Use PASSIVE checkpoint to flush what we can without modifying the
+    // corrupt database aggressively. TRUNCATE could propagate WAL-resident
+    // corruption into the main file. VACUUM on a corrupt DB risks partial
+    // overwrite of the original before failing.
+    let _ = conn.query_sync("PRAGMA wal_checkpoint(PASSIVE)", &[]);
+
+    // Copy the database file as-is (preserving corruption evidence).
     std::fs::copy(original_path, &recovery_path)
         .map_err(|e| DbError::Sqlite(format!("copy recovery failed: {e}")))?;
+    // Also copy WAL/SHM so the recovery copy has the full state.
+    let _ = std::fs::copy(
+        format!("{original_path}-wal"),
+        format!("{recovery_path}-wal"),
+    );
+    let _ = std::fs::copy(
+        format!("{original_path}-shm"),
+        format!("{recovery_path}-shm"),
+    );
 
     // Verify the recovery copy is valid.
     let recovery_conn = DbConn::open_file(&recovery_path)

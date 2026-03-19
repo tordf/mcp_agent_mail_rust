@@ -118,7 +118,10 @@ static HTML_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
             if value_lower.starts_with("data:") {
                 // Only allow data: URIs for image sources, completely block them in links
                 // to prevent navigating to malicious SVG data URIs containing scripts.
-                if element == "img" && attribute == "src" && value_lower.starts_with("data:image/")
+                if element == "img"
+                    && attribute == "src"
+                    && value_lower.starts_with("data:image/")
+                    && !value_lower.starts_with("data:image/svg")
                 {
                     Some(value.into())
                 } else {

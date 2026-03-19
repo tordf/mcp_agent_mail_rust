@@ -87,7 +87,7 @@ const KNOWN_TABLES: &[KnownTable] = &[
     KnownTable {
         name: "message_recipients",
         page_by_column: None,
-        primary_key_columns: &["message_id", "agent_id"],
+        primary_key_columns: &["message_id", "agent_id", "kind"],
         columns: &["message_id", "agent_id", "kind", "read_ts", "ack_ts"],
     },
     KnownTable {
@@ -762,6 +762,63 @@ mod tests {
         let capabilities_json: String = rows[0].get_named("capabilities_json").unwrap();
         assert_eq!(tool_name, "send_message");
         assert_eq!(capabilities_json, "[\"attachments\"]");
+    }
+
+    #[test]
+    fn snapshot_preserves_multiple_recipient_kinds_for_same_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("runtime.sqlite3");
+        let dest = dir.path().join("snapshot.sqlite3");
+
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (\
+                message_id INTEGER NOT NULL, \
+                agent_id INTEGER NOT NULL, \
+                kind TEXT NOT NULL, \
+                read_ts INTEGER, \
+                ack_ts INTEGER, \
+                PRIMARY KEY(message_id, agent_id, kind)\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (1, 7, 'to', 111, NULL)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (1, 7, 'cc', NULL, 222)")
+            .unwrap();
+        drop(conn);
+
+        create_sqlite_snapshot(&source, &dest, false).unwrap();
+
+        let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
+        let rows = copy_conn
+            .query_sync(
+                "SELECT kind, read_ts, ack_ts \
+                 FROM message_recipients \
+                 WHERE message_id = 1 AND agent_id = 7 \
+                 ORDER BY kind",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "snapshot should preserve both recipient rows"
+        );
+
+        let cc_kind: String = rows[0].get_named("kind").unwrap();
+        let cc_read_ts: Option<i64> = rows[0].get_named("read_ts").unwrap();
+        let cc_ack_ts: Option<i64> = rows[0].get_named("ack_ts").unwrap();
+        assert_eq!(cc_kind, "cc");
+        assert_eq!(cc_read_ts, None);
+        assert_eq!(cc_ack_ts, Some(222));
+
+        let to_kind: String = rows[1].get_named("kind").unwrap();
+        let to_read_ts: Option<i64> = rows[1].get_named("read_ts").unwrap();
+        let to_ack_ts: Option<i64> = rows[1].get_named("ack_ts").unwrap();
+        assert_eq!(to_kind, "to");
+        assert_eq!(to_read_ts, Some(111));
+        assert_eq!(to_ack_ts, None);
     }
 
     #[test]
