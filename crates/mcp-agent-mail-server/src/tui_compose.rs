@@ -481,6 +481,29 @@ impl ComposeState {
         self.body.len().saturating_add(additional_bytes) <= MAX_BODY_LEN
     }
 
+    fn effective_body_scroll(&self, body_rows: usize, line_count: usize) -> usize {
+        if body_rows == 0 || line_count <= body_rows {
+            return 0;
+        }
+
+        let max_scroll = line_count.saturating_sub(body_rows);
+        let cursor_line = self.body_cursor_line.min(line_count.saturating_sub(1));
+        let min_scroll_for_cursor = cursor_line.saturating_sub(body_rows.saturating_sub(1));
+        self.body_scroll
+            .clamp(min_scroll_for_cursor, cursor_line)
+            .min(max_scroll)
+    }
+
+    fn clamp_body_cursor(&mut self) {
+        let lines = self.body_lines();
+        let last_line = lines.len().saturating_sub(1);
+        self.body_cursor_line = self.body_cursor_line.min(last_line);
+        let line_len = lines
+            .get(self.body_cursor_line)
+            .map_or(0, |line| char_count(line));
+        self.body_cursor_col = self.body_cursor_col.min(line_len);
+    }
+
     /// Handle a key event. Returns a [`ComposeAction`] describing what happened.
     pub fn handle_key(&mut self, key: &KeyEvent) -> ComposeAction {
         if key.kind != KeyEventKind::Press {
@@ -569,6 +592,7 @@ impl ComposeState {
             TextTarget::Subject => (&mut self.subject, &mut self.subject_cursor),
             TextTarget::ThreadId => (&mut self.thread_id, &mut self.thread_id_cursor),
         };
+        clamp_text_cursor(text, cursor);
 
         match key.code {
             KeyCode::Left => {
@@ -618,6 +642,7 @@ impl ComposeState {
     }
 
     fn handle_body_key(&mut self, key: &KeyEvent) -> ComposeAction {
+        self.clamp_body_cursor();
         match key.code {
             KeyCode::Enter => {
                 if self.body_has_capacity_for(1) {
@@ -769,7 +794,7 @@ fn char_count(s: &str) -> usize {
 }
 
 fn char_display_width(ch: char) -> usize {
-    ftui::text::char_width(ch).max(1)
+    ftui::core::text_width::char_width(ch).max(1)
 }
 
 fn display_width(s: &str) -> usize {
@@ -792,6 +817,10 @@ fn truncate_to_display_width(s: &str, max_width: usize) -> String {
         rendered_width += ch_width;
     }
     truncated
+}
+
+fn clamp_text_cursor(text: &str, cursor: &mut usize) {
+    *cursor = (*cursor).min(char_count(text));
 }
 
 fn byte_index_from_char_index(s: &str, char_idx: usize) -> usize {
@@ -1123,6 +1152,7 @@ impl<'a> ComposePanel<'a> {
             let body_rows = (max_y.saturating_sub(y).saturating_sub(5)) as usize;
             let body_rows = body_rows.max(3);
             let lines = self.state.body_lines();
+            let body_scroll = self.state.effective_body_scroll(body_rows, lines.len());
 
             let border_fg = if is_active {
                 cp.active_border
@@ -1140,7 +1170,7 @@ impl<'a> ComposePanel<'a> {
                 if y >= max_y {
                     break;
                 }
-                let line_idx = self.state.body_scroll + vi;
+                let line_idx = body_scroll + vi;
                 let line_text = lines.get(line_idx).unwrap_or(&"");
                 let truncated = truncate_to_display_width(line_text, inner_w.saturating_sub(2));
                 self.draw_text(
@@ -1477,6 +1507,23 @@ mod tests {
         assert_eq!(truncate_to_display_width(text, 2), "A");
         assert_eq!(truncate_to_display_width(text, 3), "A界");
         assert_eq!(truncate_to_display_width(text, 4), "A界B");
+    }
+
+    #[test]
+    fn effective_body_scroll_keeps_cursor_visible_near_end() {
+        let mut s = ComposeState::new();
+        s.body = "0\n1\n2\n3\n4".into();
+        s.body_cursor_line = 4;
+        assert_eq!(s.effective_body_scroll(3, s.body_lines().len()), 2);
+    }
+
+    #[test]
+    fn effective_body_scroll_clamps_stale_scroll_above_cursor() {
+        let mut s = ComposeState::new();
+        s.body = "0\n1\n2\n3\n4".into();
+        s.body_scroll = 4;
+        s.body_cursor_line = 1;
+        assert_eq!(s.effective_body_scroll(3, s.body_lines().len()), 1);
     }
 
     // ── ComposeField ───────────────────────────────────────────
@@ -2164,6 +2211,17 @@ mod tests {
         assert_eq!(s.subject, "Hi");
     }
 
+    #[test]
+    fn subject_backspace_clamps_stale_cursor_before_mutation() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Subject;
+        s.subject = "Hi".into();
+        s.subject_cursor = 10;
+        s.handle_key(&make_key(KeyCode::Backspace));
+        assert_eq!(s.subject, "H");
+        assert_eq!(s.subject_cursor, 1);
+    }
+
     // ── Edge-case: thread ID field ────────────────────────────
 
     #[test]
@@ -2243,6 +2301,19 @@ mod tests {
         s.handle_key(&make_key(KeyCode::Char('界')));
         assert_eq!(s.body.len(), MAX_BODY_LEN - 1);
         assert_eq!(s.body_cursor_col, MAX_BODY_LEN - 1);
+    }
+
+    #[test]
+    fn body_backspace_clamps_stale_cursor_before_mutation() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "ab\nc".into();
+        s.body_cursor_line = 1;
+        s.body_cursor_col = 5;
+        s.handle_key(&make_key(KeyCode::Backspace));
+        assert_eq!(s.body, "ab\n");
+        assert_eq!(s.body_cursor_line, 1);
+        assert_eq!(s.body_cursor_col, 0);
     }
 
     // ── Edge-case: overlay area extremes ──────────────────────
