@@ -615,12 +615,16 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
         let mut table_results: Vec<ColumnConversionResult> = Vec::new();
 
         for column in columns {
-            if let Some(fmt) = detect_column_format(conn, table, column)? {
-                if fmt != "text" {
-                    continue;
+            let fmt_result = detect_column_format(conn, table, column);
+            match fmt_result {
+                Err(e) => {
+                    // Rollback the open transaction before propagating.
+                    let _ = conn.execute_raw("ROLLBACK");
+                    return Err(e);
                 }
-            } else {
-                continue;
+                Ok(Some(fmt)) if fmt != "text" => continue,
+                Ok(Some(_)) => {} // text format — proceed to convert
+                Ok(None) => continue,
             }
 
             match convert_column(conn, table, column) {

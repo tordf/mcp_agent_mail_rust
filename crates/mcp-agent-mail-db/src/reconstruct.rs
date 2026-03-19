@@ -279,7 +279,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         // Phase 3: Discover messages for this project
         let messages_dir = project_path.join("messages");
         if is_real_directory(&messages_dir) {
-            discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats);
+            discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats)?;
         }
     }
 
@@ -419,6 +419,9 @@ fn discover_agents(
 }
 
 /// Walk `messages/{YYYY}/{MM}/*.md` and insert message + recipient rows.
+///
+/// Returns `Err` only for unrecoverable DB failures (connection dead, disk full).
+/// Individual file parse errors are counted in `stats.parse_errors` and skipped.
 fn discover_messages(
     conn: &DbConn,
     messages_dir: &Path,
@@ -426,7 +429,7 @@ fn discover_messages(
     project_slug: &str,
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
-) {
+) -> DbResult<()> {
     // Walk year directories
     let Ok(years) = std::fs::read_dir(messages_dir) else {
         return;
@@ -481,6 +484,11 @@ fn discover_messages(
         {
             Ok(()) => {}
             Err(e) => {
+                // Distinguish parse errors (skip file) from DB errors (abort).
+                // Probe the connection — if it's dead, propagate the error.
+                if conn.execute_raw("SELECT 1").is_err() {
+                    return Err(e);
+                }
                 stats.parse_errors += 1;
                 stats.warnings.push(format!(
                     "Failed to reconstruct message from {}: {e}",
@@ -489,6 +497,7 @@ fn discover_messages(
             }
         }
     }
+    Ok(())
 }
 
 /// Parse a single archive `.md` file and insert the message into the database.
@@ -542,6 +551,12 @@ fn parse_and_insert_message(
     let to_names = json_str_array(&msg, "to");
     let cc_names = json_str_array(&msg, "cc");
     let bcc_names = json_str_array(&msg, "bcc");
+    let recipients_json = serde_json::json!({
+        "to": &to_names,
+        "cc": &cc_names,
+        "bcc": &bcc_names,
+    })
+    .to_string();
 
     // Insert message, preserving canonical frontmatter ID when available.
     //
@@ -582,8 +597,8 @@ fn parse_and_insert_message(
     let message_id = if let Some(cid) = canonical_id {
         conn.execute_sync(
             "INSERT OR REPLACE INTO messages \
-             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(cid),
                 Value::BigInt(project_id),
@@ -594,6 +609,7 @@ fn parse_and_insert_message(
                 Value::Text(importance.to_string()),
                 Value::BigInt(i64::from(ack_required)),
                 Value::BigInt(created_ts),
+                Value::Text(recipients_json.clone()),
                 Value::Text(attachments),
             ],
         )
@@ -602,8 +618,8 @@ fn parse_and_insert_message(
     } else {
         conn.execute_sync(
             "INSERT INTO messages \
-             (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(project_id),
                 Value::BigInt(sender_id),
@@ -613,6 +629,7 @@ fn parse_and_insert_message(
                 Value::Text(importance.to_string()),
                 Value::BigInt(i64::from(ack_required)),
                 Value::BigInt(created_ts),
+                Value::Text(recipients_json.clone()),
                 Value::Text(attachments),
             ],
         )
@@ -2368,11 +2385,19 @@ Hello Bob, this is a test message.
         let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
         let rows = conn
             .query_sync(
-                "SELECT subject, body_md, thread_id FROM messages LIMIT 1",
+                "SELECT subject, body_md, thread_id, recipients_json FROM messages LIMIT 1",
                 &[],
             )
             .unwrap();
         assert!(!rows.is_empty(), "message should exist in DB");
+        let recipients_json = rows[0]
+            .get_named::<String>("recipients_json")
+            .expect("recipients_json");
+        let recipients_value: serde_json::Value =
+            serde_json::from_str(&recipients_json).expect("recipients_json parses");
+        assert_eq!(recipients_value["to"], serde_json::json!(["Bob"]));
+        assert_eq!(recipients_value["cc"], serde_json::json!([]));
+        assert_eq!(recipients_value["bcc"], serde_json::json!(["Carol"]));
 
         // Verify Bob was auto-created as a placeholder agent
         let agent_rows = conn

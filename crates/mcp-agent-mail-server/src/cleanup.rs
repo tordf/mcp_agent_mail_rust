@@ -218,6 +218,10 @@ fn run_cleanup_cycle_with_cache(
     pool: &DbPool,
     probe_cache: &mut CleanupProbeCache,
 ) -> Result<(usize, usize), String> {
+    // This worker runs on a dedicated OS thread outside the async runtime,
+    // so there is no parent Cx to derive from. Cx::for_testing() provides
+    // Budget::INFINITE which is correct for a long-running background worker
+    // that should never be cancelled by budget exhaustion.
     let cx = Cx::for_testing();
 
     // Get all project IDs with active reservations.
