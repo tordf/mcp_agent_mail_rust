@@ -47,5 +47,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 nix = { workspace = true, features = ["signal", "process"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1.8.0"
+
 [dev-dependencies]
 similar.workspace = true

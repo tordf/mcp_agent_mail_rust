@@ -35628,8 +35628,6 @@ fn validate_mail_inbox_limit(limit: i64) -> CliResult<usize> {
 /// This bypasses the HTTP/MCP server and queries the database directly,
 /// which is faster and works even when the server is not running.
 pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInboxRpcResult> {
-    use sqlmodel_core::Value;
-
     if config.limit < 1 {
         return Err(CliError::InvalidArgument(
             "check-inbox limit must be at least 1".to_string(),
@@ -35638,47 +35636,37 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
 
     let conn = open_db_sync_mail_inbox()?;
     let project_id = crate::context::resolve_project(&conn, &config.project_key)?.id;
-
     let agent_id = resolve_agent_id_for_inbox_check(&conn, project_id, &config.agent_name)?;
-
-    // Query unread messages (where read_ts IS NULL)
-    let sql = "
-        SELECT m.id, m.subject, m.importance, m.created_ts, a.name AS sender_name
-        FROM message_recipients mr
-        JOIN messages m ON m.id = mr.message_id
-        JOIN agents a ON a.id = m.sender_id
-        WHERE mr.agent_id = ? AND m.project_id = ? AND mr.read_ts IS NULL
-        ORDER BY m.created_ts DESC
-        LIMIT ?
-    ";
-
-    let rows = conn
-        .query_sync(
-            sql,
-            &[
-                Value::BigInt(agent_id),
-                Value::BigInt(project_id),
-                Value::BigInt(config.limit),
-            ],
-        )
-        .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
+    let sqlite_path = mcp_agent_mail_db::DbPoolConfig::from_env()
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let rows = mcp_agent_mail_db::sync::fetch_inbox_native_sqlite_by_ids(
+        &sqlite_path,
+        project_id,
+        agent_id,
+        false,
+        true,
+        false,
+        None,
+        usize::try_from(config.limit)
+            .map_err(|_| CliError::InvalidArgument("check-inbox limit is too large".to_string()))?,
+    )
+    .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
 
     let mut messages = Vec::with_capacity(rows.len());
     let mut urgent_or_high_count = 0usize;
 
     for row in &rows {
-        let id: i64 = row.get_named("id").unwrap_or(0);
-        let subject: String = row.get_named("subject").unwrap_or_default();
-        let from: String = row.get_named("sender_name").unwrap_or_default();
-        let importance: String = row.get_named("importance").unwrap_or_default();
-        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+        let id = row.message.id.unwrap_or(0);
+        let subject = row.message.subject.clone();
+        let from = row.sender_name.clone();
+        let importance = row.message.importance.clone();
+        let created_ts = row.message.created_ts;
 
-        // Count urgent/high priority messages
         if importance == "urgent" || importance == "high" {
             urgent_or_high_count += 1;
         }
 
-        // Format timestamp as ISO-8601 string
         let created_ts_str = format_micros_as_iso(created_ts);
 
         let raw = serde_json::json!({
@@ -35714,57 +35702,46 @@ fn fetch_mail_inbox_direct_with_database_url(
     limit: i64,
     include_bodies: bool,
 ) -> CliResult<Vec<serde_json::Value>> {
-    use sqlmodel_core::Value;
-
     let validated_limit = validate_mail_inbox_limit(limit)?;
     let conn = open_db_sync_mail_inbox_with_database_url(database_url)?;
     let project = crate::context::resolve_project(&conn, project_key)?;
     let agent = crate::context::resolve_agent(&conn, project.id, agent_name)?;
-
-    let mut sql = String::from(
-        "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, \
-                m.created_ts, m.thread_id, mr.kind, sender.name AS sender_name \
-         FROM message_recipients mr \
-         JOIN messages m ON m.id = mr.message_id \
-         JOIN agents sender ON sender.id = m.sender_id \
-         WHERE mr.agent_id = ? AND m.project_id = ?",
-    );
-    let mut params = vec![Value::BigInt(agent.id), Value::BigInt(project.id)];
-
-    if urgent_only {
-        sql.push_str(" AND m.importance IN ('high', 'urgent')");
+    let sqlite_path = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
     }
-    if let Some(ts) = since_ts {
-        sql.push_str(" AND m.created_ts > ?");
-        params.push(Value::BigInt(ts));
-    }
-    sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
-    params.push(Value::BigInt(
-        i64::try_from(validated_limit).expect("validated mail inbox limit fits i64"),
-    ));
-
-    let rows = conn
-        .query_sync(&sql, &params)
-        .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
+    .sqlite_path()
+    .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let rows = mcp_agent_mail_db::sync::fetch_inbox_native_sqlite_by_ids(
+        &sqlite_path,
+        project.id,
+        agent.id,
+        urgent_only,
+        false,
+        false,
+        since_ts,
+        validated_limit,
+    )
+    .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
 
     let mut data = Vec::with_capacity(rows.len());
     for row in &rows {
         let mut value = serde_json::json!({
-            "id": row.get_named::<i64>("id").unwrap_or(0),
-            "subject": row.get_named::<String>("subject").unwrap_or_default(),
-            "from": row.get_named::<String>("sender_name").unwrap_or_default(),
-            "importance": row.get_named::<String>("importance").unwrap_or_default(),
-            "ack_required": row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
+            "id": row.message.id.unwrap_or(0),
+            "subject": row.message.subject.clone(),
+            "from": row.sender_name.clone(),
+            "importance": row.message.importance.clone(),
+            "ack_required": row.message.ack_required != 0,
             "created_ts": mcp_agent_mail_db::micros_to_iso(
-                row.get_named::<i64>("created_ts").unwrap_or(0),
+                row.message.created_ts,
             ),
-            "kind": row.get_named::<String>("kind").unwrap_or_default(),
-            "thread_id": row.get_named::<Option<String>>("thread_id").unwrap_or(None),
+            "kind": row.kind.clone(),
+            "thread_id": row.message.thread_id.clone(),
         });
         if include_bodies {
             value.as_object_mut().unwrap().insert(
                 "body_md".to_string(),
-                serde_json::Value::String(row.get_named("body_md").unwrap_or_default()),
+                serde_json::Value::String(row.message.body_md.clone()),
             );
         }
         data.push(value);

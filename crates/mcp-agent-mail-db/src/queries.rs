@@ -3952,7 +3952,7 @@ pub async fn fetch_inbox_ack_required(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn fetch_inbox_impl(
-    cx: &Cx,
+    _cx: &Cx,
     pool: &DbPool,
     project_id: i64,
     agent_id: i64,
@@ -3962,137 +3962,22 @@ async fn fetch_inbox_impl(
     since_ts: Option<i64>,
     limit: usize,
 ) -> Outcome<Vec<InboxRow>, DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
-    let mut sql = String::from(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, r.kind, s.name as sender_name, r.read_ts, r.ack_ts \
-         FROM message_recipients r \
-         JOIN messages m ON m.id = r.message_id \
-         JOIN agents s ON s.id = m.sender_id \
-         WHERE r.agent_id = ? AND m.project_id = ?",
-    );
-
-    let mut params: Vec<Value> = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
-
-    if urgent_only {
-        sql.push_str(" AND m.importance IN ('high', 'urgent')");
-    }
-    if unread_only {
-        sql.push_str(" AND r.read_ts IS NULL");
-    }
-    if ack_required_only {
-        sql.push_str(" AND m.ack_required = 1 AND r.ack_ts IS NULL");
-    }
-    if let Some(ts) = since_ts {
-        sql.push_str(" AND m.created_ts > ?");
-        params.push(Value::BigInt(ts));
-    }
-
-    let Ok(limit_i64) = i64::try_from(limit) else {
+    let Ok(_limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
-    sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
-    params.push(Value::BigInt(limit_i64));
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    match rows_out {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: i64 = match row.get_named("id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let project_id: i64 = match row.get_named("project_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let sender_id: i64 = match row.get_named("sender_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let thread_id: Option<String> = match row.get_named("thread_id") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let subject: String = match row.get_named("subject") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let body_md: String = match row.get_named("body_md") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let importance: String = match row.get_named("importance") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let ack_required: i64 = match row.get_named("ack_required") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let created_ts: i64 = match row.get_named("created_ts") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let recipients_json: String = match row.get_named("recipients_json") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let attachments: String = match row.get_named("attachments") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let kind: String = match row.get_named("kind") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let sender_name: String = match row.get_named("sender_name") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let read_ts: Option<i64> = match row.get_named("read_ts") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let ack_ts: Option<i64> = match row.get_named("ack_ts") {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-
-                out.push(InboxRow {
-                    message: MessageRow {
-                        id: Some(id),
-                        project_id,
-                        sender_id,
-                        thread_id,
-                        subject,
-                        body_md,
-                        importance,
-                        ack_required,
-                        created_ts,
-                        recipients_json,
-                        attachments,
-                    },
-                    kind,
-                    sender_name,
-                    read_ts,
-                    ack_ts,
-                });
-            }
-            Outcome::Ok(out)
-        }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+    match crate::sync::fetch_inbox_native_sqlite_by_ids(
+        pool.sqlite_path(),
+        project_id,
+        agent_id,
+        urgent_only,
+        unread_only,
+        ack_required_only,
+        since_ts,
+        limit,
+    ) {
+        Ok(rows) => Outcome::Ok(rows),
+        Err(error) => Outcome::Err(error),
     }
 }
 

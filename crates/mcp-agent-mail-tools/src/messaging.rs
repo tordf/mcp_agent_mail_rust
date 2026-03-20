@@ -3060,16 +3060,18 @@ pub async fn fetch_inbox(
     // inbox fetches.
     {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        if let Err(e) = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::mark_messages_read_batch(ctx.cx(), &pool, agent_id, &ids)
-                .await,
-        ) {
+        if let Err(e) =
+            mcp_agent_mail_db::sync::mark_messages_read_batch_sync(pool.sqlite_path(), agent_id, &ids)
+        {
             tracing::warn!(
                 agent_id = agent_id,
                 count = ids.len(),
                 error = %e,
                 "batch auto-mark-read on fetch_inbox failed"
             );
+        } else {
+            mcp_agent_mail_db::read_cache()
+                .invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
         }
     }
 
