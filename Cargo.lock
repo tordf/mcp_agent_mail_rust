@@ -2212,6 +2212,7 @@ dependencies = [
  "fsqlite-ext-fts5",
  "fsqlite-ext-json",
  "fsqlite-ext-rtree",
+ "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",
 ]
@@ -2347,6 +2348,7 @@ dependencies = [
  "blake3",
  "crc32c",
  "crossbeam-epoch",
+ "fsqlite-btree",
  "fsqlite-error",
  "fsqlite-observability 0.1.1",
  "fsqlite-pager",
@@ -2393,6 +2395,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-types",
  "fsqlite-vfs",
+ "fsqlite-wal",
  "hashbrown 0.14.5",
  "parking_lot",
  "smallvec",
