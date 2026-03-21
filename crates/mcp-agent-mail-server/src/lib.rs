@@ -1464,10 +1464,16 @@ enum HttpHealthProbeFailure {
 
 fn build_http_runtime() -> std::io::Result<Runtime> {
     let (reactor, reactor_name) = build_http_reactor()?;
-    tracing::info!(reactor = reactor_name, "HTTP runtime reactor selected");
+    let workers = resolve_http_runtime_worker_threads();
+    tracing::info!(
+        reactor = reactor_name,
+        workers,
+        "HTTP runtime reactor selected"
+    );
     RuntimeBuilder::new()
         .with_reactor(reactor)
-        .worker_threads(resolve_http_runtime_worker_threads())
+        .worker_threads(workers)
+        .blocking_threads(workers, 64)
         .enable_parking(true)
         .build()
         .map_err(|err| map_asupersync_err(&err))
@@ -2401,6 +2407,7 @@ async fn spawn_http_server_instance(
         config.clone(),
         Arc::clone(&request_diagnostics),
     ));
+    let _ = state.self_ref.set(Arc::downgrade(&state));
 
     let handler_state = Arc::clone(&state);
     let listener = Http1Listener::bind_with_config(
@@ -4421,7 +4428,22 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     let executor_mode = AtcExecutorMode::from_env();
     let executor_runtime = executor_mode
         .requires_runtime()
-        .then(|| RuntimeBuilder::current_thread().build())
+        .then(|| {
+            // Explicitly use epoll to avoid io_uring hangs (handle_reserve_ticket D-state).
+            // The HTTP runtime already defaults to epoll; this runtime must match.
+            #[cfg(target_os = "linux")]
+            {
+                let reactor =
+                    Arc::new(EpollReactor::new().expect("epoll reactor for ATC operator"));
+                RuntimeBuilder::current_thread()
+                    .with_reactor(reactor as Arc<dyn Reactor>)
+                    .build()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                RuntimeBuilder::current_thread().build()
+            }
+        })
         .transpose()
         .ok()
         .flatten();
@@ -6874,6 +6896,9 @@ struct HttpState {
     /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
     ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
+    /// Weak self-reference for `spawn_blocking` in async dispatch.
+    /// Set immediately after `Arc::new(HttpState::new(...))`.
+    self_ref: std::sync::OnceLock<std::sync::Weak<HttpState>>,
 }
 
 impl HttpState {
@@ -6924,10 +6949,10 @@ impl HttpState {
             web_root,
             ws_state_fallback,
             request_diagnostics,
+            self_ref: std::sync::OnceLock::new(),
         }
     }
 
-    #[allow(clippy::unused_async)] // Required for Http1Listener interface
     async fn handle(&self, req: Http1Request) -> Http1Response {
         let metrics = mcp_agent_mail_core::global_metrics();
         let _inflight_guard = InflightGuard::begin(&metrics.http.requests_inflight);
@@ -6982,13 +7007,15 @@ impl HttpState {
             && !should_suppress_tui_http_event(path)
         {
             let observability_state = tui.as_deref().unwrap_or(self.ws_state_fallback.as_ref());
-            let _ = observability_state.push_event(tui_events::MailEvent::http_request(
-                method.as_str(),
-                path.as_str(),
-                resp.status,
-                dur_ms,
-                client_ip.as_str(),
-            ));
+            let _ = observability_state
+                .push_event_async(tui_events::MailEvent::http_request(
+                    method.as_str(),
+                    path.as_str(),
+                    resp.status,
+                    dur_ms,
+                    client_ip.as_str(),
+                ))
+                .await;
             observability_state.record_request(resp.status, dur_ms);
         }
         if self.config.http_request_log_enabled
@@ -7077,7 +7104,7 @@ impl HttpState {
             return resp;
         }
 
-        let response = self.dispatch(json_rpc).map_or_else(
+        let response = self.dispatch(json_rpc).await.map_or_else(
             || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
             |resp| HttpResponse::ok().with_json(&resp),
         );
@@ -8023,9 +8050,31 @@ to skip auth for local requests.</p>
         None
     }
 
-    fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        // Upgrade self_ref to Arc so we can move into the 'static spawn_blocking closure.
+        // This keeps ALL synchronous router/DB work off the async worker threads.
+        let Some(arc_self) = self
+            .self_ref
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            // self_ref not set or HttpState already dropped — fall back to inline sync.
+            let id = request.id.clone();
+            return match self.dispatch_inner(request) {
+                Ok(value) => id.map(|req_id| JsonRpcResponse::success(req_id, value)),
+                Err(err) => {
+                    id.map(|req_id| JsonRpcResponse::error(Some(req_id), JsonRpcError::from(err)))
+                }
+            };
+        };
+
         let id = request.id.clone();
-        match self.dispatch_inner(request) {
+        let result = asupersync::runtime::spawn_blocking(move || {
+            arc_self.dispatch_inner(request)
+        })
+        .await;
+
+        match result {
             Ok(value) => id.map(|req_id| JsonRpcResponse::success(req_id, value)),
             Err(err) => {
                 id.map(|req_id| JsonRpcResponse::error(Some(req_id), JsonRpcError::from(err)))
