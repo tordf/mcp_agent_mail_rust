@@ -729,6 +729,7 @@ impl ExperimentBudgetTable {
 
     /// Whether the global experiment fraction is within limits.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn global_fraction_ok(&self) -> bool {
         if self.global_action_count == 0 {
             return true;

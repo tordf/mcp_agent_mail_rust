@@ -1662,37 +1662,23 @@ fn parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {
         let first_char = status.chars().next().unwrap_or(' ');
         match first_char {
             'R' | 'C' => {
-                // Rename/Copy: next two entries are old and new path
-                if i + 2 < parts.len() {
-                    let old_path = parts[i + 1];
-                    let new_path = parts[i + 2];
-                    if !old_path.is_empty() {
-                        paths.push(old_path.to_string());
-                    }
-                    if !new_path.is_empty() {
-                        paths.push(new_path.to_string());
-                    }
-                    i += 3;
-                } else {
-                    // Incomplete rename/copy entry — skip remaining parts to
-                    // avoid misaligning with subsequent status entries.
-                    break;
-                }
-            }
-            'A' | 'M' | 'D' | 'T' | 'U' => {
-                // Added/Modified/Deleted/Type-change/Unmerged: next entry is path
+                // Renamed/Copied use 2 paths: old_path and new_path
                 if i + 1 < parts.len() {
-                    let p = parts[i + 1];
-                    if !p.is_empty() {
-                        paths.push(p.to_string());
+                    let old_p = parts[i + 1];
+                    if !old_p.is_empty() {
+                        paths.push(old_p.to_string());
                     }
-                    i += 2;
-                } else {
-                    i += 1;
                 }
+                if i + 2 < parts.len() {
+                    let new_p = parts[i + 2];
+                    if !new_p.is_empty() {
+                        paths.push(new_p.to_string());
+                    }
+                }
+                i += 3;
             }
             _ => {
-                // Unknown status, assume 1 path and capture it to maintain alignment
+                // Others use 1 path
                 if i + 1 < parts.len() {
                     let p = parts[i + 1];
                     if !p.is_empty() {
@@ -2182,7 +2168,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = td.path().join("archive");
         let dir = archive.join("file_reservations");
-        std::fs::create_dir_all(&dir).expect("mkdir file_reservations");
+        std::fs::create_dir_all(&dir).expect("mkdir");
 
         let released_values = [
             serde_json::json!(0),
@@ -2277,13 +2263,19 @@ mod tests {
         // "MyAgent" should not conflict with its own reservation
         let conflicts =
             check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
-        assert!(conflicts.is_empty(), "own reservations should be skipped");
+        assert!(
+            conflicts.is_empty(),
+            "own reservations should be skipped"
+        );
     }
 
     #[test]
     fn check_path_conflicts_skips_own_reservations_case_insensitively() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = make_archive_with_reservations(td.path());
+
+        let reservations = read_active_reservations_from_archive(&archive, false).expect("read");
         let paths = vec!["src/main.rs".to_string()];
-        let reservations = vec![reservation("src/main.rs", "BlueLake", true)];
 
         let conflicts =
             check_path_conflicts(&paths, &reservations, "bluelake", false).expect("conflicts");
@@ -2302,8 +2294,9 @@ mod tests {
         let paths = vec!["shared/README.md".to_string()];
 
         // SharedAgent's non-exclusive reservation should not block
-        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
-            .expect("conflicts");
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
+                .expect("conflicts");
         assert!(
             conflicts.is_empty(),
             "non-exclusive reservations should not conflict"
@@ -2402,7 +2395,8 @@ mod tests {
 
     #[test]
     fn check_path_conflicts_rename_old_and_new_paths_conflict_independently() {
-        let renamed_paths = parse_name_status_z(b"R100\0src/old.rs\0src/new.rs\0").expect("parse");
+        let renamed_paths = parse_name_status_z(b"R100\0src/old.rs\0src/new.rs\0")
+            .expect("parse");
         let reservations = vec![
             reservation("src/old.rs", "OldOwner", true),
             reservation("src/new.rs", "NewOwner", true),

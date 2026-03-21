@@ -245,6 +245,7 @@ pub enum CertificationBlockReason {
 }
 
 impl std::fmt::Display for CertificationBlockReason {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InsufficientData { observed, required } => {

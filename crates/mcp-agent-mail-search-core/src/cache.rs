@@ -616,7 +616,7 @@ pub struct CacheInvalidator<T> {
 impl<T: Clone> CacheInvalidator<T> {
     /// Create a new invalidator for a cache.
     #[must_use]
-    pub fn new(cache: Arc<QueryCache<T>>, max_events: usize) -> Self {
+    pub const fn new(cache: Arc<QueryCache<T>>, max_events: usize) -> Self {
         Self {
             cache,
             events: RwLock::new(VecDeque::new()),
