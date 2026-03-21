@@ -739,11 +739,24 @@ copy_sqlite_snapshot() {
     rm -f "$tmp_db" 2>/dev/null || true
   fi
 
+  # WAL checkpoint MUST succeed before a raw cp — otherwise pages in the WAL
+  # are lost and FrankenSQLite gets a BusySnapshot error for the missing pages.
   if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$src_db" "PRAGMA busy_timeout = 5000; PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
+    if ! sqlite3 "$src_db" "PRAGMA busy_timeout = 10000; PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1; then
+      warn "WAL checkpoint failed on $src_db (database may be locked by running server)"
+      warn "Stop the Python server first, then re-run the installer"
+      return 1
+    fi
+  else
+    # Without sqlite3, we cannot safely checkpoint the WAL. Copy the WAL
+    # sidecar along with the main file so the Rust migration can replay it.
+    warn "sqlite3 not found; copying WAL sidecar to preserve uncheckpointed pages"
+    cp -p "$src_db" "$dest_db"
+    [ -f "${src_db}-wal" ] && cp -p "${src_db}-wal" "${dest_db}-wal"
+    [ -f "${src_db}-shm" ] && cp -p "${src_db}-shm" "${dest_db}-shm"
+    return 0
   fi
 
-  # Sidecars are intentionally omitted to avoid propagating stale WAL/SHM state.
   cp -p "$src_db" "$dest_db"
   rm -f "${dest_db}-wal" "${dest_db}-shm" 2>/dev/null || true
 }

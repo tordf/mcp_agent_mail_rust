@@ -1153,7 +1153,9 @@ fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
     if !path.exists() {
         return None;
     }
-    let conn = match DbConn::open_file(path.display().to_string()) {
+    // Use C SQLite for inspection — the source DB may be Python-created with
+    // uncheckpointed WAL pages that FrankenSQLite cannot read.
+    let conn = match sqlmodel_sqlite::SqliteConnection::open_file(path.display().to_string()) {
         Ok(v) => v,
         Err(_) => {
             return Some(LegacyDbSignature {
@@ -1529,8 +1531,13 @@ fn backup_db_with_sidecars(db_path: &Path, destination_root: &Path) -> CliResult
 }
 
 fn checkpoint_sqlite_for_copy(db_path: &Path) -> CliResult<()> {
+    // MUST use C SQLite (SqliteConnection) here, not FrankenConnection (DbConn).
+    // The source database was created by Python's C SQLite and may have uncheckpointed
+    // WAL pages that FrankenSQLite cannot read (different WAL format). FrankenSQLite
+    // would see the main file's page count but miss pages in the WAL, causing a
+    // BusySnapshot error ("page N > snapshot db_size M").
     let db_path_str = db_path.to_string_lossy().into_owned();
-    let conn = DbConn::open_file(db_path_str).map_err(|e| {
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path_str).map_err(|e| {
         CliError::Other(format!("cannot open sqlite DB {}: {e}", db_path.display()))
     })?;
     conn.execute_raw("PRAGMA busy_timeout = 60000;")
