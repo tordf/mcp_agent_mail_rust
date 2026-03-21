@@ -928,7 +928,7 @@ mod tests {
     #[test]
     fn screen_count_matches() {
         assert_eq!(ALL_SCREEN_IDS.len(), MAIL_SCREEN_REGISTRY.len());
-        assert_eq!(ALL_SCREEN_IDS.len(), 15);
+        assert_eq!(ALL_SCREEN_IDS.len(), 16);
     }
 
     #[test]
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn from_number_invalid() {
-        assert_eq!(MailScreenId::from_number(16), None);
+        assert_eq!(MailScreenId::from_number(17), None);
         assert_eq!(MailScreenId::from_number(100), None);
     }
 
@@ -1004,13 +1004,14 @@ mod tests {
             screen_from_jump_key('%'),
             Some(MailScreenId::ArchiveBrowser)
         );
+        assert_eq!(screen_from_jump_key('^'), Some(MailScreenId::Atc));
         assert_eq!(screen_from_jump_key(')'), None);
     }
 
     #[test]
     fn jump_key_legend_reflects_screen_count() {
         let legend = jump_key_legend();
-        assert_eq!(legend, "1-9,0,!,@,#,$,%");
+        assert_eq!(legend, "1-9,0,!,@,#,$,%,^");
     }
 
     #[test]

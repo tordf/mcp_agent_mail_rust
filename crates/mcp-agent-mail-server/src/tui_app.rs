@@ -45,7 +45,7 @@ use crate::tui_focus::{FocusManager, FocusTarget, focus_graph_for_screen, focus_
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
     ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg, agents::AgentsScreen,
-    analytics::AnalyticsScreen, archive_browser::ArchiveBrowserScreen,
+    analytics::AnalyticsScreen, archive_browser::ArchiveBrowserScreen, atc::AtcScreen,
     attachments::AttachmentExplorerScreen, contacts::ContactsScreen, dashboard::DashboardScreen,
     explorer::MailExplorerScreen, messages::MessageBrowserScreen, projects::ProjectsScreen,
     reservations::ReservationsScreen, screen_from_jump_key, screen_meta,
@@ -121,6 +121,7 @@ const fn screen_tick_key(id: MailScreenId) -> &'static str {
         MailScreenId::Analytics => "analytics",
         MailScreenId::Attachments => "attachments",
         MailScreenId::ArchiveBrowser => "archive_browser",
+        MailScreenId::Atc => "atc",
     }
 }
 
@@ -141,6 +142,7 @@ fn screen_id_from_tick_key(id: &str) -> Option<MailScreenId> {
         "analytics" => Some(MailScreenId::Analytics),
         "attachments" => Some(MailScreenId::Attachments),
         "archive_browser" => Some(MailScreenId::ArchiveBrowser),
+        "atc" => Some(MailScreenId::Atc),
         _ => None,
     }
 }
@@ -964,6 +966,11 @@ const COACH_HINTS: &[CoachHint] = &[
         screen: MailScreenId::ArchiveBrowser,
         message: "Tip: Navigate with j/k, Enter to expand dirs or preview files, Tab to switch panes",
     },
+    CoachHint {
+        id: "atc:overview",
+        screen: MailScreenId::Atc,
+        message: "Tip: Tab switches between Agents and Evidence Ledger, i toggles detail panel",
+    },
 ];
 
 /// Manages one-shot dismissible coach hints, persisted across sessions.
@@ -1069,6 +1076,7 @@ impl ScreenManager {
             MailScreenId::Analytics => Box::new(AnalyticsScreen::new()),
             MailScreenId::Attachments => Box::new(AttachmentExplorerScreen::new()),
             MailScreenId::ArchiveBrowser => Box::new(ArchiveBrowserScreen::new()),
+            MailScreenId::Atc => Box::new(AtcScreen::new()),
         }
     }
 
@@ -4875,6 +4883,7 @@ mod palette_action_ids {
     pub const SCREEN_ANALYTICS: &str = "screen:analytics";
     pub const SCREEN_ATTACHMENTS: &str = "screen:attachments";
     pub const SCREEN_ARCHIVE_BROWSER: &str = "screen:archive_browser";
+    pub const SCREEN_ATC: &str = "screen:atc";
 }
 
 pub(crate) fn screen_from_palette_action_id(id: &str) -> Option<MailScreenId> {
@@ -4904,6 +4913,7 @@ const fn screen_palette_action_id(id: MailScreenId) -> &'static str {
         MailScreenId::Analytics => palette_action_ids::SCREEN_ANALYTICS,
         MailScreenId::Attachments => palette_action_ids::SCREEN_ATTACHMENTS,
         MailScreenId::ArchiveBrowser => palette_action_ids::SCREEN_ARCHIVE_BROWSER,
+        MailScreenId::Atc => palette_action_ids::SCREEN_ATC,
     }
 }
 
@@ -9584,6 +9594,7 @@ mod tests {
             MailScreenId::Analytics => "analytics",
             MailScreenId::Attachments => "attachments",
             MailScreenId::ArchiveBrowser => "archive_browser",
+            MailScreenId::Atc => "atc",
         }
     }
 

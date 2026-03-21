@@ -79,6 +79,7 @@ const fn tab_icon(id: MailScreenId) -> &'static str {
         MailScreenId::Analytics => "\u{2207}",
         MailScreenId::Attachments => "\u{29c9}",
         MailScreenId::ArchiveBrowser => "\u{25a4}",
+        MailScreenId::Atc => "\u{2708}",
     }
 }
 
@@ -1859,7 +1860,7 @@ mod tests {
     #[test]
     fn tab_count_matches_screens() {
         assert_eq!(MAIL_SCREEN_REGISTRY.len(), ALL_SCREEN_IDS.len());
-        assert_eq!(MAIL_SCREEN_REGISTRY.len(), 15);
+        assert_eq!(MAIL_SCREEN_REGISTRY.len(), 16);
     }
 
     #[test]

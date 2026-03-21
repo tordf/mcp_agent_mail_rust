@@ -585,6 +585,12 @@ const ARCHIVE_BROWSER_FOCUS: [FocusNodeTemplate; 2] = [
     ),
 ];
 
+const ATC_FOCUS: [FocusNodeTemplate; 3] = [
+    tpl("atc.agents", FocusTarget::List(0), 0, 0, 0, 550, 400),
+    tpl("atc.decisions", FocusTarget::List(1), 1, 0, 400, 550, 600),
+    tpl("atc.detail", FocusTarget::DetailPanel, 2, 550, 0, 450, 1000),
+];
+
 const fn focus_templates_for_screen(screen: MailScreenId) -> &'static [FocusNodeTemplate] {
     match screen {
         MailScreenId::Dashboard => &DASHBOARD_FOCUS,
@@ -602,6 +608,7 @@ const fn focus_templates_for_screen(screen: MailScreenId) -> &'static [FocusNode
         MailScreenId::Analytics => &ANALYTICS_FOCUS,
         MailScreenId::Attachments => &ATTACHMENTS_FOCUS,
         MailScreenId::ArchiveBrowser => &ARCHIVE_BROWSER_FOCUS,
+        MailScreenId::Atc => &ATC_FOCUS,
     }
 }
 
