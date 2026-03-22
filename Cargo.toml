@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.14"
+version = "0.2.15"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -156,6 +156,7 @@ asupersync-macros = { path = "../asupersync/asupersync-macros" }
 franken-kernel = { path = "../asupersync/franken_kernel" }
 franken-evidence = { path = "../asupersync/franken_evidence" }
 franken-decision = { path = "../asupersync/franken_decision" }
+beads_rust = { path = "../beads_rust" }
 # sqlmodel/frankensqlite stack: force latest local /dp checkouts to avoid stale registry builds.
 sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
 sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }

@@ -182,6 +182,9 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
 
 [[package]]
 name = "arc-swap"
@@ -451,9 +454,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beads_rust"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0522259886a93175438185a69e560e0bf46d18b7bd391f04a595c2a15e8f90ad"
+version = "0.1.31"
 dependencies = [
  "anyhow",
  "chrono",
@@ -468,7 +469,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-mvcc",
- "fsqlite-observability 0.1.1",
+ "fsqlite-observability 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "fsqlite-pager",
  "fsqlite-parser",
  "fsqlite-planner",
@@ -487,6 +488,8 @@ dependencies = [
  "serde_json",
  "serde_yml",
  "sha2",
+ "shell-words",
+ "tempfile",
  "thiserror",
  "tracing",
  "tracing-subscriber",
@@ -1403,6 +1406,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1485,7 +1499,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1661,7 +1675,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2297,9 +2311,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48fa82c4fbab7576177b769f08054700b2012105aad4be2ba744a5a77d173bc4"
+version = "0.1.2"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2310,6 +2322,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-observability"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d26eeaf77c315ed9fc1ff7ce4a12059d5f10a6d8dc3036f976a132cb3fa0b71"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -4240,7 +4254,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4641,7 +4655,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "clap",
  "criterion",
@@ -4667,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4703,12 +4717,12 @@ dependencies = [
  "tru",
  "unicode-width 0.1.14",
  "walkdir",
- "zip",
+ "zip 8.1.0",
 ]
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4731,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "chrono",
  "criterion",
@@ -4754,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4797,7 +4811,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "chrono",
  "git2",
@@ -4812,7 +4826,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "chrono",
  "criterion",
@@ -4842,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4885,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "atty",
  "base64 0.22.1",
@@ -4902,12 +4916,12 @@ dependencies = [
  "sqlmodel-sqlite",
  "tempfile",
  "thiserror",
- "zip",
+ "zip 8.1.0",
 ]
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4932,7 +4946,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4958,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-wasm"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -5191,7 +5205,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5459,7 +5473,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6089,7 +6103,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6583,7 +6597,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6785,6 +6799,8 @@ version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d832c086ece0dacc29fb2947bb4219b8f6e12fe9e40b7108f9e57c4224e47b5c"
 dependencies = [
+ "either",
+ "flate2",
  "hyper",
  "indicatif 0.17.11",
  "log",
@@ -6794,8 +6810,10 @@ dependencies = [
  "self-replace",
  "semver",
  "serde_json",
+ "tar",
  "tempfile",
  "urlencoding",
+ "zip 2.4.2",
  "zipsign-api",
 ]
 
@@ -7529,6 +7547,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22692a6476a21fa75fdfc11d452fda482af402c008cdbaf3476414e122040973"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7538,7 +7567,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.3",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8568,7 +8597,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8933,6 +8962,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix 1.1.3",
+]
+
+[[package]]
 name = "xxhash-rust"
 version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9058,6 +9097,24 @@ dependencies = [
 
 [[package]]
 name = "zip"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "crossbeam-utils",
+ "displaydoc",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "thiserror",
+ "time",
+ "zopfli",
+]
+
+[[package]]
+name = "zip"
 version = "8.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e499faf5c6b97a0d086f4a8733de6d47aee2252b8127962439d8d4311a73f72"
@@ -9076,6 +9133,7 @@ version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dba6063ff82cdbd9a765add16d369abe81e520f836054e997c2db217ceca40c0"
 dependencies = [
+ "base64 0.22.1",
  "ed25519-dalek",
  "thiserror",
 ]
