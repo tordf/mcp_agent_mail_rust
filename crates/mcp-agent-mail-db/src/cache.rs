@@ -1561,7 +1561,7 @@ mod tests {
         cache.put_agent(&agent);
 
         let scope_fp = scope_fingerprint("");
-        let key = (scope_fp, 7, InternedStr::new("SharedAgent"));
+        let key = (scope_fp, 7, InternedStr::new("sharedagent"));
         let id_key = (scope_fp, 707);
 
         let shared_from_key = {

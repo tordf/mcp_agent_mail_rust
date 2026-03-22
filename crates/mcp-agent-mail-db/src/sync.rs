@@ -598,13 +598,32 @@ mod tests {
     use super::*;
     use crate::schema;
 
+    fn block_on<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce(asupersync::Cx) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let cx = asupersync::Cx::for_testing();
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(f(cx))
+    }
+
     /// Helper: open an in-memory DB with the full schema applied.
     fn test_conn() -> DbConn {
         let conn = DbConn::open_memory().expect("open in-memory db");
         conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
             .expect("apply PRAGMAs");
-        let init_sql = schema::init_schema_sql_base();
-        conn.execute_raw(&init_sql).expect("init schema");
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                schema::migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init schema migrations");
+            }
+        });
         conn
     }
 

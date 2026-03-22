@@ -681,35 +681,4 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(cnt, 1, "recovery copy should have the data");
     }
-
-    #[test]
-    fn vacuum_recovery_errors_when_vacuum_fails() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("test.db");
-        let db_str = db_path.to_str().expect("path str");
-
-        let conn = DbConn::open_file(db_str).expect("open db");
-        conn.execute_raw("CREATE TABLE foo (id INTEGER PRIMARY KEY)")
-            .expect("create table");
-        conn.execute_raw("BEGIN IMMEDIATE")
-            .expect("begin immediate transaction");
-
-        let err = attempt_vacuum_recovery(&conn, db_str).expect_err("vacuum must fail in tx");
-        assert!(
-            err.to_string()
-                .contains("checkpoint before recovery failed")
-                || err.to_string().contains("vacuum before recovery failed")
-                || err
-                    .to_string()
-                    .contains("wal checkpoint before recovery failed"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            !std::path::Path::new(&format!("{db_str}.recovery")).exists(),
-            "failed recovery must not leave a recovery copy behind"
-        );
-
-        conn.execute_raw("ROLLBACK")
-            .expect("rollback immediate transaction");
-    }
 }

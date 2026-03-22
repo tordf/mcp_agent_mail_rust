@@ -690,14 +690,15 @@ impl EncoderError {
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
+    } else if max <= 3 {
+        s.chars().take(max).collect()
     } else {
-        let mut end = max.min(s.len());
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s[..end].to_string()
+        let mut t: String = s.chars().take(max - 3).collect();
+        t.push_str("...");
+        t
     }
 }
 

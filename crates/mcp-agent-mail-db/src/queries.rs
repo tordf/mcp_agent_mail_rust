@@ -8891,22 +8891,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(db_name);
 
-        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
-            .expect("open base schema connection");
-        init_conn
-            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
-            .expect("apply init PRAGMAs");
-        let init_sql = crate::schema::init_schema_sql_base();
-        init_conn
-            .execute_raw(&init_sql)
-            .expect("initialize base schema");
-        drop(init_conn);
-
         let cfg = crate::pool::DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
             max_connections: 1,
-            run_migrations: false,
+            run_migrations: true,
             warmup_connections: 0,
             ..Default::default()
         };
