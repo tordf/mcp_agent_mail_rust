@@ -5743,12 +5743,18 @@ fn handle_config(action: ConfigCommand) -> CliResult<()> {
                 let mut found = false;
                 let updated: Vec<String> = existing
                     .lines()
-                    .map(|line: &str| {
+                    .filter_map(|line: &str| {
+                        // Remove stale env var names that set-port used to write
+                        if line.starts_with("AGENT_MAIL_HTTP_PORT=")
+                            || line.starts_with("AM_HTTP_PORT=")
+                        {
+                            return None;
+                        }
                         if line.starts_with("HTTP_PORT=") {
                             found = true;
-                            format!("HTTP_PORT={port}")
+                            Some(format!("HTTP_PORT={port}"))
                         } else {
-                            line.to_string()
+                            Some(line.to_string())
                         }
                     })
                     .collect();
@@ -9309,10 +9315,15 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
     let checksum_body = download_file_sync(&checksum_url)?;
     let checksum_text = String::from_utf8(checksum_body)
         .map_err(|_| "checksum file is not valid UTF-8".to_string())?;
-    // SHA256SUMS format: "<hex>  <filename>" per line — find the line matching our artifact
+    // SHA256SUMS format: "<hex>  <filename>" per line — find the line matching our artifact.
+    // Use exact filename match (not substring) to avoid matching .sig/.asc sidecars.
     let expected_hash = checksum_text
         .lines()
-        .find(|line| line.contains(&filename))
+        .find(|line| {
+            line.split_whitespace()
+                .last()
+                .is_some_and(|name| name == filename)
+        })
         .and_then(|line| line.split_whitespace().next())
         .ok_or_else(|| format!("no checksum found for {filename} in SHA256SUMS"))?
         .to_string();
