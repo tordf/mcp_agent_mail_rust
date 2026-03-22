@@ -26,6 +26,29 @@ static TERMINAL_MARKDOWN_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|
             .into_iter()
             .collect::<HashSet<_>>(),
     );
+
+    // Prevent XSS via data:text/html URIs in terminal OSC 8 links
+    builder.attribute_filter(|element, attribute, value| {
+        if attribute == "href" || attribute == "src" {
+            let value_lower = value.trim().to_ascii_lowercase();
+            if value_lower.starts_with("data:") {
+                if element == "img"
+                    && attribute == "src"
+                    && value_lower.starts_with("data:image/")
+                    && !value_lower.starts_with("data:image/svg")
+                {
+                    Some(value.into())
+                } else {
+                    None
+                }
+            } else {
+                Some(value.into())
+            }
+        } else {
+            Some(value.into())
+        }
+    });
+
     builder
 });
 
@@ -654,9 +677,9 @@ mod tests {
     }
 
     #[test]
-    fn code_fence_with_language_renders() {
+    fn code_fence_with_language_renders_content() {
         let md = "```python\ndef greet(name):\n    print(f'Hello {name}')\n```";
-        let text = render_body(md, &theme());
+        let text = render_body(&md, &theme());
         assert!(text.height() >= 2);
     }
 
@@ -1404,7 +1427,7 @@ Thanks!";
 
     #[test]
     fn truncate_str_handles_tiny_max_chars() {
-        // max_chars < 3: no room for "..." suffix, just take raw chars.
+        // max_chars < 3: no room for any content plus "..."; just take raw chars.
         assert_eq!(truncate_str("hello", 2), "he");
         assert_eq!(truncate_str("hello", 1), "h");
         assert_eq!(truncate_str("hello", 0), "");

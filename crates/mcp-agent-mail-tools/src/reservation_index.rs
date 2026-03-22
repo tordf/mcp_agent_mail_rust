@@ -25,6 +25,14 @@ use std::collections::{BTreeMap, HashMap};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use std::sync::Arc;
 
+fn routing_key(s: &str) -> String {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
 /// Metadata from a reservation row needed for conflict reporting.
 #[derive(Debug, Clone)]
 pub(crate) struct ReservationRef {
@@ -62,13 +70,13 @@ impl ReservationIndex {
 
             if !compiled.is_glob() {
                 exact_by_path
-                    .entry(compiled.normalized().to_owned())
+                    .entry(routing_key(compiled.normalized()))
                     .or_default()
                     .push((compiled, rref));
             } else if let Some(prefix) = compiled.first_literal_segment() {
                 // Glob with a literal prefix segment.
                 globs_by_prefix
-                    .entry(prefix.to_owned())
+                    .entry(routing_key(prefix))
                     .or_default()
                     .push((compiled, rref));
             } else {
@@ -123,7 +131,8 @@ impl ReservationIndex {
         req_prefix: Option<&str>,
         conflicts: &mut Vec<&'a ReservationRef>,
     ) {
-        if let Some(entries) = self.exact_by_path.get(req_norm) {
+        let route_norm = routing_key(req_norm);
+        if let Some(entries) = self.exact_by_path.get(&route_norm) {
             for (_, rref) in entries {
                 conflicts.push(rref);
             }
@@ -131,14 +140,15 @@ impl ReservationIndex {
 
         for slash_idx in req_norm.match_indices('/').map(|(idx, _)| idx) {
             let ancestor = &req_norm[..slash_idx];
-            if let Some(entries) = self.exact_by_path.get(ancestor) {
+            let route_ancestor = routing_key(ancestor);
+            if let Some(entries) = self.exact_by_path.get(&route_ancestor) {
                 for (_, rref) in entries {
                     conflicts.push(rref);
                 }
             }
         }
 
-        if let Some(descendant_prefix) = descendant_prefix(req_norm) {
+        if let Some(descendant_prefix) = descendant_prefix(&route_norm) {
             for (path, entries) in self.exact_by_path.range(descendant_prefix.clone()..) {
                 if !path.starts_with(&descendant_prefix) {
                     break;
@@ -150,7 +160,8 @@ impl ReservationIndex {
         }
 
         if let Some(prefix) = req_prefix {
-            if let Some(entries) = self.globs_by_prefix.get(prefix) {
+            let route_prefix = routing_key(prefix);
+            if let Some(entries) = self.globs_by_prefix.get(&route_prefix) {
                 for (res_pat, rref) in entries {
                     if res_pat.overlaps(request_pat) {
                         conflicts.push(rref);
@@ -179,10 +190,11 @@ impl ReservationIndex {
         conflicts: &mut Vec<&'a ReservationRef>,
     ) {
         if let Some(prefix) = req_prefix {
+            let route_prefix = routing_key(prefix);
             // Scoped scan: only check the exact anchor (`src`) and its
             // descendants (`src/...`) instead of every exact entry sharing the
             // first path segment.
-            if let Some(entries) = self.exact_by_path.get(prefix) {
+            if let Some(entries) = self.exact_by_path.get(&route_prefix) {
                 for (exact_pat, rref) in entries {
                     if request_pat.matches(exact_pat.normalized())
                         || exact_pat.overlaps(request_pat)
@@ -192,7 +204,7 @@ impl ReservationIndex {
                 }
             }
 
-            if let Some(descendant_prefix) = descendant_prefix(prefix) {
+            if let Some(descendant_prefix) = descendant_prefix(&route_prefix) {
                 for (path, entries) in self.exact_by_path.range(descendant_prefix.clone()..) {
                     if !path.starts_with(&descendant_prefix) {
                         break;
@@ -207,7 +219,7 @@ impl ReservationIndex {
                 }
             }
 
-            if let Some(entries) = self.globs_by_prefix.get(prefix) {
+            if let Some(entries) = self.globs_by_prefix.get(&route_prefix) {
                 for (res_pat, rref) in entries {
                     if res_pat.overlaps(request_pat) {
                         conflicts.push(rref);

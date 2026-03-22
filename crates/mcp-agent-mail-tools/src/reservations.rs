@@ -183,8 +183,18 @@ fn relativize_path(project_root: &str, path: &str) -> Option<String> {
     let path_parts = normalize_parts(&expanded_path)?;
     if path_is_absolute {
         let root_parts = normalize_parts(&expanded_root)?;
-        if path_parts.len() < root_parts.len() || path_parts[..root_parts.len()] != root_parts[..] {
+        if path_parts.len() < root_parts.len() {
             return None;
+        }
+        for (i, root_part) in root_parts.iter().enumerate() {
+            let matches = if cfg!(windows) {
+                path_parts[i].eq_ignore_ascii_case(root_part)
+            } else {
+                path_parts[i] == *root_part
+            };
+            if !matches {
+                return None;
+            }
         }
         return Some(path_parts[root_parts.len()..].join("/"));
     }
@@ -1893,8 +1903,7 @@ mod tests {
         let root = "/project";
         let err = normalize_filter_paths(root, Some(vec!["C:\\other\\main.rs".to_string()]));
         let rendered = err.expect_err("expected invalid path").to_string();
-        assert!(
-            rendered.contains("outside the project root"),
+        assert!(rendered.contains("outside the project root"),
             "expected outside-root error, got: {rendered}"
         );
         assert!(
