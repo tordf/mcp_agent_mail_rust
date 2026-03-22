@@ -1379,12 +1379,19 @@ install_legacy_launcher_takeover_shims() {
   fi
 
   local tmpfile="${helper_path}.tmp.mcp-agent-mail.$$"
-  cat > "$tmpfile" <<EOF
+cat > "$tmpfile" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
 AM_RUST_BIN="${DEST}/${BIN_CLI}"
-AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/config.env"
+AM_RUST_ENV_FILE_DEFAULT="${HOME}/.config/mcp-agent-mail/config.env"
+AM_RUST_ENV_FILE="\${AM_RUST_ENV_FILE:-\$AM_RUST_ENV_FILE_DEFAULT}"
+if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${HOME}/.config/mcp-agent-mail/config.env" ]; then
+  AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/config.env"
+fi
+if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${HOME}/.config/mcp-agent-mail/.env" ]; then
+  AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/.env"
+fi
 
 trim_ascii_whitespace() {
   local value="\${1:-}"
@@ -4764,6 +4771,8 @@ installer_apply_schema_migration() {
 
 sqlite_timestamp_fallback_migration() {
   local db_path="$1"
+  local integrity_failure=""
+  local post_heal_failure=""
   SQLITE_FALLBACK_BACKUP_PATH=""
 
   if ! command -v sqlite3 >/dev/null 2>&1; then
@@ -4848,8 +4857,16 @@ SQL
   rm -f "${db_path}-wal" "${db_path}-shm" 2>/dev/null || true
 
   if ! sqlite_pragma_reports_ok "$db_path" "integrity_check"; then
-    warn "sqlite3 fallback migration produced integrity_check='${SQLITE_LAST_PRAGMA_FAILURE:-<empty>}'"
-    return 1
+    integrity_failure="${SQLITE_LAST_PRAGMA_FAILURE:-<empty>}"
+    warn "sqlite3 fallback migration produced integrity_check='${integrity_failure}'"
+    warn "Attempting sqlite3 fallback self-heal before escalating to archive-backed recovery."
+    if sqlite_lightweight_self_heal "$db_path" && sqlite_pragma_reports_ok "$db_path" "integrity_check"; then
+      ok "sqlite3 fallback self-heal cleared post-migration integrity failures"
+    else
+      post_heal_failure="${SQLITE_LAST_PRAGMA_FAILURE:-$integrity_failure}"
+      warn "sqlite3 fallback self-heal could not clear integrity_check='${post_heal_failure}'"
+      return 1
+    fi
   fi
 
   local remaining_text_columns
@@ -4884,6 +4901,7 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   migration_fallback_ok=0
   migration_succeeded=0
   migration_final_verification_failed=0
+  migration_recovery_needed=0
 
   migration_pristine_ts=$(date -u +%Y%m%d_%H%M%S)
   migration_pristine_backup="${PYTHON_DB_MIGRATED_PATH}.pre-migrate.${migration_pristine_ts}"
@@ -4994,8 +5012,10 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     fi
 
     if [ "$migration_fallback_ok" -eq 0 ]; then
+      migration_recovery_needed=1
       warn "Database migration had issues. Retry with:"
       warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
+      warn "Installer will continue with automatic repair/reconstruction."
     fi
   fi
 
@@ -5042,20 +5062,27 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     else
       migration_succeeded=0
       migration_fallback_ok=0
+      migration_recovery_needed=1
+      warn "sqlite3 fallback migration could not fully verify the database; escalating to automatic repair/reconstruction."
     fi
   fi
 
   # Final post-migration invariants: even after fallback, the database must
   # be healthy and core legacy row counts must be preserved.
-  if [ "$migration_succeeded" -eq 1 ]; then
+  if [ "$migration_succeeded" -eq 1 ] || [ "$migration_recovery_needed" -eq 1 ]; then
     migration_final_verification_failed=0
-    if [ "$migration_schema_refresh_failed" -eq 1 ]; then
+    if [ "$migration_succeeded" -ne 1 ]; then
       migration_final_verification_failed=1
-      warn "Final migration verification detected a schema refresh failure after database repair."
-    fi
-    if ! sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts"; then
-      migration_final_verification_failed=1
-      warn "Final migration verification failed: ${SQLITE_POST_MIGRATION_FAILURES}"
+      warn "Initial migration path did not finish cleanly; continuing automatic recovery."
+    else
+      if [ "$migration_schema_refresh_failed" -eq 1 ]; then
+        migration_final_verification_failed=1
+        warn "Final migration verification detected a schema refresh failure after database repair."
+      fi
+      if ! sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts"; then
+        migration_final_verification_failed=1
+        warn "Final migration verification failed: ${SQLITE_POST_MIGRATION_FAILURES}"
+      fi
     fi
 
     if [ "$migration_final_verification_failed" -eq 1 ]; then
@@ -5138,6 +5165,7 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
 
     if [ "$migration_final_verification_failed" -eq 0 ]; then
       migration_succeeded=1
+      migration_recovery_needed=0
       ok "Database schema migrated"
     else
       migration_succeeded=0

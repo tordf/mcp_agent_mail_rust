@@ -44,6 +44,7 @@ PYTHON_CLONE="${TEST_HOME}/legacy_python_clone"
 PYTHON_DB="${PYTHON_CLONE}/storage.sqlite3"
 MCP_CONFIG="${RUN_DIR}/codex.mcp.json"
 PATH_BASE="/usr/bin:/bin"
+REAL_SQLITE3="$(command -v sqlite3)"
 LEGACY_TOKEN="legacy-token-123"
 PREEXISTING_RUST_ROOT="${TEST_HOME}/preexisting-rust-root"
 PREEXISTING_RUST_DB="${PREEXISTING_RUST_ROOT}/storage.sqlite3"
@@ -125,6 +126,7 @@ run_installer() {
     local test_home="${3:-$TEST_HOME}"
     local dest_dir="${4:-$DEST}"
     local storage_root="${5:-$STORAGE_ROOT}"
+    local path_base="${6:-$PATH_BASE}"
     local stdout_file="${WORK}/${case_id}_stdout.txt"
     local stderr_file="${WORK}/${case_id}_stderr.txt"
     set +e
@@ -132,7 +134,7 @@ run_installer() {
         cd "${run_dir}"
         # Mirror curl|bash style installer execution while keeping this suite offline.
         HOME="${test_home}" \
-        PATH="${PATH_BASE}" \
+        PATH="${path_base}" \
         STORAGE_ROOT="${storage_root}" \
         bash -s -- \
             --version "v${TARGET_VERSION}" \
@@ -675,6 +677,128 @@ e2e_assert_eq "i64 legacy db preserves migrated message content" "Legacy migrati
 e2e_assert_file_exists "i64 takeover writes rust config env" "${I64_CONFIG_ENV}"
 I64_DB_CFG="$(grep -E '^DATABASE_URL=' "${I64_CONFIG_ENV}" | head -1 | cut -d= -f2-)"
 e2e_assert_eq "i64 takeover rust config points at adopted db" "sqlite:///${I64_ADOPTED_DB}" "${I64_DB_CFG}"
+INSTALL_RC="${MAIN_INSTALL_RC}"
+INSTALL_STDOUT="${MAIN_INSTALL_STDOUT}"
+INSTALL_STDERR="${MAIN_INSTALL_STDERR}"
+
+# ===========================================================================
+# Case 6c: Installer recovery continues after fallback integrity failure
+# ===========================================================================
+e2e_case_banner "installer keeps recovering after fallback integrity failure"
+MAIN_INSTALL_RC="${INSTALL_RC}"
+MAIN_INSTALL_STDOUT="${INSTALL_STDOUT}"
+MAIN_INSTALL_STDERR="${INSTALL_STDERR}"
+RECOVER_HOME="${WORK}/recover_home"
+RECOVER_RUN_DIR="${WORK}/recover_project"
+RECOVER_DEST="${RECOVER_HOME}/.local/bin"
+RECOVER_STORAGE_ROOT="${RECOVER_HOME}/.mcp_agent_mail_git_mailbox_repo"
+RECOVER_PYTHON_CLONE="${RECOVER_HOME}/legacy_python_clone"
+RECOVER_PYTHON_DB="${RECOVER_PYTHON_CLONE}/storage.sqlite3"
+RECOVER_CONFIG_ENV="${RECOVER_HOME}/.config/mcp-agent-mail/config.env"
+RECOVER_FAKE_BIN="${WORK}/recover_fake_bin"
+RECOVER_REINDEX_COUNT_FILE="${WORK}/recover_reindex_count.txt"
+mkdir -p "${RECOVER_RUN_DIR}" "${RECOVER_DEST}" "${RECOVER_STORAGE_ROOT}" "${RECOVER_PYTHON_CLONE}/src/mcp_agent_mail" "${RECOVER_PYTHON_CLONE}/scripts" "${RECOVER_HOME}/.config/mcp-agent-mail" "${RECOVER_HOME}/.codex" "${RECOVER_FAKE_BIN}"
+cp -p "${PYTHON_DB}" "${RECOVER_PYTHON_DB}"
+cat > "${RECOVER_PYTHON_CLONE}/pyproject.toml" <<'EOF'
+[project]
+name = "mcp_agent_mail"
+version = "0.0.0"
+EOF
+cat > "${RECOVER_PYTHON_CLONE}/src/mcp_agent_mail/__init__.py" <<'EOF'
+__all__ = []
+EOF
+cat > "${RECOVER_PYTHON_CLONE}/scripts/run_server_with_token.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "LEGACY_RECOVERY_HELPER_STILL_ACTIVE" >&2
+exit 29
+EOF
+chmod +x "${RECOVER_PYTHON_CLONE}/scripts/run_server_with_token.sh"
+cat > "${RECOVER_PYTHON_CLONE}/.env" <<EOF
+DATABASE_URL=sqlite+aiosqlite:///${RECOVER_PYTHON_DB}
+HTTP_BEARER_TOKEN=${LEGACY_TOKEN}
+STORAGE_ROOT=${RECOVER_PYTHON_CLONE}
+EOF
+cat > "${RECOVER_HOME}/.zshrc" <<EOF
+# >>> MCP Agent Mail alias
+am() {
+  cd "${RECOVER_PYTHON_CLONE}" && scripts/run_server_with_token.sh "\$@"
+}
+# <<< MCP Agent Mail alias
+EOF
+git -C "${RECOVER_STORAGE_ROOT}" init >/dev/null 2>&1
+git -C "${RECOVER_STORAGE_ROOT}" config user.email "e2e@example.com"
+git -C "${RECOVER_STORAGE_ROOT}" config user.name "E2E"
+echo "seed" > "${RECOVER_STORAGE_ROOT}/README.md"
+git -C "${RECOVER_STORAGE_ROOT}" add README.md
+git -C "${RECOVER_STORAGE_ROOT}" commit -m "seed storage repo" >/dev/null 2>&1
+cat > "${RECOVER_FAKE_BIN}/sqlite3" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+REAL_SQLITE3="${REAL_SQLITE3}"
+REINDEX_COUNT_FILE="${RECOVER_REINDEX_COUNT_FILE}"
+sql_input=""
+if [ "\$#" -le 1 ] && [ ! -t 0 ]; then
+  sql_input="\$(cat)"
+fi
+sql_text="\$*
+\${sql_input}"
+reindex_count=0
+if [ -f "\${REINDEX_COUNT_FILE}" ]; then
+  reindex_count="\$(cat "\${REINDEX_COUNT_FILE}")"
+fi
+if printf '%s\n' "\${sql_text}" | grep -q 'REINDEX;'; then
+  reindex_count=\$((reindex_count + 1))
+  printf '%s\n' "\${reindex_count}" > "\${REINDEX_COUNT_FILE}"
+fi
+if printf '%s\n' "\${sql_text}" | grep -q 'PRAGMA integrity_check'; then
+  if [ "\${reindex_count}" -lt 2 ]; then
+    printf 'row 54610 missing from index sqlite_autoindex_agent_links_1\n'
+    exit 0
+  fi
+fi
+if [ -n "\${sql_input}" ]; then
+  printf '%s' "\${sql_input}" | "\${REAL_SQLITE3}" "\$@"
+else
+  "\${REAL_SQLITE3}" "\$@"
+fi
+EOF
+chmod +x "${RECOVER_FAKE_BIN}/sqlite3"
+run_installer "case_06c_recovery_install" "${RECOVER_RUN_DIR}" "${RECOVER_HOME}" "${RECOVER_DEST}" "${RECOVER_STORAGE_ROOT}" "${RECOVER_FAKE_BIN}:${PATH_BASE}"
+e2e_assert_exit_code "recovery install exits cleanly" "0" "${INSTALL_RC}"
+RECOVER_INSTALL_OUTPUT="${INSTALL_STDOUT}
+${INSTALL_STDERR}"
+e2e_assert_contains "installer enters automatic recovery after fallback failure" "${RECOVER_INSTALL_OUTPUT}" "Attempting automatic database self-heal."
+e2e_assert_contains "installer still completes migration after fallback failure" "${RECOVER_INSTALL_OUTPUT}" "Database schema migrated"
+RECOVER_DB_URL="$(grep -E '^DATABASE_URL=' "${RECOVER_CONFIG_ENV}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+RECOVER_DB="$(sqlite_path_from_database_url "${RECOVER_DB_URL}")"
+e2e_assert_file_exists "recovery install writes migrated database" "${RECOVER_DB}"
+set +e
+RECOVER_DOCTOR_JSON="$(
+    HOME="${RECOVER_HOME}" \
+    PATH="${RECOVER_DEST}:${PATH_BASE}" \
+    AM_INTERFACE_MODE=cli \
+    DATABASE_URL="${RECOVER_DB_URL}" \
+    "${RECOVER_DEST}/am" doctor check --json 2>/dev/null
+)"
+RECOVER_DOCTOR_RC=$?
+RECOVER_PROJECTS_JSON="$(
+    HOME="${RECOVER_HOME}" \
+    PATH="${RECOVER_DEST}:${PATH_BASE}" \
+    AM_INTERFACE_MODE=cli \
+    DATABASE_URL="${RECOVER_DB_URL}" \
+    "${RECOVER_DEST}/am" list-projects --json 2>/dev/null
+)"
+RECOVER_PROJECTS_RC=$?
+set -e
+e2e_save_artifact "case_06c_doctor.json" "${RECOVER_DOCTOR_JSON}"
+e2e_save_artifact "case_06c_projects.json" "${RECOVER_PROJECTS_JSON}"
+e2e_assert_exit_code "recovery install doctor check exits cleanly" "0" "${RECOVER_DOCTOR_RC}"
+e2e_assert_exit_code "recovery install list-projects exits cleanly" "0" "${RECOVER_PROJECTS_RC}"
+if json_query "${RECOVER_PROJECTS_JSON}" "assert any(p.get('human_key') == '/tmp/legacy-project' for p in d)"; then
+    e2e_pass "recovery install still preserves migrated legacy project data"
+else
+    e2e_fail "recovery install still preserves migrated legacy project data"
+fi
 INSTALL_RC="${MAIN_INSTALL_RC}"
 INSTALL_STDOUT="${MAIN_INSTALL_STDOUT}"
 INSTALL_STDERR="${MAIN_INSTALL_STDERR}"

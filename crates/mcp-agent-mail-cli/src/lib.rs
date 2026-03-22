@@ -5758,10 +5758,14 @@ fn handle_config(action: ConfigCommand) -> CliResult<()> {
                         }
                     })
                     .collect();
+                let normalized = updated.join("\n");
                 if found {
-                    updated.join("\n")
+                    normalized
                 } else {
-                    format!("{existing}\nHTTP_PORT={port}")
+                    match normalized.trim().is_empty() {
+                        true => format!("HTTP_PORT={port}"),
+                        false => format!("{normalized}\nHTTP_PORT={port}"),
+                    }
                 }
             } else {
                 format!("HTTP_PORT={port}\n")
@@ -6919,6 +6923,17 @@ fn resolve_project_slug_for_cli(
     )))
 }
 
+fn resolve_project_slug_for_cli_best_effort(
+    conn: &mcp_agent_mail_db::DbConn,
+    identifier: &str,
+) -> CliResult<String> {
+    match resolve_project_slug_for_cli(conn, identifier) {
+        Ok(slug) => Ok(slug),
+        Err(err) if is_project_not_found_error(&err) => Ok(identifier.to_string()),
+        Err(err) => Err(err),
+    }
+}
+
 fn handle_file_reservations_with_conn(
     conn: &mcp_agent_mail_db::DbConn,
     action: FileReservationsCommand,
@@ -6931,7 +6946,7 @@ fn handle_file_reservations_with_conn(
             active_only,
             all,
         } => {
-            let project = resolve_project_slug_for_cli(conn, &project)?;
+            let project = resolve_project_slug_for_cli_best_effort(conn, &project)?;
             let active_reservation_predicate =
                 active_reservation_predicate_sql("file_reservations");
             let sql = if active_only {
@@ -7002,7 +7017,7 @@ fn handle_file_reservations_with_conn(
             Ok(())
         }
         FileReservationsCommand::Active { project, limit } => {
-            let project = resolve_project_slug_for_cli(conn, &project)?;
+            let project = resolve_project_slug_for_cli_best_effort(conn, &project)?;
             let limit = limit.unwrap_or(50);
             let active_reservation_predicate =
                 active_reservation_predicate_sql("file_reservations");
@@ -7041,7 +7056,7 @@ fn handle_file_reservations_with_conn(
             Ok(())
         }
         FileReservationsCommand::Soon { project, minutes } => {
-            let project = resolve_project_slug_for_cli(conn, &project)?;
+            let project = resolve_project_slug_for_cli_best_effort(conn, &project)?;
             let minutes = minutes.unwrap_or(30);
             let threshold_us = now_us.saturating_add(minutes.saturating_mul(60_000_000));
             let active_reservation_predicate =
@@ -7403,19 +7418,17 @@ fn handle_file_reservations_with_conn(
             Ok(())
         }
         FileReservationsCommand::Conflicts { project, paths } => {
-            let project = resolve_project_slug_for_cli(conn, &project)?;
+            let project = resolve_project_slug_for_cli_best_effort(conn, &project)?;
             let proj_rows = conn
                 .query_sync(
                     "SELECT id FROM projects WHERE slug = ?",
                     &[sqlmodel_core::Value::Text(project.clone())],
                 )
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let project_id: i64 = proj_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("project not found: {project}"))
-                })?;
+            let Some(project_id) = proj_rows.first().and_then(|r| r.get_named("id").ok()) else {
+                output::success("No conflicts detected.");
+                return Ok(());
+            };
 
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
             let active_reservation_predicate = active_reservation_predicate_sql("fr");
@@ -15466,8 +15479,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 Ok(result) => result?,
                 Err(_) => {
                     return Err(CliError::Other(
-                        "mail send timed out after 30s — the server may be unresponsive"
-                            .to_string(),
+                        "mail send timed out after 30s in local fallback mode".to_string(),
                     ));
                 }
             };
@@ -17590,6 +17602,16 @@ mod mail_server_cli_bridge_tests {
     }
 
     #[test]
+    fn fetch_inbox_server_rejection_allows_local_fallback_for_busy_server() {
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "Resource is temporarily busy. Wait a moment and try again."
+        ));
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "JSON-RPC error -32000: database is busy (snapshot conflict on pages: page 4434 > snapshot db_size 4433 (latest: 4433)); data=null"
+        ));
+    }
+
+    #[test]
     fn mail_server_rejection_allows_local_fallback_for_missing_scope() {
         assert!(mail_server_rejection_allows_local_fallback(
             "Agent 'LegacyReceiver' not found. Project '/tmp/legacy-project' has no registered agents yet. Use register_agent to create an agent identity first."
@@ -17615,6 +17637,22 @@ mod mail_server_cli_bridge_tests {
         ));
         assert!(!mail_server_rejection_allows_local_fallback(
             "authentication failed (HTTP 401) while calling http://127.0.0.1:8765/mcp/; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN"
+        ));
+        assert!(!mail_server_rejection_allows_local_fallback(
+            "Resource is temporarily busy. Wait a moment and try again."
+        ));
+        assert!(!mail_server_rejection_allows_local_fallback(
+            "JSON-RPC error -32000: database is locked; data=null"
+        ));
+    }
+
+    #[test]
+    fn fetch_inbox_rejection_allows_local_fallback_for_busy_server_jsonrpc_locked() {
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "Resource is temporarily busy. Wait a moment and try again."
+        ));
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "JSON-RPC error -32000: database is locked; data=null"
         ));
     }
 
@@ -26973,6 +27011,44 @@ startup_timeout_sec = 42
         );
     }
 
+    #[test]
+    fn integration_config_set_port_rewrites_legacy_port_vars() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        std::fs::write(
+            &env_file,
+            "AGENT_MAIL_HTTP_PORT=7000\nAM_HTTP_PORT=7001\nEXTRA_FLAG=1\n",
+        )
+        .expect("seed env file");
+
+        let result = handle_config(ConfigCommand::SetPort {
+            port: 9999,
+            env_file: Some(env_file.clone()),
+        });
+        assert!(result.is_ok(), "config set-port failed: {result:?}");
+
+        let content = std::fs::read_to_string(&env_file).expect("read env file");
+        assert!(
+            !content.contains("AGENT_MAIL_HTTP_PORT="),
+            "legacy AGENT_MAIL_HTTP_PORT should be removed, got: {content}"
+        );
+        assert!(
+            !content.contains("AM_HTTP_PORT="),
+            "legacy AM_HTTP_PORT should be removed, got: {content}"
+        );
+        assert!(
+            content.contains("HTTP_PORT=9999"),
+            "env file should contain rewritten HTTP_PORT, got: {content}"
+        );
+        assert!(
+            content.contains("EXTRA_FLAG=1"),
+            "unrelated env vars must be preserved, got: {content}"
+        );
+    }
+
     /// Helper: seed a DB with projects, agents, messages, and file_reservations for CLI tests.
     fn seed_acks_and_reservations_db(db_path: &Path) -> mcp_agent_mail_db::DbConn {
         use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
@@ -27287,6 +27363,35 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn integration_file_reservations_list_accepts_human_key() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::List {
+                project: "/tmp/test-proj".to_string(),
+                active_only: false,
+                all: false,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "file_reservations list by human_key failed: {result:?}"
+        );
+        assert!(
+            output.contains("src/api/*.rs") && output.contains("BlueLake"),
+            "expected reservation when using human_key, got: {output}"
+        );
+    }
+
+    #[test]
     fn integration_file_reservations_active_shows_active() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -27580,6 +27685,31 @@ startup_timeout_sec = 42
         assert!(
             output.contains("No conflicts"),
             "expected no conflicts, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_conflicts_unknown_project_is_empty() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Conflicts {
+                project: "missing-proj".to_string(),
+                paths: vec!["src/api/*.rs".to_string()],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "conflicts check failed: {result:?}");
+        assert!(
+            output.contains("No conflicts"),
+            "expected empty conflicts result, got: {output}"
         );
     }
 
@@ -36192,6 +36322,10 @@ fn server_tool_error_is_unavailable(error: &CliError) -> bool {
     }
 }
 
+fn server_rejection_is_transient_resource_busy(message: &str) -> bool {
+    is_resource_busy_cli_error(&CliError::Other(message.trim().to_string()))
+}
+
 fn mail_server_rejection_allows_local_fallback(message: &str) -> bool {
     let lower = message.trim().to_ascii_lowercase();
     if lower.is_empty()
@@ -36216,6 +36350,7 @@ fn mail_server_rejection_allows_local_fallback(message: &str) -> bool {
 
 fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {
     mail_server_rejection_allows_local_fallback(message)
+        || server_rejection_is_transient_resource_busy(message)
 }
 
 fn mcp_error_to_cli_error(err: fastmcp::prelude::McpError) -> CliError {
