@@ -2,7 +2,19 @@
 
 All notable changes to [MCP Agent Mail (Rust)](https://github.com/Dicklesworthstone/mcp_agent_mail_rust) are documented in this file.
 
-Versions marked with **[Release]** have published [GitHub Releases](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases) with downloadable binaries. Versions marked with **[Tag only]** exist as git tags but have no GitHub Release or binary artifacts.
+Versions marked **[Release]** have published [GitHub Releases](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases) with downloadable binaries. Versions marked **[Tag only]** exist as git tags but were never published as GitHub Releases.
+
+---
+
+## Unreleased
+
+3 commits since v0.2.12 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.12...main)
+
+### Migration and Dependencies
+
+- Run full migrations via canonical SQLite for ALTER TABLE support ([3c939d7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3c939d7))
+- Update dependency versions for crates.io publish cascade ([85d948b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/85d948b))
+- Update asupersync dep to 0.2.9 ([3955d99](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3955d99))
 
 ---
 
@@ -14,7 +26,7 @@ Dependency version bump for crates.io publish cascade. Packages the FrankenSQLit
 
 ### Changes
 
-- **crates.io publish cascade**: Updated workspace dependency versions so all crates in the workspace can be published to crates.io in the correct order ([b679466](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b679466468648e09e3700c752c28f953f8242064))
+- Updated workspace dependency versions so all crates can be published to crates.io in the correct order ([b679466](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b679466468648e09e3700c752c28f953f8242064))
 - Updated Cargo.lock dependency versions ([b6819d8](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b6819d8))
 
 ---
@@ -72,66 +84,96 @@ Bundles the v0.2.8 HTTP server deadlock fix with additional clippy/lint fixes an
 
 152 commits since v0.2.7 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.7...v0.2.8)
 
-Largest release since v0.2.0. Introduces the ATC (Agent Traffic Control) learning stack, fixes a critical HTTP server deadlock, overhauls the web dashboard, and lands hundreds of correctness and performance fixes.
+Largest release since v0.2.0. Introduces the ATC learning stack, fixes a critical HTTP server deadlock, overhauls the web dashboard, and lands hundreds of correctness and performance fixes.
 
 ### Critical Fix: HTTP Server Hang Under Concurrent Load
 
-Fixed a compound deadlock that caused the HTTP server to become permanently unresponsive when multiple MCP clients connected simultaneously (e.g., Codex + Claude Code).
+Fixed a compound deadlock that caused the HTTP server to become permanently unresponsive when multiple MCP clients connected simultaneously (e.g., Codex + Claude Code). Manifested as Codex timing out after 30 seconds, curl connecting but receiving 0 bytes, and `/health/liveness` hanging.
 
-**Root cause** — three interacting issues:
-1. `dispatch()` was synchronous, blocking async worker threads on every JSON-RPC request
-2. ATC operator runtime auto-selected io_uring, causing kernel D-state hangs
-3. `push_event()` used `std::thread::sleep()` in async context
+**Root cause** -- three interacting issues:
+
+1. `dispatch()` was synchronous, blocking async worker threads on every JSON-RPC request while doing DB operations
+2. ATC operator runtime auto-selected io_uring, causing `handle_reserve_ticket` D-state hangs in the kernel
+3. `push_event()` used `std::thread::sleep()` in the HTTP handler's async context, blocking workers for up to 14ms per request
 
 **Fixes**:
+
 - `dispatch()` offloads sync router/DB work to `spawn_blocking` ([c406943](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c406943))
-- ATC operator runtime explicitly uses epoll reactor
+- ATC operator runtime explicitly uses epoll reactor, eliminating io_uring kernel hangs
 - HTTP handler uses `push_event_async()` instead of blocking `push_event()`
+- HTTP runtime configured with a dedicated blocking thread pool
 
 ### ATC (Agent Traffic Control) Learning Stack
 
-A complete causal inference and adaptive coordination engine, built across 14+ modules:
+A complete causal inference and adaptive coordination engine, extending the ATC module introduced in v0.2.7 with a full learning stack built across 14+ modules:
 
-- **Core decision engine**: martingale-based anomaly detection, calibration guard, conflict graph, liveness feedback ([bf23258](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bf23258))
-- **Learning modules**: labeling, risk budgets, regime detection, adaptation policies, experience tuples ([7271588](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7271588))
-- **Effect semantics**: preconditions, cooldown, escalation, semantic messages ([7f29595](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7f29595))
+- **Experience data model**: experience tuple data model, learning baseline, schema migration ([df0071b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/df0071b))
+- **14 learning modules**: labeling, risk budgets, regime detection, adaptation policies, and more ([7271588](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7271588))
+- **Experience persistence**: queries, runtime integration, system health display ([b85aeae](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b85aeae))
+- **Effect semantics**: preconditions, cooldown, escalation, semantic messages, family-based messaging ([7f29595](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7f29595), [6f96266](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6f96266))
 - **Policy promotion**: doubly-robust evaluation, confidence sequences ([edb871b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/edb871b))
 - **VoI control**: value-of-information, identifiability debt, safe experiment design ([52dbff7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/52dbff7))
 - **User surfaces**: state taxonomy, noise control, safe defaults, golden workflows ([46da9f0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/46da9f0))
-- **TUI ATC dashboard**: agent/decision/detail panels ([8d32023](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8d32023))
-- Numerous numerical stability fixes: overflow, unsafe subtraction, shrinkage bias, DR variance, e-process predictability ([cdbc31d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/cdbc31d), [2b3fde2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2b3fde2), [43e94e6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/43e94e6))
+- **ATC integration**: engine wired into server runtime with 6 alien-artifact tracks ([206bb26](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/206bb26))
+- **TUI ATC dashboard**: agent/decision/detail panels with screen registry integration ([8d32023](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8d32023), [65ea16c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/65ea16c))
+- **Operator telemetry**: unified tick+summary, enriched operator telemetry, heap-scheduled review loop ([b746eb3](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b746eb3), [d1cb310](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d1cb310))
+- **Numerical stability fixes**: overflow, unsafe subtraction, shrinkage bias, DR variance, e-process predictability, burst-rate false-positive floor ([cdbc31d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/cdbc31d), [2b3fde2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2b3fde2), [43e94e6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/43e94e6), [d5e5f15](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d5e5f15))
 
 ### Web Dashboard Overhaul
 
-- Screen metadata, delta streaming, and full HTML/JS client ([6654f2d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6654f2d))
+- Full HTML/JS client with screen metadata and delta streaming ([6654f2d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6654f2d))
 - `/stream` endpoint with long-poll, delta journal, and viewer tracking ([158b323](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/158b323))
+- Artifact-graph traceability, policy bundles, and effect plans for ATC ([8224148](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8224148))
+- Conflict graph management, liveness feedback tracking, pattern-overlap detection ([5021045](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5021045))
+
+### Messaging and Identity
+
+- Exposed `list_agents` MCP tool and pinned service install paths ([b848567](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b848567))
+- Identity module expansion and reconstruct overhaul ([09f114b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/09f114b))
+- Schema expansions and search service query capabilities ([1ccd3fb](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1ccd3fb))
+- TUI compose view expansion ([ed4a8ab](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ed4a8ab))
+- Native SQLite sync inbox queries and CLI direct-check path refactor ([402b4de](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/402b4de))
+- Local `send_message` fallback, reconstruct expansion, ATC routing refinements ([17be55a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/17be55a))
 
 ### Performance
 
 - Replace O(n^2) `Vec::contains` dedup with `HashSet` in recipient handling ([943d398](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/943d398))
-- `Vec` to `VecDeque` for bounded collections across DB, server, and search-core
+- `Vec` to `VecDeque` for bounded collections across DB, server, and search-core ([7c0e4d6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7c0e4d6), [5b081b9](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5b081b9), [b40d9ac](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b40d9ac))
 - Eliminate unnecessary string allocations in case-insensitive comparisons ([0b14d24](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0b14d24))
-- Byte-level ASCII lowercasing for sort comparisons
+- Byte-level ASCII lowercasing for sort comparisons ([bcddf21](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bcddf21))
 - Raise Tantivy writer arena from 3MB to 15MB minimum ([4de5d7b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4de5d7b))
+- Batch `mark_messages_read` eliminates N+1 in `fetch_inbox` ([9e5e468](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9e5e468))
+- Arc-share cached rows, batch `inbox_stats` rebuild ([bed67a2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bed67a2))
+- BTreeMap reservation index, dedup thread IDs, canonicalize-once attachments ([8f8a494](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8f8a494))
+- Sampled write maintenance on hot reads to reduce lock contention ([f0706fa](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f0706fa))
+- Indexed reservation conflict detection with BTreeMap prefix lookups ([1d9265f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1d9265f))
+- Amortize base-dir canonicalize in `process_attachments` ([eacc4f9](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eacc4f9))
 
 ### Security
 
 - Untrack MCP config files containing bearer tokens ([89f5e9b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/89f5e9b))
-- SVG XSS prevention ([d83cdfd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d83cdfd))
+- SVG XSS prevention in share pipeline ([d83cdfd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d83cdfd))
 - 1MB file-size limit for reservation JSON in archive scanner ([1eb10dd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1eb10dd))
 - 50MB safety limit on message file reads ([ae88f77](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ae88f77))
+- Skip all symlinks during ZIP bundle collection to prevent directory traversal ([c7107b3](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c7107b3))
+- Harden bundle security and normalize GitHub repo detection ([d8b308b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d8b308b))
+- XSS regression tests and pre-computed thread URLs ([28f51ab](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/28f51ab))
+- Remove client-side markdown fallback to harden XSS surface ([6551984](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6551984))
 
-### Other Notable Changes
+### Correctness
 
-- `saturating_sub` for all timestamp arithmetic across core, ATC, and CLI ([df98813](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/df98813))
+- `saturating_sub` for all timestamp arithmetic across core, ATC, and CLI ([df98813](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/df98813), [2b890e3](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2b890e3), [0f78f01](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0f78f01))
 - Preserve error context in 11 `map_err(|_|)` lock-poisoning handlers ([0e68b09](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0e68b09))
 - Replace `unreachable!()` with error return in coalesce joiner on leader panic ([711339a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/711339a))
 - Unicode-width for correct table column alignment with CJK and emoji ([a057d74](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a057d74))
 - Fix dotenv parser emitting literal backslash before escaped char ([94d9e5b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/94d9e5b))
-- Identity module expansion and reconstruct overhaul ([09f114b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/09f114b))
-- Schema expansions and search service query capabilities ([1ccd3fb](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1ccd3fb))
-- TUI compose view expansion ([ed4a8ab](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ed4a8ab))
-- Exposed `list_agents` MCP tool ([b848567](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b848567))
+- Fix integer overflow, f64 Infinity injection, and cleanup race condition ([ab139d5](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ab139d5))
+- Rebuild `inbox_stats` from ground truth, fix S3-FIFO cache leak ([57eeedd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/57eeedd))
+- WASM error handling for HTTP poll init, WebSocket wait, and bootstrap ([a66895f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a66895f))
+- Database connection lifecycle management improvements ([4043bea](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4043bea))
+- Missing v3 timestamp migrations for `message_recipients`, `agent_links`, and `project_sibling_suggestions` ([ec662d8](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ec662d8))
+- BOCPD input validation, recovery hardening, snapshot PK fix ([d83cdfd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d83cdfd))
+- Age encryption pre-flight checks and robot batch-size controls ([55a9c8f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/55a9c8f))
 
 ---
 
@@ -139,20 +181,20 @@ A complete causal inference and adaptive coordination engine, built across 14+ m
 
 53 commits since v0.2.6 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.6...v0.2.7)
 
-Major expansion: introduces the ATC (Agent Traffic Control) module, XDG Base Directory support, comprehensive security hardening, and S3-FIFO cache improvements.
+Major expansion introducing the ATC (Agent Traffic Control) module, XDG Base Directory support, comprehensive security hardening, and S3-FIFO cache improvements.
 
 ### ATC (Agent Traffic Control) Module
 
-The foundational ATC infrastructure landed in this release:
+The foundational ATC infrastructure -- a runtime coordination engine for managing agent interactions:
 
-- Decision core, liveness tracking, conflict detection, martingale testing, calibration, synthesis engine ([bf23258](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bf23258))
-- CalibrationGuard safe-mode policy engine ([0952c27](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0952c27))
-- Load router with learning-augmented capacity model ([22b5625](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/22b5625))
-- Predictive coordination intelligence ([7221f97](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7221f97))
-- VCG mechanism design, queueing theory, PID controller ([b870d8f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b870d8f))
-- `am robot atc` subcommand for ATC status queries ([aeacb1a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/aeacb1a))
-- E2E test script and load router tests ([5f4404d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5f4404d))
-- 147 total ATC tests, including 29 new edge case tests ([f028279](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f028279))
+- **Decision core**: martingale-based anomaly detection, calibration guard, conflict graph, liveness feedback ([bf23258](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bf23258))
+- **CalibrationGuard**: safe-mode policy engine for throttling aggressive agents ([0952c27](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0952c27))
+- **Load router**: learning-augmented capacity model for request distribution ([22b5625](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/22b5625))
+- **Predictive coordination**: intelligence layer for proactive conflict avoidance ([7221f97](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7221f97))
+- **Advanced algorithms**: VCG mechanism design, queueing theory, PID controller ([b870d8f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b870d8f))
+- **Robot CLI**: `am robot atc` subcommand for ATC status queries ([aeacb1a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/aeacb1a))
+- **Server integration**: ATC module wired into server runtime, e-value overflow guard ([9ba101f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9ba101f), [e708241](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/e708241))
+- **E2E testing**: test script, load router tests, 147 total ATC tests with 29 edge case tests ([5f4404d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5f4404d), [f028279](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f028279))
 
 ### Security Hardening
 
@@ -161,15 +203,30 @@ The foundational ATC infrastructure landed in this release:
 - systemd TOCTOU fix, unit file parsing, PID hint timestamps ([965364c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/965364c))
 - SQL identifier validation to prevent injection via table aliases ([9ed3ec8](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9ed3ec8))
 
-### Other Highlights
+### Search and Caching
+
+- SQL plan search for Agent/Project doc kinds, cursor pagination, query facets ([f1a202d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f1a202d))
+- S3-FIFO cache sequence tracking to prevent ghost entry amnesia ([f9154d4](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f9154d4))
+- Increased cache capacities and `CompiledPattern::cached()` for hot-path pattern compilation ([e90e95d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/e90e95d))
+
+### CLI and Operations
 
 - XDG Base Directory spec support with backward compatibility ([722d91f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/722d91f))
 - Composite tmux pane IDs to prevent collisions in multi-session setups ([b19147e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b19147e))
 - Auto-stop conflicting systemd service before launching interactive TUI ([3313205](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3313205))
-- SQL plan search for Agent/Project doc kinds, cursor pagination, query facets ([f1a202d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f1a202d))
-- S3-FIFO cache sequence tracking to prevent ghost entry amnesia ([f9154d4](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f9154d4))
-- Project boundary enforcement in `get_messages_details_by_ids` ([0b18c8a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0b18c8a298610affc3942e9734f1bea294861e91))
-- Increased cache capacities and `CompiledPattern::cached()` ([e90e95d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/e90e95d))
+- Enriched PID hint files with executable path for robust process identity ([1f08ef8](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1f08ef8))
+- Robot attachments read path and hardened query patterns ([5168fa1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5168fa1))
+- Generalized managed service conflict detection for systemd and launchd ([5deedc5](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5deedc5))
+
+### Database and Server
+
+- Project boundary enforcement in `get_messages_details_by_ids` ([0b18c8a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0b18c8a))
+- Cache-bypassing agent lookup, named columns for inbox, connection leak fixes ([304ae54](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/304ae54))
+- Cached identity resolution, binary search for name validation ([689bce3](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/689bce3))
+- Deadlock detection perf, TUI safety, HTML escaping in tests ([646a9d6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/646a9d6))
+- Denormalize `recipients_json` on message insert ([45052f1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/45052f1))
+- WBQ fallback paths and synchronous fallback when WBQ is unavailable ([b51578f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b51578f), [1dbad33](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1dbad33))
+- Service install hardening and port-kill safety ([df11d13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/df11d13))
 
 ---
 
@@ -177,12 +234,15 @@ The foundational ATC infrastructure landed in this release:
 
 3 commits since v0.2.5 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.5...v0.2.6)
 
-Performance-focused patch release targeting TUI responsiveness.
+Performance-focused patch release targeting TUI responsiveness and static file security.
 
-### Changes
+### TUI Performance
 
 - Throttle full DB snapshots when `PRAGMA data_version` is unavailable, reducing unnecessary I/O ([2f2e92c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2f2e92c))
 - Extend poller sleep interval when `PRAGMA data_version` unavailable ([2a3c2ca](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2a3c2cad04ace770930fdf480caf257be14c158a))
+
+### Security
+
 - Harden static file serving against symlink traversal; deduplicate dashboard footer widgets on dense surfaces ([f4f9a39](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f4f9a39))
 
 ---
@@ -219,25 +279,31 @@ Comprehensive symlink-safe filesystem traversal across the entire codebase:
 ### SQLite Disaster Recovery
 
 - Salvage-based disaster recovery with archive reconstruction and merge ([dcd2a47](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/dcd2a47))
-- Reconstruct file reservations from archive storage ([331e920](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/331e920))
+- Reconstruct file reservations from archive storage ([70dc440](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/70dc440))
 - Eliminate per-connection `journal_mode WAL` contention; harden write-retry logic ([fbb4baf](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/fbb4baf))
 - MVCC retry extraction, BusySnapshot recognized as MVCC conflict ([5a5f715](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5a5f715), [1b1e029](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1b1e029))
 
 ### Installer Hardening
 
 - Legacy launcher takeover shims, i64 DB adoption, env parsing hardening ([dfbefe7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/dfbefe7))
-- Detect aliases in sourced files (ACFS) and kill all Python processes ([80137e9](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/80137e9))
+- Detect aliases in sourced files (ACFS) and kill all Python processes during upgrade ([80137e9](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/80137e9))
 - Repair same-version installs when `am` is still shadowed by Python ([9215e86](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9215e86))
 - Harden PATH management for login shells and non-interactive zsh ([a60a46c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a60a46c))
 
-### Other Highlights
+### Cross-Project Isolation
 
 - Cross-project message isolation, multi-addr health check, batch tracking ([ec7a7c4](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ec7a7c4))
 - Server-first dispatch for `send`, `reply`, and `inbox` commands ([652c245](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/652c245))
+- Sender vs agent filtering distinction for outbox queries ([60b741f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/60b741f))
+
+### Operations and Monitoring
+
 - Database lock probe and startup pipeline hardening ([27e46f0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/27e46f0))
 - Release bundle validation, graceful TUI signal termination ([00909be](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/00909be))
 - Coalescer depth counter underflow fix with saturating CAS decrement ([eb413ac](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eb413ac))
 - IPv4/IPv6 wildcard normalization for client connections ([019f1b6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/019f1b6))
+- TUI palette caching, contrast tuning, rendering optimizations ([7359497](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7359497))
+- Archive-snapshot robot fallback, inbox resilience ([331e920](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/331e920))
 
 ---
 
@@ -245,43 +311,57 @@ Comprehensive symlink-safe filesystem traversal across the entire codebase:
 
 93 commits since v0.2.2 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.2...v0.2.3)
 
-Large feature release with DbConnGuard RAII wrapper, doctor subcommand enhancements, TOML config support, and extensive query/storage improvements.
+Large feature release with DbConnGuard RAII wrapper, doctor subcommand enhancements, TOML config support, BCC messaging, and extensive query/storage improvements. Also enables Windows builds by removing the optional kafka dependency.
 
 ### Database Layer
 
 - `DbConnGuard` RAII wrapper for explicit SQLite connection cleanup ([14867d3](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/14867d3))
 - All short-lived pool/search connections wrapped in `DbConnGuard` ([228891d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/228891d))
-- Release reservations returning IDs, search cache authorization keying ([a0b1742](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a0b1742))
-- Timestamps module with clock skew detection ([c51dc23](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c51dc23))
+- `release_reservations_by_ids_returning_ids` and search cache authorization keying ([a0b1742](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a0b1742))
+- Centralized clock-skew-aware timestamps module ([c51dc23](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c51dc23), [000c29e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/000c29e))
 - Batch thread participant lookup and unified inbox pagination fix ([5bae811](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5bae811))
 - Denormalize `recipients_json` on message insert ([45052f1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/45052f1))
+- Correct `sqlite://` URI path parsing to preserve absolute paths ([ba01bb5](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ba01bb5))
+- Race condition fix in `now_micros()` monotonic clock ([4a71727](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4a71727))
 
 ### CLI and Doctor Enhancements
 
 - Foreign key integrity checks and orphaned recipient cleanup ([d69bbf7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d69bbf7))
 - `sqlite3 quick_check` rescue and new integration tests ([4502029](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4502029))
 - SQLite health probes, doctor orphan detection, MCP config URL repair ([890e40d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/890e40d))
-- Auto-stop conflicting systemd service before TUI launch
+- Recognize `-cli` binary names and fall back to listener PIDs for alias-launched servers ([65e7e62](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/65e7e62))
+- Harden service install and tighten port-kill safety ([df11d13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/df11d13))
 
 ### Configuration and Tooling
 
 - TOML config support, HTTP URL mode detection, pool-scoped caching, provider prefix stripping ([dd71439](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/dd71439))
 - Tool-aware MCP config rewriting, SQLite lock retry, snapshot hardening ([08876b7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/08876b7))
 - Codex integration switched from stale JSON/HTTP to TOML/stdio config ([ca6e0dc](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ca6e0dc))
+- ATC engine configuration via 10 environment variables ([f70c0f6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f70c0f6))
 
 ### Messaging and Agent Resolution
 
-- Agent name normalization to PascalCase across all entry points ([0d3136e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0d3136e))
+- Agent name normalization to PascalCase across all entry points ([0d3136e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0d3136e), [84a938e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/84a938e), [be8fcce](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/be8fcce))
 - LLM integration hardening: Anthropic auth, JSON extraction, char boundary safety ([758604c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/758604c))
 - BCC redaction in inbox copies, proper BCC archival ([f46de2f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f46de2f))
 - Strict validation for limits, repo paths, and ordered-prefix parsing ([595af1d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/595af1d))
+- `send_message` alias normalization and stricter unique constraint detection ([af0b0e6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/af0b0e6))
+- Numeric thread reference resolution for root messages ([3abbe85](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3abbe85))
+
+### Server Architecture
+
+- Async supervisor architecture, SQL query caching, MVCC async backoff ([038e53c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/038e53c))
+- Robust HTTP supervisor lifecycle with timeout-escalated shutdown, watchdog thread, and retry respawn loop ([43f6a11](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/43f6a11))
+- Per-recipient read tracking, importance filter propagation, live mark-read in mail UI ([f5530ba](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f5530ba))
+- Reservation enrichment with project and `created_ts` fields ([0c4df4c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0c4df4c))
 
 ### Other Highlights
 
-- Async supervisor architecture, SQL query caching, MVCC async backoff ([038e53c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/038e53c))
-- Robust HTTP supervisor lifecycle with timeout-escalated shutdown ([43f6a11](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/43f6a11))
-- Race condition fix in `now_micros()` monotonic clock ([4a71727](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/4a71727))
-- Removed optional kafka feature from asupersync dependency (enables Windows builds) ([a813517](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a81351741a39b876156b45103f07ca55ec3cb5b7))
+- Removed optional kafka feature from asupersync dependency, enabling Windows builds ([a813517](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a81351741a39b876156b45103f07ca55ec3cb5b7))
+- Sender_id wired through search pipeline and result models ([cd9c5d6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/cd9c5d6), [0c75080](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/0c75080))
+- TOON encoder deadlock prevention, reservation race fix ([9533b47](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9533b47))
+- Fail-closed activity probes and precise stale release reporting ([af0b0e6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/af0b0e6))
+- Navigation views for robot: urgent, ack, tooling, identity, config ([de53a3a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/de53a3a))
 
 ---
 
@@ -289,21 +369,25 @@ Large feature release with DbConnGuard RAII wrapper, doctor subcommand enhanceme
 
 84 commits since v0.2.1 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.1...v0.2.2)
 
-Massive stabilization release. Case-insensitive agent resolution everywhere, durability probes, TUI V3 screens, and deep query/storage hardening.
+Massive stabilization release. Unifies case-insensitive agent resolution across the entire stack, adds durability probes, introduces TUI V3 screens with batch operations, and applies deep query/storage hardening.
 
 ### Case-Insensitive Agent Resolution
 
-Unified case-insensitive agent name matching across the entire stack — DB, CLI, server, tools, and resources:
+Unified case-insensitive agent name matching across DB, CLI, server, tools, and resources, preventing duplicate agent registrations from case mismatches:
 
-- ([baa350f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/baa350f), [516a089](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/516a089), [f5ab55e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f5ab55e))
+- Comprehensive cross-crate resolution ([baa350f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/baa350f), [516a089](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/516a089), [f5ab55e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f5ab55e))
+- Robot deduplication for case-insensitive name collisions ([7fee0ee](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7fee0ee))
 
 ### TUI Improvements
 
 - Shared tick event batching, interior mutability, layout artifact prevention ([adad36c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/adad36c))
 - JSON tree detail view, search filter presets, contrast guard cadence ([898510f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/898510f))
 - JSON tree clipboard copy support and contextual copy actions ([67eeec0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/67eeec0))
-- Dashboard hotspot remediation with thread-local caches ([75e511b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/75e511b))
+- Dashboard hotspot remediation with thread-local caches and constant precomputation ([75e511b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/75e511b))
 - Dirty-state gated data ingestion on all TUI screens ([b9bff58](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b9bff58))
+- TUI spin watchdog, sqlite auto-recovery, and highlight fix ([eff669d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eff669d))
+- Lazy screen materialization, semantic db-stats diffing ([f0a09af](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f0a09af))
+- Deferred background worker startup and ambient renderer cached-composite optimization ([95c4ba9](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/95c4ba9))
 
 ### Database and Storage
 
@@ -311,22 +395,30 @@ Unified case-insensitive agent name matching across the entire stack — DB, CLI
 - Enhanced search v3, integrity metrics, query pagination, JSONL reconstruction ([eb7b21b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eb7b21b))
 - Schema migrations through canonical SQLite to prevent index corruption ([c630e7f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c630e7f))
 - SQL injection fix, WAL compatibility, agent dedup, metric safety ([3eab38d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3eab38d))
-- Post-migration integrity guard ([cbc574c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/cbc574c))
+- Post-migration integrity guard and strengthened quarantine test ([cbc574c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/cbc574c))
+- Robust coalescer commit pipeline with structured outcomes and failure tracking ([146e54f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/146e54f))
 
 ### Installer and CLI
 
 - SHA256 checksum verification in `install.ps1` and E2E test hardening ([8006931](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8006931))
-- `--no-tui` flag, `--rollback` migration, expanded doctor checks, and startup refactor ([8449aee](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8449aee))
-- Service management CLI, pane identity tools ([7c374ff](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7c374ff))
-- Kafka transport enablement ([cfcaa05](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/cfcaa05))
+- `--no-tui` flag, `--rollback` migration, expanded doctor checks, startup refactor ([8449aee](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8449aee))
+- Service management CLI, pane identity tools, TUI scroll fixes ([7c374ff](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7c374ff))
+- Eliminate stale WAL/SHM sidecar propagation during DB copy ([1ea8604](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1ea8604))
+- Kafka transport enablement via `crossterm-compat` features ([cfcaa05](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/cfcaa05))
 
-### Other Highlights
+### Server
 
 - Health signature headers, PID-aware port clearing ([9a08dad](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9a08dad))
 - Attachment processing, thread ID validation, guard environment tests ([3496194](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3496194))
-- TUI spin watchdog, sqlite auto-recovery ([eff669d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eff669d))
-- Deferred background worker startup and ambient renderer optimization ([95c4ba9](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/95c4ba9))
-- Lazy screen materialization, semantic db-stats diffing ([f0a09af](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f0a09af))
+- Responsive breakpoint layouts and side detail panels on all screens ([6b4f66a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6b4f66a))
+- HTTP liveness probe supervisor and hardened listener config ([3db82b1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3db82b1))
+- Tailscale remote-access detection and display ([c602abb](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c602abb))
+
+### Performance
+
+- `DbWarmupState` enum for three-state DB readiness tracking ([3d2e326](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3d2e326))
+- Dashboard render coalescing and lazy export snapshot refresh ([c613e9e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c613e9e))
+- Resize coalescing, diff strategy, and contrast guard optimizations ([a167585](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a167585))
 
 ---
 
@@ -334,7 +426,7 @@ Unified case-insensitive agent name matching across the entire stack — DB, CLI
 
 27 commits since v0.2.0 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.0...v0.2.1)
 
-Focused on `am doctor fix`, TUI V2 testing, and installer/CLI robustness.
+Focused on `am doctor fix`, TUI V2 testing, installer UX, and performance improvements.
 
 ### am doctor fix
 
@@ -344,6 +436,7 @@ Focused on `am doctor fix`, TUI V2 testing, and installer/CLI robustness.
 ### Installer
 
 - `--dry-run` preview mode and piped install confirmation ([7e2f875](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7e2f875))
+- Incident regression gates, robust alias displacement, E2E test hardening ([29e48dd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/29e48dd))
 
 ### TUI
 
@@ -361,7 +454,12 @@ Focused on `am doctor fix`, TUI V2 testing, and installer/CLI robustness.
 ### Testing
 
 - Truth oracle, incident capture, and migration test infrastructure ([9981998](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9981998))
-- Incident regression gates, robust alias displacement, E2E test hardening ([29e48dd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/29e48dd))
+- Screen diagnostics, truth assertions, auth improvements ([afd43bd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/afd43bd))
+- Scope-aware caching, FrankenSQLite compat, and correctness fixes ([bc1c340](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bc1c340))
+
+### Security
+
+- Replace exposed bearer token in `factory.mcp.json` ([18d50e0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/18d50e0))
 
 ---
 
@@ -369,103 +467,150 @@ Focused on `am doctor fix`, TUI V2 testing, and installer/CLI robustness.
 
 325 commits since v0.1.0 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.1.0...v0.2.0)
 
-Massive release with improvements across every subsystem. Introduces Search V3, v13 database migrations, installer uninstall mode, and deep security/performance hardening.
+Massive release touching every subsystem. Introduces Search V3 (two-tier Tantivy + lexical bridge architecture), the 15-screen TUI operations console, a human-readable web dashboard, write-behind queue for extreme load resilience, RBAC/JWT enforcement, console split-mode with command palette, and comprehensive E2E/conformance testing.
 
 ### Search V3 Architecture
 
-Complete search rewrite from SQL-based to two-tier Tantivy + lexical bridge architecture:
+Complete search rewrite from SQL-based FTS5 to a two-tier Tantivy + lexical bridge architecture:
 
-- Decomposed monolithic search into focused modules ([43ec691](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/43ec691))
+- Decomposed monolithic search into focused modules with two-tier architecture ([43ec691](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/43ec691))
 - Incremental Tantivy backfill with watermark-based skip ([bf7a6c2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bf7a6c2))
 - Scope-aware cache discriminator to prevent cross-scope query collisions ([d376b82](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d376b82))
 - CLI and robot search routed through Search V3 service ([c758017](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c758017))
 - All TUI screens migrated from SQL planner to unified search service ([c94f5cd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c94f5cd))
 - Removed SQL LIKE fallback entirely ([9429825](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9429825))
+- Two-tier search observability metrics and quality health reporting ([72f7328](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/72f7328), [8962bbf](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8962bbf))
 
-### Database Improvements
+### TUI Operations Console
+
+Full-screen interactive TUI with multi-screen operations cockpit:
+
+- 15-screen TUI: dashboard, messages, threads, agents, contacts, reservations, search, timeline, metrics, health, analytics, attachments, archive browser, and more ([7278617](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7278617), [10083df](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/10083df))
+- Server-side compose dispatch via sync SQLite ([3c3e135](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3c3e135))
+- Compose panel with validated send dispatch ([caf494e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/caf494e), [43c2bec](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/43c2bec))
+- Mouse drag-and-drop message rethreading across screens ([b04ff78](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/b04ff78))
+- Vim-style visual multi-selection with batch actions ([5e1209c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/5e1209c))
+- Interactive widget inspector overlay for debugging ([76afea9](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/76afea9))
+- Theme integration mapping ftui palettes to TUI styles ([e22c250](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/e22c250))
+
+### Console Split-Mode
+
+- Alt-screen split layout wired into server ([dbf52f1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/dbf52f1))
+- Command palette with 25 actions and dispatch wiring ([d601d55](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d601d55))
+- ConsoleCaps detection, banner, help overlay, OSC-8 hyperlink support ([1eda13e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1eda13e), [47b6fcc](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/47b6fcc))
+- Event timestamps, kind filter, and detail enhancements ([6b364da](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6b364da))
+
+### Web Dashboard
+
+- Human-readable UI dashboard with archive browser and mail views ([342b821](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/342b821))
+- RBAC/JWT enforcement, tool instrumentation, mail UI pagination ([86dd07d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/86dd07d))
+- Retention engine, health endpoints, tool metrics, mail UI module ([2eb5a8f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2eb5a8f))
+
+### Database and Storage
 
 - v13 poller indexes, `busy_timeout` pragma, lock-retry migration engine ([8322891](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/8322891))
+- v3 migration for TEXT timestamps ([50977c6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/50977c6))
+- Write-behind queue for extreme load resilience ([da5e317](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/da5e317))
+- Async commit coalescer for storage pipeline ([da5e317](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/da5e317))
+- Expand query layer with retention, tracking, schema improvements ([c281fd5](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c281fd5))
+- Retry layer, expanded error taxonomy, hardened connection pool ([a8d8101](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a8d8101))
 - Three-way JOIN replaced with two-phase sampling in consistency probe ([df6e0c7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/df6e0c7))
-- Extreme load resilience: SQLite hardening, async commit coalescer, write-behind queue ([da5e317](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/da5e317))
+- Drop legacy Python FTS triggers on migration to prevent constraint failures ([880a0a9](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/880a0a9))
+- S3-FIFO frequency count preservation on main queue promotion ([3d393dc](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3d393dc))
 
 ### Performance
 
 - Deferred backfill, integrity cache, persistent poller connections ([24b5636](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/24b5636))
-- Startup latency optimization with deferred work ([27cd3fe](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/27cd3fe))
+- Startup latency optimization with redundant probe skip and minimal pool allocation ([27cd3fe](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/27cd3fe))
 - Suppress noisy fsqlite tracing, minimize worker pool allocations ([44ecfc3](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/44ecfc3))
+- Two-tier search index optimized with direct chunk iteration and destructuring moves ([09c2d6d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/09c2d6d))
 
 ### Security
 
 - TOCTOU race fix in env file creation ([bba526a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bba526a))
 - Enforce 0600 permissions on env files containing bearer tokens ([2acd47d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2acd47d))
 - Path traversal prevention in agent detection module ([a827c2e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a827c2e))
-- Structured config classification and correctness fixes ([899e0cd](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/899e0cd2164ef1c3992d9d1b37798bdb69bf25f1))
 
 ### Installer
 
 - Uninstall mode, MCP config management, Windows installer ([77b4215](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/77b4215))
 - Setup self-heal fingerprint cache and preflight optimization ([3d9c9f0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3d9c9f0))
-
-### TUI
-
-- Resize coalescing and queue stats for remote terminal WebSocket ([bfbbadb](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bfbbadb))
-- TUI poller improvements with dirty-state gating ([7777e6d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7777e6d))
-- Pre-TUI startup banner, smarter reservation validation, port migration to 8899 ([ef15f00](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ef15f00))
-
-### Server
-
-- Ack TTL, cleanup, disk monitor, retention, integrity guard ([48976b8](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/48976b8))
-- Retention engine, health endpoints, tool metrics, mail UI module ([2eb5a8f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/2eb5a8f))
-- RBAC/JWT enforcement, tool instrumentation, mail UI pagination ([86dd07d](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/86dd07d))
+- Fresh install surface validation suite ([84bc664](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/84bc664))
 
 ### CLI and Tools
 
 - ~15 CLI commands implemented, replacing `NotImplemented` stubs ([935b183](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/935b183))
 - CLI overhaul with rich output and expanded conformance test runner ([9953f94](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/9953f94))
+- Major CLI expansion with output module, new commands, and 123+ tests ([440d358](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/440d358))
 - Guard rewrite with rename and ignorecase support ([c4c742a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c4c742a))
-- LLM stub mode, identity resource, tool metrics reset ([a748623](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a748623))
-
-### Other Highlights
-
-- TOON output format, share pipeline, CLI expansion ([285036b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/285036b))
-- Addressed GitHub issues #8-#18 across multiple subsystems ([d3ec890](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d3ec890))
-- Embedding jobs, rollout system, search updater improvements ([df10995](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/df10995))
-- S3-FIFO frequency count preservation on main queue promotion ([3d393dc](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3d393dc))
 - Glob-to-regex rewrite with `[]`, `{}` syntax support ([894ebb1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/894ebb1))
+- LLM stub mode, identity resource, tool metrics reset ([a748623](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/a748623))
+- TOON output format with comprehensive tests ([285036b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/285036b), [bc0ec45](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/bc0ec45))
+- am runner + MCP base-path alias ([33ab58a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/33ab58a))
+- Pre-TUI startup banner, reservation validation, port migration to 8899 ([ef15f00](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ef15f00))
+
+### Share/Export Pipeline
+
+- Self-contained HTML viewer and improved bundle finalization ([eab8cb2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eab8cb2))
+- Deterministic ZIP output, stricter crypto validation ([852fa13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/852fa13))
+- Chunked export params and share pipeline benchmarks ([73d814a](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/73d814a))
+
+### Testing
+
+- 54 input validation + serde tests for tool modules ([6d57e63](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6d57e63))
+- E2E share/export test suite and CLI integration tests ([1c333b2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1c333b2))
+- CLI stability test suite, stdio transport verification ([16df695](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/16df695), [099780f](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/099780f))
+- Addressed GitHub issues #8-#18 across multiple subsystems ([d3ec890](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d3ec890))
 
 ---
 
-## [v0.1.0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.1.0) — 2026-02-24 **[Release — Initial]**
+## [v0.1.0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.1.0) — 2026-02-24 **[Release -- Initial]**
 
 802 commits | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/213eac7750fa368ca2b39fa72e455034158023ff...v0.1.0)
 
-Initial public release of the Rust port of [mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail). Full feature parity with the Python reference implementation plus substantial performance improvements.
+Initial public release of the Rust port of [mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail). Full feature parity with the Python reference implementation plus substantial performance improvements. Development began on 2026-02-05 with the [initial commit](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/213eac7750fa368ca2b39fa72e455034158023ff).
 
-Development began on 2026-02-05 with the [initial commit](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/213eac7750fa368ca2b39fa72e455034158023ff).
-
-### Capabilities at Launch
+### MCP Server
 
 - **34 MCP tools** across 9 clusters: messaging, reservations, search, macros, build slots, identity, resources, contacts, and products
 - **23+ MCP resources** with conformance-tested JSON output
-- **15-screen TUI** operations console with real-time dashboard, search, timeline, and analytics
-- **Dual-mode interface**: MCP server (stdio/HTTP transport) + operator CLI (`am`)
-- **Git-backed archive** for human-auditable message history
-- **SQLite** with WAL, connection pooling, write-behind cache, FTS5 full-text search
-- **Pre-commit guard** for file reservation enforcement with conflict detection
-- **Share/export pipeline** with snapshot, scope, scrub, finalize, bundle, and optional encryption
-- **Conformance test suite** against Python reference fixtures
-- **TOON output format** with deterministic stub encoders
-- **E2E test harness** with guard test suite
-- **Benchmarks** with baseline budgets and golden outputs
-- **Multi-platform binaries**: Linux x86_64, macOS arm64, Windows x86_64
-- **curl-bash installer** with auto-detection and Codex CLI auto-configuration
-
-### Key Implementation Details
-
-- Full storage layer: git-backed archive, attachment pipeline with WebP conversion, advisory file locks, commit queue batching ([c05bb3b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c05bb3b), [eb5bb09](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eb5bb09), [ec3bd47](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ec3bd47))
-- Share/export pipeline with snapshot, scrub, bundle, and crypto ([be68db2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/be68db2))
-- Query tracking and instrumentation module ([6526d80](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6526d80))
-- Guard conflict detection with reservation reading and rename handling ([09aa77e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/09aa77e))
+- **Dual-mode interface**: MCP server (`mcp-agent-mail` binary, stdio/HTTP transport) and operator CLI (`am` binary) share the same tool implementations but enforce strict surface separation
 - Tool filtering profiles and config-aware builder ([040298e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/040298e))
-- Multi-platform release distribution and curl-bash installer ([1c569d7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1c569d7b1a3f51e48c0f0d4fe97a8846a118c7a3))
-- Console split layout, command palette, PTY E2E tests ([dbf52f1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/dbf52f1), [d601d55](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/d601d55))
+
+### Storage Layer
+
+- **Git-backed archive** for human-auditable message history, reservations, and agent profiles ([c05bb3b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c05bb3b), [7ba9fe6](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/7ba9fe6))
+- Attachment pipeline with automatic WebP conversion ([eb5bb09](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/eb5bb09))
+- Advisory file locks and commit queue batching ([ec3bd47](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/ec3bd47))
+- **SQLite** with WAL, connection pooling, FTS5 full-text search
+- Write-behind cache with async commit coalescer
+
+### Coordination
+
+- **Advisory file reservations**: exclusive or shared leases on file globs with TTL
+- **Pre-commit guard** for file reservation enforcement with conflict detection ([09aa77e](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/09aa77e))
+- Force-release with multi-signal heuristics ([f1ccdce](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/f1ccdce))
+- Query tracking and instrumentation module ([6526d80](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/6526d80))
+
+### Share/Export Pipeline
+
+- Full share/export pipeline with snapshot, scope, scrub, finalize, bundle, and optional encryption ([be68db2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/be68db2))
+- Deterministic ZIP output with crypto validation
+
+### CLI
+
+- Interactive console with split-mode layout
+- ~15 operator commands for server management, diagnostics, and agent operations
+- TOON output format with deterministic stub encoders ([285036b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/285036b))
+
+### Testing and Quality
+
+- Conformance test suite against Python reference fixtures ([801c340](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/801c340))
+- E2E test harness with guard test suite ([c4471d8](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/c4471d8))
+- Benchmarks with baseline budgets and golden outputs ([891c47c](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/891c47c))
+
+### Distribution
+
+- Multi-platform binaries: Linux x86_64, macOS arm64, Windows x86_64 ([1c569d7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/1c569d7b1a3f51e48c0f0d4fe97a8846a118c7a3))
+- curl-bash installer with platform auto-detection and Codex CLI auto-configuration
+- `mcp-agent-mail` (MCP server) and `am` (operator CLI) shipped as separate binaries
