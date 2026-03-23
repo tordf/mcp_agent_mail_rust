@@ -11904,6 +11904,10 @@ impl DoctorProjectIdentity {
                 .as_deref()
                 .zip(other.slug.as_deref())
                 .is_some_and(|(left, right)| left == right)
+            || ((self.human_key.is_none() || other.human_key.is_none())
+                && doctor_project_identity_match_tokens(self)
+                    .into_iter()
+                    .any(|left| doctor_project_identity_match_tokens(other).contains(&left)))
     }
 
     fn display_label(&self) -> String {
@@ -11913,6 +11917,51 @@ impl DoctorProjectIdentity {
             (None, Some(human_key)) => human_key.to_string(),
             (None, None) => "<unknown project>".to_string(),
         }
+    }
+}
+
+fn doctor_project_identity_match_tokens(
+    identity: &DoctorProjectIdentity,
+) -> std::collections::BTreeSet<String> {
+    let mut tokens = std::collections::BTreeSet::new();
+    if let Some(slug) = identity
+        .slug
+        .as_deref()
+        .and_then(doctor_project_match_token)
+    {
+        tokens.insert(slug);
+    }
+    if let Some(basename) = identity
+        .human_key
+        .as_deref()
+        .and_then(doctor_project_human_key_basename)
+        .and_then(doctor_project_match_token)
+    {
+        tokens.insert(basename);
+    }
+    tokens
+}
+
+fn doctor_project_human_key_basename(human_key: &str) -> Option<&str> {
+    let trimmed = human_key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+}
+
+fn doctor_project_match_token(value: &str) -> Option<String> {
+    let normalized = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
     }
 }
 
@@ -12539,7 +12588,7 @@ fn doctor_archive_project_identity(project_path: &Path) -> Option<DoctorProjectI
         );
     }
 
-    DoctorProjectIdentity::from_parts(None, None, fallback_slug)
+    DoctorProjectIdentity::from_parts(fallback_slug, None, None)
 }
 
 fn doctor_is_archive_year_component(value: &str) -> bool {
@@ -24822,6 +24871,33 @@ startup_timeout_sec = 42
             .expect("missing archive-only project should be treated as parity drift");
         assert!(detail.contains("archive-only-project"));
         assert!(detail.contains("missing archive project(s) in DB"));
+    }
+
+    #[test]
+    fn doctor_archive_db_drift_detail_treats_slug_only_archive_project_as_matched_by_db_basename() {
+        let archive = DoctorArchiveInventory {
+            projects: 1,
+            agents: 1,
+            messages: 1,
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("flywheel_connectors".to_string()),
+                human_key: None,
+            }]),
+            ..DoctorArchiveInventory::default()
+        };
+        let db = DoctorDbInventory {
+            counts: DoctorInventoryCounts {
+                projects: 1,
+                agents: 1,
+                messages: 1,
+            },
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("users-jemanuel-projects-flywheel-connectors".to_string()),
+                human_key: Some("/Users/jemanuel/projects/flywheel_connectors".to_string()),
+            }]),
+        };
+
+        assert_eq!(doctor_archive_db_drift_detail(&archive, &db), None);
     }
 
     #[test]
