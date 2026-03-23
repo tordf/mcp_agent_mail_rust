@@ -4419,6 +4419,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsqlite3-sys"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "libssh2-sys"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4655,7 +4666,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "clap",
  "criterion",
@@ -4681,7 +4692,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4722,7 +4733,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4745,7 +4756,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "chrono",
  "criterion",
@@ -4768,7 +4779,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4783,6 +4794,7 @@ dependencies = [
  "half",
  "hex",
  "indexmap",
+ "libsqlite3-sys",
  "loom",
  "mcp-agent-mail-core",
  "proptest",
@@ -4811,7 +4823,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "chrono",
  "git2",
@@ -4826,7 +4838,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "chrono",
  "criterion",
@@ -4856,7 +4868,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4899,7 +4911,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "atty",
  "base64 0.22.1",
@@ -4921,7 +4933,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4946,7 +4958,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4972,7 +4984,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-wasm"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -7248,6 +7260,7 @@ name = "sqlmodel-sqlite"
 version = "0.2.1"
 dependencies = [
  "asupersync",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
  "sqlmodel-core",

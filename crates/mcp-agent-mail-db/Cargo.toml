@@ -53,6 +53,9 @@ indexmap.workspace = true
 # Async runtime
 asupersync.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+libsqlite3-sys = { workspace = true, features = ["bundled-windows"] }
+
 [features]
 default = ["hybrid", "s3fifo", "tantivy-engine"]
 # Enable Tantivy-based lexical search (moved from search-core)

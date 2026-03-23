@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.16"
+version = "0.2.17"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -92,6 +92,7 @@ hex = "0.4"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["std"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
+libsqlite3-sys = "0.37.0"
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 proptest = "1"

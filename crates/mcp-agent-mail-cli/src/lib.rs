@@ -62,24 +62,10 @@ pub enum CliError {
 pub type CliResult<T> = Result<T, CliError>;
 
 #[derive(Parser, Debug)]
-#[command(name = "am", version = version_with_update_hint(), about = "MCP Agent Mail CLI (Rust)")]
+#[command(name = "am", version = env!("CARGO_PKG_VERSION"), about = "MCP Agent Mail CLI (Rust)")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
-}
-
-/// Build a version string that includes an update hint if a cached check exists.
-fn version_with_update_hint() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| {
-        let base = env!("CARGO_PKG_VERSION");
-        // Check update cache (fast, no network)
-        if let Some(UpdateCheckResult::UpdateAvailable { latest, .. }) = read_update_cache() {
-            format!("{base} (update available: {latest} — run `am self-update`)")
-        } else {
-            base.to_string()
-        }
-    })
 }
 
 #[derive(Subcommand, Debug)]
@@ -11885,11 +11871,57 @@ struct DoctorInventoryCounts {
     messages: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DoctorProjectIdentity {
+    slug: Option<String>,
+    human_key: Option<String>,
+}
+
+impl DoctorProjectIdentity {
+    fn from_parts(
+        slug: Option<String>,
+        human_key: Option<String>,
+        fallback_slug: Option<String>,
+    ) -> Option<Self> {
+        let slug = doctor_inventory_normalize_text(slug).or_else(|| {
+            fallback_slug.and_then(|value| doctor_inventory_normalize_text(Some(value)))
+        });
+        let human_key = doctor_inventory_normalize_text(human_key);
+        if slug.is_none() && human_key.is_none() {
+            None
+        } else {
+            Some(Self { slug, human_key })
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.human_key
+            .as_deref()
+            .zip(other.human_key.as_deref())
+            .is_some_and(|(left, right)| left == right)
+            || self
+                .slug
+                .as_deref()
+                .zip(other.slug.as_deref())
+                .is_some_and(|(left, right)| left == right)
+    }
+
+    fn display_label(&self) -> String {
+        match (self.slug.as_deref(), self.human_key.as_deref()) {
+            (Some(slug), Some(human_key)) => format!("{slug} ({human_key})"),
+            (Some(slug), None) => slug.to_string(),
+            (None, Some(human_key)) => human_key.to_string(),
+            (None, None) => "<unknown project>".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DoctorArchiveInventory {
     projects: u64,
     agents: u64,
     messages: u64,
+    project_identities: std::collections::BTreeSet<DoctorProjectIdentity>,
     canonical_message_files: u64,
     duplicate_canonical_message_files: u64,
     duplicate_canonical_message_ids: u64,
@@ -11905,6 +11937,12 @@ impl DoctorArchiveInventory {
             messages: self.messages,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DoctorDbInventory {
+    counts: DoctorInventoryCounts,
+    project_identities: std::collections::BTreeSet<DoctorProjectIdentity>,
 }
 
 #[derive(Debug, Clone)]
@@ -12468,6 +12506,42 @@ fn doctor_archive_path_components(path: &Path) -> Vec<&str> {
     path.iter().filter_map(|part| part.to_str()).collect()
 }
 
+fn doctor_inventory_normalize_text(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn doctor_archive_project_identity(project_path: &Path) -> Option<DoctorProjectIdentity> {
+    let fallback_slug = project_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    let project_json = project_path.join("project.json");
+    if let Ok(content) = std::fs::read_to_string(&project_json)
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
+    {
+        return DoctorProjectIdentity::from_parts(
+            parsed
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            parsed
+                .get("human_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            fallback_slug,
+        );
+    }
+
+    DoctorProjectIdentity::from_parts(None, None, fallback_slug)
+}
+
 fn doctor_is_archive_year_component(value: &str) -> bool {
     value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
@@ -12567,6 +12641,9 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> DoctorArchiveInvento
             continue;
         }
         inventory.projects += 1;
+        if let Some(project_identity) = doctor_archive_project_identity(&project_path) {
+            inventory.project_identities.insert(project_identity);
+        }
 
         let agents_dir = project_path.join("agents");
         if path_is_real_directory(&agents_dir)
@@ -12606,9 +12683,7 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> DoctorArchiveInvento
     inventory
 }
 
-fn collect_doctor_db_inventory(
-    conn: &mcp_agent_mail_db::DbConn,
-) -> CliResult<DoctorInventoryCounts> {
+fn collect_doctor_db_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<DoctorDbInventory> {
     fn count_rows(conn: &mcp_agent_mail_db::DbConn, table: &str) -> CliResult<u64> {
         let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
         let rows = conn
@@ -12621,38 +12696,69 @@ fn collect_doctor_db_inventory(
             .max(0) as u64)
     }
 
-    Ok(DoctorInventoryCounts {
-        projects: count_rows(conn, "projects")?,
-        agents: count_rows(conn, "agents")?,
-        messages: count_rows(conn, "messages")?,
+    let mut project_identities = std::collections::BTreeSet::new();
+    let project_rows = conn
+        .query_sync("SELECT slug, human_key FROM projects", &[])
+        .map_err(|e| CliError::Other(format!("failed to inspect project identities: {e}")))?;
+    for row in project_rows {
+        let slug = row.get_named::<String>("slug").ok();
+        let human_key = row.get_named::<String>("human_key").ok();
+        if let Some(identity) = DoctorProjectIdentity::from_parts(slug, human_key, None) {
+            project_identities.insert(identity);
+        }
+    }
+
+    Ok(DoctorDbInventory {
+        counts: DoctorInventoryCounts {
+            projects: count_rows(conn, "projects")?,
+            agents: count_rows(conn, "agents")?,
+            messages: count_rows(conn, "messages")?,
+        },
+        project_identities,
     })
 }
 
 fn doctor_archive_db_drift_detail(
     archive: &DoctorArchiveInventory,
-    db: &DoctorInventoryCounts,
+    db: &DoctorDbInventory,
 ) -> Option<String> {
     if archive.counts() == DoctorInventoryCounts::default() {
         return None;
     }
 
     let mut drift = Vec::new();
-    if archive.projects > db.projects {
+    if archive.projects > db.counts.projects {
         drift.push(format!(
             "projects archive={} db={}",
-            archive.projects, db.projects
+            archive.projects, db.counts.projects
         ));
     }
-    if archive.agents > db.agents {
+    if archive.agents > db.counts.agents {
         drift.push(format!(
             "agents archive={} db={}",
-            archive.agents, db.agents
+            archive.agents, db.counts.agents
         ));
     }
-    if archive.messages > db.messages {
+    if archive.messages > db.counts.messages {
         drift.push(format!(
             "messages archive={} db={}",
-            archive.messages, db.messages
+            archive.messages, db.counts.messages
+        ));
+    }
+    let missing_projects = archive
+        .project_identities
+        .iter()
+        .filter(|archive_identity| {
+            !db.project_identities
+                .iter()
+                .any(|db_identity| archive_identity.matches(db_identity))
+        })
+        .map(DoctorProjectIdentity::display_label)
+        .collect::<Vec<_>>();
+    if !missing_projects.is_empty() {
+        drift.push(format!(
+            "missing archive project(s) in DB: {}",
+            missing_projects.join(", ")
         ));
     }
 
@@ -12660,7 +12766,7 @@ fn doctor_archive_db_drift_detail(
         None
     } else {
         Some(format!(
-            "Archive contains more canonical records than the SQLite DB ({})",
+            "Archive canonical data is not fully represented in the SQLite DB ({})",
             drift.join(", ")
         ))
     }
@@ -13291,9 +13397,9 @@ fn handle_doctor_check_with(
                     archive.projects,
                     archive.agents,
                     archive.messages,
-                    db.projects,
-                    db.agents,
-                    db.messages,
+                    db.counts.projects,
+                    db.counts.agents,
+                    db.counts.messages,
                     doctor_archive_inventory_suffix(&archive)
                 ),
             })),
@@ -13315,9 +13421,9 @@ fn handle_doctor_check_with(
                     archive.projects,
                     archive.agents,
                     archive.messages,
-                    db.projects,
-                    db.agents,
-                    db.messages,
+                    db.counts.projects,
+                    db.counts.agents,
+                    db.counts.messages,
                     doctor_archive_inventory_suffix(&archive)
                 ),
             })),
@@ -21741,6 +21847,12 @@ command = "mcp-agent-mail"
     }
 
     #[test]
+    fn clap_top_level_version_is_static_package_version() {
+        let command = Cli::command();
+        assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
     fn clap_parses_migrate_check() {
         let m = Cli::try_parse_from(["am", "migrate", "--check"]).unwrap();
         match m.command {
@@ -24430,6 +24542,111 @@ startup_timeout_sec = 42
         assert!(db_path.exists(), "reconstructed DB file should exist");
     }
 
+    #[test]
+    fn doctor_reconstruct_prefers_readable_quarantined_db_as_salvage_source() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let db_path = tmp.path().join("existing.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let conn = open_db_sync_with_database_url(&db_url).expect("open");
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at)
+             VALUES ('legacy-project', '/tmp/legacy-project', 0)",
+        )
+        .expect("insert legacy project");
+        drop(conn);
+
+        let archive_project = storage.join("projects").join("archive-only-project");
+        let archive_agent = archive_project.join("agents").join("ArchiveFox");
+        let archive_messages = archive_project.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&archive_agent).expect("create archive agent dir");
+        std::fs::create_dir_all(&archive_messages).expect("create archive message dir");
+        std::fs::write(
+            archive_project.join("project.json"),
+            r#"{"slug":"archive-only-project","human_key":"/tmp/archive-only-project"}"#,
+        )
+        .expect("write project.json");
+        std::fs::write(
+            archive_agent.join("profile.json"),
+            r#"{"name":"ArchiveFox","program":"codex","model":"gpt-5","task_description":"archive seed","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z","attachments_policy":"auto","contact_policy":"auto"}"#,
+        )
+        .expect("write profile");
+        std::fs::write(
+            archive_messages.join("20260322T000001Z__9001.md"),
+            "---json\n{\"id\":9001,\"from\":\"ArchiveFox\",\"to\":[\"LegacyAgent\"],\"subject\":\"Archive only message\",\"thread_id\":\"archive-thread\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T00:00:01Z\",\"attachments\":[]}\n---\nRecovered from archive only.\n",
+        )
+        .expect("write archive message");
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+        let result =
+            handle_doctor_reconstruct_with(Some(&db_path), Some(&storage), false, true, true);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "reconstruct failed: {result:?}");
+        assert!(db_path.exists(), "reconstructed DB file should exist");
+
+        let payload = output
+            .lines()
+            .find(|line| line.trim_start().starts_with('{'))
+            .expect("json output line");
+        let value: serde_json::Value =
+            serde_json::from_str(payload).expect("parse reconstruct json output");
+        assert_eq!(value["salvage"]["status"], "ok");
+        assert!(
+            value["salvage"]["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Using readable quarantined database"),
+            "unexpected salvage detail: {payload}"
+        );
+
+        let verify = open_db_sync_with_database_url(&db_url).expect("reopen db");
+        let rows = verify
+            .query_sync("SELECT slug, human_key FROM projects ORDER BY slug", &[])
+            .expect("query projects");
+        let projects = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named::<String>("slug").expect("slug"),
+                    row.get_named::<String>("human_key").expect("human_key"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projects,
+            vec![
+                (
+                    "archive-only-project".to_string(),
+                    "/tmp/archive-only-project".to_string(),
+                ),
+                (
+                    "legacy-project".to_string(),
+                    "/tmp/legacy-project".to_string(),
+                ),
+            ]
+        );
+
+        let salvage_artifacts = std::fs::read_dir(tmp.path())
+            .expect("read tmp dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".salvage-"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            salvage_artifacts.is_empty(),
+            "readable quarantine should not emit sqlite3 .recover artifacts: {salvage_artifacts:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn scan_archive_stats_skips_symlinked_project_entries() {
@@ -24548,16 +24765,26 @@ startup_timeout_sec = 42
             projects: 1,
             agents: 1,
             messages: 2,
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("demo".to_string()),
+                human_key: Some("/tmp/demo".to_string()),
+            }]),
             canonical_message_files: 3,
             duplicate_canonical_message_files: 1,
             duplicate_canonical_message_ids: 1,
             thread_digests: 4,
             unparseable_canonical_message_files: 0,
         };
-        let db = DoctorInventoryCounts {
-            projects: 1,
-            agents: 1,
-            messages: 2,
+        let db = DoctorDbInventory {
+            counts: DoctorInventoryCounts {
+                projects: 1,
+                agents: 1,
+                messages: 2,
+            },
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("demo".to_string()),
+                human_key: Some("/tmp/demo".to_string()),
+            }]),
         };
 
         assert_eq!(doctor_archive_db_drift_detail(&archive, &db), None);
@@ -24565,6 +24792,36 @@ startup_timeout_sec = 42
             doctor_archive_inventory_suffix(&archive),
             "; raw canonical files=3 (duplicate files=1 across 1 message id(s)), thread digests=4"
         );
+    }
+
+    #[test]
+    fn doctor_archive_db_drift_detail_flags_missing_archive_project_even_if_db_counts_are_higher() {
+        let archive = DoctorArchiveInventory {
+            projects: 1,
+            agents: 1,
+            messages: 1,
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("archive-only-project".to_string()),
+                human_key: Some("/tmp/archive-only-project".to_string()),
+            }]),
+            ..DoctorArchiveInventory::default()
+        };
+        let db = DoctorDbInventory {
+            counts: DoctorInventoryCounts {
+                projects: 10,
+                agents: 22,
+                messages: 101,
+            },
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("legacy-project".to_string()),
+                human_key: Some("/tmp/legacy-project".to_string()),
+            }]),
+        };
+
+        let detail = doctor_archive_db_drift_detail(&archive, &db)
+            .expect("missing archive-only project should be treated as parity drift");
+        assert!(detail.contains("archive-only-project"));
+        assert!(detail.contains("missing archive project(s) in DB"));
     }
 
     #[test]
@@ -35369,6 +35626,67 @@ fn attempt_sqlite_salvage_artifact(quarantined_db: &Path) -> DoctorSalvageAttemp
     })
 }
 
+fn attempt_readable_quarantined_db_salvage(quarantined_db: &Path) -> DoctorSalvageAttempt {
+    match sqlite_quick_check_via_cli(quarantined_db) {
+        Ok(Some(true)) | Ok(None) => {}
+        Ok(Some(false)) => {
+            return DoctorSalvageAttempt::Failed(format!(
+                "Quarantined database {} did not pass sqlite3 quick_check; falling back to sqlite3 .recover",
+                quarantined_db.display()
+            ));
+        }
+        Err(error) => {
+            return DoctorSalvageAttempt::Failed(format!(
+                "Failed to verify quarantined database {} directly: {error}; falling back to sqlite3 .recover",
+                quarantined_db.display()
+            ));
+        }
+    }
+
+    let conn = match mcp_agent_mail_db::DbConn::open_file(quarantined_db.to_string_lossy().as_ref())
+    {
+        Ok(conn) => conn,
+        Err(error) => {
+            return DoctorSalvageAttempt::Failed(format!(
+                "Quarantined database {} could not be opened directly: {error}; falling back to sqlite3 .recover",
+                quarantined_db.display()
+            ));
+        }
+    };
+    if let Err(error) = conn.query_sync("SELECT COUNT(*) AS cnt FROM sqlite_master", &[]) {
+        return DoctorSalvageAttempt::Failed(format!(
+            "Quarantined database {} failed a direct sqlite probe: {error}; falling back to sqlite3 .recover",
+            quarantined_db.display()
+        ));
+    }
+
+    DoctorSalvageAttempt::Succeeded(DoctorSalvageArtifact {
+        db_path: quarantined_db.to_path_buf(),
+        detail: format!(
+            "Using readable quarantined database {} as salvage source",
+            quarantined_db.display()
+        ),
+    })
+}
+
+fn attempt_best_doctor_salvage_artifact(quarantined_db: &Path) -> DoctorSalvageAttempt {
+    match attempt_readable_quarantined_db_salvage(quarantined_db) {
+        DoctorSalvageAttempt::Succeeded(artifact) => DoctorSalvageAttempt::Succeeded(artifact),
+        DoctorSalvageAttempt::Failed(direct_detail)
+        | DoctorSalvageAttempt::NotAvailable(direct_detail) => {
+            match attempt_sqlite_salvage_artifact(quarantined_db) {
+                DoctorSalvageAttempt::Succeeded(artifact) => {
+                    DoctorSalvageAttempt::Succeeded(artifact)
+                }
+                DoctorSalvageAttempt::Failed(recover_detail)
+                | DoctorSalvageAttempt::NotAvailable(recover_detail) => {
+                    DoctorSalvageAttempt::Failed(format!("{direct_detail}; {recover_detail}"))
+                }
+            }
+        }
+    }
+}
+
 fn run_doctor_subcommand_quietly<F>(json: bool, operation: F) -> CliResult<()>
 where
     F: FnOnce() -> CliResult<()>,
@@ -35515,7 +35833,7 @@ fn handle_doctor_reconstruct_with(
 
     let salvage_attempt = quarantined_original
         .as_ref()
-        .map(|state| attempt_sqlite_salvage_artifact(&state.quarantined_db));
+        .map(|state| attempt_best_doctor_salvage_artifact(&state.quarantined_db));
     let salvage_db_path = salvage_attempt.as_ref().and_then(|attempt| match attempt {
         DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
         DoctorSalvageAttempt::NotAvailable(_) | DoctorSalvageAttempt::Failed(_) => None,
