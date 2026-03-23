@@ -625,10 +625,7 @@ impl ToolMetricsScreen {
                 COL_NAME => super::cmp_ci(&a.name, &b.name),
                 COL_CALLS => a.calls.cmp(&b.calls),
                 COL_ERRORS => a.errors.cmp(&b.errors),
-                COL_ERR_PCT => a
-                    .err_pct()
-                    .partial_cmp(&b.err_pct())
-                    .unwrap_or(std::cmp::Ordering::Equal),
+                COL_ERR_PCT => a.err_pct().total_cmp(&b.err_pct()),
                 COL_AVG_MS => a.avg_ms().cmp(&b.avg_ms()),
                 COL_CP => a.change_point_count().cmp(&b.change_point_count()),
                 _ => std::cmp::Ordering::Equal,
@@ -755,12 +752,7 @@ impl ToolMetricsScreen {
                 p99: ts.percentile(99.0),
             })
             .collect();
-        rows.sort_by(|left, right| {
-            right
-                .p99
-                .partial_cmp(&left.p99)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        rows.sort_by(|left, right| right.p99.total_cmp(&left.p99));
         rows
     }
 

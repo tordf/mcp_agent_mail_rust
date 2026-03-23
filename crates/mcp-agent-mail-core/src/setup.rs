@@ -354,6 +354,10 @@ fn read_env_file_token(path: &Path) -> Option<String> {
 
 /// Save the bearer token to a .env file (create or update).
 pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupError> {
+    if token.contains('\n') || token.contains('\r') {
+        return Err(SetupError::Other("Token must not contain newlines".into()));
+    }
+
     let existing_content = if env_path.exists() {
         Some(std::fs::read_to_string(env_path)?)
     } else {

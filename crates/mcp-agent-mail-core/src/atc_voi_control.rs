@@ -244,11 +244,7 @@ impl DebtLedger {
     #[must_use]
     pub fn by_severity(&self) -> Vec<&IdentifiabilityDebt> {
         let mut sorted: Vec<_> = self.entries.iter().collect();
-        sorted.sort_by(|a, b| {
-            b.severity
-                .partial_cmp(&a.severity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sorted.sort_by(|a, b| b.severity.total_cmp(&a.severity));
         sorted
     }
 }

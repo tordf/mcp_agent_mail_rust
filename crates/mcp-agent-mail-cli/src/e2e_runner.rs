@@ -590,26 +590,19 @@ impl Runner {
     fn run_suite_once(&self, suite: &Suite) -> std::io::Result<SuiteExecution> {
         // Build the command
         let mut cmd = Command::new("bash");
-        cmd.arg(&suite.script_path);
-        cmd.current_dir(&self.config.project_root);
+        cmd.arg(&suite.path)
+            .current_dir(&self.config.project_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        // Set environment
-        cmd.env("E2E_PROJECT_ROOT", &self.config.project_root);
-        if self.config.keep_tmp {
-            cmd.env("AM_E2E_KEEP_TMP", "1");
+        for (k, v) in env_vars {
+            cmd.env(k, v);
         }
-        for (key, value) in &self.config.env {
-            cmd.env(key, value);
-        }
-
-        // Capture output
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
 
-        let mut stdout_pipe = child.stdout.take().unwrap();
-        let mut stderr_pipe = child.stderr.take().unwrap();
+        let mut stdout_pipe = child.stdout.take().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture stdout"))?;
+        let mut stderr_pipe = child.stderr.take().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture stderr"))?;
 
         // Spawn threads to read stdout/stderr so the child doesn't block on full pipe buffers
         let stdout_handle = std::thread::spawn(move || {

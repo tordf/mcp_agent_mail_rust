@@ -3483,11 +3483,7 @@ fn atc_runner_up_action(record: &atc::AtcDecisionRecord) -> Option<(String, f64)
         .loss_table
         .iter()
         .filter(|entry| entry.action != record.action)
-        .min_by(|left, right| {
-            left.expected_loss
-                .partial_cmp(&right.expected_loss)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .min_by(|left, right| left.expected_loss.total_cmp(&right.expected_loss))
         .map(|entry| (entry.action.clone(), entry.expected_loss))
 }
 

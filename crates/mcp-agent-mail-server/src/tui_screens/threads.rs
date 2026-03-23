@@ -686,11 +686,8 @@ impl ThreadExplorerScreen {
                     .sort_by_key(|t| std::cmp::Reverse(t.last_timestamp_micros));
             }
             SortMode::Velocity => {
-                self.threads.sort_by(|a, b| {
-                    b.velocity_msg_per_hr
-                        .partial_cmp(&a.velocity_msg_per_hr)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                self.threads
+                    .sort_by(|a, b| b.velocity_msg_per_hr.total_cmp(&a.velocity_msg_per_hr));
             }
             SortMode::ParticipantCount => {
                 self.threads

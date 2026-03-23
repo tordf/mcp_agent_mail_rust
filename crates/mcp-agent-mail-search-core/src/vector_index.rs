@@ -70,11 +70,7 @@ impl VectorHit {
 impl Ord for VectorHit {
     fn cmp(&self, other: &Self) -> Ordering {
         // Higher score first (reversed)
-        match other
-            .score
-            .partial_cmp(&self.score)
-            .unwrap_or(Ordering::Equal)
-        {
+        match other.score.total_cmp(&self.score) {
             Ordering::Equal => {
                 // Stable tie-breaking by doc_id ascending
                 self.doc_id.cmp(&other.doc_id)

@@ -347,7 +347,7 @@ fn corpus_v2() -> Vec<CorpusMessage> {
         },
         CorpusMessage {
             subject: "Question: should we use tokio or asupersync?",
-            body: "Project mandate: use asupersync (not tokio). Provides Cx-based context propagation, Budget-aware cancellation, and testing utilities.",
+            body: "Project mandate: use asupersync (not tokio). Provides Cx-based context propagation, budget-aware cancellation, and testing utilities.",
             thread_id: Some("tech-questions"),
             importance: "normal",
             ack_required: false,
@@ -954,7 +954,7 @@ fn score_titles(
         .collect();
 
     let mut ideal: Vec<f64> = bq.judgments.iter().map(|(_, rel)| rel.gain()).collect();
-    ideal.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    ideal.sort_by(|a, b| b.total_cmp(a));
 
     let total_relevant = bq
         .judgments

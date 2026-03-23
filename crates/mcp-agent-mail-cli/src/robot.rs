@@ -2891,11 +2891,15 @@ fn format_adjacent_thread_row(row: &sqlmodel_core::Row) -> String {
 
 /// Truncate a string to `max_len` chars, appending "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
+    } else if max_len <= 3 {
+        s.chars().take(max_len).collect()
     } else {
-        let truncated: String = s.chars().take(max_len).collect();
-        format!("{}...", truncated)
+        let mut t: String = s.chars().take(max_len - 3).collect();
+        t.push_str("...");
+        t
     }
 }
 

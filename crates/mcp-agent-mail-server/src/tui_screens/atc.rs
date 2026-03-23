@@ -117,10 +117,7 @@ impl AtcScreen {
         agents.sort_by(|a, b| {
             let ord = match self.agent_sort_col {
                 COL_STATE => format!("{:?}", a.state).cmp(&format!("{:?}", b.state)),
-                COL_POSTERIOR => a
-                    .posterior_alive
-                    .partial_cmp(&b.posterior_alive)
-                    .unwrap_or(std::cmp::Ordering::Equal),
+                COL_POSTERIOR => a.posterior_alive.total_cmp(&b.posterior_alive),
                 COL_SILENCE => a.silence_secs.cmp(&b.silence_secs),
                 _ => a.name.cmp(&b.name),
             };

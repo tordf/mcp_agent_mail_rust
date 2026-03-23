@@ -4496,8 +4496,7 @@ impl ChartDataProvider for LatencyProvider {
         let mut added_any = false;
         for &bucket_start in &self.dirty_buckets {
             if let Some(samples) = self.raw_samples.get_mut(&bucket_start) {
-                samples
-                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                samples.sort_unstable_by(|a, b| a.total_cmp(b));
                 let p50 = Self::percentile(samples, 0.50);
                 let p95 = Self::percentile(samples, 0.95);
                 let p99 = Self::percentile(samples, 0.99);

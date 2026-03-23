@@ -275,13 +275,9 @@ pub fn execute_search(
         ranked_hits.push((hit, explanation));
     }
 
-    // Deterministic tie-breaking: when scores are equal, sort by ID descending
-    // (newer documents first)
+    // Sort primarily by score descending, secondary by ID for determinism.
     ranked_hits.sort_by(|(a, _), (b, _)| {
-        let score_cmp = b
-            .score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal);
+        let score_cmp = b.score.total_cmp(&a.score);
         if score_cmp == std::cmp::Ordering::Equal {
             b.doc_id.cmp(&a.doc_id)
         } else {

@@ -290,10 +290,7 @@ pub fn execute_search(
     // Deterministic tie-breaking: when scores are equal, sort by ID descending
     // (newer documents first)
     hits.sort_by(|a, b| {
-        let score_cmp = b
-            .score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal);
+        let score_cmp = b.score.total_cmp(&a.score);
         if score_cmp == std::cmp::Ordering::Equal {
             b.doc_id.cmp(&a.doc_id)
         } else {

@@ -504,8 +504,7 @@ fn default_stage_order() -> Vec<ExplainStage> {
 pub fn factor_sort_cmp(a: &ScoreFactor, b: &ScoreFactor) -> Ordering {
     b.contribution
         .abs()
-        .partial_cmp(&a.contribution.abs())
-        .unwrap_or(Ordering::Equal)
+        .total_cmp(&a.contribution.abs())
         .then_with(|| a.code.cmp(&b.code))
         .then_with(|| a.key.cmp(&b.key))
 }

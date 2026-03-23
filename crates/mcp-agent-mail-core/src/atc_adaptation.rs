@@ -282,19 +282,15 @@ impl AdaptationEngine {
     /// Uses the EXP3 probability distribution. For deterministic
     /// testing, always selects the highest-probability policy.
     pub fn select_deterministic(&mut self) -> &PolicyCandidate {
-        let best_idx = self
+        let max_idx = self
             .trackers
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.selection_probability
-                    .partial_cmp(&b.selection_probability)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .max_by(|(_, a), (_, b)| a.selection_probability.total_cmp(&b.selection_probability))
             .map_or(0, |(i, _)| i);
 
-        self.selected_index = best_idx;
-        &self.candidates[best_idx]
+        self.selected_index = max_idx;
+        &self.candidates[max_idx]
     }
 
     /// Evaluate whether a candidate should be promoted to incumbent.

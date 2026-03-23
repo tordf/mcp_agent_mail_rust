@@ -218,7 +218,7 @@ impl DocKindFilter {
     }
 
     fn from_route_value(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "agents" => Self::Agents,
             "projects" => Self::Projects,
             "all" => Self::All,
@@ -274,7 +274,7 @@ impl ImportanceFilter {
     }
 
     fn from_persist(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "urgent" => Self::Urgent,
             "high" => Self::High,
             "normal" => Self::Normal,
@@ -317,7 +317,7 @@ impl AckFilter {
     }
 
     fn from_persist(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "required" => Self::Required,
             "not_required" | "notrequired" | "no" => Self::NotRequired,
             _ => Self::Any,
@@ -387,7 +387,7 @@ impl FieldScope {
     }
 
     fn from_persist(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "subject_only" | "subject" => Self::SubjectOnly,
             "body_only" | "body" => Self::BodyOnly,
             _ => Self::SubjectAndBody,
@@ -429,7 +429,7 @@ impl SortDirection {
     }
 
     fn from_route_value(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "oldest" => Self::OldestFirst,
             "relevance" => Self::Relevance,
             _ => Self::NewestFirst,
@@ -489,7 +489,7 @@ impl SearchModeFilter {
     }
 
     fn from_persist(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "lexical" => Self::Lexical,
             "semantic" => Self::Semantic,
             "hybrid" => Self::Hybrid,
@@ -528,7 +528,7 @@ impl ExplainToggle {
     }
 
     fn from_persist(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "on" | "true" | "1" => Self::On,
             _ => Self::Off,
         }
@@ -617,7 +617,7 @@ fn derive_tui_degraded_diagnostics(
                 diagnostics.remediation_hint.get_or_insert_with(|| {
                     "Budget pressure detected; lower limit or narrow filters.".to_string()
                 });
-            } else if outcome.to_ascii_lowercase().contains("timeout") {
+            } else if outcome.to_lowercase().contains("timeout") {
                 diagnostics.degraded = true;
                 diagnostics
                     .fallback_mode
@@ -955,7 +955,7 @@ fn build_highlight_needles(terms: &[QueryTerm]) -> Vec<String> {
     terms
         .iter()
         .filter(|t| !t.negated)
-        .map(|t| t.text.to_ascii_lowercase())
+        .map(|t| t.text.to_lowercase())
         .filter(|t| t.len() >= 2)
         .take(MAX_HIGHLIGHT_TERMS)
         .collect()
@@ -974,7 +974,7 @@ fn extract_snippet(text: &str, needles: &[String], max_chars: usize) -> String {
     let mut best_len: usize = 0;
 
     if !needles.is_empty() {
-        let hay = text.to_ascii_lowercase();
+        let hay = text.to_lowercase();
         for needle in needles {
             if let Some(pos) = hay.find(needle.as_str())
                 && (best_pos.is_none() || pos < best_pos.unwrap_or(usize::MAX))
@@ -1030,7 +1030,7 @@ fn highlight_spans_with_needles(
         )];
     }
 
-    let hay = text.to_ascii_lowercase();
+    let hay = text.to_lowercase();
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut i = 0usize;
     while i < text.len() {
@@ -2583,7 +2583,7 @@ impl SearchCockpitScreen {
             .highlight_terms
             .iter()
             .filter(|term| !term.negated && !term.text.is_empty())
-            .map(|term| format!("{:?}:{}", term.kind, term.text.to_ascii_lowercase()))
+            .map(|term| format!("{:?}:{}", term.kind, term.text.to_lowercase()))
             .collect();
         terms.sort_unstable();
         let term_sig = terms.join("|");
@@ -4128,7 +4128,7 @@ fn count_term_matches_in_lines(lines: &[SearchableLine], needles: &[String]) -> 
     lines
         .iter()
         .map(|line| {
-            let hay = line.text.to_ascii_lowercase();
+            let hay = line.text.to_lowercase();
             let mut total = 0usize;
             for needle in needles {
                 let mut offset = 0usize;
@@ -4160,7 +4160,7 @@ fn extract_context_snippet_from_lines(
         let mut best_idx: Option<usize> = None;
         let mut best_score = 0usize;
         for (idx, line) in lines.iter().enumerate() {
-            let hay = line.text.to_ascii_lowercase();
+            let hay = line.text.to_lowercase();
             let score = needles
                 .iter()
                 .map(|needle| {
@@ -4223,7 +4223,7 @@ fn count_term_matches(text: &str, needles: &[String]) -> usize {
     if text.is_empty() || needles.is_empty() {
         return 0;
     }
-    let hay = text.to_ascii_lowercase();
+    let hay = text.to_lowercase();
     let mut total = 0usize;
     for needle in needles {
         let mut offset = 0usize;

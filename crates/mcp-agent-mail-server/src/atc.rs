@@ -316,7 +316,7 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
             .min_by(|(left_idx, _), (right_idx, _)| {
                 let la = self.loss_matrix[self.loss_offset(*left_idx, state_idx)];
                 let lb = self.loss_matrix[self.loss_offset(*right_idx, state_idx)];
-                la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
+                la.total_cmp(&lb)
             })
             .map_or(self.actions[0], |(_, &action)| action)
     }
@@ -714,8 +714,7 @@ impl EvidenceLedger {
             .collect();
         losses.sort_by(|left, right| {
             left.expected_loss
-                .partial_cmp(&right.expected_loss)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&right.expected_loss)
                 .then_with(|| left.action.cmp(&right.action))
         });
         losses
@@ -1686,7 +1685,7 @@ impl AgentRhythm {
         }
 
         let mut sorted: Vec<f64> = self.recent_intervals.iter().copied().collect();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // Descending
+        sorted.sort_by(|a, b| b.total_cmp(a)); // Descending
 
         // Top 20% for tail estimation
         let tail_count = (sorted.len() / 5).max(3);
@@ -2613,7 +2612,7 @@ impl EProcessMonitor {
                 sources.push((format!("agent:{agent}"), ons.e_value));
             }
         }
-        sources.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sources.sort_by(|a, b| b.1.total_cmp(&a.1));
         sources
     }
 }
@@ -2855,7 +2854,7 @@ impl RegretTracker {
             .iter()
             .map(|(a, r)| (a.clone(), *r))
             .collect();
-        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
         sorted.truncate(n);
         sorted
     }
@@ -6747,11 +6746,7 @@ pub fn select_route_target<'a, S: BuildHasher>(
     agents
         .iter()
         .filter(|(name, _)| name.as_str() != exclude && name.as_str() != ATC_AGENT_NAME)
-        .max_by(|(_, a), (_, b)| {
-            a.routing_score()
-                .partial_cmp(&b.routing_score())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .max_by(|(_, a), (_, b)| a.routing_score().total_cmp(&b.routing_score()))
         .filter(|(_, model)| model.routing_score() >= min_score)
         .map(|(name, _)| name.as_str())
 }
@@ -6980,7 +6975,7 @@ pub fn rank_probe_targets<S: BuildHasher>(
         })
         .filter(|(_, gain)| *gain >= min_gain)
         .collect();
-    targets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    targets.sort_by(|a, b| b.1.total_cmp(&a.1));
     targets
 }
 
@@ -7205,7 +7200,7 @@ pub fn vcg_priority(participants: &[ConflictParticipant]) -> Vec<(String, f64)> 
         })
         .collect();
     // Highest externality first (should yield first)
-    priorities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    priorities.sort_by(|a, b| b.1.total_cmp(&a.1));
     priorities
 }
 
@@ -8121,7 +8116,7 @@ impl SubsystemConformal {
             return None;
         }
         let mut sorted: Vec<f64> = self.scores.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| a.total_cmp(b));
         // Quantile index at configured coverage level
         let raw_idx = (self.coverage * usize_to_f64(sorted.len())).ceil();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -8379,10 +8374,7 @@ pub fn submodular_probe_schedule<S: BuildHasher>(
             continue;
         }
         let insert_at = candidates.partition_point(|(existing_name, existing_gain)| {
-            match existing_gain
-                .partial_cmp(&gain)
-                .unwrap_or(std::cmp::Ordering::Equal)
-            {
+            match existing_gain.total_cmp(&gain) {
                 std::cmp::Ordering::Greater => true,
                 std::cmp::Ordering::Equal => existing_name.as_str() <= name.as_str(),
                 std::cmp::Ordering::Less => false,

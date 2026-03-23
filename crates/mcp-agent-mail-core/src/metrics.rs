@@ -213,9 +213,9 @@ impl Log2Histogram {
         let max = self.max.load(Ordering::Relaxed);
         // Clamp min <= max to maintain invariant even under concurrent races.
         let min = raw_min.min(max);
-        let p50 = estimate_quantile_frac(&buckets, count, 1, 2, max);
-        let p95 = estimate_quantile_frac(&buckets, count, 19, 20, max);
-        let p99 = estimate_quantile_frac(&buckets, count, 99, 100, max);
+        let p50 = estimate_quantile_from_buckets(&buckets, count, 1, 2, max);
+        let p95 = estimate_quantile_from_buckets(&buckets, count, 19, 20, max);
+        let p99 = estimate_quantile_from_buckets(&buckets, count, 99, 100, max);
 
         HistogramSnapshot {
             count,
@@ -246,7 +246,7 @@ const fn bucket_upper_bound(idx: usize) -> u64 {
     (1u64 << (idx + 1)).saturating_sub(1)
 }
 
-fn estimate_quantile_frac(
+fn estimate_quantile_from_buckets(
     buckets: &[u64; LOG2_BUCKETS],
     count: u64,
     numerator: u64,
@@ -254,13 +254,14 @@ fn estimate_quantile_frac(
     observed_max: u64,
 ) -> u64 {
     debug_assert!(denominator > 0);
+    let denom = denominator.max(1);
     // Nearest-rank method: smallest value x such that F(x) >= q.
     // rank is 1-indexed, clamp to [1, count]
-    let numerator = numerator.min(denominator);
+    let numerator = numerator.min(denom);
     let mut rank = count
         .saturating_mul(numerator)
-        .saturating_add(denominator.saturating_sub(1))
-        / denominator;
+        .saturating_add(denom.saturating_sub(1))
+        / denom;
     rank = rank.clamp(1, count);
 
     let mut cumulative = 0u64;

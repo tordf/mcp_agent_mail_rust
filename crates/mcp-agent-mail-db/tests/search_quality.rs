@@ -545,7 +545,7 @@ fn corpus_v1() -> Vec<CorpusMessage> {
         },
         CorpusMessage {
             subject: "Question: should we use tokio or asupersync?",
-            body: "The project mandate is to use asupersync (not tokio) for the async runtime. This is a firm requirement from the project lead. asupersync provides Cx-based context propagation, Budget-aware cancellation, and testing utilities that tokio does not.",
+            body: "The project mandate is to use asupersync (not tokio) for the async runtime. This is a firm requirement from the project lead. asupersync provides Cx-based context propagation, budget-aware cancellation, and testing utilities that tokio does not.",
             thread_id: Some("tech-questions"),
             importance: "normal",
             ack_required: false,
@@ -1005,7 +1005,7 @@ fn evaluate_query_with_mode(
 
     // Compute ideal ordering (sorted descending).
     let mut ideal: Vec<f64> = bq.judgments.iter().map(|(_, rel)| rel.gain()).collect();
-    ideal.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    ideal.sort_by(|a, b| b.total_cmp(a));
 
     let total_relevant = bq
         .judgments

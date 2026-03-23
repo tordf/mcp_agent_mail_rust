@@ -1903,7 +1903,8 @@ mod tests {
         let root = "/project";
         let err = normalize_filter_paths(root, Some(vec!["C:\\other\\main.rs".to_string()]));
         let rendered = err.expect_err("expected invalid path").to_string();
-        assert!(rendered.contains("outside the project root"),
+        assert!(
+            rendered.contains("outside the project root"),
             "expected outside-root error, got: {rendered}"
         );
         assert!(

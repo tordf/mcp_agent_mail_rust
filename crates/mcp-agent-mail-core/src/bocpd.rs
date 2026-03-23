@@ -319,7 +319,7 @@ impl BocpdDetector {
                 .iter()
                 .enumerate()
                 .skip(1)
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
                 .map_or(1, |(r, _)| r);
             self.stats[max_r.min(self.stats.len() - 1)].predictive_mean()
         } else {
@@ -349,7 +349,7 @@ impl BocpdDetector {
             let best_short = self.next_log_run_dist[..window]
                 .iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
                 .map_or(0, |(r, _)| r);
             self.next_stats[best_short].predictive_mean()
         } else {
@@ -411,7 +411,7 @@ impl BocpdDetector {
         self.log_run_dist
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map_or(0, |(r, _)| r)
     }
 }

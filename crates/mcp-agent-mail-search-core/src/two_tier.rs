@@ -1061,7 +1061,7 @@ impl<'a> TwoTierSearchIter<'a> {
         // Re-sort by blended score.
         let _rerank_span =
             tracing::debug_span!("two_tier.rerank", candidates = blended.len()).entered();
-        blended.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        blended.sort_by(|a, b| b.score.total_cmp(&a.score));
         blended.truncate(self.k);
         let refined_order = blended.iter().map(|hit| hit.doc_id).collect::<Vec<_>>();
         let compare_len = self.fast_order.len().min(refined_order.len()).min(self.k);

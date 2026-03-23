@@ -273,7 +273,7 @@ fn compute_likelihood(frame: &FrameState) -> [f64; NUM_STATES] {
 fn dominant_state(dist: &[f64; NUM_STATES]) -> usize {
     dist.iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map_or(0, |(i, _)| i)
 }
 

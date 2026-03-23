@@ -364,7 +364,7 @@ fn ndcg_mrr_regression_with_diversity() {
     // Pre-diversity metrics
     let pre_rels = extract_relevances(&hits, &grades);
     let mut ideal = pre_rels.clone();
-    ideal.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    ideal.sort_by(|a, b| b.total_cmp(a));
     let pre_ndcg5 = ndcg_at_k(&pre_rels, &ideal, 5);
     let pre_mrr = mrr(&pre_rels);
     let total_relevant = grades.values().filter(|&&g| g > 0.0).count();
@@ -582,7 +582,7 @@ fn config_parameter_sweep() {
         let result = diversify(hits.clone(), &metadata, &config);
         let rels = extract_relevances(&result.hits, &grades);
         let mut ideal = rels.clone();
-        ideal.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        ideal.sort_by(|a, b| b.total_cmp(a));
         let ndcg = ndcg_at_k(&rels, &ideal, 5);
         let unique_t = unique_threads_in_top_k(&result.hits, &metadata, 5);
         let unique_s = unique_senders_in_top_k(&result.hits, &metadata, 5);
@@ -728,7 +728,7 @@ fn relevance_quality_floor_gating() {
     // Without diversity
     let pre_rels = extract_relevances(&hits, &grades);
     let mut ideal = pre_rels.clone();
-    ideal.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    ideal.sort_by(|a, b| b.total_cmp(a));
     let total_rel = grades.values().filter(|&&g| g > 0.0).count();
 
     let pre_ndcg10 = ndcg_at_k(&pre_rels, &ideal, 10);
@@ -1022,7 +1022,7 @@ fn concentration_regression_artifact() {
 
     let total_rel = grades.values().filter(|&&g| g > 0.0).count();
     let mut ideal_rels = extract_relevances(&hits, &grades);
-    ideal_rels.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    ideal_rels.sort_by(|a, b| b.total_cmp(a));
 
     eprintln!("=== CONCENTRATION REGRESSION ARTIFACT ===");
 
