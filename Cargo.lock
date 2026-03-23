@@ -4655,7 +4655,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "clap",
  "criterion",
@@ -4681,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4722,7 +4722,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4745,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "chrono",
  "criterion",
@@ -4768,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4811,7 +4811,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "chrono",
  "git2",
@@ -4826,7 +4826,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "chrono",
  "criterion",
@@ -4856,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "atty",
  "base64 0.22.1",
@@ -4921,7 +4921,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4946,7 +4946,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4972,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-wasm"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
