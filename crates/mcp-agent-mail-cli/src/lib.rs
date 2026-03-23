@@ -5171,7 +5171,9 @@ fn recover_sqlite_file_with_storage_root(
             )));
         }
     } else {
-        // Fall back to archive reconstruction if no backup is available
+        // Fall back to archive reconstruction if no backup is available.
+        // Safety: reconstruct into a temp file first, validate it, then
+        // quarantine the original and swap in the new one (issue #59).
         let storage_root = storage_root_override
             .map(PathBuf::from)
             .unwrap_or_else(|| Config::from_env().storage_root);
@@ -5180,6 +5182,8 @@ fn recover_sqlite_file_with_storage_root(
                 "No backup found. Reconstructing database from archive at {}...",
                 storage_root.display()
             );
+            // Attempt salvage from the original (still in place) before
+            // quarantining.
             let salvage = match quarantined_db.as_deref() {
                 Some(quarantined_db_path) => {
                     match attempt_sqlite_salvage_via_cli(quarantined_db_path, &timestamp) {
@@ -5195,8 +5199,11 @@ fn recover_sqlite_file_with_storage_root(
                 }
                 None => None,
             };
+            // Reconstruct into a temp file so the original is untouched on failure.
+            let temp_reconstruct =
+                next_doctor_artifact_path(path, "reconstruct", "sqlite3");
             match mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-                path,
+                &temp_reconstruct,
                 &storage_root,
                 salvage
                     .as_ref()
@@ -5216,16 +5223,63 @@ fn recover_sqlite_file_with_storage_root(
                             ftui_runtime::ftui_eprintln!("Warning: {warning}");
                         }
                     }
-                    if !sqlite_file_is_healthy(path)? {
+                    if !sqlite_file_is_healthy(&temp_reconstruct)? {
+                        let _ = std::fs::remove_file(&temp_reconstruct);
+                        for suf in ["-wal", "-shm"] {
+                            let _ = std::fs::remove_file(
+                                sqlite_sidecar_path(&temp_reconstruct, suf),
+                            );
+                        }
                         return Err(CliError::Other(format!(
-                            "reconstruction from archive completed, but health checks still failed for {}",
+                            "reconstruction from archive completed, but health checks \
+                             still failed (original database is untouched at {})",
                             path.display()
                         )));
                     }
+                    // Validated — now quarantine the original and swap in the temp.
+                    if path.exists() {
+                        let quarantine_target =
+                            sqlite_quarantine_path(path, "", &timestamp)?;
+                        let _ = sqlite_quarantine_path(path, "-wal", &timestamp)?;
+                        let _ = sqlite_quarantine_path(path, "-shm", &timestamp)?;
+                        if quarantine_target.is_none() && path.exists() {
+                            // sqlite_quarantine_path returned None but the file
+                            // still exists — something unexpected; bail out safely.
+                            let _ = std::fs::remove_file(&temp_reconstruct);
+                            return Err(CliError::Other(format!(
+                                "failed to quarantine original database at {}; \
+                                 reconstruction abandoned (original is untouched)",
+                                path.display()
+                            )));
+                        }
+                    }
+                    std::fs::rename(&temp_reconstruct, path).map_err(|e| {
+                        CliError::Other(format!(
+                            "reconstruction succeeded at {} but failed to move into {}: {e}",
+                            temp_reconstruct.display(),
+                            path.display()
+                        ))
+                    })?;
+                    // Move any sidecar files from temp path to final path.
+                    for suf in ["-wal", "-shm"] {
+                        let temp_sidecar = sqlite_sidecar_path(&temp_reconstruct, suf);
+                        if temp_sidecar.exists() {
+                            let final_sidecar = sqlite_sidecar_path(path, suf);
+                            let _ = std::fs::rename(&temp_sidecar, &final_sidecar);
+                        }
+                    }
                 }
                 Err(e) => {
+                    // Clean up partial temp file; original is safe.
+                    let _ = std::fs::remove_file(&temp_reconstruct);
+                    for suf in ["-wal", "-shm"] {
+                        let _ = std::fs::remove_file(
+                            sqlite_sidecar_path(&temp_reconstruct, suf),
+                        );
+                    }
                     return Err(CliError::Other(format!(
-                        "failed to reconstruct database from archive: {e}"
+                        "failed to reconstruct database from archive \
+                         (original database is untouched): {e}"
                     )));
                 }
             }
@@ -8941,7 +8995,26 @@ fn read_update_cache() -> Option<UpdateCheckResult> {
         return None; // Cache expired
     }
 
-    serde_json::from_value(cached.get("result")?.clone()).ok()
+    let result: UpdateCheckResult = serde_json::from_value(cached.get("result")?.clone()).ok()?;
+
+    // Invalidate the cache if the binary version has changed since the check
+    // was cached (e.g. user upgraded via package manager rather than
+    // `am self-update`, so `invalidate_update_cache` was never called).
+    let running_version = env!("CARGO_PKG_VERSION");
+    let cached_current = match &result {
+        UpdateCheckResult::UpdateAvailable { current, .. } => Some(current.as_str()),
+        UpdateCheckResult::UpToDate { current } => Some(current.as_str()),
+        UpdateCheckResult::CheckFailed { .. } => None,
+    };
+    if let Some(cached_ver) = cached_current {
+        if cached_ver != running_version {
+            // Binary version changed — cached result is stale.
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    }
+
+    Some(result)
 }
 
 /// Write update check result to cache.
@@ -35289,7 +35362,7 @@ fn handle_doctor_repair_with(
 
     ftui_runtime::ftui_println!("Running database repair...");
     if !confirm_mutating_doctor_action(
-        "Proceed with database repair? This can create backups, rebuild FTS tables, VACUUM/ANALYZE, and delete orphaned rows.",
+        "Proceed with database repair? This can create backups, rebuild FTS tables, VACUUM/ANALYZE/REINDEX, and delete orphaned rows.",
         dry_run,
         yes,
     )? {
@@ -35322,6 +35395,38 @@ fn handle_doctor_repair_with(
     }
 
     let conn = open_db_sync_with_database_url_and_storage_root(database_url, Some(storage_root))?;
+
+    // 1b. Run a full PRAGMA integrity_check (not just quick_check) to detect
+    // index-level corruption that quick_check misses.  Report the result but
+    // do NOT bail to reconstruction — the REINDEX step below will fix index
+    // corruption in-place.
+    {
+        let full_rows = conn
+            .query_sync("PRAGMA integrity_check", &[])
+            .unwrap_or_default();
+        let full_ok = full_rows.len() == 1
+            && full_rows
+                .first()
+                .and_then(|r| {
+                    use sqlmodel_core::Value;
+                    if let Some(Value::Text(s)) = r.get_by_name("integrity_check") {
+                        Some(s.clone())
+                    } else if let Some(Value::Text(s)) = r.values().next() {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .as_deref()
+                == Some("ok");
+        if !full_ok {
+            ftui_runtime::ftui_println!(
+                "  Full integrity_check: FAILED (index corruption detected; REINDEX will repair)"
+            );
+        } else {
+            ftui_runtime::ftui_println!("  Full integrity_check: OK");
+        }
+    }
 
     // 2. Optional backup before repair
     if !dry_run {
@@ -35409,13 +35514,20 @@ fn handle_doctor_repair_with(
         }
     }
 
-    // 5. VACUUM + ANALYZE
+    // 5. VACUUM + ANALYZE + REINDEX
     if !dry_run {
         conn.execute_raw("VACUUM")
             .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
         conn.execute_raw("ANALYZE")
             .map_err(|e| CliError::Other(format!("ANALYZE failed: {e}")))?;
-        ftui_runtime::ftui_println!("  VACUUM + ANALYZE complete.");
+        // REINDEX rebuilds all indexes from scratch, fixing corruption that
+        // VACUUM alone cannot repair (e.g. malformed b-tree ordering in
+        // indexes like idx_agents_project_name_nocase).  PRAGMA
+        // integrity_check may not catch index-level corruption, so we run
+        // REINDEX unconditionally as a defensive measure.
+        conn.execute_raw("REINDEX")
+            .map_err(|e| CliError::Other(format!("REINDEX failed: {e}")))?;
+        ftui_runtime::ftui_println!("  VACUUM + ANALYZE + REINDEX complete.");
     }
 
     if let Some(ref slug) = project {
@@ -35948,14 +36060,67 @@ fn handle_doctor_reconstruct_with(
         return Ok(());
     }
 
-    // Rename the existing DB out of the way (if it exists), preserving a unique quarantine path.
-    let mut quarantined_original: Option<QuarantinedSqliteState> = None;
+    // Build a temp path for reconstruction. The original DB is NOT touched
+    // until the new DB is fully built and validated — this is the key safety
+    // invariant (see issue #59).
+    let base_name = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+    let temp_db_path = next_doctor_artifact_path(&db_path, "reconstruct", "sqlite3");
+
+    ftui_runtime::ftui_println!(
+        "Reconstructing database from archive at {} into temporary file {}",
+        storage_root.display(),
+        temp_db_path.display()
+    );
+
+    // Attempt salvage from the original DB *in place* (no rename yet).
+    let salvage_attempt = if db_path.exists() {
+        Some(attempt_best_doctor_salvage_artifact(&db_path))
+    } else {
+        None
+    };
+    let salvage_db_path = salvage_attempt.as_ref().and_then(|attempt| match attempt {
+        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
+        DoctorSalvageAttempt::NotAvailable(_) | DoctorSalvageAttempt::Failed(_) => None,
+    });
+
+    // Reconstruct into the TEMP path — original DB is still untouched.
+    let mut stats = match mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
+        &temp_db_path,
+        &storage_root,
+        salvage_db_path,
+    ) {
+        Ok(stats) => stats,
+        Err(e) => {
+            // Clean up the partial temp file; original DB is safe.
+            let _ = std::fs::remove_file(&temp_db_path);
+            for suffix in ["-wal", "-shm"] {
+                let _ = std::fs::remove_file(sqlite_sidecar_path(&temp_db_path, suffix));
+            }
+            return Err(CliError::Other(format!(
+                "reconstruction failed (original database is untouched): {e}"
+            )));
+        }
+    };
+
+    // Validate the reconstructed temp DB before swapping.
+    if !sqlite_file_is_healthy(&temp_db_path)? {
+        let _ = std::fs::remove_file(&temp_db_path);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(sqlite_sidecar_path(&temp_db_path, suffix));
+        }
+        return Err(CliError::Other(format!(
+            "reconstructed database at {} did not pass health checks; \
+             original database is untouched",
+            temp_db_path.display()
+        )));
+    }
+
+    // Reconstruction succeeded and is healthy — now quarantine the original.
     if db_path.exists() {
-        let base_name = db_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("storage.sqlite3");
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let mut quarantine = db_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
         let mut suffix = 1_u32;
         while quarantine.exists() {
@@ -35963,36 +36128,33 @@ fn handle_doctor_reconstruct_with(
                 db_path.with_file_name(format!("{base_name}.corrupt-{timestamp}-{suffix:02}"));
             suffix = suffix.saturating_add(1);
         }
-        ftui_runtime::ftui_println!("Moving corrupt database to {}", quarantine.display());
-        quarantined_original = Some(quarantine_sqlite_state(&db_path, &quarantine)?);
+        ftui_runtime::ftui_println!("Moving original database to {}", quarantine.display());
+        if let Err(e) = quarantine_sqlite_state(&db_path, &quarantine) {
+            // Could not move original aside; leave temp DB for manual recovery.
+            return Err(CliError::Other(format!(
+                "reconstruction succeeded at {} but failed to move original database \
+                 aside: {e}; the reconstructed file is preserved for manual swap",
+                temp_db_path.display()
+            )));
+        }
     }
 
-    ftui_runtime::ftui_println!(
-        "Reconstructing database from archive at {}",
-        storage_root.display()
-    );
-
-    let salvage_attempt = quarantined_original
-        .as_ref()
-        .map(|state| attempt_best_doctor_salvage_artifact(&state.quarantined_db));
-    let salvage_db_path = salvage_attempt.as_ref().and_then(|attempt| match attempt {
-        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
-        DoctorSalvageAttempt::NotAvailable(_) | DoctorSalvageAttempt::Failed(_) => None,
-    });
-
-    let mut stats = match mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-        &db_path,
-        &storage_root,
-        salvage_db_path,
-    ) {
-        Ok(stats) => stats,
-        Err(e) => {
-            if let Some(state) = quarantined_original.as_ref() {
-                restore_quarantined_sqlite_state(state);
-            }
-            return Err(CliError::Other(format!("reconstruction failed: {e}")));
+    // Swap the validated temp DB into the final path.
+    if let Err(e) = std::fs::rename(&temp_db_path, &db_path) {
+        return Err(CliError::Other(format!(
+            "reconstruction succeeded but failed to move {} to {}: {e}",
+            temp_db_path.display(),
+            db_path.display()
+        )));
+    }
+    // Move any sidecar files from temp path to final path.
+    for suffix in ["-wal", "-shm"] {
+        let temp_sidecar = sqlite_sidecar_path(&temp_db_path, suffix);
+        if temp_sidecar.exists() {
+            let final_sidecar = sqlite_sidecar_path(&db_path, suffix);
+            let _ = std::fs::rename(&temp_sidecar, &final_sidecar);
         }
-    };
+    }
 
     if let Some(attempt) = &salvage_attempt {
         match attempt {

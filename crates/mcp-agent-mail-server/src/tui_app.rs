@@ -6433,6 +6433,15 @@ fn apply_frame_contrast_guard(
             if is_continuation {
                 continue;
             }
+            // Cells with explicitly authored foreground colors (alpha > 0)
+            // must not be rewritten — they were intentionally set by widget
+            // code and overriding them causes a visible 1-frame flash when
+            // the next redraw restores the original color.  Only cells whose
+            // fg was materialized from a transparent/default value need the
+            // legibility enforcement below.
+            if !needs_text_materialization {
+                continue;
+            }
             if symbol_opt.is_none() && !is_grapheme {
                 continue;
             }
@@ -7098,13 +7107,15 @@ mod tests {
     }
 
     #[test]
-    fn contrast_guard_fixes_white_on_white_cells() {
+    fn contrast_guard_fixes_transparent_fg_on_white_cells() {
         let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(6, 2, &mut pool);
 
+        // Transparent/default fg (alpha=0) on an opaque white bg — the
+        // contrast guard should materialize a readable fg.
         let mut unreadable = ftui::Cell::from_char('X');
-        unreadable.fg = PackedRgba::rgb(255, 255, 255);
+        unreadable.fg = PackedRgba::rgba(0, 0, 0, 0);
         unreadable.bg = PackedRgba::rgb(255, 255, 255);
         frame.buffer.set(1, 0, unreadable);
 
@@ -7114,7 +7125,33 @@ mod tests {
         let fixed = frame.buffer.get(1, 0).expect("cell exists after guard");
         assert!(
             contrast_ratio(fixed.fg, fixed.bg) >= MIN_TEXT_CONTRAST_RATIO,
-            "contrast guard should enforce minimum readability"
+            "contrast guard should enforce minimum readability for transparent fg"
+        );
+    }
+
+    #[test]
+    fn contrast_guard_preserves_authored_fg_colors() {
+        let _theme = ScopedThemeLock::new(ThemeId::LumenLight);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(6, 2, &mut pool);
+
+        // Explicitly authored fg (alpha > 0) should never be rewritten,
+        // even when contrast against bg is poor.  This prevents the 1-frame
+        // white flash that occurs when the guard overwrites authored colors
+        // and the next redraw restores them.
+        let authored_fg = PackedRgba::rgb(255, 255, 255);
+        let mut cell = ftui::Cell::from_char('X');
+        cell.fg = authored_fg;
+        cell.bg = PackedRgba::rgb(255, 255, 255);
+        frame.buffer.set(1, 0, cell);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        apply_frame_contrast_guard(&mut frame, &tp, &mut ContrastGuardCache::default());
+
+        let result = frame.buffer.get(1, 0).expect("cell exists after guard");
+        assert_eq!(
+            result.fg, authored_fg,
+            "contrast guard must not overwrite explicitly authored foreground colors"
         );
     }
 
@@ -7124,8 +7161,9 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(6, 2, &mut pool);
 
+        // Transparent fg on white bg — guard materializes a subtle decorative fg.
         let mut decorative = ftui::Cell::from_char('│');
-        decorative.fg = PackedRgba::rgb(255, 255, 255);
+        decorative.fg = PackedRgba::rgba(0, 0, 0, 0);
         decorative.bg = PackedRgba::rgb(255, 255, 255);
         frame.buffer.set(1, 0, decorative);
 
@@ -7151,8 +7189,10 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(6, 2, &mut pool);
 
+        // Both fg and bg transparent — guard materializes both and ensures
+        // the result is readable.
         let mut unreadable = ftui::Cell::from_char('X');
-        unreadable.fg = PackedRgba::rgb(255, 255, 255);
+        unreadable.fg = PackedRgba::rgba(0, 0, 0, 0);
         unreadable.bg = PackedRgba::rgba(0, 0, 0, 0);
         frame.buffer.set(1, 0, unreadable);
 
@@ -7176,11 +7216,13 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(6, 2, &mut pool);
 
+        // Transparent fg on white bg with grapheme content — guard should
+        // materialize a readable fg that meets the text contrast minimum.
         let content = ftui::render::cell::CellContent::from_grapheme(
             ftui::render::cell::GraphemeId::new(7, 2, 1),
         );
         let mut unreadable = ftui::Cell::new(content);
-        unreadable.fg = PackedRgba::rgb(255, 255, 255);
+        unreadable.fg = PackedRgba::rgba(0, 0, 0, 0);
         unreadable.bg = PackedRgba::rgb(255, 255, 255);
         frame.buffer.set(1, 0, unreadable);
 
@@ -7202,6 +7244,7 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(4, 2, &mut pool);
 
+        // Whitespace cells with authored (opaque) fg are preserved as-is.
         let mut space = ftui::Cell::from_char(' ');
         space.fg = PackedRgba::rgb(255, 255, 255);
         space.bg = PackedRgba::rgb(255, 255, 255);

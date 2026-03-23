@@ -3061,7 +3061,7 @@ fn render_api_unified_inbox(
         limit,
         normalized_filter.as_deref(),
     )
-    .expect("aggregation should succeed");
+    .map_err(|(status, msg)| (status, format!("unified inbox aggregation failed: {msg}")))?;
 
     let mut result = serde_json::json!({ "messages": messages.into_iter().map(|message| unified_api_message_value(&message.into_view())).collect::<Vec<_>>() });
     if include_projects {
