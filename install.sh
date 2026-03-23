@@ -4719,6 +4719,69 @@ installer_reconstruct_database_from_archive() {
   fi
 }
 
+INSTALLER_ARCHIVE_PARITY_FAILURE=""
+installer_archive_parity_verify() {
+  local db_path="$1"
+  local storage_root="$2"
+  local output=""
+  local parse_status=0
+
+  INSTALLER_ARCHIVE_PARITY_FAILURE=""
+
+  if [ ! -x "$DEST/$BIN_CLI" ]; then
+    warn "Rust CLI not found at $DEST/$BIN_CLI; cannot run archive parity verification."
+    return 1
+  fi
+
+  if ! output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor check --json 2>&1); then
+    warn "Post-migration doctor check failed: $(printf '%s\n' "$output" | sed -n '1p')"
+    while IFS= read -r line; do
+      [ -n "$line" ] && verbose "migration:doctor_check ${line}"
+    done <<< "$output"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [ -n "$line" ] && verbose "migration:doctor_check ${line}"
+  done <<< "$output"
+
+  INSTALLER_ARCHIVE_PARITY_FAILURE=$(
+    printf '%s\n' "$output" | python3 - <<'PY'
+import json
+import sys
+
+text = sys.stdin.read()
+start = text.find("{")
+if start < 0:
+    sys.exit(2)
+
+try:
+    payload = json.loads(text[start:])
+except Exception:
+    sys.exit(2)
+
+for check in payload.get("checks", []):
+    if check.get("check") == "archive_db_parity" and check.get("status") == "fail":
+        print(check.get("detail") or "archive_db_parity failed")
+        sys.exit(0)
+
+sys.exit(1)
+PY
+  )
+  parse_status=$?
+
+  if [ "$parse_status" -eq 0 ]; then
+    warn "Post-migration archive parity check failed: ${INSTALLER_ARCHIVE_PARITY_FAILURE}"
+    return 1
+  fi
+  if [ "$parse_status" -eq 1 ]; then
+    return 0
+  fi
+
+  warn "Post-migration archive parity check could not be parsed safely."
+  return 1
+}
+
 installer_apply_schema_migration() {
   local db_path="$1"
   local storage_root="$2"
@@ -5082,6 +5145,8 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
       if ! sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts"; then
         migration_final_verification_failed=1
         warn "Final migration verification failed: ${SQLITE_POST_MIGRATION_FAILURES}"
+      elif ! installer_archive_parity_verify "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+        migration_final_verification_failed=1
       fi
     fi
 
@@ -5126,6 +5191,9 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
           migration_final_verification_failed=1
           warn "Post-self-heal verification passed SQLite checks, but schema refresh still failed."
         fi
+        if [ "$migration_final_verification_failed" -eq 0 ] && ! installer_archive_parity_verify "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+          migration_final_verification_failed=1
+        fi
       else
         warn "Post-self-heal verification still failed: ${SQLITE_POST_MIGRATION_FAILURES}"
 
@@ -5155,6 +5223,9 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
             if [ "$migration_schema_refresh_failed" -eq 1 ]; then
               migration_final_verification_failed=1
               warn "Archive reconstruction passed SQLite checks, but schema refresh still failed."
+            fi
+            if [ "$migration_final_verification_failed" -eq 0 ] && ! installer_archive_parity_verify "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+              migration_final_verification_failed=1
             fi
           else
             warn "Archive reconstruction completed, but verification still failed: ${SQLITE_POST_MIGRATION_FAILURES}"
