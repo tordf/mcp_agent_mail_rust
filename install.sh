@@ -4702,13 +4702,16 @@ migration_count_value_from_summary() {
 migration_core_counts_preserved() {
   local before_summary="$1"
   local after_summary="$2"
+  local mode="${3:-strict}"
   local core_tables=(
     projects
     agents
     messages
     message_recipients
-    file_reservations
   )
+  if [ "$mode" != "recovery_relaxed" ]; then
+    core_tables+=(file_reservations)
+  fi
   local table before after
   for table in "${core_tables[@]}"; do
     before=$(migration_count_value_from_summary "$before_summary" "$table")
@@ -4887,6 +4890,7 @@ sqlite_post_migration_verify() {
   local db_path="$1"
   local before_counts="$2"
   local after_counts="$3"
+  local count_mode="${4:-strict}"
 
   SQLITE_POST_MIGRATION_FAILURES=""
   SQLITE_POST_MIGRATION_REMAINING_TEXT_COLUMNS=""
@@ -4903,7 +4907,7 @@ sqlite_post_migration_verify() {
     append_sqlite_verification_failure "text_timestamps=${SQLITE_POST_MIGRATION_REMAINING_TEXT_COLUMNS}"
   fi
 
-  if ! migration_core_counts_preserved "$before_counts" "$after_counts"; then
+  if ! migration_core_counts_preserved "$before_counts" "$after_counts" "$count_mode"; then
     append_sqlite_verification_failure "core_row_counts_regressed"
   fi
 
@@ -4996,11 +5000,12 @@ installer_archive_parity_verify() {
   done <<< "$output"
 
   INSTALLER_ARCHIVE_PARITY_FAILURE=$(
-    printf '%s\n' "$output" | python3 - <<'PY'
+    INSTALLER_DOCTOR_CHECK_JSON="$output" python3 - <<'PY'
 import json
+import os
 import sys
 
-text = sys.stdin.read()
+text = os.environ.get("INSTALLER_DOCTOR_CHECK_JSON", "")
 start = text.find("{")
 if start < 0:
     sys.exit(2)
@@ -5443,6 +5448,30 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
         fi
         if [ "$migration_final_verification_failed" -eq 0 ] && ! installer_archive_parity_verify "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
           migration_final_verification_failed=1
+          warn "Archive parity still failed after self-heal; attempting archive reconstruction with salvage."
+          if installer_reconstruct_database_from_archive "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+            if installer_apply_schema_migration "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+              migration_schema_refresh_failed=0
+            else
+              migration_schema_refresh_failed=1
+            fi
+            migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
+            verbose "migration:row_counts_after_parity_reconstruct ${migration_after_counts}"
+            if sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts" "recovery_relaxed"; then
+              migration_final_verification_failed=0
+              if [ "$migration_schema_refresh_failed" -eq 1 ]; then
+                migration_final_verification_failed=1
+                warn "Archive reconstruction after parity failure passed SQLite checks, but schema refresh still failed."
+              fi
+              if [ "$migration_final_verification_failed" -eq 0 ] && ! installer_archive_parity_verify "$PYTHON_DB_MIGRATED_PATH" "$RUST_STORAGE_ROOT"; then
+                migration_final_verification_failed=1
+                warn "Archive reconstruction after parity failure completed, but archive parity still failed: ${INSTALLER_ARCHIVE_PARITY_FAILURE:-unknown failure}"
+              fi
+            else
+              migration_final_verification_failed=1
+              warn "Archive reconstruction after parity failure completed, but verification still failed: ${SQLITE_POST_MIGRATION_FAILURES}"
+            fi
+          fi
         fi
       else
         warn "Post-self-heal verification still failed: ${SQLITE_POST_MIGRATION_FAILURES}"
@@ -5468,7 +5497,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
           fi
           migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
           verbose "migration:row_counts_after_reconstruct ${migration_after_counts}"
-          if sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts"; then
+          if sqlite_post_migration_verify "$PYTHON_DB_MIGRATED_PATH" "$migration_before_counts" "$migration_after_counts" "recovery_relaxed"; then
             migration_final_verification_failed=0
             if [ "$migration_schema_refresh_failed" -eq 1 ]; then
               migration_final_verification_failed=1

@@ -1325,16 +1325,174 @@ fn should_replace_default_policy(current: &str, salvaged: &str) -> bool {
     !salvaged.is_empty() && salvaged != "auto" && (current.is_empty() || current == "auto")
 }
 
+fn synthetic_project_placeholder_human_key(slug: &str) -> String {
+    format!("/{slug}")
+}
+
+fn placeholder_human_key_for_human_key(human_key: &str) -> Option<String> {
+    let trimmed = human_key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let basename = Path::new(trimmed).file_name()?.to_str()?.trim();
+    if basename.is_empty() {
+        return None;
+    }
+    Some(format!("/{basename}"))
+}
+
+fn normalized_project_match_token(value: &str) -> Option<String> {
+    let normalized = value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn project_basename_token_for_human_key(human_key: &str) -> Option<String> {
+    let trimmed = human_key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let basename = Path::new(trimmed).file_name()?.to_str()?;
+    normalized_project_match_token(basename)
+}
+
+fn is_synthetic_project_placeholder(slug: &str, human_key: &str) -> bool {
+    let trimmed = human_key.trim();
+    trimmed.is_empty() || trimmed == synthetic_project_placeholder_human_key(slug)
+}
+
+#[derive(Debug, Clone)]
+struct SalvageProjectIdentityRow {
+    id: i64,
+    slug: String,
+    human_key: String,
+    created_at: i64,
+}
+
+fn reconcile_placeholder_project_duplicates_after_salvage(
+    conn: &DbConn,
+    project_id_map: &mut HashMap<i64, i64>,
+    stats: &mut ReconstructStats,
+) -> DbResult<()> {
+    let rows = conn
+        .query_sync(
+            "SELECT id, slug, human_key, created_at FROM projects ORDER BY id",
+            &[],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: query project rows for duplicate reconciliation: {e}"
+            ))
+        })?;
+
+    let mut placeholder_by_token: HashMap<String, SalvageProjectIdentityRow> = HashMap::new();
+    let mut canonical_rows = Vec::new();
+
+    for row in &rows {
+        let Some(id) = row.get_named::<i64>("id").ok().filter(|value| *value > 0) else {
+            continue;
+        };
+        let slug = row.get_named::<String>("slug").unwrap_or_default();
+        let human_key = row.get_named::<String>("human_key").unwrap_or_default();
+        let created_at = row.get_named::<i64>("created_at").unwrap_or_default();
+        let identity = SalvageProjectIdentityRow {
+            id,
+            slug: slug.clone(),
+            human_key: human_key.clone(),
+            created_at,
+        };
+        if is_synthetic_project_placeholder(&slug, &human_key) {
+            if let Some(token) = normalized_project_match_token(&slug) {
+                placeholder_by_token.entry(token).or_insert(identity);
+            }
+        } else if Path::new(human_key.trim()).is_absolute() {
+            canonical_rows.push(identity);
+        }
+    }
+
+    canonical_rows.sort_by_key(|row| row.created_at);
+
+    for canonical in canonical_rows {
+        let Some(token) = project_basename_token_for_human_key(&canonical.human_key) else {
+            continue;
+        };
+        let Some(placeholder) = placeholder_by_token.get(&token).cloned() else {
+            continue;
+        };
+        if placeholder.id == canonical.id {
+            continue;
+        }
+
+        for mapped_project_id in project_id_map.values_mut() {
+            if *mapped_project_id == canonical.id {
+                *mapped_project_id = placeholder.id;
+            }
+        }
+
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[Value::BigInt(canonical.id)],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: remove duplicate canonical project {}: {e}",
+                canonical.slug
+            ))
+        })?;
+
+        let merged_created_at =
+            merge_salvaged_created_at(placeholder.created_at, canonical.created_at);
+        conn.execute_sync(
+            "UPDATE projects SET slug = ?, human_key = ?, created_at = ? WHERE id = ?",
+            &[
+                Value::Text(canonical.slug.clone()),
+                Value::Text(canonical.human_key.clone()),
+                Value::BigInt(merged_created_at),
+                Value::BigInt(placeholder.id),
+            ],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: promote placeholder project {} to canonical {}: {e}",
+                placeholder.slug, canonical.slug
+            ))
+        })?;
+        if stats.salvaged_projects > 0 {
+            stats.salvaged_projects -= 1;
+        }
+
+        placeholder_by_token.insert(
+            token,
+            SalvageProjectIdentityRow {
+                id: placeholder.id,
+                slug: canonical.slug,
+                human_key: canonical.human_key,
+                created_at: merged_created_at,
+            },
+        );
+    }
+
+    Ok(())
+}
+
 fn enrich_existing_project_from_salvage(
     conn: &DbConn,
     project_id: i64,
     slug: &str,
+    salvaged_slug: &str,
     salvaged_human_key: &str,
     salvaged_created_at: i64,
 ) -> DbResult<()> {
     let existing_rows = conn
         .query_sync(
-            "SELECT human_key, created_at FROM projects WHERE id = ? LIMIT 1",
+            "SELECT slug, human_key, created_at FROM projects WHERE id = ? LIMIT 1",
             &[Value::BigInt(project_id)],
         )
         .map_err(|e| {
@@ -1346,30 +1504,48 @@ fn enrich_existing_project_from_salvage(
         return Ok(());
     };
 
+    let current_slug = existing_row
+        .get_named::<String>("slug")
+        .unwrap_or_else(|_| slug.to_string());
     let current_human_key = existing_row
         .get_named::<String>("human_key")
-        .unwrap_or_else(|_| format!("/{slug}"));
+        .unwrap_or_else(|_| synthetic_project_placeholder_human_key(&current_slug));
     let current_created_at = existing_row
         .get_named::<i64>("created_at")
         .unwrap_or_default();
-    let fallback_human_key = format!("/{slug}");
-    let next_human_key =
-        if current_human_key.trim().is_empty() || current_human_key == fallback_human_key {
-            let candidate = salvaged_human_key.trim();
-            if Path::new(candidate).is_absolute() {
-                candidate.to_string()
-            } else {
-                current_human_key.clone()
-            }
+    let fallback_human_key = synthetic_project_placeholder_human_key(&current_slug);
+    let current_is_placeholder =
+        current_human_key.trim().is_empty() || current_human_key == fallback_human_key;
+    let next_slug = if current_is_placeholder {
+        let candidate = salvaged_slug.trim();
+        if candidate.is_empty() {
+            current_slug.clone()
+        } else {
+            candidate.to_string()
+        }
+    } else {
+        current_slug.clone()
+    };
+    let next_human_key = if current_is_placeholder {
+        let candidate = salvaged_human_key.trim();
+        if Path::new(candidate).is_absolute() {
+            candidate.to_string()
         } else {
             current_human_key.clone()
-        };
+        }
+    } else {
+        current_human_key.clone()
+    };
     let next_created_at = merge_salvaged_created_at(current_created_at, salvaged_created_at);
 
-    if next_human_key != current_human_key || next_created_at != current_created_at {
+    if next_slug != current_slug
+        || next_human_key != current_human_key
+        || next_created_at != current_created_at
+    {
         conn.execute_sync(
-            "UPDATE projects SET human_key = ?, created_at = ? WHERE id = ?",
+            "UPDATE projects SET slug = ?, human_key = ?, created_at = ? WHERE id = ?",
             &[
+                Value::Text(next_slug),
                 Value::Text(next_human_key),
                 Value::BigInt(next_created_at),
                 Value::BigInt(project_id),
@@ -1598,7 +1774,7 @@ fn merge_salvaged_database(
 
             let human_key = row
                 .get_named::<String>("human_key")
-                .unwrap_or_else(|_| format!("/{slug}"));
+                .unwrap_or_else(|_| synthetic_project_placeholder_human_key(&slug));
             let created_at = row
                 .get_named::<i64>("created_at")
                 .unwrap_or_else(|_| crate::now_micros());
@@ -1609,6 +1785,26 @@ fn merge_salvaged_database(
                 enrich_existing_project_from_salvage(
                     &target_conn,
                     target_project_id,
+                    &slug,
+                    &slug,
+                    &human_key,
+                    created_at,
+                )?;
+                project_id_map.insert(source_project_id, target_project_id);
+                continue;
+            }
+            if let Some(placeholder_human_key) = placeholder_human_key_for_human_key(&human_key)
+                && let Ok(target_project_id) = query_last_insert_or_existing_id(
+                    &target_conn,
+                    "projects",
+                    "human_key",
+                    &placeholder_human_key,
+                )
+            {
+                enrich_existing_project_from_salvage(
+                    &target_conn,
+                    target_project_id,
+                    &slug,
                     &slug,
                     &human_key,
                     created_at,
@@ -1633,6 +1829,12 @@ fn merge_salvaged_database(
             project_id_map.insert(source_project_id, target_project_id);
             stats.salvaged_projects += 1;
         }
+
+        reconcile_placeholder_project_duplicates_after_salvage(
+            &target_conn,
+            &mut project_id_map,
+            stats,
+        )?;
     }
 
     if has_agents {
@@ -2064,12 +2266,12 @@ fn merge_salvaged_database(
 
 /// Load canonical `human_key` from `project.json` when available.
 ///
-/// Falls back to a synthetic `/{slug}` path when metadata is missing or
-/// malformed. The fallback remains absolute so downstream path validation
-/// continues to work.
+/// Falls back to a synthetic `/{slug}` placeholder when metadata is missing or
+/// malformed. Recovery flows that have a readable salvage database will later
+/// replace this placeholder with the canonical path.
 fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut ReconstructStats) -> String {
     let metadata_path = project_path.join("project.json");
-    let fallback = format!("/{slug}");
+    let fallback = synthetic_project_placeholder_human_key(slug);
 
     if !is_real_file(&metadata_path) {
         stats.warnings.push(format!(
@@ -2685,6 +2887,122 @@ mod tests {
             })
             .expect("human_key text");
         assert_eq!(human_key, "/test-project");
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_upgrades_slug_only_archive_project_placeholder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed.db");
+        let salvage_db_path = tmp.path().join("salvage.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("flywheel_connectors");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let salvage_conn = DbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    Value::BigInt(100),
+                    Value::Text("users-jemanuel-projects-flywheel-connectors".to_string()),
+                    Value::Text("/Users/jemanuel/projects/flywheel_connectors".to_string()),
+                    Value::BigInt(1),
+                ],
+            )
+            .unwrap();
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("salvage merge should succeed");
+        assert_eq!(stats.projects, 1);
+        assert_eq!(stats.salvaged_projects, 0);
+
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT slug, human_key FROM projects ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("slug").unwrap(),
+            "users-jemanuel-projects-flywheel-connectors"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("human_key").unwrap(),
+            "/Users/jemanuel/projects/flywheel_connectors"
+        );
+    }
+
+    #[test]
+    fn reconcile_placeholder_project_duplicates_promotes_archive_project_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed.db");
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("flywheel_connectors".to_string()),
+                Value::Text("/flywheel_connectors".to_string()),
+                Value::BigInt(10),
+            ],
+        )
+        .unwrap();
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(2),
+                Value::Text("users-jemanuel-projects-flywheel-connectors".to_string()),
+                Value::Text("/Users/jemanuel/projects/flywheel_connectors".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .unwrap();
+
+        let mut project_id_map = HashMap::from([(100_i64, 2_i64)]);
+        let mut stats = ReconstructStats {
+            salvaged_projects: 1,
+            ..ReconstructStats::default()
+        };
+
+        reconcile_placeholder_project_duplicates_after_salvage(
+            &conn,
+            &mut project_id_map,
+            &mut stats,
+        )
+        .expect("duplicate reconciliation should succeed");
+
+        let rows = conn
+            .query_sync(
+                "SELECT id, slug, human_key, created_at FROM projects ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("slug").unwrap(),
+            "users-jemanuel-projects-flywheel-connectors"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("human_key").unwrap(),
+            "/Users/jemanuel/projects/flywheel_connectors"
+        );
+        assert_eq!(rows[0].get_named::<i64>("created_at").unwrap(), 1);
+        assert_eq!(project_id_map.get(&100), Some(&1));
+        assert_eq!(stats.salvaged_projects, 0);
     }
 
     #[test]

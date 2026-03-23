@@ -608,12 +608,14 @@ impl Runner {
 
         let mut child = cmd.spawn()?;
 
-        let mut stdout_pipe = child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture stdout")
-        })?;
-        let mut stderr_pipe = child.stderr.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture stderr")
-        })?;
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("Failed to capture stdout"))?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("Failed to capture stderr"))?;
 
         // Spawn threads to read stdout/stderr so the child doesn't block on full pipe buffers
         let stdout_handle = std::thread::spawn(move || {

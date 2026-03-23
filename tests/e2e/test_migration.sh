@@ -804,6 +804,132 @@ INSTALL_STDOUT="${MAIN_INSTALL_STDOUT}"
 INSTALL_STDERR="${MAIN_INSTALL_STDERR}"
 
 # ===========================================================================
+# Case 6d: Installer reconstructs when archive parity fails after migration
+# ===========================================================================
+e2e_case_banner "installer reconstructs when archive parity still fails after migration"
+MAIN_INSTALL_RC="${INSTALL_RC}"
+MAIN_INSTALL_STDOUT="${INSTALL_STDOUT}"
+MAIN_INSTALL_STDERR="${INSTALL_STDERR}"
+PARITY_HOME="${WORK}/parity_home"
+PARITY_RUN_DIR="${WORK}/parity_project"
+PARITY_DEST="${PARITY_HOME}/.local/bin"
+PARITY_STORAGE_ROOT="${PARITY_HOME}/.mcp_agent_mail_git_mailbox_repo"
+PARITY_PYTHON_CLONE="${PARITY_HOME}/legacy_python_clone"
+PARITY_PYTHON_DB="${PARITY_PYTHON_CLONE}/storage.sqlite3"
+PARITY_CONFIG_ENV="${PARITY_HOME}/.config/mcp-agent-mail/config.env"
+PARITY_ARCHIVE_PROJECT="${PARITY_STORAGE_ROOT}/projects/archive-only-project"
+mkdir -p "${PARITY_RUN_DIR}" "${PARITY_DEST}" "${PARITY_STORAGE_ROOT}" "${PARITY_PYTHON_CLONE}/src/mcp_agent_mail" "${PARITY_PYTHON_CLONE}/scripts" "${PARITY_HOME}/.config/mcp-agent-mail" "${PARITY_HOME}/.codex"
+cp -p "${PYTHON_DB}" "${PARITY_PYTHON_DB}"
+cat > "${PARITY_PYTHON_CLONE}/pyproject.toml" <<'EOF'
+[project]
+name = "mcp_agent_mail"
+version = "0.0.0"
+EOF
+cat > "${PARITY_PYTHON_CLONE}/src/mcp_agent_mail/__init__.py" <<'EOF'
+__all__ = []
+EOF
+cat > "${PARITY_PYTHON_CLONE}/scripts/run_server_with_token.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "LEGACY_PARITY_HELPER_STILL_ACTIVE" >&2
+exit 31
+EOF
+chmod +x "${PARITY_PYTHON_CLONE}/scripts/run_server_with_token.sh"
+cat > "${PARITY_PYTHON_CLONE}/.env" <<EOF
+DATABASE_URL=sqlite+aiosqlite:///${PARITY_PYTHON_DB}
+HTTP_BEARER_TOKEN=${LEGACY_TOKEN}
+STORAGE_ROOT=${PARITY_PYTHON_CLONE}
+EOF
+cat > "${PARITY_HOME}/.zshrc" <<EOF
+# >>> MCP Agent Mail alias
+am() {
+  cd "${PARITY_PYTHON_CLONE}" && scripts/run_server_with_token.sh "\$@"
+}
+# <<< MCP Agent Mail alias
+EOF
+git -C "${PARITY_STORAGE_ROOT}" init >/dev/null 2>&1
+git -C "${PARITY_STORAGE_ROOT}" config user.email "e2e@example.com"
+git -C "${PARITY_STORAGE_ROOT}" config user.name "E2E"
+echo "seed" > "${PARITY_STORAGE_ROOT}/README.md"
+git -C "${PARITY_STORAGE_ROOT}" add README.md
+git -C "${PARITY_STORAGE_ROOT}" commit -m "seed storage repo" >/dev/null 2>&1
+mkdir -p "${PARITY_ARCHIVE_PROJECT}/agents/ArchiveFox" "${PARITY_ARCHIVE_PROJECT}/messages/2026/03"
+cat > "${PARITY_ARCHIVE_PROJECT}/project.json" <<'EOF'
+{
+  "slug": "archive-only-project",
+  "human_key": "/tmp/archive-only-project"
+}
+EOF
+cat > "${PARITY_ARCHIVE_PROJECT}/agents/ArchiveFox/profile.json" <<'EOF'
+{
+  "name": "ArchiveFox",
+  "program": "codex",
+  "model": "gpt-5",
+  "task_description": "archive-only seed",
+  "inception_ts": "2026-03-22T00:00:00Z",
+  "last_active_ts": "2026-03-22T00:00:01Z",
+  "attachments_policy": "auto",
+  "contact_policy": "auto"
+}
+EOF
+cat > "${PARITY_ARCHIVE_PROJECT}/messages/2026/03/20260322T000001Z__9001.md" <<'EOF'
+---json
+{"id":9001,"from":"ArchiveFox","to":["LegacyAgent"],"subject":"Archive only message","thread_id":"archive-only-thread","importance":"normal","ack_required":false,"created_ts":"2026-03-22T00:00:01Z","attachments":[]}
+---
+Recovered from canonical archive only.
+EOF
+git -C "${PARITY_STORAGE_ROOT}" add "${PARITY_ARCHIVE_PROJECT}"
+git -C "${PARITY_STORAGE_ROOT}" commit -m "seed archive parity project" >/dev/null 2>&1
+run_installer "case_06d_archive_parity_install" "${PARITY_RUN_DIR}" "${PARITY_HOME}" "${PARITY_DEST}" "${PARITY_STORAGE_ROOT}"
+e2e_assert_exit_code "archive parity install exits cleanly" "0" "${INSTALL_RC}"
+PARITY_INSTALL_OUTPUT="${INSTALL_STDOUT}
+${INSTALL_STDERR}"
+e2e_assert_contains "installer detects parity failure after self-heal" "${PARITY_INSTALL_OUTPUT}" "Archive parity still failed after self-heal; attempting archive reconstruction with salvage."
+e2e_assert_contains "installer reconstructs from archive after parity failure" "${PARITY_INSTALL_OUTPUT}" "Archive-backed database reconstruction completed"
+PARITY_DB_URL="$(grep -E '^DATABASE_URL=' "${PARITY_CONFIG_ENV}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+PARITY_DB="$(sqlite_path_from_database_url "${PARITY_DB_URL}")"
+e2e_assert_file_exists "archive parity install writes migrated database" "${PARITY_DB}"
+set +e
+PARITY_DOCTOR_JSON="$(
+    HOME="${PARITY_HOME}" \
+    PATH="${PARITY_DEST}:${PATH_BASE}" \
+    AM_INTERFACE_MODE=cli \
+    DATABASE_URL="${PARITY_DB_URL}" \
+    "${PARITY_DEST}/am" doctor check --json 2>/dev/null
+)"
+PARITY_DOCTOR_RC=$?
+PARITY_PROJECTS_JSON="$(
+    HOME="${PARITY_HOME}" \
+    PATH="${PARITY_DEST}:${PATH_BASE}" \
+    AM_INTERFACE_MODE=cli \
+    DATABASE_URL="${PARITY_DB_URL}" \
+    "${PARITY_DEST}/am" list-projects --json 2>/dev/null
+)"
+PARITY_PROJECTS_RC=$?
+set -e
+e2e_save_artifact "case_06d_doctor.json" "${PARITY_DOCTOR_JSON}"
+e2e_save_artifact "case_06d_projects.json" "${PARITY_PROJECTS_JSON}"
+e2e_assert_exit_code "archive parity install doctor check exits cleanly" "0" "${PARITY_DOCTOR_RC}"
+e2e_assert_exit_code "archive parity install list-projects exits cleanly" "0" "${PARITY_PROJECTS_RC}"
+if json_query "${PARITY_DOCTOR_JSON}" "assert all(check.get('check') != 'archive_db_parity' or check.get('status') != 'fail' for check in d.get('checks', []))"; then
+    e2e_pass "archive parity install clears doctor archive_db_parity failure"
+else
+    e2e_fail "archive parity install clears doctor archive_db_parity failure"
+fi
+if json_query "${PARITY_PROJECTS_JSON}" "assert any(p.get('human_key') == '/tmp/legacy-project' for p in d)"; then
+    e2e_pass "archive parity install preserves migrated legacy project data"
+else
+    e2e_fail "archive parity install preserves migrated legacy project data"
+fi
+if json_query "${PARITY_PROJECTS_JSON}" "assert any(p.get('human_key') == '/tmp/archive-only-project' or p.get('slug') == 'archive-only-project' for p in d)"; then
+    e2e_pass "archive parity install recovers archive-only project data"
+else
+    e2e_fail "archive parity install recovers archive-only project data"
+fi
+INSTALL_RC="${MAIN_INSTALL_RC}"
+INSTALL_STDOUT="${MAIN_INSTALL_STDOUT}"
+INSTALL_STDERR="${MAIN_INSTALL_STDERR}"
+
+# ===========================================================================
 # Case 7: Doctor + backup artifacts + Git health
 # ===========================================================================
 e2e_case_banner "doctor health, backup artifacts, and storage git integrity"
