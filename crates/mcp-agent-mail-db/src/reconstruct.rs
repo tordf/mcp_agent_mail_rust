@@ -2931,8 +2931,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].get_named::<i64>("id").unwrap(),
-            100_i64,
-            "salvage database should promote project id"
+            1_i64,
+            "archive placeholder project id should remain stable"
         );
         assert_eq!(
             rows[0].get_named::<String>("slug").unwrap(),

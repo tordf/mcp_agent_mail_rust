@@ -385,6 +385,10 @@ pub fn sanitize_query(query: &str) -> SanitizedQuery {
         }
     }
 
+    if is_operators_only(&result) {
+        return SanitizedQuery::Empty;
+    }
+
     // Quote hyphenated tokens (POL-358 → "POL-358")
     result = quote_hyphenated_tokens(&result);
 
@@ -395,7 +399,6 @@ pub fn sanitize_query(query: &str) -> SanitizedQuery {
     }
 }
 
-#[cfg(test)]
 /// Check whether a string contains only boolean operators and whitespace.
 fn is_operators_only(s: &str) -> bool {
     s.split_whitespace().all(|word| {

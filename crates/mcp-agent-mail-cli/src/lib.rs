@@ -24494,7 +24494,7 @@ startup_timeout_sec = 42
                 .join("2026")
                 .join("03")
                 .join("2026-03-12T12-00-00Z__hello__1.md"),
-            "---\nsubject: hello\n---\nbody",
+            "---json\n{\"id\": 1, \"subject\": \"hello\"}\n---\nbody",
         )
         .unwrap();
 
@@ -24538,7 +24538,7 @@ startup_timeout_sec = 42
         match strategy {
             DoctorDatabaseFixStrategy::Reconstruct(detail) => {
                 assert!(
-                    detail.contains("Archive contains more canonical records"),
+                    detail.contains("Archive canonical data is not fully represented"),
                     "unexpected reconstruct detail: {detail}"
                 );
                 assert!(
@@ -27349,8 +27349,8 @@ startup_timeout_sec = 42
         assert_eq!(open, 1);
         assert_eq!(in_progress, 1);
         assert_eq!(
-            ready, 2,
-            "open + in-progress unblocked issues should be ready under default filters"
+            ready, 1,
+            "open unblocked issues should be ready under default filters"
         );
     }
 

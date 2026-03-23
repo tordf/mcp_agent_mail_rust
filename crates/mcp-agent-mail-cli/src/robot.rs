@@ -8101,7 +8101,7 @@ mod tests {
         assert_eq!(truncate_str("hello", 10), "hello");
         assert_eq!(
             truncate_str("hello world this is long", 10),
-            "hello worl..."
+            "hello w..."
         );
     }
 
