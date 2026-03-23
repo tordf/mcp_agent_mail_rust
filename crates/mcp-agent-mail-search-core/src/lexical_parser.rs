@@ -377,17 +377,12 @@ pub fn sanitize_query(query: &str) -> SanitizedQuery {
         return SanitizedQuery::Empty;
     }
 
-    // Strip trailing lone wildcard: "foo *" → "foo"
-    if result.ends_with(" *") {
+    // Strip trailing lone wildcards: "foo * *" → "foo"
+    while result.ends_with(" *") {
         result = result[..result.len() - 2].trim_end().to_string();
         if result.is_empty() {
             return SanitizedQuery::Empty;
         }
-    }
-
-    // Check if only boolean operators remain
-    if is_operators_only(&result) {
-        return SanitizedQuery::Empty;
     }
 
     // Quote hyphenated tokens (POL-358 → "POL-358")
@@ -400,7 +395,8 @@ pub fn sanitize_query(query: &str) -> SanitizedQuery {
     }
 }
 
-/// Check whether a string contains only boolean operators and whitespace
+#[cfg(test)]
+/// Check whether a string contains only boolean operators and whitespace.
 fn is_operators_only(s: &str) -> bool {
     s.split_whitespace().all(|word| {
         BOOLEAN_OPERATORS
@@ -1661,8 +1657,8 @@ mod tests {
             let outcome = parser.parse(&index, "migration");
             assert!(!outcome.used_fallback());
 
-            let outcome2 = parser.parse(&index, "");
-            assert!(outcome2.into_query().is_none());
+            let outcome_empty = parser.parse(&index, "");
+            assert!(outcome_empty.into_query().is_none());
         }
 
         #[test]

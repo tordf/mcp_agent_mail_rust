@@ -3050,7 +3050,7 @@ fn decision_confidence(decision: &CandidateBudgetDecision) -> f64 {
         .iter()
         .map(|entry| entry.expected_loss)
         .collect::<Vec<_>>();
-    losses.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    losses.sort_by(f64::total_cmp);
     let Some(best) = losses.first().copied() else {
         return 0.0;
     };

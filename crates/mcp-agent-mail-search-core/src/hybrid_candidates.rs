@@ -294,11 +294,7 @@ fn derive_budget_decision(mode: CandidateMode, query_class: QueryClass) -> Candi
     let chosen = action_losses
         .iter()
         .copied()
-        .min_by(|left, right| {
-            left.expected_loss
-                .partial_cmp(&right.expected_loss)
-                .unwrap_or(Ordering::Equal)
-        })
+        .min_by(|left, right| left.expected_loss.total_cmp(&right.expected_loss))
         .unwrap_or(action_losses[0]);
 
     CandidateBudgetDecision {
@@ -604,8 +600,7 @@ fn rank_or_max(rank: Option<usize>) -> usize {
 
 fn score_cmp_desc(a: Option<f64>, b: Option<f64>) -> Ordering {
     b.unwrap_or(f64::NEG_INFINITY)
-        .partial_cmp(&a.unwrap_or(f64::NEG_INFINITY))
-        .unwrap_or(Ordering::Equal)
+        .total_cmp(&a.unwrap_or(f64::NEG_INFINITY))
 }
 
 fn prepared_candidate_cmp(left: &PreparedCandidate, right: &PreparedCandidate) -> Ordering {

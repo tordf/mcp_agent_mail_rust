@@ -578,13 +578,16 @@ impl TwoTierIndex {
             .take(self.metadata.doc_count)
             .enumerate()
         {
-            let score = dot_product_f16_simd(embedding, query_vec);
+            let entry = ScoredEntry {
+                score: dot_product_f16_simd(embedding, query_vec),
+                idx,
+            };
             if heap.len() < limit {
-                heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
+                heap.push(std::cmp::Reverse(entry));
             } else if let Some(mut top) = heap.peek_mut()
-                && score > top.0.score
+                && entry > top.0
             {
-                *top = std::cmp::Reverse(ScoredEntry { score, idx });
+                *top = std::cmp::Reverse(entry);
             }
         }
 
@@ -649,13 +652,16 @@ impl TwoTierIndex {
             if !has_quality {
                 continue;
             }
-            let score = dot_product_f16_simd(embedding, query_vec);
+            let entry = ScoredEntry {
+                score: dot_product_f16_simd(embedding, query_vec),
+                idx,
+            };
             if heap.len() < limit {
-                heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));
+                heap.push(std::cmp::Reverse(entry));
             } else if let Some(mut top) = heap.peek_mut()
-                && score > top.0.score
+                && entry > top.0
             {
-                *top = std::cmp::Reverse(ScoredEntry { score, idx });
+                *top = std::cmp::Reverse(entry);
             }
         }
 
@@ -784,7 +790,8 @@ impl Ord for ScoredEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.score
             .total_cmp(&other.score)
-            .then_with(|| self.idx.cmp(&other.idx))
+            // Smaller idx is "better" (greater), so it appears first when sorted descending
+            .then_with(|| other.idx.cmp(&self.idx))
     }
 }
 
@@ -1091,7 +1098,7 @@ impl<'a> TwoTierSearchIter<'a> {
         // Re-sort by blended score.
         let _rerank_span =
             tracing::debug_span!("two_tier.rerank", candidates = blended.len()).entered();
-        blended.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        blended.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.idx.cmp(&b.idx)));
         blended.truncate(self.k);
         let refined_order = blended.iter().map(|hit| hit.doc_id).collect::<Vec<_>>();
         let compare_len = self.fast_order.len().min(refined_order.len()).min(self.k);

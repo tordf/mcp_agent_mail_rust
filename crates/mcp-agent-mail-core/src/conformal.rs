@@ -148,9 +148,7 @@ impl ConformalPredictor {
         let quantile_idx = ((n as f64 + 1.0) * self.coverage).ceil() as usize;
         let quantile_idx = quantile_idx.min(n).saturating_sub(1); // 0-indexed, capped at n-1
 
-        let (_, q, _) = scratch_scores.select_nth_unstable_by(quantile_idx, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let (_, q, _) = scratch_scores.select_nth_unstable_by(quantile_idx, f64::total_cmp);
         let q = *q;
 
         Some(PredictionInterval {
@@ -174,9 +172,7 @@ impl ConformalPredictor {
         }
 
         let mid_idx = n / 2;
-        let (_, median, _) = scratch_values.select_nth_unstable_by(mid_idx, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let (_, median, _) = scratch_values.select_nth_unstable_by(mid_idx, f64::total_cmp);
         let median_val = *median;
 
         if n.is_multiple_of(2) {
@@ -186,7 +182,7 @@ impl ConformalPredictor {
             let left_max = scratch_values[..mid_idx]
                 .iter()
                 .copied()
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(f64::total_cmp)
                 .unwrap_or(median_val);
 
             f64::midpoint(left_max, median_val)

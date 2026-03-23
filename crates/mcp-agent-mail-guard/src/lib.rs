@@ -1201,13 +1201,13 @@ fn check_path_conflicts(
             if res.normalized_pattern.is_empty() {
                 continue;
             }
-            
+
             let mut glob_builder = globset::GlobBuilder::new(&res.normalized_pattern);
             glob_builder.literal_separator(true);
             if ignorecase {
                 glob_builder.case_insensitive(true);
             }
-            
+
             match glob_builder.build() {
                 Ok(glob) => {
                     builder.add(glob);
@@ -2264,10 +2264,7 @@ mod tests {
         // "MyAgent" should not conflict with its own reservation
         let conflicts =
             check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
-        assert!(
-            conflicts.is_empty(),
-            "own reservations should be skipped"
-        );
+        assert!(conflicts.is_empty(), "own reservations should be skipped");
     }
 
     #[test]
@@ -2295,9 +2292,8 @@ mod tests {
         let paths = vec!["shared/README.md".to_string()];
 
         // SharedAgent's non-exclusive reservation should not block
-        let conflicts =
-            check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
-                .expect("conflicts");
+        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
+            .expect("conflicts");
         assert!(
             conflicts.is_empty(),
             "non-exclusive reservations should not conflict"
@@ -3008,7 +3004,7 @@ mod tests {
             "expires_ts": future.to_rfc3339(),
             "released_ts": null
         });
-        std::fs::write(&outside_res_dir.join("escaped.json"), payload.to_string())
+        std::fs::write(outside_res_dir.join("escaped.json"), payload.to_string())
             .expect("write escaped reservation");
         symlink(&outside_res_dir, archive.join("file_reservations"))
             .expect("symlink reservations dir");

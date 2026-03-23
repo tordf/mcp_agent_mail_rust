@@ -6,58 +6,23 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::sync::LazyLock;
 
-use ammonia::Builder;
 use ftui::PackedRgba;
 use ftui::text::Text;
 use ftui::text::{Line, Span};
 pub use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown};
-
-/// Sanitizer for hostile inline HTML embedded in markdown message bodies.
-///
-/// This keeps markdown syntax intact while stripping dangerous HTML/script
-/// payloads and disallowed URL schemes before terminal rendering.
-static TERMINAL_MARKDOWN_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
-    let mut builder = Builder::new();
-    builder.clean_content_tags(["script", "style"].into_iter().collect::<HashSet<_>>());
-    builder.url_schemes(
-        ["http", "https", "mailto", "data"]
-            .into_iter()
-            .collect::<HashSet<_>>(),
-    );
-
-    // Prevent XSS via data:text/html URIs in terminal OSC 8 links
-    builder.attribute_filter(|element, attribute, value| {
-        if attribute == "href" || attribute == "src" {
-            let value_lower = value.trim().to_ascii_lowercase();
-            if value_lower.starts_with("data:") {
-                if element == "img"
-                    && attribute == "src"
-                    && value_lower.starts_with("data:image/")
-                    && !value_lower.starts_with("data:image/svg")
-                {
-                    Some(value.into())
-                } else {
-                    None
-                }
-            } else {
-                Some(value.into())
-            }
-        } else {
-            Some(value.into())
-        }
-    });
-
-    builder
-});
 
 #[must_use]
 fn sanitize_body(body: &str) -> String {
     if body.is_empty() {
         return String::new();
     }
-    TERMINAL_MARKDOWN_SANITIZER.clean(body).to_string()
+    // We previously used ammonia here, but ammonia is an HTML sanitizer.
+    // Running it on raw Markdown destroys valid code like `<T>` generics,
+    // and fails to sanitize Markdown links `[link](data:...)` anyway.
+    // Terminal rendering does not evaluate <script> tags, and ftui's OSC 8
+    // rendering handles control character sanitization.
+    body.to_string()
 }
 
 /// Render a message body with auto-detected markdown support.
