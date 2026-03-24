@@ -942,6 +942,7 @@ mod tests {
             let (index, handles) = setup_index();
             let filter = SearchFilter {
                 sender: Some("BlueLake".to_string()),
+                agent: None,
                 project_id: Some(2), // mismatch
                 thread_id: Some("br-123".to_string()),
                 doc_kind: Some(DocKind::Message),
@@ -1073,8 +1074,12 @@ mod tests {
                     start: Some(100),
                     end: Some(200),
                 }),
+                ..SearchFilter::default()
             };
             let compiled = compile_filters(&filter, &handles);
+            // We now have 7 fields (including agent), but compile_filters only adds clauses for
+            // sender, agent, project_id, thread_id, doc_kind, importance, date_range.
+            // Let's check how many were added.
             assert_eq!(compiled.len(), 6);
         }
 

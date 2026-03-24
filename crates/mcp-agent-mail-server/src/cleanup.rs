@@ -12,7 +12,7 @@
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{Config, pattern_overlap::CompiledPattern};
 use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, FileReservationRow, create_pool, now_micros,
     queries::{
@@ -570,7 +570,7 @@ fn check_git_listed_activity(
     };
 
     let Some(stdout) = child.stdout.take() else {
-        return ActivityProbeResult::Inactive;
+        return ActivityProbeResult::Unsupported;
     };
 
     let reader = BufReader::new(stdout);
@@ -589,9 +589,10 @@ fn check_git_listed_activity(
         }
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
-    ActivityProbeResult::Inactive
+    match child.wait() {
+        Ok(status) if status.success() => ActivityProbeResult::Inactive,
+        Ok(_) | Err(_) => ActivityProbeResult::Unsupported,
+    }
 }
 
 fn check_directory_activity_fallback(
@@ -650,26 +651,55 @@ fn check_glob_activity_fallback_with_limit(
     grace_us: i64,
     path_limit: usize,
 ) -> ActivityProbeResult {
-    let base_str = workspace.to_string_lossy().replace('\\', "/");
-    let base_escaped = glob::Pattern::escape(&base_str);
-    // We use format! instead of Path::join because base_escaped is a string
-    // that may contain glob escape sequences that Path::join could mishandle.
-    let full_pattern = if base_str.ends_with('/') {
-        format!("{base_escaped}{pattern}")
-    } else {
-        format!("{base_escaped}/{pattern}")
-    };
-
-    let Ok(paths) = glob::glob(&full_pattern) else {
+    let compiled = CompiledPattern::new(pattern);
+    if !compiled.is_matchable() {
         return ActivityProbeResult::Unsupported;
-    };
+    }
 
-    for (scanned, path) in paths.flatten().enumerate() {
-        if scanned >= path_limit {
+    let scan_root = compiled
+        .first_literal_segment()
+        .map(|segment| workspace.join(segment))
+        .unwrap_or_else(|| workspace.to_path_buf());
+    if !scan_root.exists() {
+        return ActivityProbeResult::Inactive;
+    }
+
+    let scan_matched_file = |path: &Path, scanned: &mut usize| {
+        let Ok(relative) = path.strip_prefix(workspace) else {
+            return ActivityProbeResult::Inactive;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if !compiled.matches(&relative) {
+            return ActivityProbeResult::Inactive;
+        }
+        if *scanned >= path_limit {
             return ActivityProbeResult::Truncated;
         }
-        if path_modified_within_grace(&path, now_us, grace_us) {
-            return ActivityProbeResult::Active;
+        *scanned += 1;
+        if path_modified_within_grace(path, now_us, grace_us) {
+            ActivityProbeResult::Active
+        } else {
+            ActivityProbeResult::Inactive
+        }
+    };
+
+    let mut scanned = 0usize;
+    if scan_root.is_file() {
+        return scan_matched_file(&scan_root, &mut scanned);
+    }
+    for entry in walkdir::WalkDir::new(&scan_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        match scan_matched_file(entry.path(), &mut scanned) {
+            ActivityProbeResult::Inactive => {}
+            ActivityProbeResult::Active => return ActivityProbeResult::Active,
+            ActivityProbeResult::Truncated => return ActivityProbeResult::Truncated,
+            ActivityProbeResult::Unsupported => return ActivityProbeResult::Unsupported,
         }
     }
     ActivityProbeResult::Inactive
@@ -1294,6 +1324,38 @@ mod tests {
             check_directory_activity_fallback_with_limit(&workspace.join("src"), now, 1_000_000, 1),
             ActivityProbeResult::Active,
             "directory entries should not consume the file activity probe budget"
+        );
+    }
+
+    #[test]
+    fn glob_probe_limit_counts_only_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let nested_dir = workspace.join("src").join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("lib.rs"), "pub fn nested() {}\n").unwrap();
+
+        let now = now_micros();
+        assert_eq!(
+            check_glob_activity_fallback_with_limit(workspace, "src/**", now, 1_000_000, 1),
+            ActivityProbeResult::Active,
+            "glob directory matches should not consume the file activity probe budget"
+        );
+    }
+
+    #[test]
+    fn glob_probe_deduplicates_overlapping_directory_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let nested_dir = workspace.join("src").join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("lib.rs"), "pub fn nested() {}\n").unwrap();
+
+        let now = now_micros();
+        assert_eq!(
+            check_glob_activity_fallback_with_limit(workspace, "src/**", now, -1, 1),
+            ActivityProbeResult::Inactive,
+            "overlapping directory matches should not count the same file more than once"
         );
     }
 

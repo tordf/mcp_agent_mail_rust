@@ -46,19 +46,19 @@ pub use frankensearch::{
 
 // ─── Doc ID Conversion ──────────────────────────────────────────────────────
 
-/// Convert a domain-specific `u64` document ID to frankensearch's `String` format.
+/// Convert a domain-specific `i64` document ID to frankensearch's `String` format.
 #[inline]
 #[must_use]
-pub fn doc_id_to_string(id: u64) -> String {
+pub fn doc_id_to_string(id: i64) -> String {
     id.to_string()
 }
 
-/// Parse a frankensearch `String` doc ID back to the domain-specific `u64`.
+/// Parse a frankensearch `String` doc ID back to the domain-specific `i64`.
 ///
-/// Returns `None` if the string is not a valid `u64`.
+/// Returns `None` if the string is not a valid `i64`.
 #[inline]
 #[must_use]
-pub fn doc_id_from_string(id: &str) -> Option<u64> {
+pub fn doc_id_from_string(id: &str) -> Option<i64> {
     id.parse().ok()
 }
 
@@ -94,12 +94,12 @@ pub fn from_fs_config(config: &FsTwoTierConfig) -> crate::two_tier::TwoTierConfi
 
 /// Convert a frankensearch `ScoredResult` to a search-core `ScoredResult`.
 ///
-/// Returns `None` if the `doc_id` cannot be parsed as `u64`.
+/// Returns `None` if the `doc_id` cannot be parsed as `i64`.
 /// Domain-specific fields (`doc_kind`, `project_id`) are set to defaults;
 /// callers should enrich them from the document store.
 #[must_use]
 pub fn from_fs_scored_result(result: &FsScoredResult) -> Option<crate::two_tier::ScoredResult> {
-    let doc_id: u64 = result.doc_id.parse().ok()?;
+    let doc_id: i64 = result.doc_id.parse().ok()?;
     Some(crate::two_tier::ScoredResult {
         idx: 0,
         doc_id,
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn doc_id_roundtrip() {
-        let id: u64 = 42;
+        let id: i64 = 42;
         let s = doc_id_to_string(id);
         assert_eq!(s, "42");
         assert_eq!(doc_id_from_string(&s), Some(id));
@@ -431,22 +431,22 @@ mod tests {
     }
 
     #[test]
-    fn doc_id_u64_max() {
-        let max = u64::MAX;
+    fn doc_id_i64_max() {
+        let max = i64::MAX;
         let s = doc_id_to_string(max);
-        assert_eq!(s, "18446744073709551615");
+        assert_eq!(s, "9223372036854775807");
         assert_eq!(doc_id_from_string(&s), Some(max));
     }
 
     #[test]
-    fn doc_id_negative_string_returns_none() {
-        assert_eq!(doc_id_from_string("-1"), None);
+    fn doc_id_negative_string_returns_value() {
+        assert_eq!(doc_id_from_string("-1"), Some(-1));
     }
 
     #[test]
     fn doc_id_overflow_string_returns_none() {
-        // u64::MAX + 1
-        assert_eq!(doc_id_from_string("18446744073709551616"), None);
+        // i64::MAX + 1
+        assert_eq!(doc_id_from_string("9223372036854775808"), None);
     }
 
     // ── Config edge cases ─────────────────────────────────────────────

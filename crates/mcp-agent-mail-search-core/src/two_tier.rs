@@ -1189,17 +1189,16 @@ impl Iterator for TwoTierSearchIter<'_> {
                         self.search_metrics.fast_embed_us =
                             u64::try_from(fast_embed_start.elapsed().as_micros())
                                 .unwrap_or(u64::MAX);
-                        warn!(error = %e, "Fast embedding failed");
-
-                        if self.searcher.config.quality_only {
-                            self.phase = 2;
-                            drop(_embed_fast_span);
-                            drop(_search_guard);
-                            return Some(self.run_refinement_phase());
-                        }
+                        warn!(error = %e, "Fast embedding failed; falling back to quality refinement if available");
 
                         self.phase = 2;
-                        None
+                        drop(_embed_fast_span);
+                        drop(_search_guard);
+                        if self.searcher.quality_embedder.is_some() {
+                            Some(self.run_refinement_phase())
+                        } else {
+                            None
+                        }
                     }
                 }
             }
@@ -1575,13 +1574,15 @@ mod tests {
         let config = TwoTierConfig::default();
         let mut index = TwoTierIndex::new(&config);
 
-        for i in 0..10_u64 {
+        for i in 0..10_i64 {
+            #[allow(clippy::cast_precision_loss)]
+            let value = 0.1 * (i + 1) as f32;
             index
                 .add_entry(TwoTierEntry {
                     doc_id: i,
                     doc_kind: crate::document::DocKind::Message,
                     project_id: Some(1),
-                    fast_embedding: vec![f16::from_f32(0.1 * i as f32); config.fast_dimension],
+                    fast_embedding: vec![f16::from_f32(value); config.fast_dimension],
                     quality_embedding: vec![f16::from_f32(0.0); config.quality_dimension],
                     has_quality: false,
                 })
@@ -1597,7 +1598,7 @@ mod tests {
         let config = TwoTierConfig::default();
         let mut index = TwoTierIndex::new(&config);
 
-        for i in 0..10_u64 {
+        for i in 0..10_i64 {
             #[allow(clippy::cast_precision_loss)]
             let value = 0.1 * (i + 1) as f32;
             index
@@ -2128,7 +2129,7 @@ mod tests {
         let writer = thread::spawn(move || {
             writer_barrier.wait();
             let mut success_count = 0_u32;
-            for i in 0..50_u64 {
+            for i in 0..50_i64 {
                 let value = 0.1 * (i + 1) as f32;
                 let entry = TwoTierEntry {
                     doc_id: i,
@@ -2195,7 +2196,7 @@ mod tests {
 
         // Build index with test data
         let mut index = TwoTierIndex::new(&config);
-        for i in 0..100_u64 {
+        for i in 0..100_i64 {
             let value = 0.01 * (i + 1) as f32;
             index
                 .add_entry(TwoTierEntry {
@@ -2357,14 +2358,51 @@ mod tests {
             })
             .unwrap();
 
-        let fast_embedder: Arc<dyn TwoTierEmbedder> =
-            Arc::new(StubEmbedder::new("fast", vec![1.0, 0.0, 0.0, 0.0]));
-        // No quality embedder provided
-        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), None, config);
+        let quality_embedder: Arc<dyn TwoTierEmbedder> =
+            Arc::new(StubEmbedder::new("quality", vec![1.0, 0.0, 0.0, 0.0]));
+        // No fast embedder provided
+        let searcher = TwoTierSearcher::new(&index, None, Some(quality_embedder), config);
 
         let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
         assert_eq!(phases.len(), 1);
-        assert!(matches!(phases[0], SearchPhase::Refined { .. }));
+        assert!(
+            matches!(phases[0], SearchPhase::Refined { .. }),
+            "should get refined results even with failing fast embedder"
+        );
+    }
+
+    #[test]
+    fn test_failing_fast_embedder_falls_back_to_quality_when_available() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            ..TwoTierConfig::default()
+        };
+
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: crate::document::DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+
+        let fast_embedder: Arc<dyn TwoTierEmbedder> = Arc::new(FailingEmbedder);
+        let quality_embedder: Arc<dyn TwoTierEmbedder> =
+            Arc::new(StubEmbedder::new("quality", vec![1.0, 0.0, 0.0, 0.0]));
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
+        assert_eq!(phases.len(), 1);
+        assert!(
+            matches!(phases[0], SearchPhase::Refined { .. }),
+            "quality refinement should still run when the fast embedder fails"
+        );
     }
 
     #[test]
@@ -2433,8 +2471,8 @@ mod tests {
             handles.push(thread::spawn(move || {
                 bar.wait();
                 let mut count = 0_u32;
-                for i in 0..20_u64 {
-                    let doc_id = (w as u64) * 100 + i;
+                for i in 0..20_i64 {
+                    let doc_id = (w as i64) * 100 + i;
                     let value = 0.01 * (doc_id + 1) as f32;
                     let entry = TwoTierEntry {
                         doc_id,
@@ -2870,8 +2908,8 @@ mod tests {
     #[test]
     fn quality_scores_for_indices_out_of_bounds() {
         let config = TwoTierConfig {
-            fast_dimension: 4,
-            quality_dimension: 4,
+            fast_dimension: 2,
+            quality_dimension: 2,
             ..TwoTierConfig::default()
         };
         let index = TwoTierIndex::new(&config);
