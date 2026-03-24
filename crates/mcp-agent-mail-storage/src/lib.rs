@@ -6991,34 +6991,34 @@ fn append_trailers(message: &str) -> String {
 /// canonicalization (fast path) and only falls back to `canonicalize()`
 /// if `strip_prefix` fails.
 fn rel_path_cached(canonical_base: &Path, target: &Path) -> Result<String> {
-    // Fast path: try strip_prefix without canonicalizing target.
-    // This succeeds when target is a direct join of the base (no symlinks).
-    if let Ok(rel) = target.strip_prefix(canonical_base) {
-        return Ok(rel.to_string_lossy().replace('\\', "/"));
-    }
-
-    // Slow path: avoid `canonicalize()` due to heavy `readlink` syscall overhead.
-    // Instead, normalize the path manually. Since `canonical_base` is absolute
-    // and canonical, we can normalize `target` and try stripping again.
-    let mut target_norm = PathBuf::new();
-    for component in target.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                target_norm.pop();
+    // Resolve symlinks in the target path for safe comparison.
+    // If canonicalize fails (file doesn't exist yet), fall back to manual normalization.
+    let canonical_target = match target.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // Manual normalization for paths that don't exist on disk yet.
+            let mut norm = PathBuf::new();
+            for component in target.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        norm.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    _ => norm.push(component),
+                }
             }
-            std::path::Component::CurDir => {}
-            _ => target_norm.push(component),
+            norm
         }
-    }
+    };
 
-    target_norm
+    canonical_target
         .strip_prefix(canonical_base)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .map_err(|_| {
             StorageError::InvalidPath(format!(
                 "Cannot compute relative path from {} to {}",
                 canonical_base.display(),
-                target_norm.display()
+                canonical_target.display()
             ))
         })
 }
@@ -7106,6 +7106,17 @@ fn write_json(path: &Path, value: &serde_json::Value, sync: bool) -> Result<()> 
 /// `fs::rename` is guaranteed to be atomic (same filesystem).
 fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     use std::io::Write as _;
+
+    // Refuse to write through symlinks (prevents symlink escape attacks)
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to write through symlink: {}", path.display()),
+            )));
+        }
+    }
+
     let parent = path.parent().unwrap_or(Path::new("."));
 
     // Use pid + seq + filename-hash for a unique temp name.
