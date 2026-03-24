@@ -368,7 +368,7 @@ set_artifact_url() {
 }
 
 check_disk_space() {
-  local min_kb=20480  # 20MB for two binaries
+  local min_kb=20480  # 20MB minimum for binaries alone
   local path="$DEST"
   if [ ! -d "$path" ]; then
     path=$(dirname "$path")
@@ -377,13 +377,44 @@ check_disk_space() {
     local avail_kb
     avail_kb=$(df -Pk "$path" | awk 'NR==2 {print $4}')
     if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$min_kb" ]; then
-      err "Insufficient disk space in $path (need at least 20MB)"
+      err "Insufficient disk space in $path (need at least 20MB, have $(( avail_kb / 1024 ))MB)"
       err "Free disk space or choose a different install directory with --dest."
       exit 1
+    fi
+    # Also check the storage root where the database lives (may be different partition)
+    local storage_dir="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
+    if [ -d "$storage_dir" ]; then
+      local storage_avail_kb
+      storage_avail_kb=$(df -Pk "$storage_dir" | awk 'NR==2 {print $4}')
+      if [ -n "$storage_avail_kb" ] && [ "$storage_avail_kb" -lt 102400 ]; then
+        warn "Low disk space in $storage_dir ($(( storage_avail_kb / 1024 ))MB free)."
+        warn "Database migration requires ~200-500MB of free space."
+        warn "Consider cleaning old backups: rm ${storage_dir}/storage.sqlite3.bak.* ${storage_dir}/storage.sqlite3.pre-python-import-* ${storage_dir}/storage.sqlite3.corrupt-*"
+      fi
     fi
   else
     warn "df not found; skipping disk space check"
   fi
+}
+
+# Helper: check if there is sufficient space to copy a file to a destination directory
+check_copy_disk_space() {
+  local src_path="$1"
+  local dest_dir="$2"
+  local multiplier="${3:-2}"
+  command -v df >/dev/null 2>&1 || return 0
+  command -v du >/dev/null 2>&1 || return 0
+  local src_kb dest_avail_kb
+  src_kb=$(du -k "$src_path" 2>/dev/null | awk '{print $1}')
+  dest_avail_kb=$(df -Pk "$dest_dir" 2>/dev/null | awk 'NR==2 {print $4}')
+  if [ -z "$src_kb" ] || [ -z "$dest_avail_kb" ]; then
+    return 0  # Cannot determine sizes; assume OK
+  fi
+  local needed_kb=$(( src_kb * multiplier ))
+  if [ "$dest_avail_kb" -lt "$needed_kb" ]; then
+    return 1
+  fi
+  return 0
 }
 
 check_write_permissions() {
@@ -1593,10 +1624,10 @@ stop_python_server() {
   fi
 
   # Kill all Python mcp_agent_mail processes, not just the single detected PID
+  local killed_any=0
   local all_py_pids
   all_py_pids=$(pgrep -f "mcp_agent_mail|mcp.agent.mail" 2>/dev/null || true)
   if [ -n "$all_py_pids" ]; then
-    local killed_any=0
     while IFS= read -r pid; do
       [ -z "$pid" ] && continue
       local cmdline
@@ -1646,6 +1677,7 @@ stop_python_server() {
   if [ -n "$PYTHON_PID" ] && kill -0 "$PYTHON_PID" 2>/dev/null; then
     info "Stopping Python mcp-agent-mail server (PID $PYTHON_PID)"
     kill "$PYTHON_PID" 2>/dev/null || true
+    killed_any=1
     local waited=0
     while [ "$waited" -lt 5 ] && kill -0 "$PYTHON_PID" 2>/dev/null; do
       sleep 1
@@ -1658,7 +1690,7 @@ stop_python_server() {
     fi
   fi
 
-  # Verify port 8765 is free
+  # Verify port 8765 is free (only check for Python processes, never kill Rust)
   if command -v ss &>/dev/null; then
     local port_holder
     port_holder=$(ss -tlnp 2>/dev/null | grep ":8765 " || true)
@@ -1668,12 +1700,17 @@ stop_python_server() {
       if [ -n "$holder_pid" ]; then
         warn "Port 8765 still held by Python process (PID $holder_pid); force-killing"
         kill -9 "$holder_pid" 2>/dev/null || true
+        killed_any=1
         sleep 1
       fi
     fi
   fi
 
-  ok "Python server stopped"
+  if [ "${killed_any:-0}" -eq 1 ]; then
+    ok "Python server stopped"
+  else
+    verbose "stop_python_server:no_python_processes_found"
+  fi
 }
 
 # T5.2: Resolve database path differences between Python and Rust
@@ -1834,16 +1871,115 @@ resolve_database_path() {
   mkdir -p "$RUST_STORAGE_ROOT"
 
   if [ -f "$rust_db" ] && [ -s "$rust_db" ]; then
-    local rust_backup_ts rust_backup
-    rust_backup_ts=$(date -u +%Y%m%dT%H%M%SZ)
-    rust_backup="${rust_db}.pre-python-import-${rust_backup_ts}"
-    copy_sqlite_snapshot "$rust_db" "$rust_backup"
-    ok "Backed up existing Rust database to $rust_backup"
+    # CRITICAL: Before overwriting the Rust DB, check if it is already in i64
+    # (integer) timestamp format. If so, the migration was already done on a
+    # previous run and we must NOT overwrite the live Rust database with the
+    # stale Python snapshot — that would lose all data added since migration.
+    local rust_db_format_check=""
+    local _saved_python_db_format="$PYTHON_DB_FORMAT"
+    if probe_database_format_with_sqlite "$rust_db" 2>/dev/null; then
+      rust_db_format_check="$PYTHON_DB_FORMAT"
+    elif probe_database_format_with_installed_am "$rust_db" 2>/dev/null; then
+      rust_db_format_check="$PYTHON_DB_FORMAT"
+    fi
+    # Restore PYTHON_DB_FORMAT — the probes above clobber this global
+    PYTHON_DB_FORMAT="$_saved_python_db_format"
+    verbose "resolve_database_path:rust_db_format format='${rust_db_format_check}'"
+
+    case "$rust_db_format_check" in
+      i64\ microseconds\ *)
+        info "Rust database already contains i64 timestamps — migration was already completed."
+        info "Skipping Python database import to preserve existing Rust data."
+        # Write the migration marker if it doesn't exist yet (retroactive)
+        if [ ! -f "${PYTHON_MIGRATION_MARKER:-$HOME/.config/mcp-agent-mail/.python-migration-complete}" ]; then
+          local _marker="${PYTHON_MIGRATION_MARKER:-$HOME/.config/mcp-agent-mail/.python-migration-complete}"
+          mkdir -p "$(dirname "$_marker")" 2>/dev/null || true
+          printf 'migrated_at=%s\nrust_db=%s\nnote=retroactive marker from resolve_database_path\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rust_db" \
+            > "$_marker" 2>/dev/null || true
+        fi
+        return 0
+        ;;
+      TEXT\ timestamps\ *|mixed\ format\ *)
+        # Rust DB has TEXT timestamps — it needs migration, proceed with overwrite
+        verbose "resolve_database_path:rust_db_needs_migration format='${rust_db_format_check}'"
+        ;;
+      "")
+        # Could not determine Rust DB format (corrupt or locked).
+        # SAFE DEFAULT: do NOT overwrite a database we can't read — it may contain
+        # valuable data that just needs repair. Let `am doctor` handle recovery.
+        warn "Cannot determine format of existing Rust database at $rust_db"
+        warn "Skipping Python database import to avoid overwriting potentially recoverable data."
+        warn "Run 'am doctor repair' or 'am doctor reconstruct' to fix the database."
+        return 0
+        ;;
+      *)
+        # Unknown format — also don't overwrite
+        warn "Unexpected Rust database format: ${rust_db_format_check}"
+        warn "Skipping Python database import to preserve existing data."
+        return 0
+        ;;
+    esac
+
+    # Check disk space before creating backup + copy (need ~3x the DB size)
+    local python_db_size_kb=0
+    local rust_db_size_kb=0
+    if command -v du >/dev/null 2>&1; then
+      python_db_size_kb=$(du -k "$PYTHON_DB_PATH" 2>/dev/null | awk '{print $1}')
+      rust_db_size_kb=$(du -k "$rust_db" 2>/dev/null | awk '{print $1}')
+    fi
+    local needed_kb=$(( (python_db_size_kb + rust_db_size_kb) * 3 ))
+    if [ "$needed_kb" -gt 0 ] && command -v df >/dev/null 2>&1; then
+      local avail_kb
+      avail_kb=$(df -Pk "$RUST_STORAGE_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+      if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$needed_kb" ]; then
+        local needed_mb=$(( needed_kb / 1024 ))
+        local avail_mb=$(( avail_kb / 1024 ))
+        warn "Insufficient disk space for database migration."
+        warn "  Need ~${needed_mb}MB, have ${avail_mb}MB free."
+        warn "  Free disk space and re-run the installer."
+        warn "Skipping database import to avoid filling disk."
+        return 0
+      fi
+    fi
+
+    # Cap backup count: don't create more than 3 pre-python-import backups
+    local existing_import_backups=0
+    existing_import_backups=$(ls -1 "${rust_db}.pre-python-import-"* 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$existing_import_backups" -ge 3 ]; then
+      warn "Already ${existing_import_backups} pre-python-import backups exist. Skipping backup creation."
+      warn "Clean old backups with: rm ${rust_db}.pre-python-import-*"
+    else
+      local rust_backup_ts rust_backup
+      rust_backup_ts=$(date -u +%Y%m%dT%H%M%SZ)
+      rust_backup="${rust_db}.pre-python-import-${rust_backup_ts}"
+      copy_sqlite_snapshot "$rust_db" "$rust_backup"
+      ok "Backed up existing Rust database to $rust_backup"
+    fi
+
     copy_sqlite_snapshot "$PYTHON_DB_PATH" "$rust_db"
     ok "Replaced Rust database with Python snapshot at $rust_db"
     export DATABASE_URL="sqlite+aiosqlite:///$rust_db"
     PYTHON_DB_MIGRATED_PATH="$rust_db"
     return 0
+  fi
+
+  # Check disk space before copying (need ~2x the Python DB size)
+  local python_db_size_kb=0
+  if command -v du >/dev/null 2>&1; then
+    python_db_size_kb=$(du -k "$PYTHON_DB_PATH" 2>/dev/null | awk '{print $1}')
+  fi
+  local needed_kb=$(( python_db_size_kb * 2 ))
+  if [ "$needed_kb" -gt 0 ] && command -v df >/dev/null 2>&1; then
+    local avail_kb
+    avail_kb=$(df -Pk "$RUST_STORAGE_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$needed_kb" ]; then
+      local needed_mb=$(( needed_kb / 1024 ))
+      local avail_mb=$(( avail_kb / 1024 ))
+      warn "Insufficient disk space for database copy (need ~${needed_mb}MB, have ${avail_mb}MB)."
+      warn "Skipping database import."
+      return 0
+    fi
   fi
 
   copy_sqlite_snapshot "$PYTHON_DB_PATH" "$rust_db"
@@ -4238,12 +4374,19 @@ print_install_plan() {
 
   # Section 3: Python migration
   if [ "$PYTHON_DETECTED" -eq 1 ]; then
-    echo -e "\033[${section_color}m[Python Migration]\033[0m"
-    [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && echo "  Will disable alias in:  $PYTHON_ALIAS_FILE (line $PYTHON_ALIAS_LINE)"
-    [ "$PYTHON_BINARY_FOUND" -eq 1 ] && echo "  Will displace binary:   $PYTHON_BINARY_PATH"
-    [ -n "$PYTHON_PID" ] && echo "  Will stop Python server: PID $PYTHON_PID"
-    [ "$PYTHON_CLONE_FOUND" -eq 1 ] && echo "  Python clone detected:  $PYTHON_CLONE_PATH (not modified)"
-    echo ""
+    local _plan_marker="$HOME/.config/mcp-agent-mail/.python-migration-complete"
+    if [ -f "$_plan_marker" ] && [ "$FORCE_MIGRATE" -ne 1 ]; then
+      echo -e "\033[${section_color}m[Python Migration]\033[0m"
+      echo "  Already migrated — skipping (marker: $_plan_marker)"
+      echo ""
+    else
+      echo -e "\033[${section_color}m[Python Migration]\033[0m"
+      [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && echo "  Will disable alias in:  $PYTHON_ALIAS_FILE (line $PYTHON_ALIAS_LINE)"
+      [ "$PYTHON_BINARY_FOUND" -eq 1 ] && echo "  Will displace binary:   $PYTHON_BINARY_PATH"
+      [ -n "$PYTHON_PID" ] && echo "  Will stop Python server: PID $PYTHON_PID"
+      [ "$PYTHON_CLONE_FOUND" -eq 1 ] && echo "  Python clone detected:  $PYTHON_CLONE_PATH (not modified)"
+      echo ""
+    fi
   fi
 
   # Section 4: MCP config
@@ -4561,9 +4704,31 @@ if detect_mac_direct_exec_compat_mode; then
   fi
 fi
 
+# T5.0: Check if Python→Rust migration was already completed on a previous run.
+# A marker file records that the database was successfully migrated, so we never
+# attempt to overwrite the live Rust database with the old Python snapshot again.
+PYTHON_MIGRATION_MARKER="$HOME/.config/mcp-agent-mail/.python-migration-complete"
+PYTHON_MIGRATION_ALREADY_DONE=0
+if [ -f "$PYTHON_MIGRATION_MARKER" ]; then
+  PYTHON_MIGRATION_ALREADY_DONE=1
+  verbose "python_migration_marker:found path=${PYTHON_MIGRATION_MARKER}"
+fi
+
 # Displace Python installation if detected (T2.2)
 if [ "$PYTHON_DETECTED" -eq 1 ]; then
-  if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
+  if [ "$PYTHON_MIGRATION_ALREADY_DONE" -eq 1 ] && [ "$FORCE_MIGRATE" -ne 1 ]; then
+    MIGRATE_PYTHON=0
+    info "Python installation detected but migration was already completed previously."
+    info "  Marker: $PYTHON_MIGRATION_MARKER"
+    info "  To force re-migration: re-run with --migrate"
+    # Still displace alias/binary so `am` resolves to Rust, but skip DB migration.
+    # Do NOT call stop_python_server here — if migration is already done, the
+    # running server (if any) is the Rust server, not Python.
+    if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
+      displace_python_alias 2>/dev/null || true
+      displace_python_binary 2>/dev/null || true
+    fi
+  elif [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
     MIGRATE_PYTHON=0
     warn "Keeping the existing Python installation active because this macOS host blocks direct execution of the newly installed Rust binaries."
   else
@@ -4614,7 +4779,11 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
         exit 1
       fi
       resolve_database_path
-      migrate_env_config
+      # Only migrate env config if resolve_database_path actually copied a Python DB.
+      # PYTHON_DB_MIGRATED_PATH is set only when a DB was copied and needs migration.
+      if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
+        migrate_env_config
+      fi
     fi
   fi
 fi
@@ -5102,14 +5271,30 @@ sqlite_timestamp_fallback_migration() {
     return 1
   fi
 
-  local backup_ts backup_path
-  backup_ts=$(date -u +%Y%m%d_%H%M%S)
-  backup_path="${db_path}.bak.${backup_ts}"
-  if copy_sqlite_snapshot "$db_path" "$backup_path"; then
-    SQLITE_FALLBACK_BACKUP_PATH="$backup_path"
-    ok "Created fallback migration backup at $backup_path"
+  # Cap backup count to prevent disk fill-up during cascading recovery.
+  local existing_bak_count=0
+  existing_bak_count=$(ls -1 "${db_path}.bak."* 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$existing_bak_count" -ge 3 ]; then
+    verbose "sqlite_timestamp_fallback_migration:backup_skipped existing_count=${existing_bak_count}"
+    warn "Skipping fallback backup (${existing_bak_count} backups already exist). Clean old backups to reclaim space."
   else
-    warn "Failed to create fallback migration backup at $backup_path"
+    # Check disk space before creating backup
+    local _db_size_kb=0 _avail_kb=0
+    _db_size_kb=$(du -k "$db_path" 2>/dev/null | awk '{print $1}')
+    _avail_kb=$(df -Pk "$(dirname "$db_path")" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ "${_avail_kb:-0}" -gt 0 ] && [ "$_avail_kb" -lt "$(( _db_size_kb * 2 ))" ]; then
+      warn "Insufficient disk space for fallback backup (need ~$(( _db_size_kb * 2 / 1024 ))MB, have $(( _avail_kb / 1024 ))MB). Skipping."
+    else
+      local backup_ts backup_path
+      backup_ts=$(date -u +%Y%m%d_%H%M%S)
+      backup_path="${db_path}.bak.${backup_ts}"
+      if copy_sqlite_snapshot "$db_path" "$backup_path"; then
+        SQLITE_FALLBACK_BACKUP_PATH="$backup_path"
+        ok "Created fallback migration backup at $backup_path"
+      else
+        warn "Failed to create fallback migration backup at $backup_path"
+      fi
+    fi
   fi
 
   local sql_file updates
@@ -5223,7 +5408,18 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
 
   migration_pristine_ts=$(date -u +%Y%m%d_%H%M%S)
   migration_pristine_backup="${PYTHON_DB_MIGRATED_PATH}.pre-migrate.${migration_pristine_ts}"
-  if copy_sqlite_snapshot "$PYTHON_DB_MIGRATED_PATH" "$migration_pristine_backup"; then
+
+  # Check disk space and existing backup count before creating pristine snapshot
+  local _pre_migrate_count=0
+  _pre_migrate_count=$(ls -1 "${PYTHON_DB_MIGRATED_PATH}.pre-migrate."* 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$_pre_migrate_count" -ge 3 ]; then
+    migration_pristine_backup=""
+    warn "Skipping pristine backup (${_pre_migrate_count} pre-migrate backups already exist)."
+    warn "Clean old backups: rm ${PYTHON_DB_MIGRATED_PATH}.pre-migrate.*"
+  elif ! check_copy_disk_space "$PYTHON_DB_MIGRATED_PATH" "$(dirname "$PYTHON_DB_MIGRATED_PATH")" 2; then
+    migration_pristine_backup=""
+    warn "Insufficient disk space for pristine migration snapshot. Skipping backup."
+  elif copy_sqlite_snapshot "$PYTHON_DB_MIGRATED_PATH" "$migration_pristine_backup"; then
     verbose "migration:pristine_backup path=${migration_pristine_backup}"
   else
     migration_pristine_backup=""
@@ -5530,6 +5726,19 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
       warn "Preserving pristine migration snapshot for manual recovery:"
       warn "  $migration_pristine_backup"
     fi
+  fi
+
+  if [ "$migration_succeeded" -eq 1 ]; then
+    # Write migration-complete marker so future installer runs skip Python migration entirely.
+    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
+    printf 'migrated_at=%s\nrust_db=%s\npython_db=%s\ninstaller_version=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${RUST_DB_PATH:-unknown}" \
+      "${PYTHON_DB_PATH:-unknown}" \
+      "${VERSION:-unknown}" \
+      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
+    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER}"
+    ok "Python→Rust migration marker saved (future installs will skip migration)"
   fi
 
   if [ "$migration_succeeded" -ne 1 ]; then
