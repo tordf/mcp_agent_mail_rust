@@ -1031,6 +1031,7 @@ mod tests {
             attachments_policy: "auto".to_string(),
             contact_policy: "open".to_string(),
             reaper_exempt: 0,
+            registration_token: None,
         }
     }
 

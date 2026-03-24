@@ -301,6 +301,63 @@ pub fn generate_token() -> String {
     hex
 }
 
+/// Generate a cryptographically random URL-safe registration token (256-bit entropy).
+///
+/// Returns a 43-character base64url-encoded string (no padding) suitable for
+/// embedding in JSON responses and passing as `sender_token` parameters.
+#[must_use]
+pub fn generate_registration_token() -> String {
+    let mut bytes = [0u8; 32];
+    let _ = getrandom::getrandom(&mut bytes);
+    base64url_encode_nopad(&bytes)
+}
+
+/// Base64url encode without padding (RFC 4648 Section 5).
+fn base64url_encode_nopad(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((input.len() * 4).div_ceil(3));
+    let chunks = input.chunks(3);
+    for chunk in chunks {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Constant-time comparison of two byte slices.
+///
+/// Returns `true` if both slices are equal in length and content.
+/// Always compares all bytes to prevent timing side-channels.
+/// Equivalent to Python's `hmac.compare_digest`.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    // XOR-fold: accumulate differences without short-circuiting.
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Constant-time comparison of two string slices (convenience wrapper).
+#[must_use]
+pub fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    constant_time_eq(a.as_bytes(), b.as_bytes())
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_ENV_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, Option<String>>> =

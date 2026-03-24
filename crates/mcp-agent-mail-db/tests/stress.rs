@@ -1676,6 +1676,7 @@ fn cache_zipfian_thrashing() {
                 attachments_policy: "auto".to_string(),
                 contact_policy: "open".to_string(),
                 reaper_exempt: 0,
+                registration_token: None,
             }
         })
         .collect();
@@ -1772,6 +1773,7 @@ fn cache_zipfian_within_capacity() {
             attachments_policy: "auto".to_string(),
             contact_policy: "open".to_string(),
             reaper_exempt: 0,
+            registration_token: None,
         })
         .collect();
 
@@ -1842,6 +1844,7 @@ fn cache_concurrent_zipfian_access() {
                 attachments_policy: "auto".to_string(),
                 contact_policy: "open".to_string(),
                 reaper_exempt: 0,
+                registration_token: None,
             })
             .collect(),
     );

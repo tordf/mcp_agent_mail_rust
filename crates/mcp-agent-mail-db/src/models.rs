@@ -143,6 +143,12 @@ pub struct AgentRow {
     /// 0 = normal (subject to reaper), 1 = exempt (reaper skips this agent).
     #[sqlmodel(default = "0")]
     pub reaper_exempt: i64,
+
+    /// Registration token for sender identity verification.
+    /// Generated on registration; callers present it as `sender_token`
+    /// when sending messages to prove they own this agent identity.
+    #[sqlmodel(nullable)]
+    pub registration_token: Option<String>,
 }
 
 impl Default for AgentRow {
@@ -160,6 +166,7 @@ impl Default for AgentRow {
             attachments_policy: "auto".to_string(),
             contact_policy: "auto".to_string(),
             reaper_exempt: 0,
+            registration_token: None,
         }
     }
 }
@@ -181,6 +188,7 @@ impl AgentRow {
             attachments_policy: "auto".to_string(),
             contact_policy: "auto".to_string(),
             reaper_exempt: 0,
+            registration_token: None,
         }
     }
 

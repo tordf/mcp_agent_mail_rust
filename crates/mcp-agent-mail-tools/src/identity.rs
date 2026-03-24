@@ -225,6 +225,11 @@ pub struct AgentResponse {
     pub reaper_exempt: bool,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Registration token for sender identity verification.
+    /// Returned only on registration; callers must store it and present it as
+    /// `sender_token` when sending messages to prove ownership of this agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_token: Option<String>,
 }
 
 /// Whois response with optional recent commits
@@ -605,6 +610,26 @@ Check that all parameters have valid values."
     let row = db_outcome_to_mcp_result(agent_out)?;
     enqueue_agent_semantic_index(&row);
 
+    // Generate and persist a registration token for sender identity verification.
+    // Every registration (new or update) rotates the token so that only the
+    // most recent registrant can prove ownership.
+    let registration_token = mcp_agent_mail_core::setup::generate_registration_token();
+    if let Some(agent_id) = row.id {
+        let token_update = mcp_agent_mail_db::queries::update_agent_registration_token(
+            ctx.cx(),
+            &pool,
+            agent_id,
+            &registration_token,
+        )
+        .await;
+        if let Err(e) = db_outcome_to_mcp_result(token_update) {
+            tracing::warn!(
+                "failed to persist registration_token for agent {}: {e}",
+                row.name
+            );
+        }
+    }
+
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
     mcp_agent_mail_db::read_cache().put_agent(&row);
@@ -651,6 +676,7 @@ Check that all parameters have valid values."
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+        registration_token: Some(registration_token),
     };
 
     serde_json::to_string(&response)
@@ -804,6 +830,24 @@ Choose a different name (or omit the name to auto-generate one)."
     };
     enqueue_agent_semantic_index(&row);
 
+    // Generate and persist a registration token for sender identity verification.
+    let registration_token = mcp_agent_mail_core::setup::generate_registration_token();
+    if let Some(agent_id) = row.id {
+        let token_update = mcp_agent_mail_db::queries::update_agent_registration_token(
+            ctx.cx(),
+            &pool,
+            agent_id,
+            &registration_token,
+        )
+        .await;
+        if let Err(e) = db_outcome_to_mcp_result(token_update) {
+            tracing::warn!(
+                "failed to persist registration_token for agent {}: {e}",
+                row.name
+            );
+        }
+    }
+
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
     mcp_agent_mail_db::read_cache().put_agent(&row);
@@ -850,6 +894,7 @@ Choose a different name (or omit the name to auto-generate one)."
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+        registration_token: Some(registration_token),
     };
 
     serde_json::to_string(&response)
@@ -965,6 +1010,8 @@ pub async fn whois(
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            // Never expose registration_token in whois responses
+            registration_token: None,
         },
         recent_commits,
     };
@@ -1263,6 +1310,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            registration_token: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -1291,6 +1339,7 @@ mod tests {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            registration_token: None,
         };
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: AgentResponse = serde_json::from_str(&json_str).unwrap();
@@ -1317,6 +1366,7 @@ mod tests {
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                registration_token: None,
             },
             recent_commits: vec![CommitInfo {
                 hexsha: "abc123".into(),
@@ -1351,6 +1401,7 @@ mod tests {
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                registration_token: None,
             },
             recent_commits: vec![],
         };

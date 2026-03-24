@@ -1439,6 +1439,27 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v20: Sender identity verification (issue #42) ─────────────────
+    //
+    // Add a registration_token column to agents. Each agent receives a
+    // cryptographically random token at registration time. Callers present
+    // it as `sender_token` when sending messages to prove ownership of the
+    // agent identity. Without this, any agent can impersonate any other.
+    migrations.push(Migration::new(
+        "v20_agents_registration_token".to_string(),
+        "add registration_token column to agents for sender identity verification".to_string(),
+        "ALTER TABLE agents ADD COLUMN registration_token TEXT DEFAULT NULL".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v20_idx_agents_registration_token".to_string(),
+        "index on agents.registration_token for token lookup".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_agents_registration_token \
+         ON agents(registration_token)"
+            .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
