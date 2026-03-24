@@ -572,17 +572,27 @@ fn block_on_outcome<T>(
             } else {
                 500
             };
-            Err((status, e.to_string()))
+            tracing::error!("DB error (status {status}): {e}");
+            Err((status, match status {
+                404 => "Not found".to_string(),
+                _ => "Internal server error".to_string(),
+            }))
         }
         asupersync::Outcome::Cancelled(_) => Err((503, "Request cancelled".to_string())),
-        asupersync::Outcome::Panicked(p) => Err((500, format!("Internal error: {}", p.message()))),
+        asupersync::Outcome::Panicked(p) => {
+            tracing::error!("Task panicked: {}", p.message());
+            Err((500, "Internal server error".to_string()))
+        }
     }
 }
 
 fn render(name: &str, ctx: impl Serialize) -> Result<Option<String>, (u16, String)> {
     templates::render_template(name, ctx)
         .map(Some)
-        .map_err(|e| (500, format!("Template error: {e}")))
+        .map_err(|e| {
+            tracing::error!("Template render error: {e}");
+            (500, "Internal server error".to_string())
+        })
 }
 
 // ---------------------------------------------------------------------------
