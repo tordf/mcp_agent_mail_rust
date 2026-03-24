@@ -103,6 +103,17 @@ codegen-units = 1   # Single codegen unit for better optimization
 strip = true        # Remove debug symbols
 ```
 
+### Release Coordination
+
+Whenever the `mcp_agent_mail_rust` version changes, you must also refresh the pinned installer checksums in `/dp/agentic_coding_flywheel_setup`, even if you expect the `mcp_agent_mail` hash to stay the same.
+
+```bash
+cd /dp/agentic_coding_flywheel_setup
+./scripts/lib/security.sh --update-checksums > checksums.yaml
+```
+
+ACFS verifies the raw installer script at `https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh` against `/dp/agentic_coding_flywheel_setup/checksums.yaml`. This is separate from the GitHub release asset `SHA256SUMS`. If `checksums.yaml` changes, keep the ACFS repo in sync as part of the same release workflow.
+
 ---
 
 ## Code Editing Discipline
