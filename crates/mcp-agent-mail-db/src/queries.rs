@@ -650,7 +650,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
 
 /// Decode `AgentRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `project_id`, `name`, `program`, `model`, `task_description`,
-/// `inception_ts`, `last_active_ts`, `attachments_policy`, `contact_policy`.
+/// `inception_ts`, `last_active_ts`, `attachments_policy`, `contact_policy`, `reaper_exempt`.
 fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     fn get_i64(row: &SqlRow, idx: usize) -> i64 {
         row.get(idx).and_then(value_as_i64).unwrap_or(0)
@@ -684,6 +684,7 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
             let s = get_string(row, 9);
             if s.is_empty() { "auto".to_string() } else { s }
         },
+        reaper_exempt: get_opt_i64(row, 10).unwrap_or(0),
     }
 }
 
@@ -938,7 +939,7 @@ async fn verify_agent_visible_after_commit(
     name: &str,
 ) -> Outcome<AgentRow, DbError> {
     let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -1360,13 +1361,17 @@ async fn cleanup_committed_message_after_consistency_failure(
 // =============================================================================
 
 /// Maximum retry attempts for MVCC write conflicts (`BEGIN CONCURRENT`
-/// page-level collisions). Read once from `FSQLITE_CONCURRENT_RETRIES`
-/// env var; default 5.
+/// page-level collisions) and plain `SQLite` write contention.
+///
+/// Read once from `FSQLITE_CONCURRENT_RETRIES` env var; default 8.
+/// Increased from 5 to 8 to give the exponential backoff (10ms..2s)
+/// enough total budget (~4s) to outlast transient WAL checkpoint stalls
+/// under sustained multi-agent write load.
 static MVCC_MAX_RETRIES: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
     std::env::var("FSQLITE_CONCURRENT_RETRIES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(5)
+        .unwrap_or(8)
 });
 
 /// Global counter: total MVCC retries performed.
@@ -1477,12 +1482,17 @@ where
 
 /// Sleep with exponential backoff for MVCC retry.
 ///
-/// Base: 10 ms, max: 200 ms, ±25 % jitter (via existing LCG in `retry` module).
+/// Base: 25 ms, max: 2000 ms, ±25 % jitter (via existing LCG in `retry` module).
+///
+/// The generous ceiling (2s) lets later retries outlast WAL checkpoint stalls
+/// that typically complete within 500ms–1s under concurrent-writer load.
+/// Total budget across 8 retries: ~4s (25+50+100+200+400+800+1600+2000 ms
+/// before jitter), which keeps the caller well below the 60s `busy_timeout`.
 async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
-        base_delay: std::time::Duration::from_millis(10),
-        max_delay: std::time::Duration::from_millis(200),
+        base_delay: std::time::Duration::from_millis(25),
+        max_delay: std::time::Duration::from_millis(2000),
         use_circuit_breaker: false,
         ..Default::default()
     };
@@ -1772,6 +1782,7 @@ pub async fn register_agent(
     model: &str,
     task_description: Option<&str>,
     attachments_policy: Option<&str>,
+    reaper_exempt: Option<bool>,
 ) -> Outcome<AgentRow, DbError> {
     // Validate agent name
     if !mcp_agent_mail_core::models::is_valid_agent_name(name) {
@@ -1824,6 +1835,10 @@ pub async fn register_agent(
                     normalize_sets.push("attachments_policy = ?");
                     normalize_base_params.push(Value::Text(ap.to_string()));
                 }
+                if let Some(exempt) = reaper_exempt {
+                    normalize_sets.push("reaper_exempt = ?");
+                    normalize_base_params.push(Value::BigInt(i64::from(exempt)));
+                }
 
                 let normalize_sql = format!(
                     "UPDATE agents SET {} WHERE project_id = ? AND name = ? COLLATE NOCASE",
@@ -1841,7 +1856,7 @@ pub async fn register_agent(
                 );
 
                 let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                                 inception_ts, last_active_ts, attachments_policy, contact_policy \
+                                 inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                                  FROM agents \
                                  WHERE project_id = ? AND name = ? COLLATE NOCASE \
                                  ORDER BY id ASC \
@@ -1860,8 +1875,8 @@ pub async fn register_agent(
                         existing
                     } else {
                     let insert_sql = "INSERT INTO agents \
-                        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                         let attach_pol = attachments_policy.map_or_else(
                             || "auto".to_string(),
                             std::string::ToString::to_string,
@@ -1876,6 +1891,7 @@ pub async fn register_agent(
                             Value::BigInt(now),
                             Value::Text(attach_pol),
                             Value::Text("auto".to_string()),
+                            Value::BigInt(i64::from(reaper_exempt.unwrap_or(false))),
                         ];
                         match map_sql_outcome(
                             traw_execute(cx, &tracked, insert_sql, &insert_params).await,
@@ -2012,7 +2028,7 @@ pub async fn create_agent(
             let task_desc = task_description.unwrap_or_default();
             let attach_pol = attachments_policy.unwrap_or("auto");
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                             inception_ts, last_active_ts, attachments_policy, contact_policy \
+                             inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                              FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                              ORDER BY id ASC LIMIT 1";
             let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -2183,7 +2199,7 @@ pub async fn get_agent(
 
     // Optimized: filter by name directly in SQL (case-insensitive).
     let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -2222,7 +2238,7 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
 
     // Use raw SQL with explicit column order to avoid ORM decoding issues
     let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -2260,7 +2276,7 @@ pub async fn get_agent_by_id_fresh(
     let tracked = tracked(&*conn);
 
     let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -2292,10 +2308,10 @@ pub async fn list_agents(
 
     // Use raw SQL with explicit column order to avoid ORM decoding issues
     let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy \
+               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                FROM ( \
                  SELECT id, project_id, name, program, model, task_description, \
-                        inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                        inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                         ROW_NUMBER() OVER ( \
                             PARTITION BY name COLLATE NOCASE \
                             ORDER BY last_active_ts DESC, id DESC \
@@ -2359,7 +2375,7 @@ pub async fn get_agents_by_ids(
         let placeholders = placeholders(chunk.len());
         let sql = format!(
             "SELECT id, project_id, name, program, model, task_description, \
-             inception_ts, last_active_ts, attachments_policy, contact_policy \
+             inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
              FROM agents WHERE id IN ({placeholders})"
         );
 
@@ -2552,7 +2568,7 @@ pub async fn set_agent_contact_policy(
 
         // Fetch updated agent using raw SQL with explicit column order.
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                         inception_ts, last_active_ts, attachments_policy, contact_policy \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(agent_id)];
         let rows = try_in_tx!(
@@ -2609,7 +2625,7 @@ pub async fn set_agent_contact_policy_by_name(
 
         // Resolve row first so we can preserve attachments_policy explicitly.
         let current_sql = "SELECT id, project_id, name, program, model, task_description, \
-                           inception_ts, last_active_ts, attachments_policy, contact_policy \
+                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                            FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                            ORDER BY last_active_ts DESC, id DESC LIMIT 1";
         let current_params = [
@@ -2649,7 +2665,7 @@ pub async fn set_agent_contact_policy_by_name(
         );
 
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                         inception_ts, last_active_ts, attachments_policy, contact_policy \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(current_id)];
         let rows = try_in_tx!(
@@ -7834,7 +7850,7 @@ pub async fn insert_system_agent(
         );
 
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
-                          inception_ts, last_active_ts, attachments_policy, contact_policy \
+                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt \
                           FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
         let rows = try_in_tx!(
@@ -9837,7 +9853,7 @@ mod tests {
                 "gpt-5",
                 Some("first registration"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent");
@@ -9908,7 +9924,7 @@ mod tests {
                 "gpt-5",
                 Some("first"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("initial register");
@@ -9922,7 +9938,7 @@ mod tests {
                 "gpt-5.1",
                 Some("second"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("case-insensitive register");
@@ -9991,7 +10007,7 @@ mod tests {
                 "gpt-5",
                 Some("keep me"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("initial register agent");
@@ -10006,7 +10022,7 @@ mod tests {
                 "gpt-5.1",
                 None,
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("update register agent");
@@ -10185,7 +10201,7 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -10198,7 +10214,7 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");
@@ -10263,7 +10279,7 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -10276,7 +10292,7 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");
@@ -10346,7 +10362,7 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -10359,7 +10375,7 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");
@@ -10462,7 +10478,7 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent");
@@ -10522,7 +10538,7 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent");
@@ -10588,7 +10604,7 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register holder");
@@ -10603,7 +10619,7 @@ mod tests {
                 "gpt-5",
                 Some("requester"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register requester");
@@ -10677,7 +10693,7 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register holder");
@@ -10692,7 +10708,7 @@ mod tests {
                 "gpt-5",
                 Some("requester"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register requester");
@@ -10767,7 +10783,7 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent");
@@ -10882,7 +10898,7 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent");
@@ -10973,7 +10989,7 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent");
@@ -11667,7 +11683,7 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect_err("suppressed insert must not return success");
@@ -11970,7 +11986,7 @@ mod tests {
                 "opus-4.6",
                 Some("durability test"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register_agent should succeed");
@@ -12452,7 +12468,7 @@ mod tests {
                 "gpt-5",
                 Some("policy update test"),
                 Some("inline"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent");
@@ -12588,7 +12604,7 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -12601,7 +12617,7 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");
@@ -12702,7 +12718,7 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -12715,7 +12731,7 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");
@@ -12799,7 +12815,7 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("inline"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register red");
@@ -12814,7 +12830,7 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register blue");
@@ -14046,7 +14062,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -14059,7 +14075,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");
@@ -14189,7 +14205,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -14202,7 +14218,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");
@@ -14415,7 +14431,7 @@ mod tests {
                 "opus-4.6",
                 Some("regression test"),
                 Some("auto"),
-            )
+            , None)
             .await
             .into_result()
             .expect("register_agent should succeed without REINDEX");
@@ -14487,7 +14503,7 @@ mod tests {
                 "opus",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent");
@@ -14602,7 +14618,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent a");
@@ -14615,7 +14631,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register agent b");
@@ -14685,7 +14701,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender A");
@@ -14698,7 +14714,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient A");
@@ -14711,7 +14727,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender B");
@@ -14724,7 +14740,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient B");
@@ -14838,7 +14854,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -14851,7 +14867,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");
@@ -14917,7 +14933,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register sender");
@@ -14930,7 +14946,7 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            )
+            , None)
             .await
             .into_result()
             .expect("register recipient");

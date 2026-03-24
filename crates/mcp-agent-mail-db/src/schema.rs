@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS agents (
     last_active_ts INTEGER NOT NULL,
     attachments_policy TEXT NOT NULL DEFAULT 'auto',
     contact_policy TEXT NOT NULL DEFAULT 'auto',
+    reaper_exempt INTEGER NOT NULL DEFAULT 0,
     UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name);
@@ -202,12 +203,12 @@ END;
 /// - `journal_mode=WAL`: readers never block writers; writers never block readers
 /// - `synchronous=NORMAL`: fsync on commit (not per-statement); safe with WAL
 /// - `busy_timeout=60s`: 60 second wait for locks (matches Python `PRAGMA busy_timeout=60000`)
-/// - `wal_autocheckpoint=2000`: fewer checkpoints under sustained write bursts
+/// - `wal_autocheckpoint=1000`: balanced checkpoint frequency for concurrent workloads
 /// - `cache_size`: budget-aware, scales inversely with pool size (see [`build_conn_pragmas`])
 /// - `mmap_size=256MB`: memory-mapped I/O for sequential scan acceleration
 /// - `temp_store=MEMORY`: temp tables and indices stay in RAM (never hit disk)
 /// - `threads=4`: allow `SQLite` to parallelize sorting and other internal work
-/// - `journal_size_limit=64MB`: cap WAL file size to prevent unbounded growth
+/// - `journal_size_limit=256MB`: cap WAL file size; generous to avoid truncation races with readers
 /// - `foreign_keys=OFF`: the statically linked `SQLite` is compiled with
 ///   `SQLITE_DEFAULT_FOREIGN_KEYS` which enables FK enforcement by default.
 ///   We must explicitly disable it because: (a) our schema uses `REFERENCES`
@@ -221,12 +222,12 @@ PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
-PRAGMA wal_autocheckpoint = 2000;
+PRAGMA wal_autocheckpoint = 1000;
 PRAGMA cache_size = -8192;
 PRAGMA mmap_size = 268435456;
 PRAGMA temp_store = MEMORY;
 PRAGMA threads = 4;
-PRAGMA journal_size_limit = 67108864;
+PRAGMA journal_size_limit = 268435456;
 ";
 
 /// Database-wide initialization PRAGMAs (applied once per sqlite file).
@@ -259,12 +260,12 @@ pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
 PRAGMA synchronous = NORMAL;
-PRAGMA wal_autocheckpoint = 2000;
+PRAGMA wal_autocheckpoint = 1000;
 PRAGMA cache_size = -8192;
 PRAGMA mmap_size = 268435456;
 PRAGMA temp_store = MEMORY;
 PRAGMA threads = 4;
-PRAGMA journal_size_limit = 67108864;
+PRAGMA journal_size_limit = 268435456;
 ";
 
 /// Total memory budget (in KB) for page caches across all pooled connections.
@@ -296,12 +297,12 @@ pub fn build_conn_pragmas(max_connections: usize) -> String {
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
 PRAGMA synchronous = NORMAL;
-PRAGMA wal_autocheckpoint = 2000;
+PRAGMA wal_autocheckpoint = 1000;
 PRAGMA cache_size = -{per_conn_kb};
 PRAGMA mmap_size = 268435456;
 PRAGMA temp_store = MEMORY;
 PRAGMA threads = 4;
-PRAGMA journal_size_limit = 67108864;
+PRAGMA journal_size_limit = 268435456;
 "
     )
 }
@@ -1423,6 +1424,18 @@ pub fn schema_migrations() -> Vec<Migration> {
         "add delay max column to experience rollups".to_string(),
         "ALTER TABLE atc_experience_rollups ADD COLUMN delay_max_micros INTEGER NOT NULL DEFAULT 0"
             .to_string(),
+        String::new(),
+    ));
+
+    // ── v19: Reaper-exempt agents (issue #64) ────────────────────────
+    //
+    // Allow agents to be marked as exempt from the inactivity reaper
+    // while still being routable. Exempt agents keep their file
+    // reservations even when idle beyond the normal timeout.
+    migrations.push(Migration::new(
+        "v19_agents_reaper_exempt".to_string(),
+        "add reaper_exempt column to agents for inactivity reaper exemption".to_string(),
+        "ALTER TABLE agents ADD COLUMN reaper_exempt INTEGER NOT NULL DEFAULT 0".to_string(),
         String::new(),
     ));
 

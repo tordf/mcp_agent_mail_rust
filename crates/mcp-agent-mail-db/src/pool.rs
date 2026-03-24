@@ -845,6 +845,47 @@ impl DbPool {
         Ok(checkpointed)
     }
 
+    /// Run a **passive** WAL checkpoint that never blocks writers.
+    ///
+    /// Unlike [`wal_checkpoint`] (which uses `TRUNCATE` mode and can block),
+    /// this uses `PRAGMA wal_checkpoint(PASSIVE)` which checkpoints as many
+    /// WAL frames as possible without waiting for any readers or writers to
+    /// finish. Suitable for periodic background maintenance to keep WAL size
+    /// bounded without introducing write contention.
+    ///
+    /// Returns the number of WAL frames checkpointed, or an error.
+    /// No-ops silently for `:memory:` databases.
+    pub fn wal_checkpoint_passive(&self) -> DbResult<u64> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(0);
+        }
+        let conn = crate::guard_db_conn(
+            open_sqlite_file_with_lock_retry(&self.sqlite_path)
+                .map_err(|e| DbError::Sqlite(format!("passive checkpoint: open failed: {e}")))?,
+            "passive wal checkpoint connection",
+        );
+
+        conn.execute_raw("PRAGMA busy_timeout = 5000;")
+            .map_err(|e| {
+                DbError::Sqlite(format!("passive checkpoint: busy_timeout: {e}"))
+            })?;
+
+        let rows = conn
+            .query_sync("PRAGMA wal_checkpoint(PASSIVE);", &[])
+            .map_err(|e| DbError::Sqlite(format!("passive checkpoint: {e}")))?;
+
+        let checkpointed = rows
+            .first()
+            .and_then(|r| match r.get_by_name("checkpointed") {
+                Some(sqlmodel_core::Value::BigInt(n)) => Some(u64::try_from(*n).unwrap_or(0)),
+                Some(sqlmodel_core::Value::Int(n)) => Some(u64::try_from(*n).unwrap_or(0)),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        Ok(checkpointed)
+    }
+
     /// Create (or refresh) a `.bak` backup of the database file.
     ///
     /// Skips silently for `:memory:` databases or when the primary file
@@ -1145,6 +1186,14 @@ async fn run_sqlite_init_once(
     sqlite_path: &str,
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
+    // Clean up empty/corrupt WAL sidecars before opening any connections.
+    // A 0-byte WAL file (left by a crash during DELETE->WAL journal mode
+    // transition) triggers "WAL file too small for header during rebuild"
+    // errors. Removing it is safe: SQLite recreates WAL on next write.
+    if sqlite_path != ":memory:" {
+        cleanup_empty_wal_sidecar(sqlite_path);
+    }
+
     if run_migrations {
         let mig_conn = crate::guard_db_conn(
             match open_sqlite_file_with_lock_retry(sqlite_path) {
@@ -1395,6 +1444,7 @@ pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
         || lower.contains("called `option::unwrap()` on a `none` value")
         || lower.contains("internal error")
         || lower.contains("cursor must be on a leaf")
+        || lower.contains("wal file too small")
 }
 
 #[must_use]
@@ -1650,6 +1700,7 @@ pub fn is_corruption_error_message(message: &str) -> bool {
         || lower.contains("page checksum mismatch")
         || lower.contains("header checksum mismatch")
         || lower.contains("no healthy backup was found")
+        || lower.contains("wal file too small")
 }
 
 #[allow(clippy::result_large_err)]
@@ -1726,6 +1777,40 @@ fn sqlite_canonical_incremental_check_is_ok(
     conn: &sqlmodel_sqlite::SqliteConnection,
 ) -> Result<bool, SqlError> {
     sqlite_pragma_check_is_ok_canonical(conn, "PRAGMA integrity_check(1)")
+}
+
+/// Remove empty WAL/SHM sidecars that cause "WAL file too small for header"
+/// errors during SQLite open.
+///
+/// A 0-byte `-wal` file is pathological: SQLite expects either no WAL (so it
+/// creates a fresh one) or a WAL with at least a 32-byte header. A zero-length
+/// WAL can be left behind when:
+/// - A crash occurs during the `DELETE` -> `WAL` journal mode transition
+/// - A `PRAGMA journal_size_limit` triggers truncation racing with a reader
+/// - The process is killed between WAL creation and first header write
+///
+/// Removing the empty file is always safe because SQLite recreates the WAL
+/// on the next write. We also remove empty SHM files for consistency.
+fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
+    let db_path = Path::new(sqlite_path);
+    if !db_path.exists() {
+        return;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_os = db_path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar_path = PathBuf::from(sidecar_os);
+        match std::fs::metadata(&sidecar_path) {
+            Ok(meta) if meta.len() == 0 => {
+                tracing::warn!(
+                    path = %sidecar_path.display(),
+                    "removing empty WAL/SHM sidecar (prevents 'WAL file too small for header' errors)"
+                );
+                let _ = std::fs::remove_file(&sidecar_path);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[must_use]
@@ -3021,8 +3106,8 @@ mod tests {
         // All should have journal_size_limit
         for sql in [&sql_100, &sql_25, &sql_1, &sql_500] {
             assert!(
-                sql.contains("journal_size_limit = 67108864"),
-                "all should have 64MB journal_size_limit"
+                sql.contains("journal_size_limit = 268435456"),
+                "all should have 256MB journal_size_limit"
             );
             assert!(
                 sql.contains("busy_timeout = 60000"),
@@ -4722,6 +4807,54 @@ mod tests {
         assert!(!is_sqlite_recovery_error_message("timeout"));
         assert!(!is_sqlite_recovery_error_message("no such table"));
         assert!(!is_sqlite_recovery_error_message(""));
+    }
+
+    #[test]
+    fn recovery_error_detects_wal_file_too_small() {
+        assert!(is_sqlite_recovery_error_message(
+            "WAL file too small for header during rebuild: read 0, need 32"
+        ));
+        assert!(is_corruption_error_message(
+            "WAL file too small for header during rebuild: read 0, need 32"
+        ));
+    }
+
+    #[test]
+    fn cleanup_empty_wal_sidecar_removes_zero_byte_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup_test.db");
+        // Create a real DB so the main file exists.
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)").expect("create table");
+        drop(conn);
+
+        // Create a 0-byte WAL sidecar (simulating crash artifact).
+        let wal_path = dir.path().join("cleanup_test.db-wal");
+        std::fs::write(&wal_path, b"").expect("create empty wal");
+        assert!(wal_path.exists());
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+
+        cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
+
+        assert!(!wal_path.exists(), "empty WAL should have been removed");
+    }
+
+    #[test]
+    fn cleanup_empty_wal_sidecar_preserves_nonempty_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("preserve_test.db");
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)").expect("create table");
+        drop(conn);
+
+        // Create a non-empty WAL sidecar.
+        let wal_path = dir.path().join("preserve_test.db-wal");
+        std::fs::write(&wal_path, b"some WAL content here").expect("create wal");
+        assert!(wal_path.exists());
+
+        cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
+
+        assert!(wal_path.exists(), "non-empty WAL should be preserved");
     }
 
     #[test]
