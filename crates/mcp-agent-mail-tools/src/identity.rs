@@ -490,6 +490,7 @@ Check that all parameters have valid values."
 /// - `name`: Optional agent name (auto-generated if omitted)
 /// - `task_description`: Optional current task description
 /// - `attachments_policy`: Optional attachment handling policy
+/// - `reaper_exempt`: Optional bool to exempt agent from the inactivity reaper (default: false)
 ///
 /// # Returns
 /// Agent profile with all fields
