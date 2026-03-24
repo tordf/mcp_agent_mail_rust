@@ -664,12 +664,10 @@ fn check_glob_activity_fallback_with_limit(
         return ActivityProbeResult::Unsupported;
     };
 
-    let mut scanned = 0usize;
-    for path in paths.flatten() {
+    for (scanned, path) in paths.flatten().enumerate() {
         if scanned >= path_limit {
             return ActivityProbeResult::Truncated;
         }
-        scanned += 1;
         if path_modified_within_grace(&path, now_us, grace_us) {
             return ActivityProbeResult::Active;
         }

@@ -1508,9 +1508,7 @@ fn create_table_statement_for(table: &str) -> Option<&'static str> {
     let expected_id = format!("v1_create_table_{table}");
     CREATE_TABLES_SQL.split(';').find_map(|chunk| {
         let stmt = chunk.trim();
-        let Some((id, _desc)) = derive_migration_id_and_description(stmt) else {
-            return None;
-        };
+        let (id, _desc) = derive_migration_id_and_description(stmt)?;
         (id == expected_id).then_some(stmt)
     })
 }
