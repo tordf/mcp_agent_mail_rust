@@ -497,7 +497,8 @@ mod tests {
         let recipient = match block_on(async {
             queries::register_agent(
                 &cx, &pool, project_id, "BlueBear", "test", "test", None, None,
-            , None)
+                None,
+            )
             .await
         }) {
             Outcome::Ok(a) => a,
@@ -936,7 +937,8 @@ mod tests {
         let recip1 = match block_on(async {
             queries::register_agent(
                 &cx, &pool, project_id, "BlueBear", "test", "test", None, None,
-            , None)
+                None,
+            )
             .await
         }) {
             Outcome::Ok(a) => a,
@@ -947,7 +949,8 @@ mod tests {
         let recip2 = match block_on(async {
             queries::register_agent(
                 &cx, &pool, project_id, "GoldHawk", "test", "test", None, None,
-            , None)
+                None,
+            )
             .await
         }) {
             Outcome::Ok(a) => a,

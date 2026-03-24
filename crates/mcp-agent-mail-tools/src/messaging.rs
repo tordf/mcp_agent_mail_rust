@@ -402,7 +402,8 @@ async fn resolve_or_register_agent(
                     "unknown",
                     None,
                     None,
-                , None)
+                    None,
+                )
                 .await
                 {
                     Outcome::Ok(_) => {}
@@ -937,7 +938,7 @@ async fn push_recipient(
     let agent = if let Some(existing) = recipient_map.get(&name_key) {
         existing.clone()
     } else {
-        let agent = match resolve_or_register_agent(ctx, pool, project_id, name, sender, config, None)
+        let agent = match resolve_or_register_agent(ctx, pool, project_id, name, sender, config)
             .await
         {
             Ok(a) => a,
@@ -3290,7 +3291,8 @@ mod tests {
             "gpt-5",
             Some("messaging thread-id test"),
             None,
-        , None)
+            None,
+        )
         .await
         {
             Outcome::Ok(agent) => agent,

@@ -282,7 +282,8 @@ fn seed_corpus(pool: &DbPool) -> (i64, HashMap<&'static str, i64>, BTreeMap<Stri
                     "test-model",
                     Some("golden ranking test agent"),
                     None,
-                , None)
+                    None,
+                )
                 .await
                 {
                     Outcome::Ok(a) => a.id.expect("agent id"),

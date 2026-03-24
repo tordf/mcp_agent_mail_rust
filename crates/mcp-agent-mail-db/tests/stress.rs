@@ -244,7 +244,8 @@ fn stress_concurrent_register_agent() {
                         &format!("model-{i}"),
                         Some(&format!("task from thread {i}")),
                         None,
-                    , None)
+                        None,
+                    )
                     .await
                     {
                         Outcome::Ok(row) => row,
@@ -317,7 +318,8 @@ fn stress_concurrent_message_sending() {
                 "test",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(r) => r,
@@ -440,7 +442,8 @@ fn stress_concurrent_file_reservations() {
                 "test",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(r) => r,
@@ -615,7 +618,8 @@ fn stress_cache_coherency_mixed_workload() {
                 "test",
                 Some("initial"),
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(_) => {}
@@ -653,7 +657,8 @@ fn stress_cache_coherency_mixed_workload() {
                             &format!("model-w{w}-i{i}"),
                             Some(&format!("task from writer {w} iter {i}")),
                             None,
-                        , None)
+                            None,
+                        )
                         .await;
                     });
                 }
@@ -733,7 +738,8 @@ fn stress_concurrent_inbox_and_send() {
                 "test",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(r) => r,
@@ -1133,7 +1139,8 @@ fn stress_1000_agent_concurrent_workload() {
                                 "stress-model",
                                 None,
                                 None,
-                            , None)
+                                None,
+                            )
                             .await
                         }
                     });
@@ -3016,7 +3023,8 @@ fn chaos_data_integrity_after_cb_recovery() {
                 "test",
                 Some("sender"),
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(r) => r,
@@ -3032,7 +3040,8 @@ fn chaos_data_integrity_after_cb_recovery() {
                 "test",
                 Some("receiver"),
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(r) => r,
@@ -3179,7 +3188,8 @@ fn set_contact_policy_updates_cache() {
                 "test",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .unwrap();
 

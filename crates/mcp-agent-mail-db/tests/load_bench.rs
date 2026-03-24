@@ -255,7 +255,8 @@ fn load_scenario_a_registration_storm() {
                                 "model",
                                 None,
                                 None,
-                            , None)
+                                None,
+                            )
                             .await
                         }
                     }) {
@@ -482,7 +483,8 @@ fn load_scenario_c_mixed_workload() {
                         "model",
                         None,
                         None,
-                    , None)
+                        None,
+                    )
                     .await
                 }
             })
@@ -906,7 +908,8 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
                 "model",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
         }
     })
@@ -925,7 +928,8 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
                 "model",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
         }
     })

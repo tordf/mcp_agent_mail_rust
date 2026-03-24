@@ -315,7 +315,8 @@ fn seed_corpus(pool: &DbPool) -> (i64, i64, i64, Vec<i64>) {
                 "opus-4.6",
                 Some("Search benchmark sender agent"),
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(a) => a,
@@ -331,7 +332,8 @@ fn seed_corpus(pool: &DbPool) -> (i64, i64, i64, Vec<i64>) {
                 "opus-4.6",
                 Some("Search benchmark recipient agent"),
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(a) => a,
@@ -398,7 +400,8 @@ fn seed_second_project(pool: &DbPool) -> (i64, i64, Vec<i64>) {
                 "gpt-5.2",
                 Some("Secondary project agent for cross-project search"),
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(a) => a,

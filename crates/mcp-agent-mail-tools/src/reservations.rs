@@ -1548,7 +1548,8 @@ mod tests {
             "gpt-5",
             Some("reservation test"),
             None,
-        , None)
+            None,
+        )
         .await
         {
             Outcome::Ok(agent) => agent,

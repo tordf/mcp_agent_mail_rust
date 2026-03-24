@@ -97,7 +97,8 @@ fn seed_corpus(tag: &str) -> TestCorpus {
                     "opus",
                     None,
                     None,
-                , None)
+                    None,
+                )
                 .await
                 {
                     Outcome::Ok(r) => r,
@@ -116,7 +117,8 @@ fn seed_corpus(tag: &str) -> TestCorpus {
                 "opus",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(r) => r,
@@ -134,7 +136,8 @@ fn seed_corpus(tag: &str) -> TestCorpus {
                 "o3",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             {
                 Outcome::Ok(r) => r,

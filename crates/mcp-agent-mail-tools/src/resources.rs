@@ -4218,7 +4218,8 @@ mod resource_shape_tests {
             "gpt-5",
             Some("resource-shape test"),
             None,
-        , None)
+            None,
+        )
         .await
         {
             Outcome::Ok(agent) => agent,
@@ -4953,7 +4954,8 @@ mod resource_shape_tests {
                         Some("BlueLake".to_string()),
                         Some("resource visibility regression".to_string()),
                         None,
-                    , None)
+                        None,
+                    )
                     .await
                     .expect("register_agent"),
                 );
@@ -5029,7 +5031,8 @@ mod resource_shape_tests {
                     Some("BlueLake".to_string()),
                     Some("resource visibility regression".to_string()),
                     None,
-                , None)
+                    None,
+                )
                 .await
                 .expect("register sender");
                 crate::register_agent(
@@ -5040,7 +5043,8 @@ mod resource_shape_tests {
                     Some("RedPeak".to_string()),
                     Some("resource visibility regression".to_string()),
                     None,
-                , None)
+                    None,
+                )
                 .await
                 .expect("register recipient");
 
@@ -5861,7 +5865,8 @@ mod resource_shape_tests {
                     Some("GreenLake".to_string()),
                     Some("backend development".to_string()),
                     None,
-                , None)
+                    None,
+                )
                 .await
                 .expect("register_agent GreenLake");
 
@@ -5873,7 +5878,8 @@ mod resource_shape_tests {
                     Some("BlueDog".to_string()),
                     Some("frontend work".to_string()),
                     None,
-                , None)
+                    None,
+                )
                 .await
                 .expect("register_agent BlueDog");
 

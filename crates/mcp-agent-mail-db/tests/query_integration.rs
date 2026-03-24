@@ -166,7 +166,8 @@ fn setup_agent(pool: &DbPool, project_id: i64, name: &str) -> i64 {
             "test-model",
             Some("integration test"),
             None,
-        , None)
+            None,
+        )
         .await
         {
             Outcome::Ok(a) => a.id.unwrap(),
@@ -314,7 +315,8 @@ fn register_agent_idempotent_upsert() {
             "new-model",
             Some("updated"),
             None,
-        , None)
+            None,
+        )
         .await
         {
             Outcome::Ok(a) => a.id.unwrap(),

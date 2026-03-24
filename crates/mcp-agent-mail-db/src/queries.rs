@@ -9853,7 +9853,8 @@ mod tests {
                 "gpt-5",
                 Some("first registration"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent");
@@ -9924,7 +9925,8 @@ mod tests {
                 "gpt-5",
                 Some("first"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("initial register");
@@ -9938,7 +9940,8 @@ mod tests {
                 "gpt-5.1",
                 Some("second"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("case-insensitive register");
@@ -10007,7 +10010,8 @@ mod tests {
                 "gpt-5",
                 Some("keep me"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("initial register agent");
@@ -10022,7 +10026,8 @@ mod tests {
                 "gpt-5.1",
                 None,
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("update register agent");
@@ -10201,7 +10206,8 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -10214,7 +10220,8 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");
@@ -10279,7 +10286,8 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -10292,7 +10300,8 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");
@@ -10362,7 +10371,8 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -10375,7 +10385,8 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");
@@ -10478,7 +10489,8 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent");
@@ -10538,7 +10550,8 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent");
@@ -10604,7 +10617,8 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register holder");
@@ -10619,7 +10633,8 @@ mod tests {
                 "gpt-5",
                 Some("requester"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register requester");
@@ -10693,7 +10708,8 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register holder");
@@ -10708,7 +10724,8 @@ mod tests {
                 "gpt-5",
                 Some("requester"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register requester");
@@ -10783,7 +10800,8 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent");
@@ -10898,7 +10916,8 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent");
@@ -10989,7 +11008,8 @@ mod tests {
                 "gpt-5",
                 Some("holder"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent");
@@ -11683,7 +11703,8 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect_err("suppressed insert must not return success");
@@ -11986,7 +12007,8 @@ mod tests {
                 "opus-4.6",
                 Some("durability test"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register_agent should succeed");
@@ -12468,7 +12490,8 @@ mod tests {
                 "gpt-5",
                 Some("policy update test"),
                 Some("inline"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent");
@@ -12604,7 +12627,8 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -12617,7 +12641,8 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");
@@ -12718,7 +12743,8 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -12731,7 +12757,8 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");
@@ -12815,7 +12842,8 @@ mod tests {
                 "gpt-5",
                 Some("sender"),
                 Some("inline"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register red");
@@ -12830,7 +12858,8 @@ mod tests {
                 "gpt-5",
                 Some("recipient"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register blue");
@@ -14062,7 +14091,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -14075,7 +14105,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");
@@ -14205,7 +14236,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -14218,7 +14250,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");
@@ -14431,7 +14464,8 @@ mod tests {
                 "opus-4.6",
                 Some("regression test"),
                 Some("auto"),
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register_agent should succeed without REINDEX");
@@ -14503,7 +14537,8 @@ mod tests {
                 "opus",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent");
@@ -14618,7 +14653,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent a");
@@ -14631,7 +14667,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register agent b");
@@ -14701,7 +14738,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender A");
@@ -14714,7 +14752,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient A");
@@ -14727,7 +14766,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender B");
@@ -14740,7 +14780,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient B");
@@ -14854,7 +14895,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -14867,7 +14909,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");
@@ -14933,7 +14976,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register sender");
@@ -14946,7 +14990,8 @@ mod tests {
                 "gpt-5",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
             .into_result()
             .expect("register recipient");

@@ -16571,7 +16571,8 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 &model,
                 task.as_deref(),
                 Some(attachments_policy.as_str()),
-            , None)
+                None,
+            )
             .await
             {
                 asupersync::Outcome::Ok(r) => r,
@@ -16942,7 +16943,8 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     &model,
                     task.as_deref(),
                     Some("auto"),
-                , None)
+                    None,
+                )
                 .await,
             )?;
 
@@ -17055,7 +17057,8 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                         &model,
                         task.as_deref(),
                         Some("auto"),
-                    , None)
+                        None,
+                    )
                     .await,
                 )?
             } else {
@@ -17301,7 +17304,8 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                             &model,
                             reg_task.as_deref(),
                             Some("auto"),
-                        , None)
+                            None,
+                        )
                         .await,
                     )?
                 }

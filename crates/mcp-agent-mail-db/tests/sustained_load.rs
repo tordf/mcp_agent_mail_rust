@@ -255,7 +255,8 @@ fn sustained_100_rps_load_test() {
                     "load-model",
                     Some("sustained load worker"),
                     None,
-                , None)
+                    None,
+                )
                 .await
                 {
                     Outcome::Ok(a) => a,
@@ -933,7 +934,8 @@ fn multi_project_soak_replay() {
                         "soak-model",
                         Some("multi-project soak worker"),
                         None,
-                    , None)
+                        None,
+                    )
                     .await
                     {
                         Outcome::Ok(a) => a.id.unwrap(),

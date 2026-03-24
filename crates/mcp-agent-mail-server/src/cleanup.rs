@@ -1092,7 +1092,8 @@ mod tests {
                 "test",
                 None,
                 None,
-            , None)
+                None,
+            )
             .await
         }) {
             Outcome::Ok(a) => a,
