@@ -116,7 +116,7 @@ pub struct Config {
     pub http_probe_failure_threshold: u32,
     /// Seconds of grace after spawn before probing begins (default 15).
     pub http_probe_startup_grace_secs: u64,
-    /// Per-probe timeout in seconds (default 1).
+    /// Per-probe timeout in seconds (default 3).
     pub http_probe_timeout_secs: u64,
     /// Minimum restart back-off in milliseconds (default 200).
     pub http_restart_backoff_min_ms: u64,
@@ -707,6 +707,49 @@ pub fn is_default_storage_root(path: &Path) -> bool {
     path == default_storage_root_path()
 }
 
+/// Resolve `storage_root` to a canonical (symlink-free) path.
+///
+/// If the full path exists, `std::fs::canonicalize` resolves every symlink
+/// component.  If it doesn't exist yet (first run), we walk upward to find
+/// the longest existing prefix, canonicalize that, then re-append the
+/// missing tail.  This lets a symlinked `STORAGE_ROOT` work while the
+/// downstream `path_existing_prefix_has_symlink()` guards in the storage
+/// crate continue to reject symlinks *within* the resolved tree.
+fn canonicalize_storage_root(path: &Path) -> io::Result<PathBuf> {
+    // Fast path: the entire path already exists.
+    match fs::canonicalize(path) {
+        Ok(c) => return Ok(c),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => { /* fall through */ }
+        Err(e) => return Err(e),
+    }
+
+    // Walk upward to find the deepest existing ancestor, collecting the
+    // trailing components that don't exist yet.
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        match fs::canonicalize(cursor) {
+            Ok(canonical_prefix) => {
+                let mut resolved = canonical_prefix;
+                for component in missing_tail.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(name) = cursor.file_name() {
+                    missing_tail.push(name.to_os_string());
+                }
+                match cursor.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+                    _ => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Resolve a *data* path with backward compatibility.
 ///
 /// `legacy_base` is the old parent directory (e.g. `~/.mcp_agent_mail`).
@@ -793,7 +836,7 @@ impl Default for Config {
             http_probe_interval_secs: 2,
             http_probe_failure_threshold: 3,
             http_probe_startup_grace_secs: 15,
-            http_probe_timeout_secs: 1,
+            http_probe_timeout_secs: 3,
             http_restart_backoff_min_ms: 200,
             http_restart_backoff_max_ms: 5_000,
             http_max_restart_failures: 10,
@@ -1822,6 +1865,19 @@ impl Config {
             env_usize("AM_COALESCER_MAX_WORKERS", config.coalescer_max_workers).clamp(1, 128);
         config.coalescer_queue_cap =
             env_usize("AM_COALESCER_QUEUE_CAP", config.coalescer_queue_cap).clamp(16, 16_384);
+
+        // Canonicalize storage_root so that a symlinked STORAGE_ROOT (common
+        // deployment pattern) is resolved to its real path at startup.  This
+        // prevents the downstream symlink-rejection guards in ensure_dir() and
+        // atomic_write_bytes() from rejecting writes to an otherwise valid
+        // storage location.  If the path doesn't exist yet we attempt to
+        // canonicalize the longest existing prefix and re-append the missing
+        // tail, so that symlinks in existing ancestors are still resolved.
+        // Failure is non-fatal: we keep the original path and let later I/O
+        // surface any real problems.
+        if let Ok(canonical) = canonicalize_storage_root(&config.storage_root) {
+            config.storage_root = canonical;
+        }
 
         config
     }
