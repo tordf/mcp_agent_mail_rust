@@ -65,10 +65,14 @@ pub struct AppConfig {
     pub debug_overlay: bool,
 }
 
+/// Default WebSocket URL matching the server's canonical port (8765).
+/// Must stay in sync with `Config::http_port` default in mcp-agent-mail-core.
+const DEFAULT_WS_URL: &str = "ws://127.0.0.1:8765/ws";
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            websocket_url: "ws://127.0.0.1:8765/ws".to_string(),
+            websocket_url: DEFAULT_WS_URL.to_string(),
             canvas_selector: "#terminal".to_string(),
             high_contrast: false,
             font_size_px: 14,

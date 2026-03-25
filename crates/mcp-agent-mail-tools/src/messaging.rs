@@ -1141,27 +1141,31 @@ fn process_message_attachments(
                         )
                     })?;
 
-                    let stored = mcp_agent_mail_storage::store_raw_attachment(&archive, &resolved)
-                        .map_err(|e| {
-                            let (code, message) = match &e {
-                                mcp_agent_mail_storage::StorageError::InvalidPath(_) => {
-                                    ("INVALID_ARGUMENT", format!("Invalid attachment_paths: {e}"))
-                                }
-                                _ => (
-                                    "ARCHIVE_ERROR",
-                                    format!("Failed to store raw attachment: {e}"),
-                                ),
-                            };
-                            legacy_tool_error(
-                                code,
-                                message,
-                                true,
-                                json!({
-                                    "field": "attachment_paths",
-                                    "path": path,
-                                }),
-                            )
-                        })?;
+                    let stored = mcp_agent_mail_storage::store_raw_attachment(
+                        &archive,
+                        &resolved,
+                        config.max_attachment_bytes,
+                    )
+                    .map_err(|e| {
+                        let (code, message) = match &e {
+                            mcp_agent_mail_storage::StorageError::InvalidPath(_) => {
+                                ("INVALID_ARGUMENT", format!("Invalid attachment_paths: {e}"))
+                            }
+                            _ => (
+                                "ARCHIVE_ERROR",
+                                format!("Failed to store raw attachment: {e}"),
+                            ),
+                        };
+                        legacy_tool_error(
+                            code,
+                            message,
+                            true,
+                            json!({
+                                "field": "attachment_paths",
+                                "path": path,
+                            }),
+                        )
+                    })?;
 
                     all_attachment_rel_paths.extend(stored.rel_paths);
                     if let Ok(value) = serde_json::to_value(&stored.meta) {

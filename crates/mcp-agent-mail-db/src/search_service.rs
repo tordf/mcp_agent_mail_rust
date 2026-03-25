@@ -2186,28 +2186,52 @@ const FRANKENSEARCH_MODEL_DIR_ENV: &str = "FRANKENSEARCH_MODEL_DIR";
 #[cfg(feature = "hybrid")]
 const DEFAULT_RERANK_MODEL_NAME: &str = "flashrank";
 #[cfg(feature = "hybrid")]
-const AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS_ENV: &str = "AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS";
-#[cfg(feature = "hybrid")]
-const DEFAULT_TWO_TIER_FAST_FIRST_BUDGET_MS: u64 = 150;
-#[cfg(feature = "hybrid")]
 const AM_SEARCH_TWO_TIER_FAST_ONLY_ENV: &str = "AM_SEARCH_TWO_TIER_FAST_ONLY";
 const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_ENABLED_ENV: &str =
     "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_ENABLED";
-const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS_ENV: &str =
-    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS";
-const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS_ENV: &str =
-    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS";
-const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT_ENV: &str =
-    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT";
-const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT_ENV: &str =
-    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT";
-const AM_SEARCH_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR_ENV: &str =
-    "AM_SEARCH_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR";
-const DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_MS: u64 = 250;
-const DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS: u64 = 120;
-const DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT: u32 = 70;
-const DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT: u32 = 40;
-const DEFAULT_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR: usize = 10;
+
+#[cfg(feature = "hybrid")]
+fn default_two_tier_fast_first_budget_ms() -> u64 {
+    std::env::var("AM_SEARCH_FAST_FIRST_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(150)
+}
+
+fn default_hybrid_budget_governor_tight_ms() -> u64 {
+    std::env::var("AM_SEARCH_BUDGET_TIGHT_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(250)
+}
+
+fn default_hybrid_budget_governor_critical_ms() -> u64 {
+    std::env::var("AM_SEARCH_BUDGET_CRITICAL_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(120)
+}
+
+fn default_hybrid_budget_governor_tight_scale_pct() -> u32 {
+    std::env::var("AM_SEARCH_BUDGET_TIGHT_SCALE_PCT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(70)
+}
+
+fn default_hybrid_budget_governor_critical_scale_pct() -> u32 {
+    std::env::var("AM_SEARCH_BUDGET_CRITICAL_SCALE_PCT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(40)
+}
+
+fn default_hybrid_budget_governor_result_floor() -> usize {
+    std::env::var("AM_SEARCH_BUDGET_RESULT_FLOOR")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(10)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HybridBudgetGovernorTier {
@@ -2242,11 +2266,11 @@ impl Default for HybridBudgetGovernorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            tight_ms: DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_MS,
-            critical_ms: DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS,
-            tight_scale_pct: DEFAULT_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT,
-            critical_scale_pct: DEFAULT_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT,
-            result_floor: DEFAULT_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR,
+            tight_ms: default_hybrid_budget_governor_tight_ms(),
+            critical_ms: default_hybrid_budget_governor_critical_ms(),
+            tight_scale_pct: default_hybrid_budget_governor_tight_scale_pct(),
+            critical_scale_pct: default_hybrid_budget_governor_critical_scale_pct(),
+            result_floor: default_hybrid_budget_governor_result_floor(),
         }
     }
 }
@@ -2388,6 +2412,7 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
         .clamp(min, max)
 }
 
+#[allow(dead_code)]
 fn env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
     std::env::var(name)
         .ok()
@@ -2406,6 +2431,7 @@ fn env_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
 }
 
 #[cfg(feature = "hybrid")]
+#[allow(dead_code)]
 fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -2417,18 +2443,8 @@ fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
 #[cfg(feature = "hybrid")]
 fn hybrid_budget_governor_config_from_env() -> HybridBudgetGovernorConfig {
     let defaults = HybridBudgetGovernorConfig::default();
-    let tight_ms = env_u64(
-        AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_MS_ENV,
-        defaults.tight_ms,
-        1,
-        60_000,
-    );
-    let critical_ms = env_u64(
-        AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_MS_ENV,
-        defaults.critical_ms,
-        1,
-        tight_ms,
-    );
+    let tight_ms = defaults.tight_ms.clamp(1, 60_000);
+    let critical_ms = defaults.critical_ms.clamp(1, tight_ms);
 
     HybridBudgetGovernorConfig {
         enabled: env_bool(
@@ -2437,24 +2453,9 @@ fn hybrid_budget_governor_config_from_env() -> HybridBudgetGovernorConfig {
         ),
         tight_ms,
         critical_ms,
-        tight_scale_pct: env_u32(
-            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_TIGHT_SCALE_PCT_ENV,
-            defaults.tight_scale_pct,
-            1,
-            100,
-        ),
-        critical_scale_pct: env_u32(
-            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_CRITICAL_SCALE_PCT_ENV,
-            defaults.critical_scale_pct,
-            1,
-            100,
-        ),
-        result_floor: env_usize(
-            AM_SEARCH_HYBRID_BUDGET_GOVERNOR_RESULT_FLOOR_ENV,
-            defaults.result_floor,
-            1,
-            200,
-        ),
+        tight_scale_pct: defaults.tight_scale_pct.clamp(1, 100),
+        critical_scale_pct: defaults.critical_scale_pct.clamp(1, 100),
+        result_floor: defaults.result_floor.clamp(1, 200),
     }
 }
 
@@ -2610,12 +2611,7 @@ fn hybrid_rerank_config_from_env() -> HybridRerankConfig {
 
 #[cfg(feature = "hybrid")]
 fn two_tier_fast_first_budget_ms() -> u64 {
-    env_u64(
-        AM_SEARCH_TWO_TIER_FAST_FIRST_BUDGET_MS_ENV,
-        DEFAULT_TWO_TIER_FAST_FIRST_BUDGET_MS,
-        1,
-        30_000,
-    )
+    default_two_tier_fast_first_budget_ms().clamp(1, 30_000)
 }
 
 #[cfg(feature = "hybrid")]

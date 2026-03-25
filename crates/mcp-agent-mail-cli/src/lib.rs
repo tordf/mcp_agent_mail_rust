@@ -23413,6 +23413,7 @@ http_headers = { Authorization = "Bearer secret" }
                 max_lifetime_ms: 60_000,
                 run_migrations: false, // skip migrations to isolate corruption
                 warmup_connections: 0,
+                cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
             })
             .unwrap()
         };

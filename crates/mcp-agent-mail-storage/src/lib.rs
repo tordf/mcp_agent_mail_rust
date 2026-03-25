@@ -206,6 +206,9 @@ struct WriteBehindQueue {
     op_depth: Arc<AtomicU64>,
 }
 
+// WBQ defaults — overridable via Config / AM_WBQ_* env vars.
+// These fallbacks are used when the static WBQ is initialised before Config
+// is available (e.g. in tests).
 const WBQ_CHANNEL_CAPACITY: usize = 8_192;
 const WBQ_DRAIN_BATCH_CAP: usize = 256;
 const WBQ_FLUSH_INTERVAL_MS: u64 = 100;
@@ -1535,10 +1538,10 @@ pub struct CommitCoalescer {
     worker_count: usize,
 }
 
+// Coalescer defaults — overridable via Config / AM_COALESCER_* env vars.
+// These fallbacks are used when the coalescer is initialised before Config
+// is available (e.g. in tests).
 /// Default flush interval for the coalescer (50ms).
-///
-/// This is the maximum time a commit request waits before being processed.
-/// Under sustained load, workers drain all pending requests every interval.
 pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 50;
 /// Guardrail against accidental zero-duration flush intervals.
 const MIN_COALESCER_FLUSH_MS: u64 = 5;
@@ -4541,9 +4544,10 @@ fn update_thread_digest(
 /// Maximum concurrent WebP conversion threads for parallel attachment processing.
 const MAX_CONCURRENT_CONVERSIONS: usize = 4;
 
-/// Maximum attachment file size for WebP conversion (50 MB).
-/// Files larger than this are rejected to prevent pathological decode times.
-const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+/// Fallback attachment size limit used only when `Config::max_attachment_bytes`
+/// is zero (unlimited).  In that case we still guard against pathological
+/// decode times during WebP conversion.
+const FALLBACK_MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 
 /// Metadata about a stored attachment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4687,13 +4691,19 @@ pub fn store_attachment(
     use base64::Engine;
     use image::GenericImageView;
 
-    // Check size before reading entire file to prevent OOM
+    // Check size before reading entire file to prevent OOM.
+    // Use the config limit when set (non-zero), otherwise the fallback.
+    let effective_limit = if config.max_attachment_bytes > 0 {
+        config.max_attachment_bytes
+    } else {
+        FALLBACK_MAX_ATTACHMENT_BYTES
+    };
     let meta = fs::metadata(file_path)?;
-    if meta.len() > MAX_ATTACHMENT_BYTES as u64 {
+    if meta.len() > effective_limit as u64 {
         return Err(StorageError::InvalidPath(format!(
             "Attachment too large ({} bytes, max {})",
             meta.len(),
-            MAX_ATTACHMENT_BYTES,
+            effective_limit,
         )));
     }
 
@@ -4743,11 +4753,11 @@ pub fn store_attachment(
     }
 
     // -- File size guard: reject pathologically large files --
-    if original_bytes.len() > MAX_ATTACHMENT_BYTES {
+    if original_bytes.len() > effective_limit {
         return Err(StorageError::InvalidPath(format!(
             "Attachment too large for conversion ({} bytes, max {})",
             original_bytes.len(),
-            MAX_ATTACHMENT_BYTES,
+            effective_limit,
         )));
     }
 
@@ -4863,14 +4873,20 @@ pub fn store_attachment(
 pub fn store_raw_attachment(
     archive: &ProjectArchive,
     file_path: &Path,
+    max_bytes: usize,
 ) -> Result<StoredAttachment> {
+    let effective_limit = if max_bytes > 0 {
+        max_bytes
+    } else {
+        FALLBACK_MAX_ATTACHMENT_BYTES
+    };
     // Check size before reading entire file to prevent OOM
     let meta = fs::metadata(file_path)?;
-    if meta.len() > MAX_ATTACHMENT_BYTES as u64 {
+    if meta.len() > effective_limit as u64 {
         return Err(StorageError::InvalidPath(format!(
             "Attachment too large ({} bytes, max {})",
             meta.len(),
-            MAX_ATTACHMENT_BYTES,
+            effective_limit,
         )));
     }
 
@@ -7598,6 +7614,7 @@ mod tests {
             max_lifetime_ms: 3_600_000,
             run_migrations: true,
             warmup_connections: 0,
+            cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
         };
         let pool = DbPool::new(&pool_config).expect("create db pool");
         let pool_for_setup = pool.clone();
@@ -7744,6 +7761,7 @@ mod tests {
             max_lifetime_ms: 3_600_000,
             run_migrations: true,
             warmup_connections: 0,
+            cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
         };
         let pool = DbPool::new(&pool_config).expect("create db pool");
         let pool_for_setup = pool.clone();
@@ -9389,12 +9407,8 @@ mod tests {
         let config = test_config(tmp.path());
         let archive = ensure_archive(&config, "oversize-proj").unwrap();
 
-        // Create a file larger than MAX_ATTACHMENT_BYTES (50MB)
-        // We can't actually write 50MB in a unit test, but we can temporarily
-        // create a smaller "image" and test the guard path by using a non-image
-        // file that would fail decode before the size check. Instead, verify
-        // the constant is set correctly.
-        assert_eq!(MAX_ATTACHMENT_BYTES, 50 * 1024 * 1024);
+        // Verify the fallback constant is the expected value.
+        assert_eq!(FALLBACK_MAX_ATTACHMENT_BYTES, 50 * 1024 * 1024);
 
         // Create a valid but empty file (should fail with "empty" error, not size)
         let empty_path = archive.root.join("empty.png");
