@@ -178,6 +178,7 @@ _E2E_FIXTURE_IDS=()
 
 # Trace file (initialized by e2e_init_artifacts)
 _E2E_TRACE_FILE=""
+_E2E_CASE_ARTIFACTS_FILE=""
 
 # Temp dirs to clean up
 _E2E_TMP_DIRS=()
@@ -450,9 +451,37 @@ trap _e2e_cleanup EXIT
 e2e_init_artifacts() {
     mkdir -p "$E2E_ARTIFACT_DIR"/{diagnostics,trace,transcript,logs,screenshots}
     _E2E_TRACE_FILE="${E2E_ARTIFACT_DIR}/trace/events.jsonl"
+    _E2E_CASE_ARTIFACTS_FILE="${E2E_ARTIFACT_DIR}/trace/.case_artifacts.tsv"
     touch "$_E2E_TRACE_FILE"
+    : >"$_E2E_CASE_ARTIFACTS_FILE"
     _e2e_trace_event "suite_start" ""
     e2e_log "Artifacts: $E2E_ARTIFACT_DIR"
+}
+
+_e2e_record_case_artifact_paths() {
+    local case_name="${1:-}"
+    shift || true
+
+    if [ -z "$case_name" ] || [ -z "${_E2E_CASE_ARTIFACTS_FILE:-}" ]; then
+        return 0
+    fi
+
+    local path abs rel
+    for path in "$@"; do
+        [ -z "$path" ] && continue
+        if [ -d "$path" ]; then
+            while IFS= read -r abs; do
+                rel="${abs#"$E2E_ARTIFACT_DIR"/}"
+                [ "$rel" = "$abs" ] && continue
+                printf '%s\t%s\n' "$case_name" "$rel" >>"$_E2E_CASE_ARTIFACTS_FILE"
+            done < <(find "$path" -type f | sort)
+            continue
+        fi
+        [ -f "$path" ] || continue
+        rel="${path#"$E2E_ARTIFACT_DIR"/}"
+        [ "$rel" = "$path" ] && continue
+        printf '%s\t%s\n' "$case_name" "$rel" >>"$_E2E_CASE_ARTIFACTS_FILE"
+    done
 }
 
 # Save a file to the artifact directory
@@ -462,6 +491,7 @@ e2e_save_artifact() {
     local dest="${E2E_ARTIFACT_DIR}/${name}"
     mkdir -p "$(dirname "$dest")"
     echo "$content" > "$dest"
+    _e2e_record_case_artifact_paths "${_E2E_MARKER_ACTIVE_CASE:-}" "$dest"
 }
 
 # Save a file (by path) to artifacts
@@ -471,6 +501,7 @@ e2e_copy_artifact() {
     local dest="${E2E_ARTIFACT_DIR}/${dest_name}"
     mkdir -p "$(dirname "$dest")"
     cp -r "$src" "$dest" 2>/dev/null || true
+    _e2e_record_case_artifact_paths "${_E2E_MARKER_ACTIVE_CASE:-}" "$dest"
 }
 
 e2e_add_fixture_id() {
@@ -498,6 +529,34 @@ _e2e_json_escape() {
 _e2e_stat_bytes() {
     local file="$1"
     stat --format='%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null || echo "0"
+}
+
+_e2e_binary_version() {
+    local bin
+    for bin in \
+        "${CARGO_TARGET_DIR}/debug/mcp-agent-mail" \
+        "${E2E_PROJECT_ROOT}/target/debug/mcp-agent-mail" \
+        "${CARGO_TARGET_DIR}/debug/am" \
+        "${E2E_PROJECT_ROOT}/target/debug/am"
+    do
+        if [ -x "$bin" ]; then
+            "$bin" --version 2>/dev/null | head -n 1
+            return 0
+        fi
+    done
+
+    if command -v am >/dev/null 2>&1; then
+        am --version 2>/dev/null | head -n 1
+        return 0
+    fi
+    if command -v mcp-agent-mail >/dev/null 2>&1; then
+        mcp-agent-mail --version 2>/dev/null | head -n 1
+        return 0
+    fi
+
+    awk -F'"' '
+        /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ { print $2; exit }
+    ' "${E2E_PROJECT_ROOT}/Cargo.toml" 2>/dev/null
 }
 
 e2e_write_repro_files() {
@@ -696,6 +755,211 @@ e2e_write_forensic_indexes() {
     e2e_write_fixture_ids_json "$artifact_dir"
     e2e_write_logs_index_json "$artifact_dir"
     e2e_write_screenshots_index_json "$artifact_dir"
+}
+
+e2e_write_suite_manifest_json() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    if [ ! -d "$artifact_dir" ]; then
+        return 0
+    fi
+
+    local py="python3"
+    if ! command -v "$py" >/dev/null 2>&1; then
+        py="python"
+    fi
+    if ! command -v "$py" >/dev/null 2>&1; then
+        e2e_log "python unavailable; skipping manifest.json generation"
+        return 0
+    fi
+
+    local rust_version binary_version os_name arch_name rerun_command
+    rust_version="$(rustc --version 2>/dev/null || echo "")"
+    binary_version="$(_e2e_binary_version)"
+    os_name="$(uname -s 2>/dev/null || echo "")"
+    arch_name="$(uname -m 2>/dev/null || echo "")"
+    rerun_command="$(e2e_repro_command)"
+
+    "$py" - \
+        "$artifact_dir" \
+        "${_E2E_CASE_ARTIFACTS_FILE:-}" \
+        "$E2E_SUITE" \
+        "$E2E_RUN_STARTED_AT" \
+        "$E2E_RUN_ENDED_AT" \
+        "$rust_version" \
+        "$binary_version" \
+        "$os_name" \
+        "$arch_name" \
+        "${_E2E_SERVER_PORT:-}" \
+        "${_E2E_SERVER_AUTH_MODE:-none}" \
+        "${_E2E_SERVER_STORAGE_ROOT:-}" \
+        "$rerun_command" <<'PY'
+import json
+import os
+import sys
+from collections import OrderedDict, defaultdict
+from datetime import datetime
+
+artifact_dir = sys.argv[1]
+case_artifacts_path = sys.argv[2]
+suite = sys.argv[3]
+started_at = sys.argv[4]
+finished_at = sys.argv[5]
+rust_version = sys.argv[6]
+binary_version = sys.argv[7]
+os_name = sys.argv[8]
+arch_name = sys.argv[9]
+server_port_raw = sys.argv[10]
+server_auth = sys.argv[11]
+server_storage_root = sys.argv[12]
+rerun_command = sys.argv[13]
+
+manifest_path = os.path.join(artifact_dir, "manifest.json")
+trace_path = os.path.join(artifact_dir, "trace", "events.jsonl")
+
+def parse_ts(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+cases = OrderedDict()
+artifact_map = defaultdict(set)
+
+if case_artifacts_path and os.path.isfile(case_artifacts_path):
+    with open(case_artifacts_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line or "\t" not in line:
+                continue
+            case_name, rel_path = line.split("\t", 1)
+            if case_name and rel_path:
+                artifact_map[case_name].add(rel_path)
+
+def ensure_case(name: str):
+    if not name:
+        return None
+    if name not in cases:
+        cases[name] = {
+            "name": name,
+            "status": "unknown",
+            "duration_ms": None,
+            "assertion_count": 0,
+            "artifacts": set(),
+            "_pass": 0,
+            "_fail": 0,
+            "_skip": 0,
+            "_start_ts": None,
+            "_end_ts": None,
+            "_last_elapsed_ms": None,
+        }
+    return cases[name]
+
+if os.path.isfile(trace_path):
+    with open(trace_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = event.get("kind")
+            case_name = event.get("case") or ""
+            case = ensure_case(case_name)
+            if case is None:
+                continue
+            elapsed_ms = event.get("elapsed_ms")
+            if isinstance(elapsed_ms, (int, float)):
+                case["_last_elapsed_ms"] = int(elapsed_ms)
+            if kind == "case_start":
+                case["_start_ts"] = event.get("ts")
+            elif kind == "case_end":
+                case["_end_ts"] = event.get("ts")
+                if isinstance(elapsed_ms, (int, float)):
+                    case["duration_ms"] = int(elapsed_ms)
+            elif kind == "assert_pass":
+                case["assertion_count"] += 1
+                case["_pass"] += 1
+            elif kind == "assert_fail":
+                case["assertion_count"] += 1
+                case["_fail"] += 1
+            elif kind == "assert_skip":
+                case["assertion_count"] += 1
+                case["_skip"] += 1
+
+for case_name, case in cases.items():
+    case_dir = os.path.join(artifact_dir, case_name)
+    if os.path.isdir(case_dir):
+        for root, _, files in os.walk(case_dir):
+            for filename in files:
+                abs_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(abs_path, artifact_dir).replace(os.sep, "/")
+                artifact_map[case_name].add(rel_path)
+
+    case["artifacts"].update(
+        rel_path
+        for rel_path in artifact_map.get(case_name, set())
+        if os.path.isfile(os.path.join(artifact_dir, rel_path))
+    )
+
+    if case["duration_ms"] is None:
+        if case["_last_elapsed_ms"] is not None:
+            case["duration_ms"] = case["_last_elapsed_ms"]
+        else:
+            start_ts = parse_ts(case["_start_ts"])
+            end_ts = parse_ts(case["_end_ts"])
+            if start_ts and end_ts:
+                case["duration_ms"] = max(0, int((end_ts - start_ts).total_seconds() * 1000))
+
+    if case["_fail"] > 0:
+        case["status"] = "fail"
+    elif case["_pass"] > 0:
+        case["status"] = "pass"
+    elif case["_skip"] > 0:
+        case["status"] = "skip"
+
+    case["artifacts"] = sorted(case["artifacts"])
+    if case["duration_ms"] is None:
+        case["duration_ms"] = 0
+
+server_port = int(server_port_raw) if server_port_raw.isdigit() else None
+
+manifest = {
+    "schema_version": 1,
+    "test_suite": suite,
+    "started_at": started_at,
+    "finished_at": finished_at,
+    "cases": [
+        {
+            "name": case["name"],
+            "status": case["status"],
+            "duration_ms": case["duration_ms"],
+            "assertion_count": case["assertion_count"],
+            "artifacts": case["artifacts"],
+        }
+        for case in cases.values()
+    ],
+    "environment": {
+        "rust_version": rust_version,
+        "binary_version": binary_version,
+        "os": os_name,
+        "arch": arch_name,
+    },
+    "server_config": {
+        "port": server_port,
+        "auth": server_auth,
+        "storage_root": server_storage_root,
+    },
+    "rerun_command": rerun_command,
+}
+
+with open(manifest_path, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
 }
 
 _e2e_now_rfc3339() {
@@ -972,6 +1236,7 @@ e2e_write_bundle_manifest() {
         echo "    \"metadata\": {\"path\": \"meta.json\", \"schema\": \"meta.v1\"},"
         echo "    \"metrics\": {\"path\": \"metrics.json\", \"schema\": \"metrics.v1\"},"
         echo "    \"summary\": {\"path\": \"summary.json\", \"schema\": \"summary.v1\"},"
+        echo "    \"manifest\": {\"path\": \"manifest.json\", \"schema\": \"e2e-manifest.v1\"},"
         echo "    \"diagnostics\": {"
         echo "      \"env_redacted\": {\"path\": \"diagnostics/env_redacted.txt\"},"
         echo "      \"tree\": {\"path\": \"diagnostics/tree.txt\"}"
@@ -1003,6 +1268,10 @@ e2e_write_bundle_manifest() {
                 summary.json)
                     kind="metrics"
                     schema_json="\"summary.v1\""
+                    ;;
+                manifest.json)
+                    kind="metadata"
+                    schema_json="\"e2e-manifest.v1\""
                     ;;
                 meta.json)
                     kind="metadata"
@@ -1066,7 +1335,7 @@ e2e_write_bundle_manifest() {
                 echo "    ,"
             fi
             echo "    {\"path\": \"$( _e2e_json_escape "$rel" )\", \"sha256\": \"$( _e2e_json_escape "$sha" )\", \"bytes\": ${bytes}, \"kind\": \"$( _e2e_json_escape "$kind" )\", \"schema\": ${schema_json}}"
-        done < <(find "$artifact_dir" -type f ! -name "bundle.json" | sort)
+        done < <(find "$artifact_dir" -type f ! -name "bundle.json" ! -name ".case_artifacts.tsv" | sort)
 
         echo "  ]"
         echo "}"
@@ -1158,6 +1427,7 @@ def req_path(obj, key, require_schema=False):
 req_path(artifacts, "metadata", True)
 req_path(artifacts, "metrics", True)
 req_path(artifacts, "summary", True)
+req_path(artifacts, "manifest", True)
 
 diag = require(artifacts, "diagnostics", dict)
 req_path(diag, "env_redacted")
@@ -1257,6 +1527,52 @@ require(summary, "started_at", str)
 require(summary, "ended_at", str)
 for k in ("total", "pass", "fail", "skip"):
     require(summary, k, int)
+
+suite_manifest = load_json("manifest.json")
+require(suite_manifest, "schema_version", int)
+if require(suite_manifest, "test_suite", str) != suite:
+    fail("manifest.json suite mismatch")
+if require(suite_manifest, "started_at", str) != require(summary, "started_at", str):
+    fail("manifest.json started_at mismatch")
+if require(suite_manifest, "finished_at", str) != require(summary, "ended_at", str):
+    fail("manifest.json finished_at mismatch")
+cases = require(suite_manifest, "cases", list)
+seen_case_names = set()
+allowed_case_statuses = {"pass", "fail", "skip", "unknown"}
+for i, ent in enumerate(cases):
+    if not isinstance(ent, dict):
+        fail(f"manifest.json cases[{i}] must be object")
+    case_name = require(ent, "name", str)
+    if case_name in seen_case_names:
+        fail(f"manifest.json case names must be unique: {case_name}")
+    seen_case_names.add(case_name)
+    case_status = require(ent, "status", str)
+    if case_status not in allowed_case_statuses:
+        fail(f"manifest.json cases[{i}].status invalid: {case_status}")
+    duration_ms = require(ent, "duration_ms", int)
+    if duration_ms < 0:
+        fail(f"manifest.json cases[{i}].duration_ms must be >= 0")
+    assertion_count = require(ent, "assertion_count", int)
+    if assertion_count < 0:
+        fail(f"manifest.json cases[{i}].assertion_count must be >= 0")
+    case_artifacts = require(ent, "artifacts", list)
+    for j, rel_path in enumerate(case_artifacts):
+        if not isinstance(rel_path, str):
+            fail(f"manifest.json cases[{i}].artifacts[{j}] must be string")
+        if rel_path not in file_map:
+            fail(f"manifest.json cases[{i}] references missing artifact: {rel_path}")
+
+environment = require(suite_manifest, "environment", dict)
+for key in ("rust_version", "binary_version", "os", "arch"):
+    require(environment, key, str)
+
+server_config = require(suite_manifest, "server_config", dict)
+port = require(server_config, "port")
+if port is not None and not isinstance(port, int):
+    fail("manifest.json server_config.port must be int or null")
+require(server_config, "auth", str)
+require(server_config, "storage_root", str)
+require(suite_manifest, "rerun_command", str)
 
 meta = load_json("meta.json")
 require(meta, "schema_version", int)
@@ -1577,6 +1893,7 @@ e2e_rpc_call() {
     local status_file="${case_dir}/status.txt"
     local curl_stderr_file="${case_dir}/curl_stderr.txt"
     local diagnostics_file="${case_dir}/diagnostics.txt"
+    local owner_case="${_E2E_MARKER_ACTIVE_CASE:-$case_id}"
 
     # Build JSON-RPC request payload
     local payload
@@ -1648,6 +1965,9 @@ EOJSON
             cat "${request_file}"
         } > "${diagnostics_file}"
         _e2e_trace_event "rpc_call_fail" "curl_rc=${curl_rc}" "${case_id}"
+        _e2e_record_case_artifact_paths "$owner_case" \
+            "$request_file" "$response_file" "$headers_file" "$timing_file" \
+            "$status_file" "$curl_stderr_file" "$diagnostics_file"
         return 1
     fi
 
@@ -1677,6 +1997,9 @@ EOJSON
             "${E2E_RPC_CALL_HOOK}" "${case_id}" "${http_status}" "${elapsed_ms}" "${case_dir}" || true
         fi
 
+        _e2e_record_case_artifact_paths "$owner_case" \
+            "$request_file" "$response_file" "$headers_file" "$timing_file" \
+            "$status_file" "$curl_stderr_file" "$diagnostics_file"
         return 1
     fi
 
@@ -1687,6 +2010,9 @@ EOJSON
         "${E2E_RPC_CALL_HOOK}" "${case_id}" "${http_status}" "${elapsed_ms}" "${case_dir}" || true
     fi
 
+    _e2e_record_case_artifact_paths "$owner_case" \
+        "$request_file" "$response_file" "$headers_file" "$timing_file" \
+        "$status_file" "$curl_stderr_file" "$diagnostics_file"
     return 0
 }
 
@@ -1713,6 +2039,7 @@ e2e_rpc_call_raw() {
     local status_file="${case_dir}/status.txt"
     local curl_stderr_file="${case_dir}/curl_stderr.txt"
     local diagnostics_file="${case_dir}/diagnostics.txt"
+    local owner_case="${_E2E_MARKER_ACTIVE_CASE:-$case_id}"
 
     echo "${payload}" > "${request_file}"
 
@@ -1769,6 +2096,9 @@ e2e_rpc_call_raw() {
             cat "${request_file}"
         } > "${diagnostics_file}"
         _e2e_trace_event "rpc_call_fail" "curl_rc=${curl_rc}" "${case_id}"
+        _e2e_record_case_artifact_paths "$owner_case" \
+            "$request_file" "$response_file" "$headers_file" "$timing_file" \
+            "$status_file" "$curl_stderr_file" "$diagnostics_file"
         return 1
     fi
 
@@ -1795,6 +2125,9 @@ e2e_rpc_call_raw() {
             "${E2E_RPC_CALL_HOOK}" "${case_id}" "${http_status}" "${elapsed_ms}" "${case_dir}" || true
         fi
 
+        _e2e_record_case_artifact_paths "$owner_case" \
+            "$request_file" "$response_file" "$headers_file" "$timing_file" \
+            "$status_file" "$curl_stderr_file" "$diagnostics_file"
         return 1
     fi
 
@@ -1804,6 +2137,9 @@ e2e_rpc_call_raw() {
         "${E2E_RPC_CALL_HOOK}" "${case_id}" "${http_status}" "${elapsed_ms}" "${case_dir}" || true
     fi
 
+    _e2e_record_case_artifact_paths "$owner_case" \
+        "$request_file" "$response_file" "$headers_file" "$timing_file" \
+        "$status_file" "$curl_stderr_file" "$diagnostics_file"
     return 0
 }
 
@@ -2011,6 +2347,9 @@ e2e_ensure_binary() {
 _E2E_SERVER_PID=""
 _E2E_SERVER_LOG=""
 _E2E_SERVER_LABEL=""
+_E2E_SERVER_PORT=""
+_E2E_SERVER_STORAGE_ROOT=""
+_E2E_SERVER_AUTH_MODE="none"
 _E2E_CASE_MARKERS=()
 _E2E_CASE_LOG_LINE_COUNTS=()
 
@@ -2048,6 +2387,19 @@ e2e_start_server_with_logs() {
     # Server log file
     _E2E_SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_${label}.log"
     _E2E_SERVER_LABEL="$label"
+    _E2E_SERVER_PORT="${port}"
+    _E2E_SERVER_STORAGE_ROOT="${storage_root}"
+    _E2E_SERVER_AUTH_MODE="none"
+    local extra_env
+    for extra_env in "$@"; do
+        case "$extra_env" in
+            HTTP_BEARER_TOKEN=*)
+                if [ -n "${extra_env#HTTP_BEARER_TOKEN=}" ]; then
+                    _E2E_SERVER_AUTH_MODE="bearer"
+                fi
+                ;;
+        esac
+    done
     mkdir -p "$(dirname "$_E2E_SERVER_LOG")"
 
     e2e_log "Starting server (${label}): 127.0.0.1:${port}"
@@ -2138,6 +2490,19 @@ e2e_start_server_with_pty() {
 
     _E2E_SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_${label}.typescript"
     _E2E_SERVER_LABEL="$label"
+    _E2E_SERVER_PORT="${port}"
+    _E2E_SERVER_STORAGE_ROOT="${storage_root}"
+    _E2E_SERVER_AUTH_MODE="none"
+    local extra_env
+    for extra_env in "$@"; do
+        case "$extra_env" in
+            HTTP_BEARER_TOKEN=*)
+                if [ -n "${extra_env#HTTP_BEARER_TOKEN=}" ]; then
+                    _E2E_SERVER_AUTH_MODE="bearer"
+                fi
+                ;;
+        esac
+    done
     mkdir -p "$(dirname "${_E2E_SERVER_LOG}")" "${storage_root}"
 
     e2e_log "Starting PTY server (${label}): 127.0.0.1:${port}"
@@ -2278,6 +2643,14 @@ e2e_mark_case_end() {
     if [ -z "$case_name" ]; then
         return 0
     fi
+    if [ "${_E2E_MARKER_ACTIVE_CASE:-}" = "$case_name" ]; then
+        local now_ms elapsed=""
+        now_ms="$(_e2e_now_ms)"
+        if [ "${_E2E_CASE_START_MS:-0}" -gt 0 ]; then
+            elapsed=$(( now_ms - _E2E_CASE_START_MS ))
+        fi
+        _e2e_trace_event "case_end" "" "$case_name" "" "" "$elapsed"
+    fi
     _e2e_server_log_marker "CASE_END" "$case_name"
     if [ "${_E2E_MARKER_ACTIVE_CASE:-}" = "$case_name" ]; then
         _E2E_MARKER_ACTIVE_CASE=""
@@ -2326,6 +2699,8 @@ e2e_extract_case_logs() {
         # Fallback: grep for case name in logs
         grep -i "$case_name" "$_E2E_SERVER_LOG" > "$out_file" 2>/dev/null || true
     fi
+
+    _e2e_record_case_artifact_paths "$case_name" "$out_file"
 
     cat "$out_file"
 }
@@ -2774,6 +3149,7 @@ e2e_summary() {
 
         # Write server log stats if server was used (br-3h13.12.2)
         e2e_write_server_log_stats
+        e2e_write_suite_manifest_json
 
         # Emit a versioned bundle manifest and validate it. This provides
         # artifact-contract enforcement for CI regression triage (br-3vwi.10.18).

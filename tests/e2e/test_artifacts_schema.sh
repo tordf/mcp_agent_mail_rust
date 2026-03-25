@@ -42,6 +42,7 @@ e2e_write_diagnostics_files "${GOOD_DIR}"
 e2e_write_transcript_summary "${GOOD_DIR}"
 e2e_write_repro_files "${GOOD_DIR}"
 e2e_write_forensic_indexes "${GOOD_DIR}"
+e2e_write_suite_manifest_json "${GOOD_DIR}"
 e2e_write_bundle_manifest "${GOOD_DIR}"
 
 e2e_case_banner "Valid bundle validates"
@@ -140,6 +141,36 @@ if e2e_validate_bundle_manifest "${BAD_BYTES_DIR}"; then
     e2e_fail "validator accepted bytes mismatch"
 else
     e2e_pass "validator rejects bytes mismatch"
+fi
+
+e2e_case_banner "Manifest artifact references are enforced (negative test)"
+BAD_MANIFEST_DIR="${FIX_ROOT}/bad_manifest_ref"
+cp -r "${GOOD_DIR}" "${BAD_MANIFEST_DIR}"
+python3 - <<'PY' "${BAD_MANIFEST_DIR}/manifest.json"
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    d = json.load(f)
+d["cases"] = [
+    {
+        "name": "case_missing_artifact",
+        "status": "pass",
+        "duration_ms": 7,
+        "assertion_count": 1,
+        "artifacts": ["missing.json"],
+    }
+]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(d, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+e2e_write_bundle_manifest "${BAD_MANIFEST_DIR}"
+if e2e_validate_bundle_manifest "${BAD_MANIFEST_DIR}"; then
+    e2e_fail "validator accepted manifest artifact reference to missing file"
+else
+    e2e_pass "validator rejects manifest artifact reference to missing file"
 fi
 
 e2e_summary
