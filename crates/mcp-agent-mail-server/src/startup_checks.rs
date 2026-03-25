@@ -1297,7 +1297,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     };
 
     match pool.run_startup_integrity_check() {
-        Ok(_) => attempt_archive_drift_recovery(config),
+        Ok(_) => ProbeResult::Ok { name: "integrity" },
         Err(ref e) => {
             let err_str = e.to_string();
             tracing::warn!(
@@ -1306,92 +1306,6 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             );
             attempt_probe_recovery(config)
         }
-    }
-}
-
-fn query_database_message_inventory(db_path: &std::path::Path) -> Result<(usize, i64), String> {
-    let conn =
-        mcp_agent_mail_db::open_sqlite_file_with_recovery(db_path.to_string_lossy().as_ref())
-            .map_err(|e| format!("open failed: {e}"))?;
-    let rows = conn
-        .query_sync(
-            "SELECT COUNT(*) AS message_count, COALESCE(MAX(id), 0) AS max_id FROM messages",
-            &[],
-        )
-        .map_err(|e| format!("query failed: {e}"))?;
-    let Some(row) = rows.first() else {
-        return Err("no rows returned from message inventory query".into());
-    };
-
-    let message_count = row
-        .get_named::<i64>("message_count")
-        .ok()
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or(0);
-    let max_id = row.get_named::<i64>("max_id").unwrap_or(0);
-    Ok((message_count, max_id))
-}
-
-fn attempt_archive_drift_recovery(config: &Config) -> ProbeResult {
-    let Some(db_path) = sqlite_file_path_from_database_url(&config.database_url) else {
-        return ProbeResult::Ok { name: "integrity" };
-    };
-    if !db_path.exists() {
-        return ProbeResult::Ok { name: "integrity" };
-    }
-
-    let storage_root = std::path::Path::new(&config.storage_root);
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
-    if archive.unique_message_ids == 0 {
-        return ProbeResult::Ok { name: "integrity" };
-    }
-
-    let (db_message_count, db_max_id) = match query_database_message_inventory(&db_path) {
-        Ok(inventory) => inventory,
-        Err(err) => {
-            tracing::warn!(
-                path = %db_path.display(),
-                error = %err,
-                "archive drift probe could not read SQLite message inventory; leaving startup integrity probe green"
-            );
-            return ProbeResult::Ok { name: "integrity" };
-        }
-    };
-
-    let archive_max_id = archive.latest_message_id.unwrap_or(0);
-    let archive_ahead = archive.unique_message_ids > db_message_count || archive_max_id > db_max_id;
-    if !archive_ahead {
-        return ProbeResult::Ok { name: "integrity" };
-    }
-
-    tracing::warn!(
-        path = %db_path.display(),
-        db_message_count,
-        db_max_id,
-        archive_message_count = archive.unique_message_ids,
-        archive_max_id,
-        "archive inventory is ahead of the SQLite database; attempting automatic reconstruction with salvage"
-    );
-
-    match mcp_agent_mail_db::reconstruct_sqlite_file_with_archive_salvage(&db_path, storage_root) {
-        Ok(stats) => {
-            tracing::warn!(
-                path = %db_path.display(),
-                %stats,
-                "archive drift auto-recovery completed successfully"
-            );
-            ProbeResult::Ok { name: "integrity" }
-        }
-        Err(err) => ProbeResult::Fail(ProbeFailure {
-            name: "integrity",
-            problem: format!(
-                "Archive-backed recovery was required because the archive is ahead of the SQLite DB, but it failed: {err}"
-            ),
-            fix: format!(
-                "Run `am doctor reconstruct` to rebuild {} from the archive while salvaging DB-only state.",
-                db_path.display()
-            ),
-        }),
     }
 }
 

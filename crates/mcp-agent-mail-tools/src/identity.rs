@@ -13,7 +13,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
 use crate::tool_util::{
@@ -49,6 +49,47 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
         op,
         &format!("agent profile archive write project={project_slug}"),
     );
+}
+
+fn path_has_ephemeral_root(path: &Path) -> bool {
+    let temp_root = std::env::temp_dir();
+    if path.starts_with(&temp_root) {
+        return true;
+    }
+
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    normalized == "/tmp"
+        || normalized.starts_with("/tmp/")
+        || normalized == "/var/tmp"
+        || normalized.starts_with("/var/tmp/")
+        || normalized == "/private/tmp"
+        || normalized.starts_with("/private/tmp/")
+        || normalized == "/var/folders"
+        || normalized.starts_with("/var/folders/")
+}
+
+fn reject_ephemeral_project_in_default_storage(config: &Config, human_key: &str) -> McpResult<()> {
+    if config.allow_ephemeral_projects_in_default_storage
+        || !mcp_agent_mail_core::config::is_default_storage_root(&config.storage_root)
+        || !path_has_ephemeral_root(Path::new(human_key))
+    {
+        return Ok(());
+    }
+
+    Err(legacy_tool_error(
+        "EPHEMERAL_PROJECT_REQUIRES_STORAGE_ROOT",
+        format!(
+            "Refusing to register temporary project path '{human_key}' into the default global mailbox storage root '{}'. \
+Set STORAGE_ROOT to an isolated directory for this run, or explicitly opt in with ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE=true if you really intend to persist temporary projects in the operator mailbox archive.",
+            config.storage_root.display()
+        ),
+        true,
+        json!({
+            "field": "human_key",
+            "error_detail": human_key,
+            "storage_root": config.storage_root.display().to_string(),
+        }),
+    ))
 }
 
 fn enqueue_project_semantic_index(project: &mcp_agent_mail_db::ProjectRow) {
@@ -440,6 +481,7 @@ Check that all parameters have valid values."
     }
 
     let config = &Config::get();
+    reject_ephemeral_project_in_default_storage(config, &human_key)?;
     let pool = get_db_pool()?;
 
     // Log identity_mode if provided (future: resolve project identity via git remotes, etc.)
@@ -1504,6 +1546,44 @@ mod tests {
     #[test]
     fn ensure_project_accepts_deeply_nested_path() {
         assert!(Path::new("/a/b/c/d/e/f/g").is_absolute());
+    }
+
+    #[test]
+    fn path_has_ephemeral_root_detects_common_temp_locations() {
+        assert!(path_has_ephemeral_root(Path::new("/tmp/test-project")));
+        assert!(path_has_ephemeral_root(Path::new("/var/tmp/test-project")));
+        assert!(path_has_ephemeral_root(Path::new(
+            "/private/tmp/test-project"
+        )));
+        assert!(path_has_ephemeral_root(Path::new(
+            "/var/folders/aa/bb/T/test-project"
+        )));
+        assert!(!path_has_ephemeral_root(Path::new(
+            "/data/projects/not-temporary"
+        )));
+    }
+
+    #[test]
+    fn reject_ephemeral_project_in_default_storage_blocks_tmp_projects() {
+        let mut config = Config::default();
+        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
+        config.allow_ephemeral_projects_in_default_storage = false;
+
+        let err = reject_ephemeral_project_in_default_storage(&config, "/tmp/test-project")
+            .expect_err("tmp project should be rejected for default global storage");
+        let message = err.to_string();
+        assert!(message.contains("Refusing to register temporary project path"));
+        assert!(message.contains("ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE=true"));
+    }
+
+    #[test]
+    fn reject_ephemeral_project_in_default_storage_allows_custom_storage_roots() {
+        let mut config = Config::default();
+        config.storage_root = PathBuf::from("/tmp/custom-storage-root");
+        config.allow_ephemeral_projects_in_default_storage = false;
+
+        reject_ephemeral_project_in_default_storage(&config, "/tmp/test-project")
+            .expect("custom storage root should allow tmp project");
     }
 
     // ── Agent name validation extended ──

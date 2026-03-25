@@ -1551,7 +1551,8 @@ const COALESCER_MAX_BATCH_SIZE: usize = 10;
 const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
 /// Maximum worker threads for the coalescer pool.
 const COALESCER_MAX_WORKERS: usize = 32;
-/// Per-repo queue capacity before spilling.
+/// Per-repo queue capacity before spilling (now read from `Config::coalescer_queue_cap`).
+#[cfg(test)]
 const COALESCER_REPO_QUEUE_CAP: usize = 512;
 
 const COALESCER_SPILL_PATH_CAP: usize = 4_096;
@@ -1761,11 +1762,12 @@ impl CommitCoalescer {
         }
 
         // Try to push into the per-repo queue; spill if full.
+        let repo_queue_cap = config.coalescer_queue_cap;
         let queue_depth = rq.depth.load(Ordering::Relaxed);
-        if queue_depth < COALESCER_REPO_QUEUE_CAP as u64 {
+        if queue_depth < repo_queue_cap as u64 {
             let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
             // Re-check under lock
-            if q.len() < COALESCER_REPO_QUEUE_CAP {
+            if q.len() < repo_queue_cap {
                 q.push_back(fields);
                 rq.depth.fetch_add(1, Ordering::Relaxed);
                 drop(q);

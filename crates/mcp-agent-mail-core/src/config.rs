@@ -78,6 +78,7 @@ pub struct Config {
     pub convert_images: bool,
     pub keep_original_images: bool,
     pub allow_absolute_attachment_paths: bool,
+    pub allow_ephemeral_projects_in_default_storage: bool,
 
     // Disk space monitoring
     pub disk_space_monitor_enabled: bool,
@@ -687,6 +688,25 @@ fn xdg_data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(XDG_APP_DIR))
 }
 
+#[must_use]
+pub fn default_storage_root_path() -> PathBuf {
+    let legacy = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".mcp_agent_mail_git_mailbox_repo");
+    if legacy.exists() {
+        legacy
+    } else {
+        xdg_data_dir()
+            .map(|d| d.join("git_mailbox_repo"))
+            .unwrap_or(legacy)
+    }
+}
+
+#[must_use]
+pub fn is_default_storage_root(path: &Path) -> bool {
+    path == default_storage_root_path()
+}
+
 /// Resolve a *data* path with backward compatibility.
 ///
 /// `legacy_base` is the old parent directory (e.g. `~/.mcp_agent_mail`).
@@ -734,24 +754,14 @@ impl Default for Config {
             fsqlite_concurrent_retries: 5,
 
             // Storage
-            storage_root: {
-                let legacy = dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".mcp_agent_mail_git_mailbox_repo");
-                if legacy.exists() {
-                    legacy
-                } else {
-                    xdg_data_dir()
-                        .map(|d| d.join("git_mailbox_repo"))
-                        .unwrap_or(legacy)
-                }
-            },
+            storage_root: default_storage_root_path(),
             git_author_name: "mcp-agent".to_string(),
             git_author_email: "mcp-agent@example.com".to_string(),
             inline_image_max_bytes: 65536,
             convert_images: true,
             keep_original_images: false,
             allow_absolute_attachment_paths: false,
+            allow_ephemeral_projects_in_default_storage: false,
 
             // Disk space monitoring
             disk_space_monitor_enabled: true,
@@ -1143,6 +1153,10 @@ impl Config {
         config.allow_absolute_attachment_paths = env_bool(
             "ALLOW_ABSOLUTE_ATTACHMENT_PATHS",
             config.allow_absolute_attachment_paths,
+        );
+        config.allow_ephemeral_projects_in_default_storage = env_bool(
+            "ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE",
+            config.allow_ephemeral_projects_in_default_storage,
         );
 
         // Disk space monitoring
@@ -2701,6 +2715,7 @@ mod tests {
         );
         assert!(config.contact_enforcement_enabled);
         assert!(!config.allow_absolute_attachment_paths);
+        assert!(!config.allow_ephemeral_projects_in_default_storage);
     }
 
     #[test]

@@ -1099,23 +1099,23 @@ const HTTP_RUNTIME_MIN_WORKERS: usize = 4;
 const HTTP_RUNTIME_DEFAULT_WORKERS_CAP: usize = 4;
 const HTTP_RUNTIME_MAX_WORKERS: usize = 64;
 
-// The following HTTP supervisor constants are now configurable via Config fields
-// (AM_HTTP_MAX_CONNECTIONS, AM_HTTP_IDLE_TIMEOUT_SECS, etc.) and are kept as
-// fallbacks only for code paths that don't yet thread Config.
-const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
-const HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD: u32 = 3;
-const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
-const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_SUPERVISOR_CONTROL_CHANNEL_CAPACITY: usize = 32;
+
+// The following HTTP supervisor constants have been replaced by Config fields
+// (AM_HTTP_* env vars). They are retained for test assertions only.
+#[cfg(test)]
+const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD: u32 = 3;
+#[cfg(test)]
+const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(test)]
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS: u64 = 200;
+#[cfg(test)]
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
-/// Maximum consecutive spawn failures before the supervisor gives up and exits.
-///
-/// With exponential backoff (200ms -> 5s cap), 10 failures span roughly 30s of
-/// retry time.  This prevents the process from staying alive indefinitely in a
-/// degraded state where nothing listens on the configured port -- which is the
-/// root cause of macOS LaunchAgent reporting `state=running` with a live PID
-/// while no server is actually reachable.
+#[cfg(test)]
 const HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES: u32 = 10;
 const HTTP_SERVER_STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_SERVER_FORCE_CLOSE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2717,7 +2717,8 @@ async fn run_http_server_supervisor(
     );
 
     let mut last_restart_sleep_ms: u64 = 0;
-    let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) = reset_probe_state(&config);
+    let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =
+        reset_probe_state(&config);
 
     loop {
         if cx.is_cancel_requested() {
@@ -2799,7 +2800,8 @@ async fn run_http_server_supervisor(
                     )
                     .await?;
                     last_restart_sleep_ms = 0;
-                    (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
+                    (liveness_failures, next_probe_at, probe_grace_until) =
+                        reset_probe_state(&config);
                     handled_control = true;
                 }
                 Ok(Ok(tui_bridge::ServerControlMsg::SetTransportBase(desired))) => {
@@ -2812,7 +2814,8 @@ async fn run_http_server_supervisor(
                     )
                     .await?;
                     last_restart_sleep_ms = 0;
-                    (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
+                    (liveness_failures, next_probe_at, probe_grace_until) =
+                        reset_probe_state(&config);
                     handled_control = true;
                 }
                 Ok(Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(envelope))) => {
@@ -22418,19 +22421,31 @@ mod tests {
             retry_backoffs,
             vec![
                 HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS,
-                restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS),
+                restart_backoff_ms(
+                    HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS,
+                    HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS,
+                    HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS
+                ),
             ]
         );
         assert_eq!(
             slept,
             vec![
                 Duration::from_millis(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS),
-                Duration::from_millis(restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS)),
+                Duration::from_millis(restart_backoff_ms(
+                    HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS,
+                    HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS,
+                    HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS
+                )),
             ]
         );
         assert_eq!(
             last_restart_sleep_ms,
-            restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS)
+            restart_backoff_ms(
+                HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS,
+                HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS,
+                HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS
+            )
         );
 
         runtime.block_on(async {

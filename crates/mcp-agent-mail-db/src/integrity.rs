@@ -16,11 +16,11 @@
 //! - Returns an `IntegrityCorruption` error so callers can set health to Red.
 //! - Optionally attempts recovery via checkpoint + `VACUUM` + validated file copy.
 
-use crate::error::{DbError, DbResult};
 use crate::DbConn;
+use crate::error::{DbError, DbResult};
 use sqlmodel_core::{Row, Value};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Result of an integrity check.
 #[derive(Debug, Clone)]

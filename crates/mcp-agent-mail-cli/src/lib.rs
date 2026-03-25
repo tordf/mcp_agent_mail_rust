@@ -1525,6 +1525,29 @@ pub enum DoctorCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Audit archive hygiene without mutating the mailbox archive.
+    #[command(name = "archive-scan")]
+    ArchiveScan {
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Normalize safe archive hygiene issues non-destructively.
+    #[command(name = "archive-normalize")]
+    ArchiveNormalize {
+        /// Preview changes without writing or moving archive files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Auto-confirm archive normalization actions.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Output JSON (shorthand for machine-readable output).
+        #[arg(long)]
+        json: bool,
+    },
     /// Attempt automatic remediation for detected issues.
     ///
     /// Runs all doctor checks, then fixes each fixable issue:
@@ -4017,6 +4040,10 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
         } => handle_doctor_restore(backup_path, dry_run, yes),
         DoctorCommand::Reconstruct { dry_run, yes, json } => {
             handle_doctor_reconstruct(dry_run, yes, json)
+        }
+        DoctorCommand::ArchiveScan { format, json } => handle_doctor_archive_scan(format, json),
+        DoctorCommand::ArchiveNormalize { dry_run, yes, json } => {
+            handle_doctor_archive_normalize(dry_run, yes, json)
         }
         DoctorCommand::Fix { dry_run, yes, json } => handle_doctor_fix(dry_run, yes, json),
     }
@@ -11908,14 +11935,14 @@ struct DoctorProcessSample {
     command: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct DoctorInventoryCounts {
     projects: u64,
     agents: u64,
     messages: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct DoctorProjectIdentity {
     slug: Option<String>,
     human_key: Option<String>,
@@ -12040,7 +12067,7 @@ fn doctor_project_match_token(value: &str) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct DoctorArchiveInventory {
     projects: u64,
     agents: u64,
@@ -12061,6 +12088,76 @@ impl DoctorArchiveInventory {
             messages: self.messages,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DoctorArchiveProjectMetadataFinding {
+    project_dir: String,
+    project_json: String,
+    slug: String,
+    canonical_human_key: Option<String>,
+    problem: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DoctorArchiveMalformedMessageFinding {
+    path: String,
+    problem: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DoctorArchiveDuplicateCanonicalGroup {
+    message_id: i64,
+    keep: String,
+    duplicates: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DoctorArchiveSuspiciousProjectFinding {
+    project_dir: String,
+    slug: String,
+    human_key: Option<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct DoctorArchiveAuditReport {
+    inventory: DoctorArchiveInventory,
+    missing_project_metadata: Vec<DoctorArchiveProjectMetadataFinding>,
+    invalid_project_metadata: Vec<DoctorArchiveProjectMetadataFinding>,
+    malformed_message_files: Vec<DoctorArchiveMalformedMessageFinding>,
+    duplicate_canonical_groups: Vec<DoctorArchiveDuplicateCanonicalGroup>,
+    suspicious_projects: Vec<DoctorArchiveSuspiciousProjectFinding>,
+}
+
+impl DoctorArchiveAuditReport {
+    fn finding_count(&self) -> usize {
+        self.missing_project_metadata.len()
+            + self.invalid_project_metadata.len()
+            + self.malformed_message_files.len()
+            + self.duplicate_canonical_groups.len()
+            + self.suspicious_projects.len()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct DoctorArchiveNormalizeAction {
+    kind: String,
+    path: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct DoctorArchiveNormalizeResult {
+    dry_run: bool,
+    storage_root: String,
+    metadata_files_written: usize,
+    duplicate_files_quarantined: usize,
+    unresolved_project_metadata_files: usize,
+    unresolved_malformed_message_files: usize,
+    unresolved_suspicious_projects: usize,
+    actions: Vec<DoctorArchiveNormalizeAction>,
+    report_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -12807,6 +12904,327 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> DoctorArchiveInvento
     inventory
 }
 
+fn doctor_archive_project_fallback_slug(project_path: &Path) -> String {
+    project_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown-project".to_string())
+}
+
+fn doctor_archive_path_has_ephemeral_root(path: &Path) -> bool {
+    let temp_root = std::env::temp_dir();
+    if path.starts_with(&temp_root) {
+        return true;
+    }
+
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    normalized == "/tmp"
+        || normalized.starts_with("/tmp/")
+        || normalized == "/var/tmp"
+        || normalized.starts_with("/var/tmp/")
+        || normalized == "/private/tmp"
+        || normalized.starts_with("/private/tmp/")
+        || normalized == "/var/folders"
+        || normalized.starts_with("/var/folders/")
+}
+
+fn doctor_archive_suspicious_project_reason(slug: &str, human_key: Option<&str>) -> Option<String> {
+    if slug.starts_with("tmp-") {
+        return Some(format!("project slug '{slug}' looks ephemeral"));
+    }
+
+    let human_key = human_key?;
+    if doctor_archive_path_has_ephemeral_root(Path::new(human_key)) {
+        Some(format!(
+            "human_key '{human_key}' resolves into a temporary filesystem root"
+        ))
+    } else {
+        None
+    }
+}
+
+fn doctor_archive_metadata_finding(
+    project_path: &Path,
+    slug: String,
+    canonical_human_key: Option<String>,
+    problem: String,
+) -> DoctorArchiveProjectMetadataFinding {
+    DoctorArchiveProjectMetadataFinding {
+        project_dir: project_path.display().to_string(),
+        project_json: project_path.join("project.json").display().to_string(),
+        slug,
+        canonical_human_key,
+        problem,
+    }
+}
+
+fn doctor_audit_project_metadata(
+    project_path: &Path,
+    report: &mut DoctorArchiveAuditReport,
+) -> (String, Option<String>) {
+    let fallback_slug = doctor_archive_project_fallback_slug(project_path);
+    let project_json = project_path.join("project.json");
+
+    let (resolved_slug, resolved_human_key) = if !path_is_real_file(&project_json) {
+        report
+            .missing_project_metadata
+            .push(doctor_archive_metadata_finding(
+                project_path,
+                fallback_slug.clone(),
+                None,
+                format!("missing {}", project_json.display()),
+            ));
+        (fallback_slug, None)
+    } else {
+        match std::fs::read_to_string(&project_json) {
+            Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(parsed) => {
+                    let metadata_slug = doctor_inventory_normalize_text(
+                        parsed
+                            .get("slug")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    );
+                    let human_key = doctor_inventory_normalize_text(
+                        parsed
+                            .get("human_key")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    );
+
+                    match human_key {
+                        Some(value) if Path::new(&value).is_absolute() => {
+                            let slug_problem = match metadata_slug.as_deref() {
+                                Some(existing) if existing == fallback_slug => None,
+                                Some(existing) => Some(format!(
+                                    "slug '{}' does not match archive dir '{}' in {}",
+                                    existing,
+                                    fallback_slug,
+                                    project_json.display()
+                                )),
+                                None => Some(format!(
+                                    "missing or empty slug in {}",
+                                    project_json.display()
+                                )),
+                            };
+                            if let Some(problem) = slug_problem {
+                                report.invalid_project_metadata.push(
+                                    doctor_archive_metadata_finding(
+                                        project_path,
+                                        fallback_slug.clone(),
+                                        Some(value.clone()),
+                                        problem,
+                                    ),
+                                );
+                            }
+                            (fallback_slug.clone(), Some(value))
+                        }
+                        Some(value) => {
+                            report
+                                .invalid_project_metadata
+                                .push(doctor_archive_metadata_finding(
+                                    project_path,
+                                    metadata_slug.unwrap_or_else(|| fallback_slug.clone()),
+                                    None,
+                                    format!(
+                                        "non-absolute human_key '{}' in {}",
+                                        value,
+                                        project_json.display()
+                                    ),
+                                ));
+                            (fallback_slug, None)
+                        }
+                        None => {
+                            report
+                                .invalid_project_metadata
+                                .push(doctor_archive_metadata_finding(
+                                    project_path,
+                                    metadata_slug.unwrap_or_else(|| fallback_slug.clone()),
+                                    None,
+                                    format!(
+                                        "missing or empty human_key in {}",
+                                        project_json.display()
+                                    ),
+                                ));
+                            (fallback_slug, None)
+                        }
+                    }
+                }
+                Err(err) => {
+                    report
+                        .invalid_project_metadata
+                        .push(doctor_archive_metadata_finding(
+                            project_path,
+                            fallback_slug.clone(),
+                            None,
+                            format!("invalid JSON in {}: {err}", project_json.display()),
+                        ));
+                    (fallback_slug, None)
+                }
+            },
+            Err(err) => {
+                report
+                    .invalid_project_metadata
+                    .push(doctor_archive_metadata_finding(
+                        project_path,
+                        fallback_slug.clone(),
+                        None,
+                        format!("cannot read {}: {err}", project_json.display()),
+                    ));
+                (fallback_slug, None)
+            }
+        }
+    };
+
+    if let Some(reason) =
+        doctor_archive_suspicious_project_reason(&resolved_slug, resolved_human_key.as_deref())
+    {
+        report
+            .suspicious_projects
+            .push(DoctorArchiveSuspiciousProjectFinding {
+                project_dir: project_path.display().to_string(),
+                slug: resolved_slug.clone(),
+                human_key: resolved_human_key.clone(),
+                reason,
+            });
+    }
+
+    (resolved_slug, resolved_human_key)
+}
+
+fn doctor_audit_project_messages(
+    messages_dir: &Path,
+    duplicate_candidates: &mut std::collections::BTreeMap<i64, Vec<PathBuf>>,
+    malformed_messages: &mut Vec<DoctorArchiveMalformedMessageFinding>,
+) {
+    for entry in walkdir::WalkDir::new(messages_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let file_type = entry.file_type();
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+
+        let Ok(relative) = entry.path().strip_prefix(messages_dir) else {
+            continue;
+        };
+        let components = doctor_archive_path_components(relative);
+        if components.first().copied() == Some("threads") {
+            continue;
+        }
+        if components.len() != 3
+            || !doctor_is_archive_year_component(components[0])
+            || !doctor_is_archive_month_component(components[1])
+        {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(content) => content,
+            Err(err) => {
+                malformed_messages.push(DoctorArchiveMalformedMessageFinding {
+                    path: entry.path().display().to_string(),
+                    problem: format!("cannot read canonical message file: {err}"),
+                });
+                continue;
+            }
+        };
+        let Some(frontmatter) = doctor_extract_json_frontmatter(&content) else {
+            malformed_messages.push(DoctorArchiveMalformedMessageFinding {
+                path: entry.path().display().to_string(),
+                problem: "no JSON frontmatter".to_string(),
+            });
+            continue;
+        };
+        let message = match serde_json::from_str::<serde_json::Value>(frontmatter) {
+            Ok(message) => message,
+            Err(err) => {
+                malformed_messages.push(DoctorArchiveMalformedMessageFinding {
+                    path: entry.path().display().to_string(),
+                    problem: format!("invalid JSON frontmatter: {err}"),
+                });
+                continue;
+            }
+        };
+
+        if let Some(message_id) = message
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|&id| id > 0)
+        {
+            duplicate_candidates
+                .entry(message_id)
+                .or_default()
+                .push(entry.path().to_path_buf());
+        }
+    }
+}
+
+fn audit_doctor_archive(storage_root: &Path) -> DoctorArchiveAuditReport {
+    let mut report = DoctorArchiveAuditReport {
+        inventory: collect_doctor_archive_inventory(storage_root),
+        ..DoctorArchiveAuditReport::default()
+    };
+    let projects_root = storage_root.join("projects");
+    if !path_is_real_directory(&projects_root) {
+        return report;
+    }
+
+    let Ok(entries) = std::fs::read_dir(&projects_root) else {
+        return report;
+    };
+
+    let mut duplicate_candidates: std::collections::BTreeMap<i64, Vec<PathBuf>> =
+        std::collections::BTreeMap::new();
+
+    for entry in entries.flatten() {
+        let project_path = entry.path();
+        let Ok(project_type) = entry.file_type() else {
+            continue;
+        };
+        if !project_type.is_dir() || project_type.is_symlink() {
+            continue;
+        }
+
+        let _ = doctor_audit_project_metadata(&project_path, &mut report);
+
+        let messages_dir = project_path.join("messages");
+        if path_is_real_directory(&messages_dir) {
+            doctor_audit_project_messages(
+                &messages_dir,
+                &mut duplicate_candidates,
+                &mut report.malformed_message_files,
+            );
+        }
+    }
+
+    for (message_id, mut files) in duplicate_candidates {
+        if files.len() < 2 {
+            continue;
+        }
+        files.sort();
+        let keep = files.remove(0);
+        report
+            .duplicate_canonical_groups
+            .push(DoctorArchiveDuplicateCanonicalGroup {
+                message_id,
+                keep: keep.display().to_string(),
+                duplicates: files
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            });
+    }
+
+    report
+}
+
 fn collect_doctor_db_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<DoctorDbInventory> {
     fn count_rows(conn: &mcp_agent_mail_db::DbConn, table: &str) -> CliResult<u64> {
         let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
@@ -13547,6 +13965,12 @@ fn handle_doctor_check_with(
 
     // Check 2: Storage root exists
     let storage_ok = storage_root.exists();
+    let projects_root = storage_root.join("projects");
+    let archive_audit = if storage_ok && path_is_real_directory(&projects_root) {
+        Some(audit_doctor_archive(storage_root))
+    } else {
+        None
+    };
     checks.push(serde_json::json!({
         "check": "storage_root",
         "status": if storage_ok { "ok" } else { "warn" },
@@ -13585,13 +14009,13 @@ fn handle_doctor_check_with(
             "status": "warn",
             "detail": "Skipped: storage root missing",
         }));
-    } else if !path_is_real_directory(&storage_root.join("projects")) {
+    } else if archive_audit.is_none() {
         checks.push(serde_json::json!({
             "check": "archive_db_parity",
             "status": "warn",
             "detail": format!(
                 "Skipped: no archive projects directory found under {}",
-                storage_root.join("projects").display()
+                projects_root.display()
             ),
         }));
     } else if db_file_sanity_failed {
@@ -13602,7 +14026,14 @@ fn handle_doctor_check_with(
         }));
     } else {
         match open_db_for_doctor_check(database_url).and_then(|conn| {
-            let archive = collect_doctor_archive_inventory(storage_root);
+            let archive = archive_audit
+                .as_ref()
+                .map(|report| report.inventory.clone())
+                .ok_or_else(|| {
+                    CliError::Other(
+                        "archive audit unexpectedly missing during parity probe".to_string(),
+                    )
+                })?;
             let db = collect_doctor_db_inventory(&conn)?;
             let drift = doctor_archive_db_drift_detail(&archive, &db);
             Ok((archive, db, drift))
@@ -13651,6 +14082,25 @@ fn handle_doctor_check_with(
                 "detail": format!("Archive/DB inventory probe failed: {err}"),
             })),
         }
+    }
+
+    if let Some(archive_audit) = archive_audit.as_ref() {
+        checks.push(serde_json::json!({
+            "check": "archive_hygiene",
+            "status": if archive_audit.finding_count() > 0 { "warn" } else { "ok" },
+            "detail": if archive_audit.finding_count() > 0 {
+                format!(
+                    "Archive hygiene findings: missing project.json={}, invalid project.json={}, duplicate canonical ids={}, malformed canonical messages={}, suspicious temp projects={}. Run `am doctor archive-scan` for details.",
+                    archive_audit.missing_project_metadata.len(),
+                    archive_audit.invalid_project_metadata.len(),
+                    archive_audit.duplicate_canonical_groups.len(),
+                    archive_audit.malformed_message_files.len(),
+                    archive_audit.suspicious_projects.len(),
+                )
+            } else {
+                "No archive hygiene findings detected".to_string()
+            },
+        }));
     }
 
     // Check 2d: Storage root disk space
@@ -24826,6 +25276,34 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn capture_doctor_forensic_bundle_preserves_db_family() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let db_path = tmp.path().join("storage.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"sqlite-bytes").unwrap();
+        std::fs::write(&wal_path, b"wal-bytes").unwrap();
+        std::fs::write(&shm_path, b"shm-bytes").unwrap();
+
+        let bundle_dir = capture_doctor_forensic_bundle(
+            "repair",
+            &format!("sqlite:///{}", db_path.display()),
+            &db_path,
+            &storage_root,
+            Some("integrity failed"),
+        )
+        .expect("bundle capture should succeed")
+        .expect("bundle should be created");
+
+        assert!(bundle_dir.join("storage.sqlite3").exists());
+        assert!(bundle_dir.join("storage.sqlite3-wal").exists());
+        assert!(bundle_dir.join("storage.sqlite3-shm").exists());
+        assert!(bundle_dir.join("summary.json").exists());
+    }
+
+    #[test]
     fn doctor_reconstruct_with_archive_data() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = tmp.path();
@@ -25025,6 +25503,141 @@ startup_timeout_sec = 42
         assert_eq!(stats.duplicate_canonical_message_ids, 1);
         assert_eq!(stats.thread_digests, 1);
         assert_eq!(stats.unparseable_canonical_message_files, 0);
+    }
+
+    #[test]
+    fn audit_doctor_archive_reports_metadata_duplicates_and_temp_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("tmp-demo-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-02-00Z__broken__8.md"),
+            "not-json-frontmatter\nbody\n",
+        )
+        .unwrap();
+
+        let report = audit_doctor_archive(&storage_root);
+        assert_eq!(report.missing_project_metadata.len(), 1);
+        assert_eq!(report.duplicate_canonical_groups.len(), 1);
+        assert_eq!(report.duplicate_canonical_groups[0].message_id, 7);
+        assert_eq!(report.duplicate_canonical_groups[0].duplicates.len(), 1);
+        assert_eq!(report.malformed_message_files.len(), 1);
+        assert_eq!(report.suspicious_projects.len(), 1);
+        assert!(
+            report.suspicious_projects[0]
+                .reason
+                .contains("looks ephemeral")
+        );
+    }
+
+    #[test]
+    fn doctor_archive_normalize_repairs_safe_project_metadata_and_quarantines_duplicates() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"wrong-slug","human_key":"/data/projects/demo-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .unwrap();
+        let duplicate = canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md");
+        std::fs::write(
+            &duplicate,
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .unwrap();
+
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_text.as_str())],
+            || {
+                handle_doctor_archive_normalize(false, true, false)
+                    .expect("archive normalization should succeed");
+            },
+        );
+
+        let project_json = project_dir.join("project.json");
+        assert!(
+            project_json.exists(),
+            "normalization should write project metadata"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&project_json).unwrap()).unwrap();
+        assert_eq!(metadata["slug"], "demo-project");
+        assert_eq!(metadata["human_key"], "/data/projects/demo-project");
+        assert!(
+            !duplicate.exists(),
+            "duplicate canonical file should be moved out of the live archive"
+        );
+
+        let quarantine_root = storage_root.join("doctor").join("archive-quarantine");
+        let quarantined = walkdir::WalkDir::new(&quarantine_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().file_name() == duplicate.file_name());
+        assert!(quarantined, "duplicate should be preserved in quarantine");
+
+        let reports_root = storage_root.join("doctor").join("reports");
+        let wrote_report = walkdir::WalkDir::new(&reports_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("archive-normalize-"))
+            });
+        assert!(wrote_report, "normalization should emit a report artifact");
+    }
+
+    #[test]
+    fn doctor_archive_normalize_does_not_invent_missing_project_metadata() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        std::fs::create_dir_all(project_dir.join("messages").join("2026").join("03")).unwrap();
+
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_text.as_str())],
+            || {
+                handle_doctor_archive_normalize(false, true, false)
+                    .expect("archive normalization should succeed");
+            },
+        );
+
+        assert!(
+            !project_dir.join("project.json").exists(),
+            "normalization should not invent a synthetic human_key when metadata is missing"
+        );
     }
 
     #[test]
@@ -27681,6 +28294,44 @@ COMMIT;\n";
             matches!(status, "ok" | "warn"),
             "unexpected status for beads_issue_awareness: {status}"
         );
+    }
+
+    #[test]
+    fn integration_doctor_check_reports_archive_hygiene_findings() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("doctor_hygiene.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let project_dir = dir.path().join("projects").join("tmp-demo-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .unwrap();
+
+        let parsed = run_doctor_check_json(&db_url, dir.path());
+        let checks = parsed["checks"].as_array().expect("checks array");
+        let hygiene = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("archive_hygiene"))
+            .expect("archive_hygiene check should be present");
+        assert_eq!(hygiene["status"].as_str(), Some("warn"));
+        let detail = hygiene["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("missing project.json=1"));
+        assert!(detail.contains("duplicate canonical ids=1"));
+        assert!(detail.contains("suspicious temp projects=1"));
+        assert!(detail.contains("am doctor archive-scan"));
     }
 
     #[test]
@@ -35619,6 +36270,89 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
 // Doctor repair, backups, restore
 // ---------------------------------------------------------------------------
 
+fn doctor_redact_database_url(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://")
+        && let Some((_creds, host)) = rest.rsplit_once('@')
+    {
+        return format!("{scheme}://****@{host}");
+    }
+    url.to_string()
+}
+
+fn doctor_forensics_root(storage_root: &Path, db_path: &Path) -> PathBuf {
+    if storage_root.exists() {
+        storage_root.join("doctor").join("forensics")
+    } else {
+        db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("doctor")
+            .join("forensics")
+    }
+}
+
+fn capture_doctor_forensic_bundle(
+    command_name: &str,
+    database_url: &str,
+    db_path: &Path,
+    storage_root: &Path,
+    integrity_detail: Option<&str>,
+) -> CliResult<Option<PathBuf>> {
+    let source_paths = [
+        ("db", db_path.to_path_buf()),
+        ("wal", sqlite_sidecar_path(db_path, "-wal")),
+        ("shm", sqlite_sidecar_path(db_path, "-shm")),
+    ];
+    if source_paths.iter().all(|(_, path)| !path.exists()) {
+        return Ok(None);
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let bundle_dir =
+        doctor_forensics_root(storage_root, db_path).join(format!("{command_name}-{timestamp}"));
+    std::fs::create_dir_all(&bundle_dir)?;
+
+    let mut artifacts = Vec::new();
+    for (kind, source_path) in source_paths {
+        if !source_path.exists() {
+            continue;
+        }
+        let destination = bundle_dir.join(
+            source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(kind),
+        );
+        let copy_result = std::fs::copy(&source_path, &destination);
+        let size_bytes = source_path.metadata().ok().map(|meta| meta.len());
+        artifacts.push(serde_json::json!({
+            "kind": kind,
+            "source_path": source_path.display().to_string(),
+            "captured_path": destination.display().to_string(),
+            "size_bytes": size_bytes,
+            "status": if copy_result.is_ok() { "captured" } else { "error" },
+            "error": copy_result.err().map(|err| err.to_string()),
+        }));
+    }
+
+    let summary_path = bundle_dir.join("summary.json");
+    write_doctor_json_report(
+        &summary_path,
+        &serde_json::json!({
+            "command": command_name,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "database_url": doctor_redact_database_url(database_url),
+            "db_path": db_path.display().to_string(),
+            "storage_root": storage_root.display().to_string(),
+            "integrity_detail": integrity_detail,
+            "archive_scan": scan_archive_stats(storage_root),
+            "artifacts": artifacts,
+        }),
+    )?;
+
+    Ok(Some(bundle_dir))
+}
+
 fn handle_doctor_repair(
     project: Option<String>,
     dry_run: bool,
@@ -35685,6 +36419,18 @@ fn handle_doctor_repair_with(
         "  Integrity: {}",
         if integrity_ok { "OK" } else { "FAILED" }
     );
+
+    if !dry_run
+        && let Some(bundle_dir) = capture_doctor_forensic_bundle(
+            "repair",
+            database_url,
+            &reconstruct_db_path,
+            storage_root,
+            Some(&integrity_detail),
+        )?
+    {
+        ftui_runtime::ftui_println!("  Forensics: {}", bundle_dir.display());
+    }
 
     if !integrity_ok && !dry_run {
         ftui_runtime::ftui_eprintln!(
@@ -36583,6 +37329,18 @@ fn handle_doctor_reconstruct_with(
         return Ok(());
     }
 
+    if !dry_run
+        && let Some(bundle_dir) = capture_doctor_forensic_bundle(
+            "reconstruct",
+            &cfg.database_url,
+            &db_path,
+            &storage_root,
+            None,
+        )?
+    {
+        ftui_runtime::ftui_println!("Forensics: {}", bundle_dir.display());
+    }
+
     // Build a temp path for reconstruction. The original DB is NOT touched
     // until the new DB is fully built and validated — this is the key safety
     // invariant (see issue #59).
@@ -36653,6 +37411,13 @@ fn handle_doctor_reconstruct_with(
         }
     }
 
+    let warning_report_path = if stats.warnings.len() > 8 {
+        persist_doctor_warning_report(&storage_root, "reconstruct-warnings", &stats.warnings)?
+            .map(|path| path.display().to_string())
+    } else {
+        None
+    };
+
     if json {
         let salvage_json = match &salvage_attempt {
             Some(DoctorSalvageAttempt::Succeeded(artifact)) => serde_json::json!({
@@ -36689,6 +37454,8 @@ fn handle_doctor_reconstruct_with(
                     "salvaged_recipients": stats.salvaged_recipients,
                 },
                 "salvage": salvage_json,
+                "warning_count": stats.warnings.len(),
+                "warning_report_path": warning_report_path,
                 "warnings": stats.warnings,
             })
         );
@@ -36698,9 +37465,23 @@ fn handle_doctor_reconstruct_with(
             ftui_runtime::ftui_println!("Salvage: {}", artifact.detail);
         }
         if !stats.warnings.is_empty() {
-            ftui_runtime::ftui_println!("Warnings:");
-            for w in &stats.warnings {
+            ftui_runtime::ftui_println!("Warnings: {} total", stats.warnings.len());
+            for w in stats.warnings.iter().take(8) {
                 ftui_runtime::ftui_println!("  - {w}");
+            }
+            if stats.warnings.len() > 8 {
+                if let Some(report_path) = &warning_report_path {
+                    ftui_runtime::ftui_println!(
+                        "  ... {} additional warning(s); full report: {}",
+                        stats.warnings.len() - 8,
+                        report_path
+                    );
+                } else {
+                    ftui_runtime::ftui_println!(
+                        "  ... {} additional warning(s) omitted.",
+                        stats.warnings.len() - 8
+                    );
+                }
             }
         }
         if stats.parse_errors > 0 {
@@ -36738,6 +37519,355 @@ fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
         thread_digests: inventory.thread_digests as usize,
         unparseable_canonical_message_files: inventory.unparseable_canonical_message_files as usize,
     }
+}
+
+fn doctor_archive_audit_summary_text(report: &DoctorArchiveAuditReport) -> Vec<String> {
+    let inventory = &report.inventory;
+    let mut lines = vec![
+        format!("Projects:                 {}", inventory.projects),
+        format!("Agents:                   {}", inventory.agents),
+        format!("Logical messages:         {}", inventory.messages),
+        format!(
+            "Canonical message files:  {}",
+            inventory.canonical_message_files
+        ),
+        format!(
+            "Duplicate canonical ids:  {} id(s) / {} extra file(s)",
+            inventory.duplicate_canonical_message_ids, inventory.duplicate_canonical_message_files
+        ),
+        format!(
+            "Malformed canonical files: {}",
+            inventory.unparseable_canonical_message_files
+        ),
+        format!("Thread digests:           {}", inventory.thread_digests),
+        format!(
+            "Missing project.json:     {}",
+            report.missing_project_metadata.len()
+        ),
+        format!(
+            "Invalid project.json:     {}",
+            report.invalid_project_metadata.len()
+        ),
+        format!(
+            "Suspicious temp projects: {}",
+            report.suspicious_projects.len()
+        ),
+    ];
+
+    if let Some(group) = report.duplicate_canonical_groups.first() {
+        lines.push(format!(
+            "Sample duplicate id {}: keep {} + {} duplicate(s)",
+            group.message_id,
+            truncate_path(&group.keep, 72),
+            group.duplicates.len()
+        ));
+    }
+    if let Some(finding) = report.missing_project_metadata.first() {
+        lines.push(format!(
+            "Sample missing project.json: {}",
+            truncate_path(&finding.project_dir, 72)
+        ));
+    }
+    if let Some(finding) = report.invalid_project_metadata.first() {
+        lines.push(format!(
+            "Sample invalid project.json: {} ({})",
+            truncate_path(&finding.project_json, 72),
+            finding.problem
+        ));
+    }
+    if let Some(finding) = report.malformed_message_files.first() {
+        lines.push(format!(
+            "Sample malformed message: {} ({})",
+            truncate_path(&finding.path, 72),
+            finding.problem
+        ));
+    }
+    if let Some(finding) = report.suspicious_projects.first() {
+        lines.push(format!(
+            "Sample suspicious project: {} ({})",
+            truncate_path(&finding.project_dir, 72),
+            finding.reason
+        ));
+    }
+
+    lines
+}
+
+fn doctor_archive_quarantine_destination(
+    storage_root: &Path,
+    original: &Path,
+    timestamp: &str,
+    lane: &str,
+) -> CliResult<PathBuf> {
+    let relative = original.strip_prefix(storage_root).map_err(|_| {
+        CliError::Other(format!(
+            "cannot quarantine {} because it is not inside storage root {}",
+            original.display(),
+            storage_root.display()
+        ))
+    })?;
+    Ok(storage_root
+        .join("doctor")
+        .join("archive-quarantine")
+        .join(timestamp)
+        .join(lane)
+        .join(relative))
+}
+
+fn doctor_archive_report_path(storage_root: &Path, label: &str, timestamp: &str) -> PathBuf {
+    storage_root
+        .join("doctor")
+        .join("reports")
+        .join(format!("{label}-{timestamp}.json"))
+}
+
+fn write_doctor_json_report<T: Serialize>(report_path: &Path, payload: &T) -> CliResult<()> {
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let report = serde_json::to_vec_pretty(payload)
+        .map_err(|err| CliError::Other(format!("failed to serialize report: {err}")))?;
+    std::fs::write(report_path, report)?;
+    Ok(())
+}
+
+fn persist_doctor_warning_report(
+    storage_root: &Path,
+    label: &str,
+    warnings: &[String],
+) -> CliResult<Option<PathBuf>> {
+    if warnings.is_empty() {
+        return Ok(None);
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let report_path = doctor_archive_report_path(storage_root, label, &timestamp);
+    write_doctor_json_report(
+        &report_path,
+        &serde_json::json!({
+            "warning_count": warnings.len(),
+            "warnings": warnings,
+        }),
+    )?;
+    Ok(Some(report_path))
+}
+
+fn normalize_archive_project_metadata_content(slug: &str, human_key: &str) -> CliResult<String> {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "slug": slug,
+        "human_key": human_key,
+    }))
+    .map_err(|err| {
+        CliError::Other(format!(
+            "failed to serialize normalized project metadata: {err}"
+        ))
+    })
+}
+
+fn handle_doctor_archive_scan(
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
+    let config = Config::from_env();
+    let storage_root = config.storage_root;
+    let report = audit_doctor_archive(&storage_root);
+    let value = serde_json::json!({
+        "storage_root": storage_root.display().to_string(),
+        "finding_count": report.finding_count(),
+        "inventory": report.inventory,
+        "missing_project_metadata": report.missing_project_metadata,
+        "invalid_project_metadata": report.invalid_project_metadata,
+        "duplicate_canonical_groups": report.duplicate_canonical_groups,
+        "malformed_message_files": report.malformed_message_files,
+        "suspicious_projects": report.suspicious_projects,
+    });
+
+    output::emit_output(&value, fmt, || {
+        output::section("Archive Scan:");
+        output::kv("Storage root", &storage_root.display().to_string());
+        for line in doctor_archive_audit_summary_text(&report) {
+            ftui_runtime::ftui_println!("  {line}");
+        }
+        if report.finding_count() == 0 {
+            ftui_runtime::ftui_println!("");
+            ftui_runtime::ftui_println!("  No archive hygiene findings detected.");
+            return;
+        }
+        ftui_runtime::ftui_println!("");
+        ftui_runtime::ftui_println!(
+            "  Run `am doctor archive-normalize --dry-run` to preview non-destructive remediation."
+        );
+    });
+    Ok(())
+}
+
+fn handle_doctor_archive_normalize(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
+    let config = Config::from_env();
+    let storage_root = config.storage_root;
+    let report = audit_doctor_archive(&storage_root);
+    let mut result = DoctorArchiveNormalizeResult {
+        dry_run,
+        storage_root: storage_root.display().to_string(),
+        unresolved_project_metadata_files: report.missing_project_metadata.len()
+            + report
+                .invalid_project_metadata
+                .iter()
+                .filter(|finding| finding.canonical_human_key.is_none())
+                .count(),
+        unresolved_malformed_message_files: report.malformed_message_files.len(),
+        unresolved_suspicious_projects: report.suspicious_projects.len(),
+        ..DoctorArchiveNormalizeResult::default()
+    };
+
+    let actionable_count = report
+        .invalid_project_metadata
+        .iter()
+        .filter(|finding| finding.canonical_human_key.is_some())
+        .count()
+        + report
+            .duplicate_canonical_groups
+            .iter()
+            .map(|group| group.duplicates.len())
+            .sum::<usize>();
+    if actionable_count == 0 {
+        if json {
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "result": result,
+                    "message": "No safe archive normalization actions were needed."
+                })
+            );
+        } else {
+            ftui_runtime::ftui_println!("No safe archive normalization actions were needed.");
+            if result.unresolved_project_metadata_files > 0
+                || result.unresolved_malformed_message_files > 0
+                || result.unresolved_suspicious_projects > 0
+            {
+                ftui_runtime::ftui_println!(
+                    "Unresolved findings remain: project metadata={}, malformed messages={}, suspicious temp projects={}",
+                    result.unresolved_project_metadata_files,
+                    result.unresolved_malformed_message_files,
+                    result.unresolved_suspicious_projects
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if !confirm_mutating_doctor_action(
+        "Proceed with archive normalization? This can rewrite safely-normalizable project.json files and quarantine duplicate canonical message files without deleting them.",
+        dry_run,
+        yes,
+    )? {
+        ftui_runtime::ftui_println!("Archive normalization cancelled.");
+        return Ok(());
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+
+    for finding in report
+        .invalid_project_metadata
+        .iter()
+        .filter(|finding| finding.canonical_human_key.is_some())
+    {
+        let project_json = PathBuf::from(&finding.project_json);
+        let normalized = normalize_archive_project_metadata_content(
+            &finding.slug,
+            finding.canonical_human_key.as_deref().unwrap_or_default(),
+        )?;
+        result.actions.push(DoctorArchiveNormalizeAction {
+            kind: "write_project_metadata".to_string(),
+            path: project_json.display().to_string(),
+            detail: format!(
+                "slug={}, human_key={}",
+                finding.slug,
+                finding.canonical_human_key.as_deref().unwrap_or_default()
+            ),
+        });
+        if !dry_run {
+            if let Some(parent) = project_json.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&project_json, normalized)?;
+        }
+        result.metadata_files_written += 1;
+    }
+
+    for group in &report.duplicate_canonical_groups {
+        for duplicate in &group.duplicates {
+            let duplicate_path = PathBuf::from(duplicate);
+            let quarantine_path = doctor_archive_quarantine_destination(
+                &storage_root,
+                &duplicate_path,
+                &timestamp,
+                "duplicate-canonical",
+            )?;
+            result.actions.push(DoctorArchiveNormalizeAction {
+                kind: "quarantine_duplicate_canonical_message".to_string(),
+                path: duplicate_path.display().to_string(),
+                detail: format!(
+                    "keep {}; quarantine to {}",
+                    group.keep,
+                    quarantine_path.display()
+                ),
+            });
+            if !dry_run {
+                if let Some(parent) = quarantine_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(&duplicate_path, &quarantine_path)?;
+            }
+            result.duplicate_files_quarantined += 1;
+        }
+    }
+
+    if !dry_run {
+        let report_path =
+            doctor_archive_report_path(&storage_root, "archive-normalize", &timestamp);
+        write_doctor_json_report(
+            &report_path,
+            &serde_json::json!({
+                "audit": &report,
+                "result": &result,
+            }),
+        )?;
+        result.report_path = Some(report_path.display().to_string());
+    }
+
+    if json {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "result": result,
+            })
+        );
+    } else {
+        ftui_runtime::ftui_println!(
+            "{} archive normalization planned/applied: metadata written={}, duplicate files quarantined={}",
+            if dry_run { "Dry-run" } else { "Archive" },
+            result.metadata_files_written,
+            result.duplicate_files_quarantined
+        );
+        if result.unresolved_project_metadata_files > 0
+            || result.unresolved_malformed_message_files > 0
+            || result.unresolved_suspicious_projects > 0
+        {
+            ftui_runtime::ftui_println!(
+                "Unresolved findings remain: project metadata={}, malformed messages={}, suspicious temp projects={}",
+                result.unresolved_project_metadata_files,
+                result.unresolved_malformed_message_files,
+                result.unresolved_suspicious_projects
+            );
+        }
+        if let Some(report_path) = &result.report_path {
+            ftui_runtime::ftui_println!("Report: {report_path}");
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
