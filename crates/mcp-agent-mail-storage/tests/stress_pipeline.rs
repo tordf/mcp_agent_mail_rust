@@ -138,6 +138,7 @@ fn make_pool(tmp: &TempDir) -> DbPool {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     DbPool::new(&config).expect("create pool")
 }
@@ -154,6 +155,7 @@ fn make_large_pool(tmp: &TempDir) -> DbPool {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 5,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     DbPool::new(&config).expect("create large pool")
 }
@@ -1059,6 +1061,7 @@ fn stress_pool_exhaustion_with_archive_writes() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 3,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&pool_config).expect("create constrained pool");
 
@@ -1891,6 +1894,7 @@ fn stress_150_agent_message_storm() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 10,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&pool_config).expect("create production pool");
 
@@ -2143,6 +2147,7 @@ fn stress_100_agent_full_lifecycle() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 10,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&pool_config).expect("create pool");
 
@@ -2539,6 +2544,7 @@ fn stress_multi_project_120_agents() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 10,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&pool_config).expect("create pool");
 
@@ -2777,6 +2783,7 @@ fn stress_200_agent_pool_exhaustion_torture() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 5,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&pool_config).expect("create constrained pool");
 
@@ -3055,6 +3062,7 @@ fn stress_sustained_100_agents_60s() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 15,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&pool_config).expect("create production pool");
 

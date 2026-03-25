@@ -217,6 +217,7 @@ fn sustained_100_rps_load_test() {
         max_lifetime_ms: 1_800_000,
         run_migrations: true,
         warmup_connections: 10,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
     std::mem::forget(dir); // prevent cleanup while threads running
@@ -879,6 +880,7 @@ fn multi_project_soak_replay() {
         max_lifetime_ms: 1_800_000,
         run_migrations: true,
         warmup_connections: 10,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
     std::mem::forget(dir);

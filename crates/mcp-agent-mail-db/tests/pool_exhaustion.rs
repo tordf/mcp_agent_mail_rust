@@ -52,6 +52,7 @@ fn make_pool(min: usize, max: usize) -> (DbPool, tempfile::TempDir) {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
     (pool, dir)
@@ -500,6 +501,7 @@ fn pool_memory_minimal_config() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create in-memory pool");
 

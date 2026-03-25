@@ -45,6 +45,7 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
     (pool, dir)
@@ -105,6 +106,7 @@ fn stress_concurrent_pool_warmup_has_no_sqlite_busy() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
 
@@ -982,6 +984,7 @@ fn stress_pool_exhaustion_recovery() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
     std::mem::forget(dir);
@@ -1072,6 +1075,7 @@ fn stress_1000_agent_concurrent_workload() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
     std::mem::forget(dir); // prevent cleanup while threads are running
@@ -1295,6 +1299,7 @@ fn stress_burst_200_concurrent_acquire_release() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
     std::mem::forget(dir);
@@ -1384,6 +1389,7 @@ fn stress_pool_acquire_latency_budget() {
         max_lifetime_ms: 3_600_000,
         run_migrations: true,
         warmup_connections: 10,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
     let pool = DbPool::new(&config).expect("create pool");
     std::mem::forget(dir);
