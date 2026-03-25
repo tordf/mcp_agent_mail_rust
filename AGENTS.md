@@ -403,7 +403,8 @@ All configuration via environment variables. Key variables:
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
 | `DATABASE_URL` | `sqlite:///:memory:` | SQLite connection URL |
-| `STORAGE_ROOT` | `~/.mcp_agent_mail` | Archive root directory |
+| `STORAGE_ROOT` | XDG-aware (legacy fallback to `~/.mcp_agent_mail_git_mailbox_repo`) | Archive root directory |
+| `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer an isolated `STORAGE_ROOT` for test/repro runs. |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
 | `TUI_HIGH_CONTRAST` | `false` | Accessibility mode |
 | `AM_TUI_TOAST_ENABLED` | `true` | Enable toast notifications |

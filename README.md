@@ -503,7 +503,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Quality gates | `ci`, `lint`, `typecheck`, `bench` | Run the native quality pipeline and capture CLI/perf baselines |
 | E2E and determinism | `e2e list|run|show`, `golden capture|verify|list`, `flake-triage scan|reproduce|detect` | Test transports and workflows, guard CLI output contracts, and triage flaky failures |
 | Share and deploy | `share export|update|preview|verify|decrypt|wizard|static-export`, `share deploy validate|tooling|verify|verify-live` | Build portable mailbox bundles, preview them, and validate live static deployments |
-| Archive and recovery | `archive save|list|restore`, `doctor check|repair|backups|restore|reconstruct|fix` | Snapshot mailbox state, restore it, or repair/rebuild SQLite from the Git archive |
+| Archive and recovery | `archive save|list|restore`, `doctor check|archive-scan|archive-normalize|repair|backups|restore|reconstruct|fix` | Snapshot mailbox state, scan/archive hygiene, normalize safe archive debt, or repair/rebuild SQLite from the Git archive |
 | Coordination data | `agents ...`, `mail ...`, `contacts ...`, `macros ...`, `file_reservations ...`, `acks ...`, `list-acks` | Operate directly on the same concepts the MCP tools expose |
 | Project and product routing | `projects ...`, `products ...`, `list-projects`, `beads ...` | Manage project identity, cross-project product groupings, and task-tracker views |
 | Platform and setup | `setup run|status`, `config set-port|show-port`, `amctl env`, `tooling ...`, `docs insert-blurbs` | Bootstrap connectors, inspect runtime config, introspect tool schemas/metrics/locks, and stamp docs |
@@ -522,7 +522,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | `projects` | `mark-identity`, `discovery-init`, `adopt` |
 | `mail` | `status`, `send`, `reply`, `inbox`, `read`, `ack`, `search`, `summarize-thread` |
 | `products` | `ensure`, `link`, `status`, `search`, `inbox`, `summarize-thread` |
-| `doctor` | `check`, `repair`, `backups`, `restore`, `reconstruct`, `fix` |
+| `doctor` | `check`, `archive-scan`, `archive-normalize`, `repair`, `backups`, `restore`, `reconstruct`, `fix` |
 | `agents` | `register`, `create`, `list`, `show`, `detect` |
 | `tooling` | `directory`, `schemas`, `metrics`, `metrics-core`, `diagnostics`, `locks`, `decommission-fts` |
 | `macros` | `start-session`, `prepare-thread`, `file-reservation-cycle`, `contact-handshake` |
@@ -884,6 +884,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
 | `STORAGE_ROOT` | XDG-aware (see below) | Archive root directory |
+| `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer a per-run `STORAGE_ROOT` instead. |
 | `LOG_LEVEL` | `info` | Minimum log level |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
 | `TUI_HIGH_CONTRAST` | `false` | Accessibility mode |
@@ -1321,6 +1322,12 @@ am doctor check
 am doctor check --verbose
 am doctor check --json          # Machine-readable output
 
+# Audit/archive hygiene without mutating the mailbox archive
+am doctor archive-scan
+am doctor archive-scan --json
+am doctor archive-normalize --dry-run
+am doctor archive-normalize --yes
+
 # Repair (creates backup first, prompts before data changes)
 am doctor repair --dry-run      # Preview what would change
 am doctor repair                # Apply safe fixes, prompt for data fixes
@@ -1346,11 +1353,12 @@ What `check` inspects:
 | MCP config | Legacy stdio/Python launcher entries, wrong HTTP URLs, missing Codex timeout settings |
 | Database file sanity | Missing/zero-byte files, malformed relative paths, corruption signatures, reopen probe failures |
 | Archive vs DB parity | Cases where Git-backed canonical mail artifacts are ahead of SQLite and a reconstruct is safer than repair |
+| Archive hygiene | Missing/invalid `project.json`, duplicate canonical message ids, malformed canonical message files, and suspicious temp-project archive roots |
 | Database integrity | `PRAGMA integrity_check`, foreign-key violations, orphaned recipient rows, missing core tables |
 | Search/index state | Legacy FTS artifact presence, rebuildability, and search-side schema hygiene |
 | Storage/runtime hygiene | Stale archive locks, WAL mode, expired reservations, writable storage root |
 
-`am doctor repair` is the in-place path: it creates a backup, cleans orphaned rows, rebuilds legacy FTS artifacts if they still exist, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
+`am doctor archive-scan` is the non-mutating hygiene report for the Git archive itself. `am doctor archive-normalize` is the non-destructive remediation path for safe archive debt: it only rewrites `project.json` when the canonical absolute `human_key` is already known, and it quarantines duplicate canonical message files instead of deleting them. `am doctor repair` is the in-place SQLite hygiene path: it creates a backup, captures a forensic bundle, cleans orphaned rows, rebuilds legacy FTS artifacts if they still exist, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it captures a forensic bundle, quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file while writing oversized warning sets to a report artifact instead of flooding the terminal. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
 
 ---
 
