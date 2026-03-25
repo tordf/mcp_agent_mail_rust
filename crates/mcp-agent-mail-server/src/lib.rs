@@ -1462,15 +1462,23 @@ pub(crate) fn connect_authority_host(http_host: &str) -> String {
     format_http_authority_host(normalized_probe_host(http_host))
 }
 
+/// Build the shared [`HttpClient`] used for liveness probes.
+///
+/// Reusing a single client across probes avoids the TCP-setup overhead that
+/// caused spurious timeouts when each probe created its own connection (see
+/// GitHub issue #74).
+fn build_probe_http_client() -> HttpClient {
+    HttpClient::builder()
+        .max_connections_per_host(1)
+        .max_total_connections(1)
+        .build()
+}
+
 async fn probe_http_healthz(
     cx: &Cx,
     config: &mcp_agent_mail_core::Config,
+    client: &HttpClient,
 ) -> Result<(), HttpHealthProbeFailure> {
-    let client = HttpClient::builder()
-        .max_connections_per_host(1)
-        .max_total_connections(1)
-        .idle_timeout(Duration::ZERO)
-        .build();
     let authority_host = connect_authority_host(&config.http_host);
     let url = format!("http://{authority_host}:{}{}", config.http_port, "/healthz");
     let started_at = Instant::now();
@@ -1525,10 +1533,11 @@ async fn startup_readiness_self_probe(
     cx: &Cx,
     config: &mcp_agent_mail_core::Config,
 ) -> Result<(), HttpHealthProbeFailure> {
+    let client = build_probe_http_client();
     let deadline = Instant::now() + STARTUP_READINESS_SELF_PROBE_TIMEOUT;
     let mut last_failure = HttpHealthProbeFailure::Timeout { elapsed_ms: 0 };
     while Instant::now() < deadline {
-        match probe_http_healthz(cx, config).await {
+        match probe_http_healthz(cx, config, &client).await {
             Ok(()) => return Ok(()),
             Err(failure) => {
                 last_failure = failure;
@@ -2713,6 +2722,7 @@ async fn run_http_server_supervisor(
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =
         reset_probe_state(&config);
+    let mut probe_client = build_probe_http_client();
 
     loop {
         if cx.is_cancel_requested() {
@@ -2775,6 +2785,7 @@ async fn run_http_server_supervisor(
                 "HTTP server auto-restarted after unexpected exit"
             );
             (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
+            probe_client = build_probe_http_client();
             continue;
         }
 
@@ -2796,6 +2807,7 @@ async fn run_http_server_supervisor(
                     last_restart_sleep_ms = 0;
                     (liveness_failures, next_probe_at, probe_grace_until) =
                         reset_probe_state(&config);
+                    probe_client = build_probe_http_client();
                     handled_control = true;
                 }
                 Ok(Ok(tui_bridge::ServerControlMsg::SetTransportBase(desired))) => {
@@ -2810,6 +2822,7 @@ async fn run_http_server_supervisor(
                     last_restart_sleep_ms = 0;
                     (liveness_failures, next_probe_at, probe_grace_until) =
                         reset_probe_state(&config);
+                    probe_client = build_probe_http_client();
                     handled_control = true;
                 }
                 Ok(Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(envelope))) => {
@@ -2841,7 +2854,7 @@ async fn run_http_server_supervisor(
         }
         next_probe_at = now + Duration::from_secs(config.http_probe_interval_secs);
 
-        let probe_result = probe_http_healthz(cx, &config).await;
+        let probe_result = probe_http_healthz(cx, &config, &probe_client).await;
         if probe_result.is_ok() {
             liveness_failures = 0;
             continue;
@@ -2850,9 +2863,34 @@ async fn run_http_server_supervisor(
             continue;
         }
 
+        // Cross-reference the server's own request diagnostics: if the server
+        // successfully completed a real request within the current probe
+        // interval, the probe timeout is a false positive (e.g. TCP setup
+        // overhead on fresh connection).  Demote to DEBUG and do NOT count
+        // toward the restart threshold.  See GitHub issue #74.
+        let probe_failure = probe_result.expect_err("probe_result checked above");
+        let diag_now_ms = http_runtime_diag_now_ms();
+        let last_completed_ms = instance
+            .request_diagnostics
+            .last_completed_at_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let probe_window_ms = config.http_probe_interval_secs * 1000;
+        if let Some(age_ms) = http_runtime_diag_age_ms(last_completed_ms, diag_now_ms) {
+            if age_ms < probe_window_ms {
+                tracing::debug!(
+                    ?probe_failure,
+                    last_completed_age_ms = age_ms,
+                    host = %config.http_host,
+                    port = config.http_port,
+                    "HTTP liveness probe failed but server completed a request \
+                     within the probe window; treating as false positive"
+                );
+                continue;
+            }
+        }
+
         liveness_failures = liveness_failures.saturating_add(1);
         log_http_runtime_snapshot(&instance, "liveness-probe-failed");
-        let probe_failure = probe_result.expect_err("probe_result checked above");
         tracing::warn!(
             ?probe_failure,
             failures = liveness_failures,
@@ -2908,6 +2946,7 @@ async fn run_http_server_supervisor(
             "HTTP server auto-restarted after liveness probe failures"
         );
         (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
+        probe_client = build_probe_http_client();
     }
 }
 
