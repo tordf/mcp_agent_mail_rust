@@ -8,7 +8,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
+use std::future::Future;
+use std::task::{Context, Poll, Wake};
+
 use asupersync::{Budget, Cx};
+// Tests run outside the HTTP server's async runtime, so `fastmcp_core::block_on`
+// is safe there. Production code uses `spin_block_on` instead (see below).
+#[cfg(test)]
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
@@ -560,11 +566,65 @@ fn get_pool() -> Result<DbPool, (u16, String)> {
     get_or_create_pool(&cfg).map_err(|e| (500, format!("Database error: {e}")))
 }
 
+/// No-op waker: `spin_block_on` re-polls unconditionally, so the waker
+/// never needs to do anything.
+struct SpinWaker;
+
+impl Wake for SpinWaker {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+
+/// Drive a future to completion using a spin loop.
+///
+/// **Why not `fastmcp_core::block_on`?**
+///
+/// `fastmcp_core::block_on` creates its own single-threaded `asupersync`
+/// runtime and installs a *new* `Cx` as the thread-local context.  When the
+/// mail UI handlers are called from within the HTTP server's async handler
+/// (which already has its own runtime and `Cx`), this causes:
+///
+/// 1. The thread-local `Cx` to be silently replaced, breaking cancellation
+///    propagation and budget enforcement for in-flight pool operations.
+/// 2. Potential deadlocks when the inner runtime contends with the outer
+///    runtime for the same thread — particularly when the connection pool's
+///    `test_on_checkout` triggers an async `ping()` validation query during
+///    `pool.acquire()`.
+///
+/// Since all underlying SQLite operations in frankensqlite are synchronous
+/// (wrapped in `async move { ... }` blocks that resolve on the first poll),
+/// a simple spin loop is sufficient and avoids the nested-runtime problem
+/// entirely.  The `Cx` that callers pass to query functions is preserved
+/// because we never overwrite the thread-local context.
+///
+/// See: <https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/72>
+fn spin_block_on<F: Future>(future: F) -> F::Output {
+    const MAX_POLLS: u64 = 500_000;
+
+    let waker = std::task::Waker::from(std::sync::Arc::new(SpinWaker));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+
+    for _ in 0..MAX_POLLS {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => {
+                // Yield to allow other threads to make progress (e.g. pool
+                // lock holders).
+                std::thread::yield_now();
+            }
+        }
+    }
+    panic!(
+        "spin_block_on: future did not resolve after {MAX_POLLS} polls — \
+         likely a genuine hang (not a waker issue)"
+    );
+}
+
 fn block_on_outcome<T>(
     _cx: &Cx,
-    fut: impl std::future::Future<Output = asupersync::Outcome<T, mcp_agent_mail_db::DbError>>,
+    fut: impl Future<Output = asupersync::Outcome<T, mcp_agent_mail_db::DbError>>,
 ) -> Result<T, (u16, String)> {
-    match block_on(fut) {
+    match spin_block_on(fut) {
         asupersync::Outcome::Ok(v) => Ok(v),
         asupersync::Outcome::Err(e) => {
             let status = if matches!(e, mcp_agent_mail_db::DbError::NotFound { .. }) {
