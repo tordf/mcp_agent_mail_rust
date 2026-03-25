@@ -919,9 +919,15 @@ impl Default for Config {
             retention_report_enabled: false,
             retention_report_interval_seconds: 3600,
             retention_max_age_days: 180,
-            // Conservative default: only auto-skip obvious test projects.
             // Override via RETENTION_IGNORE_PROJECT_PATTERNS env var.
-            retention_ignore_project_patterns: vec!["test*".to_string()],
+            retention_ignore_project_patterns: vec![
+                "demo".to_string(),
+                "test*".to_string(),
+                "testproj*".to_string(),
+                "testproject".to_string(),
+                "backendproj*".to_string(),
+                "frontendproj*".to_string(),
+            ],
             quota_enabled: false,
             quota_attachments_limit_bytes: 0,
             quota_inbox_limit_count: 0,

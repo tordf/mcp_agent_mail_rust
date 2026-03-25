@@ -4690,10 +4690,14 @@ pub fn store_attachment(
     use base64::Engine;
     use image::GenericImageView;
 
-    // Check size before reading entire file to prevent OOM.
-    // Use the config limit when set (non-zero), otherwise the fallback.
+    // Guard against pathological decode times during WebP conversion.
+    // Use whichever is larger: the config limit (tool-layer) or the
+    // conversion-safety fallback.  The tool layer already validates
+    // against config.max_attachment_bytes; this guard is about OOM
+    // prevention in the image decoder, so it should never be MORE
+    // restrictive than the old hard-coded 50 MiB.
     let effective_limit = if config.max_attachment_bytes > 0 {
-        config.max_attachment_bytes
+        config.max_attachment_bytes.max(FALLBACK_MAX_ATTACHMENT_BYTES)
     } else {
         FALLBACK_MAX_ATTACHMENT_BYTES
     };
@@ -4875,7 +4879,7 @@ pub fn store_raw_attachment(
     max_bytes: usize,
 ) -> Result<StoredAttachment> {
     let effective_limit = if max_bytes > 0 {
-        max_bytes
+        max_bytes.max(FALLBACK_MAX_ATTACHMENT_BYTES)
     } else {
         FALLBACK_MAX_ATTACHMENT_BYTES
     };
