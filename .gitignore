@@ -279,3 +279,6 @@ release-artifacts/
 
 # Codex CLI ephemeral target directories
 .codex-target-*/
+
+# Codex temp directory
+.codex-tmp/
