@@ -437,8 +437,9 @@ fn parse_attachments_json(value: &str) -> Vec<Value> {
 fn scrub_structure(value: &Value, depth: usize) -> (Value, i64, i64) {
     // Cap recursion at a high hard limit to avoid stack blow-ups on malicious
     // payloads while still scrubbing realistically deep JSON structures.
+    // Return the value as-is rather than Null to avoid data corruption.
     if depth > 256 {
-        return (Value::Null, 0, 0); // Return Null for exceeded depth instead of cloning large structure
+        return (value.clone(), 0, 0);
     }
     match value {
         Value::String(s) => {

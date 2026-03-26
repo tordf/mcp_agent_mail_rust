@@ -626,9 +626,9 @@ def released_ts_marks_released(value):
             try:
                 return float(trimmed) > 0
             except ValueError:
-                return True
+                return False
         return True
-    return True
+    return False
 
 def is_expired(value, now):
     if value is None:
