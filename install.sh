@@ -5410,7 +5410,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
   migration_pristine_backup="${PYTHON_DB_MIGRATED_PATH}.pre-migrate.${migration_pristine_ts}"
 
   # Check disk space and existing backup count before creating pristine snapshot
-  local _pre_migrate_count=0
+  _pre_migrate_count=0
   _pre_migrate_count=$(ls -1 "${PYTHON_DB_MIGRATED_PATH}.pre-migrate."* 2>/dev/null | wc -l | tr -d ' ')
   if [ "$_pre_migrate_count" -ge 3 ]; then
     migration_pristine_backup=""
