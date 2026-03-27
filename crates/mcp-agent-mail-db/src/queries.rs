@@ -922,7 +922,10 @@ async fn durability_probe_query(
         return map_sql_outcome(traw_query(cx, &tracked, sql, params).await);
     }
 
-    let probe_conn = match crate::pool::open_sqlite_file_with_recovery(pool.sqlite_path()) {
+    // Use a plain open — no recovery, no fallback paths.  Durability probes
+    // must be side-effect-free so they never trigger REINDEX or open a fallback
+    // database, which could make committed rows appear to vanish.
+    let probe_conn = match crate::DbConn::open_file(pool.sqlite_path()) {
         Ok(conn) => conn,
         Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
     };
