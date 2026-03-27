@@ -884,6 +884,15 @@ copy_sqlite_snapshot() {
   rm -f "${dest_db}-wal" "${dest_db}-shm" 2>/dev/null || true
 }
 
+count_matching_backup_files() {
+  local prefix="$1"
+  local dir
+  local base
+  dir=$(dirname "$prefix")
+  base=$(basename "$prefix")
+  find "$dir" -maxdepth 1 -type f -name "${base}*" 2>/dev/null | wc -l | tr -d ' '
+}
+
 extract_migrate_check_format() {
   local output="$1"
   printf "%s\n" "$output" | sed -n 's/^Database format: //p' | head -1
@@ -1945,7 +1954,7 @@ resolve_database_path() {
 
     # Cap backup count: don't create more than 3 pre-python-import backups
     local existing_import_backups=0
-    existing_import_backups=$(ls -1 "${rust_db}.pre-python-import-"* 2>/dev/null | wc -l | tr -d ' ')
+    existing_import_backups=$(count_matching_backup_files "${rust_db}.pre-python-import-")
     if [ "$existing_import_backups" -ge 3 ]; then
       warn "Already ${existing_import_backups} pre-python-import backups exist. Skipping backup creation."
       warn "Clean old backups with: rm ${rust_db}.pre-python-import-*"
@@ -5411,7 +5420,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
 
   # Check disk space and existing backup count before creating pristine snapshot
   _pre_migrate_count=0
-  _pre_migrate_count=$(ls -1 "${PYTHON_DB_MIGRATED_PATH}.pre-migrate."* 2>/dev/null | wc -l | tr -d ' ')
+  _pre_migrate_count=$(count_matching_backup_files "${PYTHON_DB_MIGRATED_PATH}.pre-migrate.")
   if [ "$_pre_migrate_count" -ge 3 ]; then
     migration_pristine_backup=""
     warn "Skipping pristine backup (${_pre_migrate_count} pre-migrate backups already exist)."
