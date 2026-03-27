@@ -197,6 +197,34 @@ function Parse-ChecksumHex {
     return $match.Groups[1].Value.ToLowerInvariant()
 }
 
+function Resolve-ChecksumText {
+    param(
+        [string]$AssetUrl,
+        [string]$AssetName,
+        [string]$WorkDir
+    )
+
+    $checksumPath = Join-Path $WorkDir "$AssetName.sha256"
+    $checksumUrl = "$AssetUrl.sha256"
+    try {
+        Write-Info "Downloading checksum $checksumUrl"
+        Download-File -Url $checksumUrl -OutFile $checksumPath
+        return (Get-Content -LiteralPath $checksumPath -Raw)
+    } catch {
+        $sha256sumsUrl = [regex]::Replace($AssetUrl, "/$([regex]::Escape($AssetName))$", "/SHA256SUMS")
+        $sha256sumsPath = Join-Path $WorkDir "SHA256SUMS"
+        Write-WarnText "Per-asset checksum unavailable; falling back to $sha256sumsUrl"
+        Download-File -Url $sha256sumsUrl -OutFile $sha256sumsPath
+
+        $assetPattern = "(?im)^([a-f0-9]{64})\s+\*?$([regex]::Escape($AssetName))\s*$"
+        $match = [regex]::Match((Get-Content -LiteralPath $sha256sumsPath -Raw), $assetPattern)
+        if (-not $match.Success) {
+            throw "Could not find checksum entry for $AssetName in SHA256SUMS."
+        }
+        return $match.Groups[1].Value
+    }
+}
+
 function Verify-ChecksumFile {
     param(
         [string]$FilePath,
@@ -532,16 +560,11 @@ try {
     $zipPath = Join-Path $workDir $AssetName
     $extractDir = Join-Path $workDir "extract"
     $assetUrl = "https://github.com/$Owner/$Repo/releases/download/$resolvedVersion/$AssetName"
-    $checksumPath = Join-Path $workDir "$AssetName.sha256"
-
     Write-Info "Downloading $assetUrl"
     Download-File -Url $assetUrl -OutFile $zipPath
 
     if ($ShouldVerifyChecksum) {
-        $checksumUrl = "$assetUrl.sha256"
-        Write-Info "Downloading checksum $checksumUrl"
-        Download-File -Url $checksumUrl -OutFile $checksumPath
-        $checksumText = Get-Content -LiteralPath $checksumPath -Raw
+        $checksumText = Resolve-ChecksumText -AssetUrl $assetUrl -AssetName $AssetName -WorkDir $workDir
         Verify-ChecksumFile -FilePath $zipPath -ExpectedChecksum $checksumText
     } else {
         Write-WarnText "Checksum verification skipped (-NoVerify)"
