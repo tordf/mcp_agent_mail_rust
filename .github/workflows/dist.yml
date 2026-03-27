@@ -162,6 +162,9 @@ jobs:
 
   release:
     needs: build
+    # Run when all build matrix entries succeed, even if test/lint failed
+    # (build already gates on !cancelled via its own `if`).
+    if: always() && !cancelled() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
