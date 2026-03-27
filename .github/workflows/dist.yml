@@ -21,6 +21,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -44,6 +45,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -84,6 +86,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
