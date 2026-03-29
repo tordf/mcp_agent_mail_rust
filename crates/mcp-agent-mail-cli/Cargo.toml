@@ -25,12 +25,12 @@ chrono.workspace = true
 sqlmodel-core.workspace = true
 sqlmodel-sqlite.workspace = true
 mcp-agent-mail-core = { workspace = true, features = ["agent-detect"] }
-mcp-agent-mail-db = { workspace = true }
-mcp-agent-mail-share = { workspace = true }
+mcp-agent-mail-db = { workspace = true, default-features = false }
+mcp-agent-mail-share = { workspace = true, default-features = false }
 mcp-agent-mail-guard = { workspace = true }
-mcp-agent-mail-server = { workspace = true }
-mcp-agent-mail-tools = { workspace = true }
-mcp-agent-mail-storage = { workspace = true }
+mcp-agent-mail-server = { workspace = true, default-features = false }
+mcp-agent-mail-tools = { workspace = true, default-features = false }
+mcp-agent-mail-storage = { workspace = true, default-features = false }
 beads_rust.workspace = true
 sha2.workspace = true
 hex.workspace = true
@@ -49,6 +49,22 @@ nix = { workspace = true, features = ["signal", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1.8.0"
+
+[features]
+default = [
+    "mcp-agent-mail-db/default",
+    "mcp-agent-mail-server/default",
+    "mcp-agent-mail-tools/default",
+    "mcp-agent-mail-storage/default",
+    "mcp-agent-mail-share/default",
+]
+portable = [
+    "mcp-agent-mail-db/portable",
+    "mcp-agent-mail-server/portable",
+    "mcp-agent-mail-tools/portable",
+    "mcp-agent-mail-storage/portable",
+    "mcp-agent-mail-share/portable",
+]
 
 [dev-dependencies]
 similar.workspace = true

@@ -58,6 +58,9 @@ libsqlite3-sys = { workspace = true, features = ["bundled-windows"] }
 
 [features]
 default = ["hybrid", "s3fifo", "tantivy-engine"]
+# Portable build: everything except hybrid/fastembed (avoids ONNX Runtime AVX2 SIGILL
+# on machines without AVX2).  Used by CI release builds.
+portable = ["s3fifo", "tantivy-engine"]
 # Enable Tantivy-based lexical search (moved from search-core)
 tantivy-engine = []
 # Enable hybrid search (lexical + semantic + frankensearch)

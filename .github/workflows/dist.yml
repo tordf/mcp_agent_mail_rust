@@ -94,8 +94,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binaries
+        # --no-default-features --features portable: exclude hybrid/fastembed
+        # (ONNX Runtime ships AVX2-only static libs → SIGILL on older x86 CPUs).
+        # Portable keeps s3fifo + tantivy-engine; hybrid can still be enabled
+        # by users who build from source with default features.
         run: |
-          cargo build --release --target ${{ matrix.target }} -p mcp-agent-mail -p mcp-agent-mail-cli
+          cargo build --release --target ${{ matrix.target }} -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'

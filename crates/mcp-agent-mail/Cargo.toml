@@ -14,16 +14,30 @@ path = "src/main.rs"
 
 [dependencies]
 mcp-agent-mail-core = { workspace = true }
-mcp-agent-mail-storage = { workspace = true }
-mcp-agent-mail-tools = { workspace = true }
-mcp-agent-mail-server = { workspace = true }
-mcp-agent-mail-cli = { workspace = true }
+mcp-agent-mail-storage = { workspace = true, default-features = false }
+mcp-agent-mail-tools = { workspace = true, default-features = false }
+mcp-agent-mail-server = { workspace = true, default-features = false }
+mcp-agent-mail-cli = { workspace = true, default-features = false }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ftui-runtime = { workspace = true, features = ["stdio-capture"] }
+
+[features]
+default = [
+    "mcp-agent-mail-server/default",
+    "mcp-agent-mail-cli/default",
+    "mcp-agent-mail-tools/default",
+    "mcp-agent-mail-storage/default",
+]
+portable = [
+    "mcp-agent-mail-server/portable",
+    "mcp-agent-mail-cli/portable",
+    "mcp-agent-mail-tools/portable",
+    "mcp-agent-mail-storage/portable",
+]
 
 [dev-dependencies]
 criterion = { workspace = true }
