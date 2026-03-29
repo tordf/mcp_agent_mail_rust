@@ -3134,6 +3134,62 @@ fn run_tui_main_thread(
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+// ---------------------------------------------------------------------------
+// Cached health-check counts (Fix: avoid running COUNT(*) on every /health)
+// ---------------------------------------------------------------------------
+
+/// TTL for cached project/message counts returned by the readiness endpoint.
+const HEALTH_COUNT_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Cached `(last_refresh, project_count, message_count)`.  Both counts are
+/// `Option` so we can distinguish "never fetched" from "fetch failed".
+static HEALTH_COUNT_CACHE: std::sync::LazyLock<Mutex<(Instant, Option<(u64, u64)>)>> =
+    std::sync::LazyLock::new(|| {
+        // Initialise with an `Instant` far enough in the past to guarantee the
+        // first call always refreshes.
+        Mutex::new((Instant::now() - HEALTH_COUNT_CACHE_TTL - Duration::from_secs(1), None))
+    });
+
+// ---------------------------------------------------------------------------
+// Dispatch admission control (Fix: bound concurrent spawn_blocking threads)
+// ---------------------------------------------------------------------------
+
+/// Maximum concurrent `tools/call` dispatches allowed through `spawn_blocking`.
+/// Threads that exceed this limit receive an immediate "overloaded" error
+/// instead of queueing, preventing unbounded thread accumulation when the
+/// blocking pool backs up behind a timeout.
+const MAX_CONCURRENT_DISPATCHES: u32 = 128;
+
+/// Atomic counter tracking in-flight `spawn_blocking` dispatches.
+static DISPATCH_INFLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// RAII guard that decrements `DISPATCH_INFLIGHT` on drop, ensuring the
+/// counter stays accurate even when the future is cancelled or panics.
+struct DispatchPermit;
+
+impl DispatchPermit {
+    /// Try to acquire a dispatch slot.  Returns `None` when the server is at
+    /// capacity (`DISPATCH_INFLIGHT >= MAX_CONCURRENT_DISPATCHES`).
+    fn try_acquire() -> Option<Self> {
+        // Relaxed ordering is fine: the counter is advisory and races between
+        // concurrent fetch_add calls are harmless (off-by-one at most).
+        let prev = DISPATCH_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+        if prev >= MAX_CONCURRENT_DISPATCHES {
+            DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+            None
+        } else {
+            Some(DispatchPermit)
+        }
+    }
+}
+
+impl Drop for DispatchPermit {
+    fn drop(&mut self) {
+        DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 static LIVE_DASHBOARD: std::sync::LazyLock<Mutex<Option<Arc<StartupDashboard>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
@@ -8263,9 +8319,38 @@ to skip auth for local requests.</p>
 
         let id = request.id.clone();
         let method = request.method.clone();
+
+        // Admission control: reject early when the blocking pool is saturated
+        // so timed-out threads don't accumulate unboundedly.
+        let permit = match DispatchPermit::try_acquire() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    method = %method,
+                    inflight = MAX_CONCURRENT_DISPATCHES,
+                    "dispatch admission control: too many concurrent requests, rejecting",
+                );
+                return id.map(|req_id| {
+                    JsonRpcResponse::error(
+                        Some(req_id),
+                        JsonRpcError::from(McpError::new(
+                            McpErrorCode::InternalError,
+                            format!(
+                                "Server overloaded, too many concurrent requests \
+                                 (limit={MAX_CONCURRENT_DISPATCHES}, method={method})"
+                            ),
+                        )),
+                    )
+                });
+            }
+        };
+
         let hard_timeout_secs = self.request_timeout_secs.saturating_add(5);
         let spawn_future =
-            asupersync::runtime::spawn_blocking(move || arc_self.dispatch_inner(request));
+            asupersync::runtime::spawn_blocking(move || {
+                let _permit = permit; // hold permit until blocking work finishes
+                arc_self.dispatch_inner(request)
+            });
 
         let result = if hard_timeout_secs == 5 && self.request_timeout_secs == 0 {
             // request_timeout_secs == 0 means no timeout (infinite budget).
@@ -9821,14 +9906,28 @@ fn enrich_readiness_response(database_url: &str, body: &mut serde_json::Value) {
         };
     body["database_path"] = db_basename;
 
-    // Lightweight COUNT queries — reuse the dashboard connection pattern so we
-    // never block the readiness response on a heavy pool build.
-    let counts = dashboard_open_connection(database_url).and_then(|conn| {
-        let projects = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM projects");
-        let messages = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages");
-        Some((projects, messages))
-    });
-    match counts {
+    // Cached COUNT queries — avoid running COUNT(*) on every /health poll.
+    // The cache has a short TTL (HEALTH_COUNT_CACHE_TTL) so operators still
+    // see reasonably fresh numbers while load-balancer probes stay fast.
+    let cached_counts = {
+        let guard = lock_mutex(&HEALTH_COUNT_CACHE);
+        let (last_refresh, cached) = &*guard;
+        if last_refresh.elapsed() < HEALTH_COUNT_CACHE_TTL {
+            *cached
+        } else {
+            // Cache is stale — release the lock before doing I/O, then
+            // re-acquire to write the refreshed value.
+            drop(guard);
+            let fresh = dashboard_open_connection(database_url).and_then(|conn| {
+                let projects = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM projects");
+                let messages = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages");
+                Some((projects, messages))
+            });
+            *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), fresh);
+            fresh
+        }
+    };
+    match cached_counts {
         Some((projects, messages)) => {
             body["project_count"] = serde_json::json!(projects);
             body["message_count"] = serde_json::json!(messages);
