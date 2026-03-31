@@ -504,7 +504,10 @@ fn main() {
         None => {
             // Default: start MCP server in stdio mode
             tracing::info!("Starting MCP Agent Mail server (stdio mode)");
-            mcp_agent_mail_server::run_stdio(&config);
+            if let Err(err) = mcp_agent_mail_server::run_stdio(&config) {
+                tracing::error!("stdio server failed: {err}");
+                std::process::exit(1);
+            }
         }
         Some(Commands::Serve {
             host,

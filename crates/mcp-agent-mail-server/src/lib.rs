@@ -177,9 +177,11 @@ use mcp_agent_mail_tools::{
     ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1039,11 +1041,157 @@ fn start_advisory_consistency_probe(config: &mcp_agent_mail_core::Config) {
         });
 }
 
-pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxActivityLockMode {
+    Shared,
+    Exclusive,
+}
+
+impl MailboxActivityLockMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Exclusive => "exclusive",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct MailboxActivityLockGuard {
+    _mode: MailboxActivityLockMode,
+    _sqlite_path: PathBuf,
+    _lock_path: PathBuf,
+    lock_file: fs::File,
+}
+
+impl Drop for MailboxActivityLockGuard {
+    fn drop(&mut self) {
+        use fs2::FileExt;
+
+        let _ = self.lock_file.unlock();
+    }
+}
+
+fn normalized_mailbox_activity_sqlite_path(sqlite_path: &Path) -> PathBuf {
+    PathBuf::from(mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
+        sqlite_path.to_string_lossy().as_ref(),
+    ))
+}
+
+fn mailbox_activity_lock_path(sqlite_path: &Path) -> PathBuf {
+    let mut lock_os = sqlite_path.as_os_str().to_os_string();
+    lock_os.push(".activity.lock");
+    PathBuf::from(lock_os)
+}
+
+fn mailbox_activity_lock_contention_error(
+    sqlite_path: &Path,
+    lock_path: &Path,
+    mode: MailboxActivityLockMode,
+    err: &std::io::Error,
+) -> std::io::Error {
+    let detail = format!(
+        "mailbox activity lock is busy for SQLite mailbox {} ({} lock {}): another Agent Mail runtime or mutating `am doctor` operation is already active; stop it or wait for it to finish",
+        sqlite_path.display(),
+        mode.label(),
+        lock_path.display()
+    );
+    if err.kind() == std::io::ErrorKind::WouldBlock
+        || mcp_agent_mail_db::is_lock_error(&err.to_string())
+    {
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, detail)
+    } else {
+        std::io::Error::new(
+            err.kind(),
+            format!("failed to acquire {detail}: {err}"),
+        )
+    }
+}
+
+pub fn acquire_mailbox_activity_lock_for_sqlite_path(
+    sqlite_path: &Path,
+    mode: MailboxActivityLockMode,
+) -> std::io::Result<Option<MailboxActivityLockGuard>> {
+    if sqlite_path == Path::new(":memory:") {
+        return Ok(None);
+    }
+
+    let sqlite_path = normalized_mailbox_activity_sqlite_path(sqlite_path);
+    if let Some(parent) = sqlite_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let lock_path = mailbox_activity_lock_path(&sqlite_path);
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    {
+        use fs2::FileExt;
+
+        let lock_result = match mode {
+            MailboxActivityLockMode::Shared => lock_file.try_lock_shared(),
+            MailboxActivityLockMode::Exclusive => lock_file.try_lock_exclusive(),
+        };
+        if let Err(err) = lock_result {
+            return Err(mailbox_activity_lock_contention_error(
+                &sqlite_path,
+                &lock_path,
+                mode,
+                &err,
+            ));
+        }
+    }
+
+    Ok(Some(MailboxActivityLockGuard {
+        _mode: mode,
+        _sqlite_path: sqlite_path,
+        _lock_path: lock_path,
+        lock_file,
+    }))
+}
+
+pub fn acquire_mailbox_activity_lock_for_database_url(
+    database_url: &str,
+    mode: MailboxActivityLockMode,
+) -> std::io::Result<Option<MailboxActivityLockGuard>> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return Ok(None);
+    }
+
+    let Some(sqlite_path) =
+        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "cannot resolve sqlite path from DATABASE_URL for mailbox activity locking: {database_url}"
+            ),
+        ));
+    };
+
+    acquire_mailbox_activity_lock_for_sqlite_path(&sqlite_path, mode)
+}
+
+pub fn acquire_mailbox_activity_lock(
+    config: &mcp_agent_mail_core::Config,
+    mode: MailboxActivityLockMode,
+) -> std::io::Result<Option<MailboxActivityLockGuard>> {
+    acquire_mailbox_activity_lock_for_database_url(&config.database_url, mode)
+}
+
+pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
+    let _mailbox_activity_lock =
+        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Shared)?;
 
     // Check for resource collisions (e.g. another am process holding locks)
     let probe_report = startup_checks::run_stdio_startup_probes(config);
@@ -1092,6 +1240,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
         disk_monitor::shutdown();
         mcp_agent_mail_storage::wbq_shutdown();
         mcp_agent_mail_storage::flush_async_commits();
+        Ok(())
     }
 }
 
@@ -1930,6 +2079,8 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
+    let _mailbox_activity_lock =
+        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Shared)?;
 
     prepare_http_runtime_startup(config)?;
     log_active_database(config);
@@ -1999,6 +2150,8 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
+    let _mailbox_activity_lock =
+        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Shared)?;
 
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
@@ -11167,6 +11320,73 @@ mod tests {
         if let Some(parent) = relative_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn mailbox_activity_lock_allows_multiple_shared_guards() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("storage.sqlite3");
+
+        let first = acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire first shared lock");
+        let second = acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire second shared lock");
+
+        assert!(first.is_some());
+        assert!(second.is_some());
+        assert!(PathBuf::from(format!("{}.activity.lock", db_path.display())).exists());
+    }
+
+    #[test]
+    fn mailbox_activity_lock_rejects_exclusive_when_shared_guard_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("storage.sqlite3");
+        let _shared = acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared lock");
+
+        let error = acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect_err("exclusive lock should fail while shared lock is held");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            error.to_string().contains("mailbox activity lock is busy"),
+            "unexpected contention error: {error}"
+        );
+    }
+
+    #[test]
+    fn mailbox_activity_lock_rejects_shared_when_exclusive_guard_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("storage.sqlite3");
+        let _exclusive = acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire exclusive lock");
+
+        let error = acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            MailboxActivityLockMode::Shared,
+        )
+        .expect_err("shared lock should fail while exclusive lock is held");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            error.to_string().contains("mailbox activity lock is busy"),
+            "unexpected contention error: {error}"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -3761,7 +3761,7 @@ fn build_setup_run_command_for_http_server(config: &Config) -> SetupCommand {
 
 fn handle_serve_stdio() -> CliResult<()> {
     let config = Config::from_env();
-    mcp_agent_mail_server::run_stdio(&config);
+    mcp_agent_mail_server::run_stdio(&config)?;
     Ok(())
 }
 
@@ -4600,6 +4600,49 @@ fn sqlite_doctor_busy_error(path: &Path, detail: &str) -> CliError {
         "Resource is temporarily busy. Wait a moment and try again. (database health probe could not access {} because another Agent Mail or doctor process is using it: {detail})",
         path.display()
     ))
+}
+
+fn mailbox_activity_lock_cli_error(err: std::io::Error) -> CliError {
+    if err.kind() == std::io::ErrorKind::WouldBlock
+        || mcp_agent_mail_db::is_lock_error(&err.to_string())
+        || err.to_string().contains("mailbox activity lock is busy")
+    {
+        CliError::Other(format!(
+            "Resource is temporarily busy. Wait a moment and try again. ({err})"
+        ))
+    } else {
+        CliError::Io(err)
+    }
+}
+
+fn acquire_doctor_mailbox_activity_lock_for_database_url(
+    database_url: &str,
+    dry_run: bool,
+) -> CliResult<Option<mcp_agent_mail_server::MailboxActivityLockGuard>> {
+    if dry_run {
+        return Ok(None);
+    }
+
+    mcp_agent_mail_server::acquire_mailbox_activity_lock_for_database_url(
+        database_url,
+        mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+    )
+    .map_err(mailbox_activity_lock_cli_error)
+}
+
+fn acquire_doctor_mailbox_activity_lock_for_sqlite_path(
+    sqlite_path: &Path,
+    dry_run: bool,
+) -> CliResult<Option<mcp_agent_mail_server::MailboxActivityLockGuard>> {
+    if dry_run {
+        return Ok(None);
+    }
+
+    mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+        sqlite_path,
+        mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+    )
+    .map_err(mailbox_activity_lock_cli_error)
 }
 
 fn is_snapshot_conflict_cli_error(error: &CliError) -> bool {
@@ -16042,7 +16085,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     skipped_count += 1;
                 } else {
                     match run_doctor_subcommand_quietly(json, || {
-                        handle_doctor_reconstruct_with(None, None, false, true, false)
+                        handle_doctor_reconstruct(false, true, false)
                     }) {
                         Ok(()) => {
                             results.push(serde_json::json!({
@@ -16079,14 +16122,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     skipped_count += 1;
                 } else {
                     match run_doctor_subcommand_quietly(json, || {
-                        handle_doctor_repair_with(
-                            &cfg.database_url,
-                            storage_root,
-                            &backup_dir,
-                            None,
-                            false,
-                            true,
-                        )
+                        handle_doctor_repair(None, false, true, Some(backup_dir.clone()))
                     }) {
                         Ok(()) => {
                             results.push(serde_json::json!({
@@ -18316,6 +18352,25 @@ mod mail_server_cli_bridge_tests {
         assert!(
             is_resource_busy_cli_error(&error),
             "doctor sanity busy error should be classified as resource busy: {error}"
+        );
+    }
+
+    #[test]
+    fn doctor_mailbox_activity_lock_reports_resource_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("doctor-mailbox-lock.sqlite3");
+        std::fs::write(&db_path, b"placeholder").expect("create placeholder db");
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared mailbox activity lock");
+
+        let error = acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, false)
+            .expect_err("doctor exclusive lock should fail while shared lock is held");
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "doctor mailbox activity contention should be classified as resource busy: {error}"
         );
     }
 
@@ -36412,6 +36467,8 @@ fn handle_doctor_repair(
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let database_url = &cfg.database_url;
     let bak_dir = backup_dir.unwrap_or_else(|| config.storage_root.join("backups"));
+    let _mailbox_activity_lock =
+        acquire_doctor_mailbox_activity_lock_for_database_url(database_url, dry_run)?;
     handle_doctor_repair_with(
         database_url,
         &config.storage_root,
@@ -36717,6 +36774,10 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, yes: bool) -> CliR
             "cannot restore into an in-memory database (:memory:)".to_string(),
         ));
     }
+    let dest_path = resolve_sqlite_path_with_absolute_candidate(&dest_path);
+
+    let _mailbox_activity_lock =
+        acquire_doctor_mailbox_activity_lock_for_sqlite_path(Path::new(&dest_path), dry_run)?;
 
     handle_doctor_restore_to(&backup_path, Path::new(&dest_path), dry_run, yes)
 }
@@ -36762,6 +36823,15 @@ fn handle_doctor_restore_to(
 }
 
 fn handle_doctor_reconstruct(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let db_path = PathBuf::from(
+        resolve_sqlite_path_with_absolute_candidate(
+            &cfg.sqlite_path()
+                .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?,
+        ),
+    );
+    let _mailbox_activity_lock =
+        acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, dry_run)?;
     handle_doctor_reconstruct_with(None, None, dry_run, yes, json)
 }
 
