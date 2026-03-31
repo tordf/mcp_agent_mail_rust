@@ -1205,7 +1205,7 @@ fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
         .take(128)
         .collect();
-    if sanitized.is_empty() || !sanitized.as_bytes()[0].is_ascii_alphanumeric() {
+    if sanitized.is_empty() || !sanitized.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
         None
     } else {
         Some(sanitized)

@@ -452,7 +452,9 @@ fn is_valid_thread_id(tid: &str) -> bool {
     if tid.is_empty() || tid.len() > 128 {
         return false;
     }
-    let first = tid.as_bytes()[0];
+    let Some(first) = tid.chars().next() else {
+        return false;
+    };
     if !first.is_ascii_alphanumeric() {
         return false;
     }
@@ -530,7 +532,7 @@ fn sanitize_thread_id(raw: &str, fallback: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
         .take(128)
         .collect();
-    if sanitized.is_empty() || !sanitized.as_bytes()[0].is_ascii_alphanumeric() {
+    if sanitized.is_empty() || !sanitized.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
         return fallback.to_string();
     }
     sanitized
@@ -4211,7 +4213,8 @@ mod tests {
 
     fn apply_prefix(original_subject: &str, prefix: &str) -> String {
         if original_subject.len() >= prefix.len()
-            && original_subject.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+            && original_subject.is_char_boundary(prefix.len())
+            && original_subject[..prefix.len()].eq_ignore_ascii_case(&prefix)
         {
             original_subject.to_string()
         } else {

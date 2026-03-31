@@ -981,7 +981,7 @@ impl<'a> TwoTierSearchIter<'a> {
 
         // If no fast candidates are available OR they are empty, fall back to full quality search.
         // This ensures that even if lexical search misses everything, semantic search has a chance.
-        if fast_results.is_none() || fast_results.is_some_and(|r| r.is_empty()) {
+        if fast_results.is_none() || fast_results.is_some_and(std::vec::Vec::is_empty) {
             let _score_span =
                 tracing::debug_span!("two_tier.score_quality", candidates = 0).entered();
             let score_start = Instant::now();

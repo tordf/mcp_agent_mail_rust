@@ -50,10 +50,12 @@ fn generate_product_uid(now_micros: i64) -> String {
     let pid = u64::from(std::process::id());
     let mut out = String::with_capacity(32);
     // Format directly into the output buffer
+    #[allow(clippy::cast_sign_loss)]
+    let time_component = now_micros as u64;
     let _ = write!(
         out,
         "{:016x}{:08x}{:08x}",
-        now_micros as u64,
+        time_component,
         pid,
         seq
     );
