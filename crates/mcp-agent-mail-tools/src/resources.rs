@@ -3515,9 +3515,10 @@ fn reservation_glob_matcher(normalized_pattern: &str) -> Option<globset::GlobMat
 
 fn reservation_glob_walk_latest_micros(
     workspace: &Path,
+    start_dir: &Path,
     matcher: &globset::GlobMatcher,
 ) -> (bool, Option<i64>) {
-    let mut stack = vec![workspace.to_path_buf()];
+    let mut stack = vec![start_dir.to_path_buf()];
     let mut matched_any = false;
     let mut fs_latest: Option<i64> = None;
     let mut visited_entries = 0usize;
@@ -3631,7 +3632,7 @@ pub(crate) fn reservation_compute_pattern_activity(
 
         if !matched_paths && let Some(matcher) = reservation_glob_matcher(&normalized) {
             let (fallback_matches, fallback_latest) =
-                reservation_glob_walk_latest_micros(workspace, &matcher);
+                reservation_glob_walk_latest_micros(workspace, workspace, &matcher);
             matched_paths = fallback_matches;
             fs_latest = fallback_latest;
         } else if !matched_paths {
@@ -3642,7 +3643,27 @@ pub(crate) fn reservation_compute_pattern_activity(
         if candidate.exists() {
             matched_paths = true;
 
-            if let Ok(meta) = std::fs::metadata(&candidate)
+            if candidate.is_dir() {
+                // For directory reservations, scan contents for most recent modification
+                // to avoid missing activity because the directory mtime didn't update.
+                let pattern_with_glob = if normalized.ends_with('/') {
+                    format!("{normalized}**")
+                } else {
+                    format!("{normalized}/**")
+                };
+                if let Some(matcher) = reservation_glob_matcher(&pattern_with_glob) {
+                    let (_, latest) = reservation_glob_walk_latest_micros(workspace, &candidate, &matcher);
+                    fs_latest = latest;
+                }
+                // Fallback to directory mtime if scan found nothing or failed
+                if fs_latest.is_none() {
+                    if let Ok(meta) = std::fs::metadata(&candidate)
+                        && let Ok(modified) = meta.modified()
+                    {
+                        fs_latest = reservation_system_time_to_micros(modified);
+                    }
+                }
+            } else if let Ok(meta) = std::fs::metadata(&candidate)
                 && let Ok(modified) = meta.modified()
             {
                 fs_latest = reservation_system_time_to_micros(modified);
