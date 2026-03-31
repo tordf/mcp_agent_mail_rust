@@ -1525,6 +1525,11 @@ fn base_schema_contains_column(table: &str, column: &str) -> bool {
     })
 }
 
+/// Previously used to filter ADD COLUMN migrations from base mode when the
+/// column already existed in the static base schema definition.  Removed from
+/// `schema_migrations_base()` because it incorrectly skipped columns on
+/// Python-imported databases, but retained for potential future use.
+#[allow(dead_code)]
 #[must_use]
 fn add_column_migration_is_redundant_for_base_schema(migration: &Migration) -> bool {
     let Some((table, column)) = parse_alter_table_add_column(&migration.up) else {
@@ -1661,12 +1666,17 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
 /// migrations table.
 #[must_use]
 pub fn schema_migrations_base() -> Vec<Migration> {
+    // NOTE: We intentionally do NOT filter out ADD COLUMN migrations here.
+    // The migration runner already handles "duplicate column name" errors
+    // gracefully via `migration_statement_already_satisfied()`, so ADD COLUMN
+    // migrations that target columns already present in the base schema are
+    // safe to include.  Previously we filtered them as a performance
+    // optimization, but that caused Python-imported databases (which have an
+    // older schema lacking those columns) to skip the ADD COLUMN while still
+    // running dependent CREATE INDEX migrations → "no such column" errors.
     let mut migrations: Vec<Migration> = schema_migrations()
         .into_iter()
-        .filter(|m| {
-            !is_unsupported_by_franken(&m.id)
-                && !add_column_migration_is_redundant_for_base_schema(m)
-        })
+        .filter(|m| !is_unsupported_by_franken(&m.id))
         .collect();
     migrations.extend(base_trigger_cleanup_migrations());
     migrations
@@ -2725,8 +2735,13 @@ mod tests {
         assert!(!ids.contains("v6_trg_inbox_stats_insert"));
         assert!(!ids.contains("v6_trg_inbox_stats_mark_read"));
         assert!(!ids.contains("v6_trg_inbox_stats_ack"));
-        assert!(!ids.contains("v19_agents_reaper_exempt"));
-        assert!(!ids.contains("v20_agents_registration_token"));
+        // ADD COLUMN migrations are intentionally included in base mode — the
+        // migration runner handles "duplicate column" errors gracefully.  This
+        // ensures Python-imported databases (with older schemas) get the columns
+        // added instead of hitting "no such column" on dependent indexes.
+        assert!(ids.contains("v19_agents_reaper_exempt"));
+        assert!(ids.contains("v20_agents_registration_token"));
+        assert!(ids.contains("v20_idx_agents_registration_token"));
     }
 
     #[test]

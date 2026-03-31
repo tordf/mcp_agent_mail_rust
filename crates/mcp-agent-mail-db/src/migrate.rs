@@ -710,8 +710,32 @@ const PYTHON_DB_CANDIDATES: &[&str] = &[
 /// 1. An explicit path (if provided, e.g. from alias detection)
 /// 2. Common clone directory locations
 /// 3. The `DATABASE_URL` environment variable
-pub fn find_python_database(
+fn database_url_python_database_candidate(database_url: &str) -> Option<std::path::PathBuf> {
+    let path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)?;
+    if path.is_absolute() {
+        return Some(path);
+    }
+
+    let path_text = path.to_string_lossy();
+    if path_text.starts_with("./") || path_text.starts_with("../") {
+        return Some(path);
+    }
+
+    if is_sqlite_file(&path) {
+        return Some(path);
+    }
+
+    let absolute_candidate = std::path::Path::new("/").join(&path);
+    if is_sqlite_file(&absolute_candidate) {
+        return Some(absolute_candidate);
+    }
+
+    Some(path)
+}
+
+fn find_python_database_with_database_url(
     explicit_clone_path: Option<&std::path::Path>,
+    database_url: Option<&str>,
 ) -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
 
@@ -731,8 +755,8 @@ pub fn find_python_database(
     }
 
     // 3. DATABASE_URL env var
-    if let Ok(url) = std::env::var("DATABASE_URL")
-        && let Some(path) = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&url)
+    if let Some(url) = database_url
+        && let Some(path) = database_url_python_database_candidate(url)
     {
         candidates.push(path);
     }
@@ -748,6 +772,14 @@ pub fn find_python_database(
     }
 
     None
+}
+
+#[must_use]
+pub fn find_python_database(
+    explicit_clone_path: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let database_url = std::env::var("DATABASE_URL").ok();
+    find_python_database_with_database_url(explicit_clone_path, database_url.as_deref())
 }
 
 /// Check if a file has the `SQLite` magic header bytes.
@@ -1552,6 +1584,38 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn database_url_python_database_candidate_uses_absolute_candidate_for_malformed_relative_database_url()
+     {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("python-env.sqlite3");
+        let mut file = std::fs::File::create(&absolute_db).expect("create absolute db");
+        file.write_all(b"SQLite format 3\0")
+            .expect("write sqlite header");
+        file.write_all(&[0u8; 84]).expect("pad sqlite header");
+        drop(file);
+
+        let relative_path = absolute_db
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        let relative_candidate = std::path::PathBuf::from(&relative_path);
+        assert!(
+            !relative_candidate.exists(),
+            "relative shadow path should be absent so discovery must exercise the absolute candidate"
+        );
+
+        let database_url = format!("sqlite:///{}", relative_path);
+        let found = database_url_python_database_candidate(&database_url);
+        assert_eq!(
+            found,
+            Some(absolute_db),
+            "DATABASE_URL candidate resolution should prefer the existing absolute candidate"
+        );
     }
 
     // ── copy_python_database_to_rust tests ────────────────────────────

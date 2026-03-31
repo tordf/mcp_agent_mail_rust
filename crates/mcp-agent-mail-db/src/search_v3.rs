@@ -909,6 +909,27 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 
 // ── Startup backfill ─────────────────────────────────────────────────────
 
+pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Option<String> {
+    let path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)?;
+    let path_text = path.to_string_lossy().into_owned();
+
+    if path == Path::new(":memory:") || path.is_absolute() {
+        return Some(path_text);
+    }
+    if path_text.starts_with("./") || path_text.starts_with("../") {
+        return Some(path_text);
+    }
+    if !path.exists() {
+        let absolute_candidate = Path::new("/").join(&path);
+        if absolute_candidate.exists() {
+            return Some(absolute_candidate.to_string_lossy().into_owned());
+        }
+        return Some(path_text);
+    }
+
+    Some(crate::pool::normalize_sqlite_path_for_pool_key(&path_text))
+}
+
 /// Backfill the Tantivy index with all messages from the database.
 ///
 /// Uses a sync `DbConn` (`FrankenSQLite`) to scan the messages table joined with
@@ -930,9 +951,8 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     // Open a sync connection via FrankenSQLite.
     let db_path_owned = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
         ":memory:".to_string()
-    } else if let Some(path) = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)
-    {
-        crate::pool::normalize_sqlite_path_for_pool_key(path.to_string_lossy().as_ref())
+    } else if let Some(path) = resolve_search_sqlite_path_from_database_url(db_url) {
+        path
     } else {
         db_url.to_string()
     };
@@ -1218,9 +1238,15 @@ mod tests {
     fn concurrent_writer_behavior() {
         let dir = tempfile::TempDir::new().unwrap();
         let bridge = TantivyBridge::open(dir.path()).unwrap();
-        let _writer1 = bridge.index().writer::<TantivyDocument>(15_000_000).unwrap();
+        let _writer1 = bridge
+            .index()
+            .writer::<TantivyDocument>(15_000_000)
+            .unwrap();
         let writer2_res = bridge.index().writer::<TantivyDocument>(15_000_000);
-        assert!(writer2_res.is_err(), "second writer should fail with lock error");
+        assert!(
+            writer2_res.is_err(),
+            "second writer should fail with lock error"
+        );
     }
 
     #[test]
@@ -2659,6 +2685,33 @@ mod tests {
             results.len(),
             2,
             "thread filter should return 2 messages from thread-A"
+        );
+    }
+
+    #[test]
+    fn resolve_search_sqlite_path_from_database_url_uses_absolute_candidate_when_relative_path_is_missing()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("backfill-missing-relative.sqlite3");
+        std::fs::write(&absolute_db, b"seed").expect("write absolute db");
+
+        let relative_path = absolute_db
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        let relative_candidate = PathBuf::from(&relative_path);
+        assert!(
+            !relative_candidate.exists(),
+            "relative shadow path should be absent so search backfill resolves the absolute candidate"
+        );
+
+        let db_url = format!("sqlite:///{}", relative_path);
+        let resolved =
+            resolve_search_sqlite_path_from_database_url(&db_url).expect("resolve search path");
+        assert_eq!(
+            resolved,
+            absolute_db.to_string_lossy(),
+            "search backfill should open the existing absolute candidate"
         );
     }
 

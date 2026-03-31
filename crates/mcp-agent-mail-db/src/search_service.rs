@@ -844,9 +844,7 @@ fn sqlite_key_from_database_url(database_url: &str) -> Option<String> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return None;
     }
-    mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url).map(|path| {
-        crate::pool::normalize_sqlite_path_for_pool_key(path.to_string_lossy().as_ref())
-    })
+    crate::search_v3::resolve_search_sqlite_path_from_database_url(database_url)
 }
 
 fn sqlite_key_for_pool(pool: &DbPool) -> String {
@@ -4095,6 +4093,27 @@ mod tests {
             .clone();
 
         assert!(active_key.is_none());
+    }
+
+    #[test]
+    fn sqlite_key_from_database_url_uses_absolute_candidate_when_relative_path_is_missing() {
+        let absolute_dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = absolute_dir.path().join("storage-missing.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let conn = crate::DbConn::open_file(&absolute_db_str).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let relative_path = std::path::PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        assert!(
+            !relative_path.exists(),
+            "relative shadow path should be absent so sqlite key resolution uses the absolute candidate"
+        );
+
+        let db_url = format!("sqlite:///{}", relative_path.display());
+        let sqlite_key = sqlite_key_from_database_url(&db_url).expect("sqlite key");
+        assert_eq!(sqlite_key, absolute_db_str);
     }
 
     #[test]
