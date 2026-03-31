@@ -5431,21 +5431,25 @@ impl AtcEngine {
                     "[ATC] Deadlock in {project}: {subject}. {} is the likeliest stale-holder bottleneck; inspect the cycle and release only inactive work if safe.{}",
                     best_target, fallback_suffix
                 );
-                actions.push(AtcTickAction::SendAdvisory {
-                    agent: best_target.clone(),
-                    message: message.clone(),
-                });
-                if let Some(effect) = self.effect_plan_for_decision_id(
-                    decision_id,
-                    now_micros,
-                    "send_advisory",
-                    "conflict",
-                    "deadlock_remediation",
-                    best_target,
-                    Some(project.clone()),
-                    Some(message),
-                ) {
-                    effects.push(effect);
+
+                // Notify all agents in the cycle so they are aware of the bottleneck.
+                for agent in cycle {
+                    actions.push(AtcTickAction::SendAdvisory {
+                        agent: agent.clone(),
+                        message: message.clone(),
+                    });
+                    if let Some(effect) = self.effect_plan_for_decision_id(
+                        decision_id,
+                        now_micros,
+                        "send_advisory",
+                        "conflict",
+                        "deadlock_remediation",
+                        agent.clone(),
+                        Some(project.clone()),
+                        Some(message.clone()),
+                    ) {
+                        effects.push(effect);
+                    }
                 }
             }
         }
@@ -9094,7 +9098,7 @@ pub fn atc_agent_last_activity(agent: &str) -> Option<i64> {
     let engine = engine_lock.lock().unwrap_or_else(|p| p.into_inner());
     engine
         .agents
-        .get(&agent.to_ascii_lowercase())
+        .get(agent)
         .map(|entry| entry.rhythm.last_activity_ts)
         .filter(|ts| *ts > 0)
 }
