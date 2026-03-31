@@ -68,8 +68,11 @@ fn slot_dir(project_root: &Path, slot: &str) -> PathBuf {
     project_root.join("build_slots").join(safe_component(slot))
 }
 
-fn holder_identity(agent_name: &str, _branch: Option<&str>) -> String {
-    agent_name.to_string()
+fn holder_identity(agent_name: &str, branch: Option<&str>) -> String {
+    match branch {
+        Some(b) => format!("{agent_name}:::{b}"),
+        None => agent_name.to_string(),
+    }
 }
 
 fn lease_path_for_holder(slot_path: &Path, agent_name: &str, branch: Option<&str>) -> PathBuf {
@@ -80,8 +83,8 @@ fn lease_path_for_holder(slot_path: &Path, agent_name: &str, branch: Option<&str
     slot_path.join(format!("{holder_id}.json"))
 }
 
-fn lease_matches_holder(lease: &BuildSlotLease, agent_name: &str, _branch: Option<&str>) -> bool {
-    lease.agent == agent_name
+fn lease_matches_holder(lease: &BuildSlotLease, agent_name: &str, branch: Option<&str>) -> bool {
+    lease.agent == agent_name && lease.branch.as_deref() == branch
 }
 
 fn legacy_lease_path_for_holder(
