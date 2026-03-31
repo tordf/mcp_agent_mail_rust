@@ -18,7 +18,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sqlmodel_core::Value as SqlValue;
 use sqlmodel_sqlite::SqliteConnection;
 
 use crate::{ExportRedactionPolicy, RedactionAuditLog, RedactionReason, ShareError, ShareResult};
@@ -258,6 +257,7 @@ pub fn render_static_site(
     output_dir: &Path,
     config: &StaticRenderConfig,
 ) -> ShareResult<StaticRenderResult> {
+    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
     let path_str = snapshot_path.display().to_string();
     let conn = SqliteConnection::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot for static render: {e}"),
@@ -1657,6 +1657,46 @@ mod tests {
         assert!(output.join("viewer/data/sitemap.json").exists());
         assert!(output.join("viewer/data/search_index.json").exists());
         assert!(output.join("viewer/data/navigation.json").exists());
+    }
+
+    #[test]
+    fn render_static_site_uses_absolute_candidate_for_missing_relative_snapshot_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shadow-render.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER,              subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER,              read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let relative_db_path = PathBuf::from(db_path.strip_prefix("/").unwrap());
+        assert!(!relative_db_path.exists());
+
+        let output = dir.path().join("shadow-output");
+        let result =
+            render_static_site(&relative_db_path, &output, &StaticRenderConfig::default()).unwrap();
+
+        assert!(result.pages_generated > 0);
+        assert!(output.join("viewer/pages/index.html").exists());
+        assert!(!relative_db_path.exists());
     }
 
     #[test]

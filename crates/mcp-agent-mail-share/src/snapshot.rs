@@ -201,6 +201,8 @@ pub fn create_sqlite_snapshot(
     destination: &Path,
     checkpoint: bool,
 ) -> Result<PathBuf, ShareError> {
+    let source = crate::resolve_share_sqlite_path(source);
+
     // Validate source exists
     if !source.exists() {
         return Err(ShareError::SnapshotSourceNotFound {
@@ -608,6 +610,36 @@ mod tests {
         let rows = copy_conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
         let result: String = rows[0].get_named("integrity_check").unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn snapshot_uses_absolute_candidate_for_missing_relative_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shadow-source.sqlite3");
+        let dest = dir.path().join("shadow-dest.sqlite3");
+
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'shadow', '/shadow', 0)")
+            .unwrap();
+        drop(conn);
+
+        let relative_source = PathBuf::from(source.strip_prefix("/").unwrap());
+        assert!(!relative_source.exists());
+
+        create_sqlite_snapshot(&relative_source, &dest, false).unwrap();
+        assert!(dest.exists());
+        assert!(!relative_source.exists());
+
+        let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
+        let rows = copy_conn
+            .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
+            .unwrap();
+        let slug: String = rows[0].get_named("slug").unwrap();
+        assert_eq!(slug, "shadow");
     }
 
     #[test]

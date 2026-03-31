@@ -149,6 +149,7 @@ pub fn bundle_attachments(
 ) -> ShareResult<AttachmentManifest> {
     use base64::Engine;
 
+    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
     let path_str = snapshot_path.display().to_string();
     let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot: {e}"),
@@ -392,7 +393,7 @@ pub fn bundle_attachments(
     drop(conn);
 
     if attachments_rewritten {
-        crate::build_materialized_views(snapshot_path, fts_enabled)?;
+        crate::build_materialized_views(&snapshot_path, fts_enabled)?;
     }
 
     // Ensure attachments dir exists even if empty
@@ -1320,6 +1321,7 @@ pub fn export_viewer_data(
     let data_dir = output_dir.join("viewer").join("data");
     ensure_real_directory(&data_dir)?;
 
+    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
     let path_str = snapshot_path.display().to_string();
     let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot for viewer data: {e}"),

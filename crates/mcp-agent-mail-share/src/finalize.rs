@@ -479,6 +479,7 @@ pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareE
 /// (PRAGMA journal_mode changes, VACUUM, FTS5 virtual tables), so we
 /// use the real C SQLite driver here.
 fn open_conn(path: &Path) -> Result<SqliteConnection, ShareError> {
+    let path = crate::resolve_share_sqlite_path(path);
     let path_str = path.display().to_string();
     SqliteConnection::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open {path_str}: {e}"),

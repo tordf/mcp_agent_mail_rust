@@ -1797,6 +1797,7 @@ fn validate_database_artifacts(
 }
 
 fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
+    let db_path = crate::resolve_share_sqlite_path(db_path);
     let db_path_str = db_path.display().to_string();
     let conn = SqliteConnection::open_file(&db_path_str)
         .map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
@@ -1824,6 +1825,7 @@ fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
 }
 
 fn validate_agent_mail_schema(db_path: &Path) -> Result<(), String> {
+    let db_path = crate::resolve_share_sqlite_path(db_path);
     let db_path_str = db_path.display().to_string();
     let conn = SqliteConnection::open_file(&db_path_str)
         .map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;

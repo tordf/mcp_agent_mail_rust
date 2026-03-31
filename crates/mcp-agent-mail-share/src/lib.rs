@@ -379,6 +379,27 @@ pub fn resolve_sqlite_database_path(database_url: &str) -> ShareResult<PathBuf> 
     }
 }
 
+#[must_use]
+pub(crate) fn resolve_share_sqlite_path(path: &Path) -> PathBuf {
+    if path == Path::new(":memory:") {
+        return path.to_path_buf();
+    }
+
+    let raw = path.to_string_lossy();
+    if path.is_absolute() || raw.starts_with("./") || raw.starts_with("../") {
+        return path.to_path_buf();
+    }
+
+    if !path.exists() {
+        let absolute_candidate = Path::new("/").join(path);
+        if absolute_candidate.exists() {
+            return absolute_candidate;
+        }
+    }
+
+    path.to_path_buf()
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredExportConfig {
     pub projects: Vec<String>,
@@ -672,6 +693,26 @@ mod tests {
                 .expect("aiosqlite prefix should resolve"),
             PathBuf::from("/tmp/agent-mail-aio.sqlite3")
         );
+    }
+
+    #[test]
+    fn resolve_share_sqlite_path_prefers_existing_absolute_candidate() {
+        let dir = tempdir().unwrap();
+        let absolute_path = dir.path().join("share-resolve.sqlite3");
+        std::fs::write(&absolute_path, b"sqlite").unwrap();
+
+        let relative_path = PathBuf::from(absolute_path.strip_prefix("/").unwrap());
+        assert!(!relative_path.exists());
+
+        let resolved = resolve_share_sqlite_path(&relative_path);
+        assert_eq!(resolved, absolute_path);
+    }
+
+    #[test]
+    fn resolve_share_sqlite_path_keeps_explicit_relative_paths() {
+        let explicit_relative = PathBuf::from("./tmp/share.sqlite3");
+        let resolved = resolve_share_sqlite_path(&explicit_relative);
+        assert_eq!(resolved, explicit_relative);
     }
 
     #[test]
