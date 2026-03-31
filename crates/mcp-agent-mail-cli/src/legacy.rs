@@ -228,6 +228,71 @@ struct ImportPlan {
     operations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LegacyImportMailboxLockKind {
+    StorageRoot,
+    Sqlite,
+}
+
+#[derive(Debug)]
+struct LegacyImportMailboxLocks {
+    _guards: Vec<mcp_agent_mail_server::MailboxActivityLockGuard>,
+}
+
+fn legacy_import_lock_specs(plan: &ImportPlan) -> Vec<(LegacyImportMailboxLockKind, PathBuf)> {
+    let mut specs = vec![
+        (
+            LegacyImportMailboxLockKind::StorageRoot,
+            plan.source_storage_root.clone(),
+        ),
+        (LegacyImportMailboxLockKind::Sqlite, plan.source_db.clone()),
+    ];
+
+    // Copy-mode targets are usually fresh paths. Only lock them when they already
+    // exist so a failed import does not create brand-new directories just for
+    // advisory lock files.
+    if plan.mode == ImportMode::InPlace || plan.target_storage_root.exists() {
+        specs.push((
+            LegacyImportMailboxLockKind::StorageRoot,
+            plan.target_storage_root.clone(),
+        ));
+    }
+    if plan.mode == ImportMode::InPlace || plan.target_db.exists() {
+        specs.push((LegacyImportMailboxLockKind::Sqlite, plan.target_db.clone()));
+    }
+
+    specs
+}
+
+fn acquire_legacy_import_mailbox_locks(plan: &ImportPlan) -> CliResult<LegacyImportMailboxLocks> {
+    let mut specs = legacy_import_lock_specs(plan);
+    specs.sort();
+    specs.dedup();
+
+    let mut guards = Vec::with_capacity(specs.len());
+    for (kind, path) in specs {
+        let guard = match kind {
+            LegacyImportMailboxLockKind::StorageRoot => {
+                crate::acquire_cli_mailbox_activity_lock_for_storage_root(
+                    &path,
+                    mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+                )?
+            }
+            LegacyImportMailboxLockKind::Sqlite => {
+                crate::acquire_cli_mailbox_activity_lock_for_sqlite_path(
+                    &path,
+                    mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+                )?
+            }
+        };
+        if let Some(guard) = guard {
+            guards.push(guard);
+        }
+    }
+
+    Ok(LegacyImportMailboxLocks { _guards: guards })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyImportReceipt {
     receipt_version: u32,
@@ -767,6 +832,9 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
 }
 
 fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<LegacyImportReceipt> {
+    // Legacy import checkpoints, copies, and may migrate the live mailbox in
+    // place. Fence those paths before any backup/copy work begins.
+    let _mailbox_locks = acquire_legacy_import_mailbox_locks(&plan)?;
     let now = Utc::now();
     let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
     let mut warnings = Vec::new();
@@ -1346,6 +1414,25 @@ fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResul
     })
 }
 
+fn resolve_legacy_database_url_path(db_path: &Path, search_root: &Path) -> PathBuf {
+    let db_path_text = db_path.to_string_lossy();
+    if db_path.is_absolute() || db_path_text.starts_with("./") || db_path_text.starts_with("../") {
+        return db_path.to_path_buf();
+    }
+
+    let joined = search_root.join(db_path);
+    if joined.exists() {
+        return joined;
+    }
+
+    let absolute_candidate = Path::new("/").join(db_path);
+    if absolute_candidate.exists() {
+        return absolute_candidate;
+    }
+
+    joined
+}
+
 fn parse_database_value(
     value: &str,
     search_root: &Path,
@@ -1357,19 +1444,15 @@ fn parse_database_value(
         ));
     }
 
-    let db_path = if value.contains("://") {
-        sqlite_file_path_from_database_url(value).ok_or_else(|| {
+    let path = if value.contains("://") {
+        let db_path = sqlite_file_path_from_database_url(value).ok_or_else(|| {
             CliError::InvalidArgument(format!(
                 "unsupported DATABASE_URL scheme for import: {value}"
             ))
-        })?
+        })?;
+        resolve_legacy_database_url_path(&db_path, search_root)
     } else {
-        PathBuf::from(value)
-    };
-    let path = if db_path.is_absolute() {
-        db_path
-    } else {
-        search_root.join(db_path)
+        search_root.join(value)
     };
     Ok(ResolvedPath {
         exists: path.exists(),
@@ -1740,6 +1823,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, tmp.path().join("legacy.db"));
+    }
+
+    #[test]
+    fn parse_database_value_prefers_absolute_candidate_for_missing_bare_relative_sqlite_url() {
+        let search_root = tempfile::tempdir().unwrap();
+        let db_home = tempfile::tempdir().unwrap();
+        let absolute_db = db_home.path().join("legacy-url.sqlite3");
+        fs::write(&absolute_db, b"sqlite").unwrap();
+
+        let relative_path = absolute_db
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        assert!(
+            !search_root.path().join(&relative_path).exists(),
+            "search-root relative target should be absent so absolute candidate fallback is exercised"
+        );
+
+        let parsed = parse_database_value(
+            &format!("sqlite://{}", relative_path),
+            search_root.path(),
+            ResolvedSource::Default,
+        )
+        .unwrap();
+        assert_eq!(parsed.path, absolute_db);
     }
 
     #[test]
@@ -2184,6 +2292,120 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
 
         assert!(!paths_overlap(&source, &sibling_via_parent));
+    }
+
+    #[test]
+    fn legacy_import_in_place_reports_busy_before_mutating_mailbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_db = tmp.path().join("legacy_in_place_busy.sqlite3");
+        drop(DbConn::open_file(source_db.display().to_string()).unwrap());
+        let source_storage = tmp.path().join("legacy-storage");
+        fs::create_dir_all(&source_storage).unwrap();
+
+        let plan = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(tmp.path().to_path_buf()),
+            db: Some(source_db.clone()),
+            storage_root: Some(source_storage.clone()),
+            in_place: true,
+            copy: false,
+            target_db: None,
+            target_storage_root: None,
+            dry_run: false,
+            yes: true,
+        })
+        .unwrap();
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            &source_db,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .unwrap()
+        .unwrap();
+
+        let err = execute_import(plan, false).unwrap_err();
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("temporarily busy")
+                || err_text.contains("mailbox activity lock is busy"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !tmp.path().join("mcp-agent-mail-legacy-backups").exists(),
+            "busy import must fail before creating backup directories"
+        );
+        assert!(
+            !source_storage.join("legacy_import_receipts").exists(),
+            "busy import must fail before writing a receipt"
+        );
+
+        let verify = DbConn::open_file(source_db.display().to_string()).unwrap();
+        let rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='mcp_agent_mail_migrations'",
+                &[],
+            )
+            .unwrap();
+        let migration_table_count = rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or(0);
+        assert_eq!(
+            migration_table_count, 0,
+            "busy import must fail before migrating the live database"
+        );
+    }
+
+    #[test]
+    fn legacy_import_copy_reports_busy_before_creating_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_db = tmp.path().join("legacy_copy_busy.sqlite3");
+        drop(DbConn::open_file(source_db.display().to_string()).unwrap());
+        let source_storage = tmp.path().join("legacy-storage");
+        fs::create_dir_all(&source_storage).unwrap();
+        let target_db = tmp.path().join("rust-copy.sqlite3");
+        let target_storage = tmp.path().join("rust-storage");
+
+        let plan = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(tmp.path().to_path_buf()),
+            db: Some(source_db.clone()),
+            storage_root: Some(source_storage.clone()),
+            in_place: false,
+            copy: true,
+            target_db: Some(target_db.clone()),
+            target_storage_root: Some(target_storage.clone()),
+            dry_run: false,
+            yes: true,
+        })
+        .unwrap();
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            &source_db,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .unwrap()
+        .unwrap();
+
+        let err = execute_import(plan, false).unwrap_err();
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("temporarily busy")
+                || err_text.contains("mailbox activity lock is busy"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !target_db.exists(),
+            "busy copy import must fail before creating the target database"
+        );
+        assert!(
+            !target_storage.exists(),
+            "busy copy import must fail before creating the target storage root"
+        );
+        assert!(
+            !source_storage.join("legacy_import_receipts").exists(),
+            "busy copy import must fail before writing a receipt"
+        );
     }
 
     #[test]

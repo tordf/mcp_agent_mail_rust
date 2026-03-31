@@ -242,6 +242,7 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
+    let path = crate::resolve_server_sync_sqlite_path(&path);
     let conn = DbConn::open_file(&path).ok()?;
     let _ = conn.execute_raw(&format!(
         "PRAGMA busy_timeout = {METRICS_DB_BUSY_TIMEOUT_MS};"
@@ -750,6 +751,47 @@ mod tests {
     }
 
     // ── br-3h13: Additional tool_metrics.rs test coverage ──────────
+
+    #[test]
+    fn open_metrics_connection_uses_absolute_candidate_for_missing_relative_database_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("tool_metrics_fallback.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let absolute_conn = DbConn::open_file(&absolute_db_str).expect("open absolute db");
+        absolute_conn
+            .execute_raw("CREATE TABLE seed(id INTEGER PRIMARY KEY)")
+            .expect("create seed table");
+        drop(absolute_conn);
+
+        let relative_path = std::path::PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        if let Some(parent) = relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create relative parent");
+        }
+        assert!(
+            !relative_path.exists(),
+            "relative fallback fixture should be absent so metrics connection must resolve the absolute candidate"
+        );
+
+        let database_url = format!("sqlite://{}", relative_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open metrics fallback db");
+        conn.execute_raw("CREATE TABLE marker(id INTEGER PRIMARY KEY)")
+            .expect("create marker table through fallback connection");
+        drop(conn);
+
+        assert!(
+            !relative_path.exists(),
+            "metrics fallback should not create a stray relative sqlite file"
+        );
+
+        let verify_conn = DbConn::open_file(&absolute_db_str).expect("reopen absolute db");
+        let rows = verify_conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'marker'",
+                &[],
+            )
+            .expect("query sqlite_master");
+        assert_eq!(rows[0].get_named::<i64>("count").unwrap_or(0), 1);
+    }
 
     #[test]
     fn i64_from_u64_saturating_boundaries() {

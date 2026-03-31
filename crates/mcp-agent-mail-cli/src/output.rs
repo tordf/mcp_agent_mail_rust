@@ -806,7 +806,7 @@ mod tests {
         let col1_start = "very-long-value".len() + 2;
         for line in &lines {
             if line.len() > col1_start {
-                let ch = line.bytes().nth(col1_start).unwrap();
+                let ch = line.as_bytes()[col1_start];
                 assert!(
                     ch != b' ',
                     "column 1 should start at offset {col1_start}: {:?}",

@@ -966,9 +966,7 @@ fn normalized_startup_search_backfill_database_url(database_url: &str) -> String
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return database_url.to_string();
     }
-    let Some(sqlite_path) =
-        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
-    else {
+    let Some(sqlite_path) = resolve_server_database_url_sqlite_path(database_url) else {
         return database_url.to_string();
     };
     let normalized = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
@@ -987,19 +985,13 @@ fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, erro
         return false;
     }
 
-    let Some(sqlite_path) =
-        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
-    else {
+    let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
         tracing::warn!(
             database_url = %config.database_url,
             "[startup-search] background backfill hit sqlite recovery error, but automatic server-side recovery is disabled"
         );
         return false;
     };
-    let sqlite_path =
-        std::path::PathBuf::from(mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
-            sqlite_path.to_string_lossy().as_ref(),
-        ));
 
     tracing::warn!(
         sqlite = %sqlite_path.display(),
@@ -1059,16 +1051,14 @@ impl MailboxActivityLockMode {
 #[derive(Debug)]
 pub struct MailboxActivityLockGuard {
     _mode: MailboxActivityLockMode,
-    _sqlite_path: PathBuf,
+    _lock_subject_path: PathBuf,
     _lock_path: PathBuf,
     lock_file: fs::File,
 }
 
 impl Drop for MailboxActivityLockGuard {
     fn drop(&mut self) {
-        use fs2::FileExt;
-
-        let _ = self.lock_file.unlock();
+        let _ = fs2::FileExt::unlock(&self.lock_file);
     }
 }
 
@@ -1085,14 +1075,15 @@ fn mailbox_activity_lock_path(sqlite_path: &Path) -> PathBuf {
 }
 
 fn mailbox_activity_lock_contention_error(
-    sqlite_path: &Path,
+    subject_path: &Path,
+    subject_kind: &str,
     lock_path: &Path,
     mode: MailboxActivityLockMode,
     err: &std::io::Error,
 ) -> std::io::Error {
     let detail = format!(
-        "mailbox activity lock is busy for SQLite mailbox {} ({} lock {}): another Agent Mail runtime or mutating `am doctor` operation is already active; stop it or wait for it to finish",
-        sqlite_path.display(),
+        "mailbox activity lock is busy for {subject_kind} {} ({} lock {}): another Agent Mail runtime or mutating `am doctor` operation is already active; stop it or wait for it to finish",
+        subject_path.display(),
         mode.label(),
         lock_path.display()
     );
@@ -1101,11 +1092,49 @@ fn mailbox_activity_lock_contention_error(
     {
         std::io::Error::new(std::io::ErrorKind::WouldBlock, detail)
     } else {
-        std::io::Error::new(
-            err.kind(),
-            format!("failed to acquire {detail}: {err}"),
-        )
+        std::io::Error::new(err.kind(), format!("failed to acquire {detail}: {err}"))
     }
+}
+
+fn acquire_mailbox_activity_lock_for_subject(
+    subject_path: &Path,
+    subject_kind: &str,
+    lock_path: PathBuf,
+    mode: MailboxActivityLockMode,
+) -> std::io::Result<Option<MailboxActivityLockGuard>> {
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    let lock_result = match mode {
+        MailboxActivityLockMode::Shared => fs2::FileExt::try_lock_shared(&lock_file),
+        MailboxActivityLockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&lock_file),
+    };
+    if let Err(err) = lock_result {
+        return Err(mailbox_activity_lock_contention_error(
+            subject_path,
+            subject_kind,
+            &lock_path,
+            mode,
+            &err,
+        ));
+    }
+
+    Ok(Some(MailboxActivityLockGuard {
+        _mode: mode,
+        _lock_subject_path: subject_path.to_path_buf(),
+        _lock_path: lock_path,
+        lock_file,
+    }))
 }
 
 pub fn acquire_mailbox_activity_lock_for_sqlite_path(
@@ -1117,43 +1146,17 @@ pub fn acquire_mailbox_activity_lock_for_sqlite_path(
     }
 
     let sqlite_path = normalized_mailbox_activity_sqlite_path(sqlite_path);
-    if let Some(parent) = sqlite_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-
     let lock_path = mailbox_activity_lock_path(&sqlite_path);
-    let lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
+    acquire_mailbox_activity_lock_for_subject(&sqlite_path, "SQLite mailbox", lock_path, mode)
+}
 
-    {
-        use fs2::FileExt;
-
-        let lock_result = match mode {
-            MailboxActivityLockMode::Shared => lock_file.try_lock_shared(),
-            MailboxActivityLockMode::Exclusive => lock_file.try_lock_exclusive(),
-        };
-        if let Err(err) = lock_result {
-            return Err(mailbox_activity_lock_contention_error(
-                &sqlite_path,
-                &lock_path,
-                mode,
-                &err,
-            ));
-        }
-    }
-
-    Ok(Some(MailboxActivityLockGuard {
-        _mode: mode,
-        _sqlite_path: sqlite_path,
-        _lock_path: lock_path,
-        lock_file,
-    }))
+pub fn acquire_mailbox_activity_lock_for_storage_root(
+    storage_root: &Path,
+    mode: MailboxActivityLockMode,
+) -> std::io::Result<Option<MailboxActivityLockGuard>> {
+    let storage_root = storage_root.to_path_buf();
+    let lock_path = storage_root.join(".mailbox.activity.lock");
+    acquire_mailbox_activity_lock_for_subject(&storage_root, "storage root", lock_path, mode)
 }
 
 pub fn acquire_mailbox_activity_lock_for_database_url(
@@ -1164,9 +1167,7 @@ pub fn acquire_mailbox_activity_lock_for_database_url(
         return Ok(None);
     }
 
-    let Some(sqlite_path) =
-        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
-    else {
+    let Some(sqlite_path) = resolve_server_database_url_sqlite_path(database_url) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -1182,7 +1183,7 @@ pub fn acquire_mailbox_activity_lock(
     config: &mcp_agent_mail_core::Config,
     mode: MailboxActivityLockMode,
 ) -> std::io::Result<Option<MailboxActivityLockGuard>> {
-    acquire_mailbox_activity_lock_for_database_url(&config.database_url, mode)
+    acquire_mailbox_activity_lock_for_storage_root(&config.storage_root, mode)
 }
 
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
@@ -1191,7 +1192,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
     let _mailbox_activity_lock =
-        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Shared)?;
+        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
 
     // Check for resource collisions (e.g. another am process holding locks)
     let probe_report = startup_checks::run_stdio_startup_probes(config);
@@ -1201,7 +1202,6 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
             probe_report.format_errors()
         );
     }
-
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -1801,11 +1801,50 @@ pub(crate) const INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 1_000;
 // without degrading into chronic "counts present, detail rows missing" snapshots.
 pub(crate) const BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 5_000;
 
+pub(crate) fn resolve_server_database_url_sqlite_path(
+    database_url: &str,
+) -> Option<std::path::PathBuf> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+
+    let sqlite_path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)?;
+    Some(std::path::PathBuf::from(resolve_server_sync_sqlite_path(
+        sqlite_path.to_string_lossy().as_ref(),
+    )))
+}
+
+pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
+    if path == ":memory:" {
+        return path.to_string();
+    }
+
+    let resolved = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path);
+    if resolved != path {
+        return resolved;
+    }
+
+    let relative_path = std::path::Path::new(path);
+    if relative_path.is_absolute() || path.starts_with("./") || path.starts_with("../") {
+        return path.to_string();
+    }
+
+    if !relative_path.exists() {
+        let absolute_candidate = std::path::Path::new("/").join(relative_path);
+        if absolute_candidate.exists() {
+            return absolute_candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    resolved
+}
+
 fn open_sync_db_connection_with_busy_timeout(
     path: &str,
     busy_timeout_ms: u32,
 ) -> std::io::Result<DbConn> {
-    let conn = DbConn::open_file(path)
+    let path = resolve_server_sync_sqlite_path(path);
+    let conn = DbConn::open_file(&path)
         .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
     conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
         .map_err(|err| {
@@ -2080,7 +2119,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
     let _mailbox_activity_lock =
-        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Shared)?;
+        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
 
     prepare_http_runtime_startup(config)?;
     log_active_database(config);
@@ -2151,7 +2190,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
     let _mailbox_activity_lock =
-        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Shared)?;
+        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
 
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
@@ -8502,11 +8541,10 @@ to skip auth for local requests.</p>
         };
 
         let hard_timeout_secs = self.request_timeout_secs.saturating_add(5);
-        let spawn_future =
-            asupersync::runtime::spawn_blocking(move || {
-                let _permit = permit; // hold permit until blocking work finishes
-                arc_self.dispatch_inner(request)
-            });
+        let spawn_future = asupersync::runtime::spawn_blocking(move || {
+            let _permit = permit; // hold permit until blocking work finishes
+            arc_self.dispatch_inner(request)
+        });
 
         let result = if hard_timeout_secs == 5 && self.request_timeout_secs == 0 {
             // request_timeout_secs == 0 means no timeout (infinite budget).
@@ -9912,7 +9950,7 @@ fn sqlite_startup_fingerprint(
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return None;
     }
-    let sqlite_path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)?;
+    let sqlite_path = resolve_server_database_url_sqlite_path(database_url)?;
     let schema_version = read_pragma_i64(conn, "PRAGMA schema_version", "schema_version")?;
     let user_version = read_pragma_i64(conn, "PRAGMA user_version", "user_version").unwrap_or(0);
     Some((
@@ -9999,11 +10037,12 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
 /// which typically means the DB was recreated without restoring from archive.
 fn log_active_database(config: &mcp_agent_mail_core::Config) {
     let db_display: std::borrow::Cow<'_, str> =
-        match mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url) {
+        match resolve_server_database_url_sqlite_path(&config.database_url) {
             Some(p) => std::borrow::Cow::Owned(p.display().to_string()),
             None if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
                 &config.database_url,
-            ) => {
+            ) =>
+            {
                 std::borrow::Cow::Borrowed(":memory:")
             }
             None => std::borrow::Cow::Borrowed("<unknown>"),
@@ -10049,17 +10088,17 @@ fn enrich_readiness_response(database_url: &str, body: &mut serde_json::Value) {
     body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
 
     // Database basename (security: never expose the full filesystem path).
-    let db_basename: serde_json::Value =
-        match mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url) {
-            Some(p) => p
-                .file_name()
-                .map(|n| serde_json::Value::String(n.to_string_lossy().into_owned()))
-                .unwrap_or(serde_json::Value::Null),
-            None if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) => {
-                serde_json::json!(":memory:")
-            }
-            None => serde_json::Value::Null,
-        };
+    let db_basename: serde_json::Value = match resolve_server_database_url_sqlite_path(database_url)
+    {
+        Some(p) => p
+            .file_name()
+            .map(|n| serde_json::Value::String(n.to_string_lossy().into_owned()))
+            .unwrap_or(serde_json::Value::Null),
+        None if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) => {
+            serde_json::json!(":memory:")
+        }
+        None => serde_json::Value::Null,
+    };
     body["database_path"] = db_basename;
 
     // Cached COUNT queries — avoid running COUNT(*) on every /health poll.
@@ -10074,24 +10113,21 @@ fn enrich_readiness_response(database_url: &str, body: &mut serde_json::Value) {
             // Cache is stale — release the lock before doing I/O, then
             // re-acquire to write the refreshed value.
             drop(guard);
-            let fresh = dashboard_open_connection(database_url).and_then(|conn| {
+            let fresh = dashboard_open_connection(database_url).map(|conn| {
                 let projects = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM projects");
                 let messages = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages");
-                Some((projects, messages))
+                (projects, messages)
             });
             *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), fresh);
             fresh
         }
     };
-    match cached_counts {
-        Some((projects, messages)) => {
-            body["project_count"] = serde_json::json!(projects);
-            body["message_count"] = serde_json::json!(messages);
-        }
-        None => {
-            body["project_count"] = serde_json::Value::Null;
-            body["message_count"] = serde_json::Value::Null;
-        }
+    if let Some((projects, messages)) = cached_counts {
+        body["project_count"] = serde_json::json!(projects);
+        body["message_count"] = serde_json::json!(messages);
+    } else {
+        body["project_count"] = serde_json::Value::Null;
+        body["message_count"] = serde_json::Value::Null;
     }
 }
 
@@ -10101,24 +10137,33 @@ fn readiness_check_with_integrity(
     run_integrity_check: bool,
 ) -> Result<(), String> {
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
+    let sqlite_path = if is_memory {
+        None
+    } else {
+        resolve_server_database_url_sqlite_path(&config.database_url)
+    };
+    let _sqlite_activity_lock = if let Some(sqlite_path) = sqlite_path.as_ref() {
+        acquire_mailbox_activity_lock_for_sqlite_path(sqlite_path, MailboxActivityLockMode::Shared)
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
 
     // Pre-flight check: Auto-recover missing SQLite files before acquiring pool connections
     // that would otherwise create a fresh empty DB (bypassing archive reconstruction).
     if run_integrity_check
         && config.integrity_check_on_startup
-        && !is_memory
-        && let Some(sqlite_path) =
-            mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
+        && let Some(sqlite_path) = sqlite_path.as_ref()
     {
         let storage_root = std::path::Path::new(&config.storage_root);
         if !sqlite_path.exists() {
             let recovery_res = if storage_root.is_dir() {
                 mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
-                    &sqlite_path,
+                    sqlite_path,
                     storage_root,
                 )
             } else {
-                mcp_agent_mail_db::ensure_sqlite_file_healthy(&sqlite_path)
+                mcp_agent_mail_db::ensure_sqlite_file_healthy(sqlite_path)
             };
             if let Err(e) = recovery_res {
                 return Err(format!("Failed to recover missing SQLite database: {e}"));
@@ -11162,6 +11207,69 @@ mod tests {
     }
 
     #[test]
+    fn readiness_check_reports_busy_before_initializing_missing_sqlite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = temp.path().join("busy-missing.sqlite3");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = true;
+
+        let _sqlite_lock = acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire exclusive sqlite mailbox lock");
+
+        let error = readiness_check(&config).expect_err("busy mailbox should block readiness init");
+        assert!(
+            error.contains("mailbox activity lock is busy") || error.contains("temporarily busy"),
+            "busy readiness error should mention mailbox contention: {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "busy readiness check should fail before initializing the sqlite file"
+        );
+    }
+
+    #[test]
+    fn readiness_check_uses_absolute_candidate_for_mailbox_activity_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let absolute_db = temp.path().join("readiness-absolute.sqlite3");
+        std::fs::write(&absolute_db, b"placeholder").expect("create absolute db");
+
+        let relative_path =
+            std::path::PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        assert!(
+            !relative_path.exists(),
+            "relative shadow path should be absent so absolute candidate fallback is exercised"
+        );
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", relative_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = false;
+
+        let _sqlite_lock = acquire_mailbox_activity_lock_for_sqlite_path(
+            &absolute_db,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire exclusive sqlite mailbox lock on absolute candidate");
+
+        let error = readiness_check_quick(&config)
+            .expect_err("resolved absolute candidate lock should block readiness");
+        assert!(
+            error.contains("mailbox activity lock is busy") || error.contains("temporarily busy"),
+            "busy readiness error should mention mailbox contention on the resolved absolute candidate: {error}"
+        );
+    }
+
+    #[test]
     fn tui_deferred_wait_helpers_stop_on_headless_detach() {
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
@@ -11381,6 +11489,30 @@ mod tests {
             MailboxActivityLockMode::Shared,
         )
         .expect_err("shared lock should fail while exclusive lock is held");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            error.to_string().contains("mailbox activity lock is busy"),
+            "unexpected contention error: {error}"
+        );
+    }
+
+    #[test]
+    fn mailbox_activity_lock_rejects_second_exclusive_storage_root_guard() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("mailbox");
+
+        let _first = acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire first exclusive storage-root lock");
+
+        let error = acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect_err("second exclusive storage-root lock should fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert!(
@@ -18105,10 +18237,22 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(body["status"], "ready");
         // Enriched identity fields are present.
-        assert!(body.get("version").is_some(), "version field must be present");
-        assert!(body.get("database_path").is_some(), "database_path field must be present");
-        assert!(body.get("project_count").is_some(), "project_count field must be present");
-        assert!(body.get("message_count").is_some(), "message_count field must be present");
+        assert!(
+            body.get("version").is_some(),
+            "version field must be present"
+        );
+        assert!(
+            body.get("database_path").is_some(),
+            "database_path field must be present"
+        );
+        assert!(
+            body.get("project_count").is_some(),
+            "project_count field must be present"
+        );
+        assert!(
+            body.get("message_count").is_some(),
+            "message_count field must be present"
+        );
         assert_eq!(body["database_path"], ":memory:");
     }
 
@@ -18125,8 +18269,14 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(body["status"], "ready");
         // Enriched identity fields are present.
-        assert!(body.get("version").is_some(), "version field must be present");
-        assert!(body.get("database_path").is_some(), "database_path field must be present");
+        assert!(
+            body.get("version").is_some(),
+            "version field must be present"
+        );
+        assert!(
+            body.get("database_path").is_some(),
+            "database_path field must be present"
+        );
         assert_eq!(body["database_path"], ":memory:");
     }
 
@@ -19026,6 +19176,43 @@ mod tests {
             })
             .unwrap_or_default();
         assert_eq!(configured, i64::from(BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn dashboard_open_connection_uses_absolute_candidate_for_missing_relative_database_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("dashboard-fallback.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let absolute_conn = DbConn::open_file(&absolute_db_str).expect("open absolute db");
+        absolute_conn
+            .execute_raw("CREATE TABLE marker(id INTEGER PRIMARY KEY)")
+            .expect("create marker table");
+        drop(absolute_conn);
+
+        let relative_path = std::path::PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        if let Some(parent) = relative_path.parent() {
+            std::fs::create_dir_all(parent).expect("create relative parent");
+        }
+        assert!(
+            !relative_path.exists(),
+            "relative fallback fixture should be absent so dashboard opens the absolute candidate"
+        );
+
+        let database_url = format!("sqlite://{}", relative_path.display());
+        let conn = dashboard_open_connection(&database_url).expect("open dashboard fallback db");
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'marker'",
+                &[],
+            )
+            .expect("query sqlite_master");
+        assert_eq!(rows[0].get_named::<i64>("count").unwrap_or(0), 1);
+        drop(conn);
+
+        assert!(
+            !relative_path.exists(),
+            "dashboard fallback should not create a stray relative sqlite file"
+        );
     }
 
     #[test]

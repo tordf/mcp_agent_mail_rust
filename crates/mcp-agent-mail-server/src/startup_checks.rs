@@ -4,10 +4,11 @@
 //! a [`ProbeResult`] with a human-friendly error message and remediation
 //! hints when something is wrong.
 
-use mcp_agent_mail_core::{
-    Config,
-    disk::{is_sqlite_memory_database_url, sqlite_file_path_from_database_url},
+use crate::{
+    MailboxActivityLockMode, acquire_mailbox_activity_lock_for_database_url,
+    resolve_server_database_url_sqlite_path,
 };
+use mcp_agent_mail_core::{Config, disk::is_sqlite_memory_database_url};
 use mcp_agent_mail_db::DbPoolConfig;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -40,7 +41,7 @@ pub fn check_db_lock_status(config: &Config) -> DbLockStatus {
         return DbLockStatus::Available;
     }
 
-    let Some(sqlite_path) = sqlite_file_path_from_database_url(&config.database_url) else {
+    let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
         return DbLockStatus::Error("Failed to resolve sqlite path from DATABASE_URL".to_string());
     };
 
@@ -166,6 +167,83 @@ fn identify_lock_holder_via_proc(db_path: &std::path::Path) -> Option<LockHolder
 fn identify_lock_holder_via_proc(_db_path: &std::path::Path) -> Option<LockHolder> {
     // /proc/locks is Linux-specific; gracefully return None elsewhere.
     None
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Database file holder detection via /proc/*/fd (br-db-lock)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Find all PIDs that have the given file open (via `/proc/*/fd/` symlink targets).
+///
+/// This is more comprehensive than the flock-based `identify_lock_holder` because
+/// it catches SQLite WAL-mode readers/writers that hold the file open without an
+/// explicit flock.  Automatically excludes the current process.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(target_meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    let target_ino = target_meta.ino();
+    let target_dev = target_meta.dev();
+    let my_pid = std::process::id();
+
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+
+    let mut holders = Vec::new();
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == my_pid {
+            continue;
+        }
+        let fd_dir = format!("/proc/{pid}/fd");
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd_entry in fds.flatten() {
+            // readlink on /proc/<pid>/fd/<N> gives the target path.
+            let Ok(link_target) = std::fs::read_link(fd_entry.path()) else {
+                continue;
+            };
+            // Compare by inode+device to handle symlinks and bind mounts.
+            if let Ok(link_meta) = std::fs::metadata(&link_target) {
+                if link_meta.ino() == target_ino && link_meta.dev() == target_dev {
+                    holders.push(pid);
+                    break; // One match per PID is enough
+                }
+            }
+        }
+    }
+
+    holders
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn pids_holding_file(_path: &std::path::Path) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Find Agent Mail PIDs that have the given database file open.
+///
+/// Filters `pids_holding_file` results to only include processes whose
+/// executable or command line matches the Agent Mail signature.
+#[must_use]
+pub fn agent_mail_pids_holding_file(path: &std::path::Path) -> Vec<u32> {
+    pids_holding_file(path)
+        .into_iter()
+        .filter(|pid| pid_is_agent_mail(*pid))
+        .collect()
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1315,7 +1393,7 @@ fn probe_database(config: &Config) -> ProbeResult {
         if is_sqlite_memory_database_url(url) {
             return ProbeResult::Ok { name: "database" };
         }
-        let Some(path) = sqlite_file_path_from_database_url(url) else {
+        let Some(path) = resolve_server_database_url_sqlite_path(url) else {
             return ProbeResult::Fail(ProbeFailure {
                 name: "database",
                 problem: format!("Invalid SQLite database URL: {url}"),
@@ -1362,7 +1440,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     }
 
     // Skip integrity probe for fresh installs to avoid noisy recovery warnings.
-    if let Some(path) = sqlite_file_path_from_database_url(&config.database_url)
+    if let Some(path) = resolve_server_database_url_sqlite_path(&config.database_url)
         && !path.exists()
         && !std::path::Path::new(&config.storage_root)
             .join("projects")
@@ -1370,6 +1448,14 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     {
         return ProbeResult::Ok { name: "integrity" };
     }
+
+    let _integrity_activity_lock = match acquire_mailbox_activity_lock_for_database_url(
+        &config.database_url,
+        MailboxActivityLockMode::Exclusive,
+    ) {
+        Ok(lock) => lock,
+        Err(err) => return integrity_busy_probe_failure(config, &err.to_string()),
+    };
 
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
@@ -1417,7 +1503,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
 }
 
 fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
-    let db_target = sqlite_file_path_from_database_url(&config.database_url).map_or_else(
+    let db_target = resolve_server_database_url_sqlite_path(&config.database_url).map_or_else(
         || config.database_url.clone(),
         |path| path.display().to_string(),
     );
@@ -1437,7 +1523,7 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
 /// 3. Reinitialize an empty database (last resort)
 #[allow(dead_code)]
 fn attempt_probe_recovery(config: &Config) -> ProbeResult {
-    let Some(db_path) = sqlite_file_path_from_database_url(&config.database_url) else {
+    let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
         return ProbeResult::Fail(ProbeFailure {
             name: "integrity",
             problem: "Cannot determine database file path for recovery".into(),
@@ -1662,25 +1748,30 @@ fn probe_db_lock(config: &Config) -> ProbeResult {
     match check_db_lock_status(config) {
         DbLockStatus::Available | DbLockStatus::Missing => ProbeResult::Ok { name: "db-lock" },
         DbLockStatus::Locked => {
-            let Some(sqlite_path) = sqlite_file_path_from_database_url(&config.database_url) else {
+            let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url)
+            else {
                 return ProbeResult::Ok { name: "db-lock" }; // Should be caught by probe_database
             };
 
             // Best-effort: try to identify the process holding the lock.
             let holder = identify_lock_holder(&sqlite_path);
 
-            let problem = match &holder {
-                Some(h) => format!(
-                    "Database file {} is exclusively locked by PID {} ({})",
-                    sqlite_path.display(),
-                    h.pid,
-                    h.cmdline,
-                ),
-                None => format!(
-                    "Database file {} is exclusively locked by another process",
-                    sqlite_path.display(),
-                ),
-            };
+            let problem = holder.as_ref().map_or_else(
+                || {
+                    format!(
+                        "Database file {} is exclusively locked by another process",
+                        sqlite_path.display(),
+                    )
+                },
+                |h| {
+                    format!(
+                        "Database file {} is exclusively locked by PID {} ({})",
+                        sqlite_path.display(),
+                        h.pid,
+                        h.cmdline,
+                    )
+                },
+            );
 
             let fix = match &holder {
                 Some(h) if h.is_python => format!(
@@ -1863,6 +1954,29 @@ mod tests {
         let config = default_config();
         let result = probe_database(&config);
         assert!(matches!(result, ProbeResult::Ok { .. }));
+    }
+
+    #[test]
+    fn probe_database_uses_absolute_candidate_for_missing_relative_database_url() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let absolute_db = temp.path().join("probe-absolute.sqlite3");
+        std::fs::write(&absolute_db, b"placeholder").expect("create absolute db");
+
+        let relative_path =
+            std::path::PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        assert!(
+            !relative_path.exists(),
+            "relative shadow path should be absent so absolute candidate fallback is exercised"
+        );
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", relative_path.display());
+
+        let result = probe_database(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { name: "database" }),
+            "probe_database should accept the resolved absolute candidate: {result:?}"
+        );
     }
 
     #[test]
@@ -2780,6 +2894,31 @@ mod tests {
         assert!(
             matches!(result, ProbeResult::Ok { .. }),
             "healthy DB should pass probe_integrity; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_integrity_reports_busy_when_mailbox_activity_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("busy.db");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw("CREATE TABLE t(x TEXT)").unwrap();
+        drop(conn);
+
+        let _shared_lock = acquire_mailbox_activity_lock_for_database_url(
+            &format!("sqlite:///{}", db_path.display()),
+            MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared mailbox activity lock");
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "integrity", ref problem, .. }) if problem.contains("busy")),
+            "probe_integrity should report mailbox activity contention as busy: {result:?}"
         );
     }
 

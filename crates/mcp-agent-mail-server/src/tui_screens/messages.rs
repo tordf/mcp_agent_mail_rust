@@ -904,8 +904,7 @@ impl ComposeFormState {
                 let starts_with_ci = prefix_lower.is_empty() || {
                     name.len() >= prefix_lower.len()
                         && name.is_char_boundary(prefix_lower.len())
-                        && name[..prefix_lower.len()]
-                            .eq_ignore_ascii_case(&prefix_lower)
+                        && name[..prefix_lower.len()].eq_ignore_ascii_case(&prefix_lower)
                 };
                 starts_with_ci && !already.iter().any(|existing| existing == *name)
             })
@@ -5464,7 +5463,8 @@ fn prefixed_reply_subject(subject: &str) -> String {
     if trimmed.is_empty() {
         return "Re:".to_string();
     }
-    if trimmed.len() >= 3 && trimmed.is_char_boundary(3) && trimmed[..3].eq_ignore_ascii_case("re:") {
+    if trimmed.len() >= 3 && trimmed.is_char_boundary(3) && trimmed[..3].eq_ignore_ascii_case("re:")
+    {
         trimmed.to_string()
     } else {
         format!("Re: {trimmed}")

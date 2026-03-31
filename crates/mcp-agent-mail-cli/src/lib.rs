@@ -2627,6 +2627,115 @@ fn maybe_stop_conflicting_managed_service(
     Ok(())
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Database blocker auto-clear (kill stale am processes holding the DB)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Kill any stale Agent Mail processes holding the SQLite database file open.
+///
+/// This prevents "database is busy" startup failures caused by zombie or hung
+/// `am`/`agent-mail` processes from a previous session.  Only Agent Mail processes
+/// are terminated; foreign processes that happen to have the file open are left
+/// alone (a warning is emitted instead).
+fn resolve_auto_clear_db_blockers_sqlite_path(config: &Config) -> Option<PathBuf> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return None;
+    }
+
+    resolve_mailbox_activity_sqlite_path(&config.database_url).ok()
+}
+
+fn auto_clear_db_blockers(config: &Config) -> CliResult<()> {
+    use mcp_agent_mail_server::startup_checks::{agent_mail_pids_holding_file, pids_holding_file};
+    use std::time::{Duration, Instant};
+
+    let Some(db_path) = resolve_auto_clear_db_blockers_sqlite_path(config) else {
+        return Ok(());
+    };
+
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    let am_pids = agent_mail_pids_holding_file(&db_path);
+    if am_pids.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "[info] Stale Agent Mail process(es) holding {} — killing PIDs {:?}",
+        db_path.display(),
+        am_pids,
+    );
+
+    // Phase 1: SIGTERM + grace period
+    const TERM_GRACE: Duration = Duration::from_secs(2);
+    const KILL_GRACE: Duration = Duration::from_millis(500);
+
+    for &pid in &am_pids {
+        send_sigterm(pid);
+    }
+
+    let deadline = Instant::now() + TERM_GRACE;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if agent_mail_pids_holding_file(&db_path).is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    // Phase 2: SIGKILL remaining holders
+    let remaining = agent_mail_pids_holding_file(&db_path);
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "[info] SIGTERM did not stop PIDs {:?} — sending SIGKILL",
+        remaining
+    );
+    for &pid in &remaining {
+        send_sigkill(pid);
+    }
+
+    let kill_deadline = Instant::now() + KILL_GRACE;
+    loop {
+        std::thread::sleep(Duration::from_millis(25));
+        if agent_mail_pids_holding_file(&db_path).is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= kill_deadline {
+            break;
+        }
+    }
+
+    // Final check: are there still holders?
+    let still_holding = pids_holding_file(&db_path);
+    if still_holding.is_empty() {
+        return Ok(());
+    }
+
+    // If only non-Agent-Mail processes remain, warn but don't fail — the
+    // preflight integrity probe will catch genuine lock contention.
+    let am_still = agent_mail_pids_holding_file(&db_path);
+    if !am_still.is_empty() {
+        return Err(CliError::Other(format!(
+            "Failed to stop Agent Mail process(es) holding {}: PIDs {:?}",
+            db_path.display(),
+            am_still,
+        )));
+    }
+
+    eprintln!(
+        "[warn] Non-Agent-Mail process(es) holding {}: PIDs {:?} — not killing",
+        db_path.display(),
+        still_holding,
+    );
+    Ok(())
+}
+
 /// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
 ///
 /// Refuses to terminate non-Agent-Mail processes.
@@ -3331,13 +3440,14 @@ fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
     let Ok(sqlite_path) = cfg.sqlite_path() else {
         return PreflightBannerStats::default();
     };
+    let sqlite_path = resolve_sqlite_path_with_absolute_candidate(&sqlite_path);
     if sqlite_path != ":memory:" && !Path::new(&sqlite_path).exists() {
         return PreflightBannerStats::default();
     }
     // Keep startup stats on the fastest possible path: banner counts are purely
     // cosmetic, so do not trigger fallback probing or sqlite auto-recovery here.
     // The real readiness/server startup path still performs full recovery checks.
-    let Ok(conn) = mcp_agent_mail_db::DbConn::open_file(&sqlite_path) else {
+    let Ok((conn, _opened_path)) = open_sqlite_read_only_with_fallback(&sqlite_path) else {
         return PreflightBannerStats::default();
     };
     query_preflight_banner_stats_batched(&conn).unwrap_or_default()
@@ -3413,6 +3523,9 @@ fn handle_serve_http(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
         ));
     }
+    // Kill any stale Agent Mail processes holding the database file BEFORE
+    // running preflight probes — otherwise the db-lock probe will fail.
+    auto_clear_db_blockers(&config)?;
     let preflight_report =
         mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
     if !preflight_report.is_ok() {
@@ -3761,6 +3874,7 @@ fn build_setup_run_command_for_http_server(config: &Config) -> SetupCommand {
 
 fn handle_serve_stdio() -> CliResult<()> {
     let config = Config::from_env();
+    auto_clear_db_blockers(&config)?;
     mcp_agent_mail_server::run_stdio(&config)?;
     Ok(())
 }
@@ -4518,7 +4632,7 @@ const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 40] = [
 const SQLITE_MAIL_INBOX_READ_TABLES: [&str; 4] =
     ["projects", "agents", "messages", "message_recipients"];
 
-const SQLITE_MAIL_INBOX_READ_COLUMNS: [(&str, &str); 20] = [
+const SQLITE_MAIL_INBOX_READ_COLUMNS: [(&str, &str); 22] = [
     ("projects", "id"),
     ("projects", "slug"),
     ("projects", "human_key"),
@@ -4534,6 +4648,8 @@ const SQLITE_MAIL_INBOX_READ_COLUMNS: [(&str, &str); 20] = [
     ("messages", "importance"),
     ("messages", "ack_required"),
     ("messages", "created_ts"),
+    ("messages", "recipients_json"),
+    ("messages", "attachments"),
     ("message_recipients", "message_id"),
     ("message_recipients", "agent_id"),
     ("message_recipients", "kind"),
@@ -4615,6 +4731,57 @@ fn mailbox_activity_lock_cli_error(err: std::io::Error) -> CliError {
     }
 }
 
+fn resolve_mailbox_activity_sqlite_path(database_url: &str) -> CliResult<PathBuf> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let sqlite_path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    Ok(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+        &sqlite_path,
+    )))
+}
+
+fn acquire_cli_mailbox_activity_lock_for_storage_root(
+    storage_root: &Path,
+    mode: mcp_agent_mail_server::MailboxActivityLockMode,
+) -> CliResult<Option<mcp_agent_mail_server::MailboxActivityLockGuard>> {
+    mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(storage_root, mode)
+        .map_err(mailbox_activity_lock_cli_error)
+}
+
+fn acquire_cli_mailbox_activity_lock_for_database_url(
+    database_url: &str,
+    mode: mcp_agent_mail_server::MailboxActivityLockMode,
+) -> CliResult<Option<mcp_agent_mail_server::MailboxActivityLockGuard>> {
+    let sqlite_path = resolve_mailbox_activity_sqlite_path(database_url)?;
+    acquire_cli_mailbox_activity_lock_for_sqlite_path(&sqlite_path, mode)
+}
+
+fn acquire_cli_mailbox_activity_lock_for_sqlite_path(
+    sqlite_path: &Path,
+    mode: mcp_agent_mail_server::MailboxActivityLockMode,
+) -> CliResult<Option<mcp_agent_mail_server::MailboxActivityLockGuard>> {
+    mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(sqlite_path, mode)
+        .map_err(mailbox_activity_lock_cli_error)
+}
+
+fn acquire_doctor_mailbox_activity_lock_for_storage_root(
+    storage_root: &Path,
+    dry_run: bool,
+) -> CliResult<Option<mcp_agent_mail_server::MailboxActivityLockGuard>> {
+    if dry_run {
+        return Ok(None);
+    }
+
+    acquire_cli_mailbox_activity_lock_for_storage_root(
+        storage_root,
+        mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+    )
+}
+
 fn acquire_doctor_mailbox_activity_lock_for_database_url(
     database_url: &str,
     dry_run: bool,
@@ -4623,11 +4790,10 @@ fn acquire_doctor_mailbox_activity_lock_for_database_url(
         return Ok(None);
     }
 
-    mcp_agent_mail_server::acquire_mailbox_activity_lock_for_database_url(
+    acquire_cli_mailbox_activity_lock_for_database_url(
         database_url,
         mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
     )
-    .map_err(mailbox_activity_lock_cli_error)
 }
 
 fn acquire_doctor_mailbox_activity_lock_for_sqlite_path(
@@ -4638,11 +4804,67 @@ fn acquire_doctor_mailbox_activity_lock_for_sqlite_path(
         return Ok(None);
     }
 
-    mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+    acquire_cli_mailbox_activity_lock_for_sqlite_path(
         sqlite_path,
         mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
     )
-    .map_err(mailbox_activity_lock_cli_error)
+}
+
+struct CliMailboxReadLocks {
+    _storage_root_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+    _sqlite_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+}
+
+struct CliMailboxMutationLocks {
+    _storage_root_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+    _sqlite_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+}
+
+fn resolve_mailbox_activity_storage_root(storage_root_override: Option<&Path>) -> PathBuf {
+    storage_root_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Config::from_env().storage_root)
+}
+
+fn acquire_cli_mailbox_read_locks_for_paths(
+    sqlite_path: &Path,
+    storage_root: &Path,
+) -> CliResult<CliMailboxReadLocks> {
+    let storage_root_lock = acquire_cli_mailbox_activity_lock_for_storage_root(
+        storage_root,
+        mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+    )?;
+    let sqlite_lock = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+        sqlite_path,
+        mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+    )?;
+    Ok(CliMailboxReadLocks {
+        _storage_root_lock: storage_root_lock,
+        _sqlite_lock: sqlite_lock,
+    })
+}
+
+fn acquire_cli_mailbox_read_locks(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+) -> CliResult<CliMailboxReadLocks> {
+    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    let sqlite_path = resolve_mailbox_activity_sqlite_path(database_url)?;
+    acquire_cli_mailbox_read_locks_for_paths(&sqlite_path, &storage_root)
+}
+
+fn acquire_cli_mailbox_mutation_locks(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+) -> CliResult<CliMailboxMutationLocks> {
+    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    let storage_root_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, false)?;
+    let sqlite_lock = acquire_doctor_mailbox_activity_lock_for_database_url(database_url, false)?;
+    Ok(CliMailboxMutationLocks {
+        _storage_root_lock: storage_root_lock,
+        _sqlite_lock: sqlite_lock,
+    })
 }
 
 fn is_snapshot_conflict_cli_error(error: &CliError) -> bool {
@@ -5374,9 +5596,23 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
     open_sqlite_with_fallback_and_storage_root(path, None)
 }
 
+fn open_sqlite_read_only_with_fallback(
+    path: &str,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    open_sqlite_with_fallback_internal(path, None, false)
+}
+
 fn open_sqlite_with_fallback_and_storage_root(
     path: &str,
     storage_root_override: Option<&Path>,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    open_sqlite_with_fallback_internal(path, storage_root_override, true)
+}
+
+fn open_sqlite_with_fallback_internal(
+    path: &str,
+    storage_root_override: Option<&Path>,
+    allow_recovery: bool,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     retry_sync_sqlite_lock(|| match mcp_agent_mail_db::DbConn::open_file(path) {
         Ok(conn) => Ok((conn, path.to_string())),
@@ -5395,7 +5631,10 @@ fn open_sqlite_with_fallback_and_storage_root(
                 )?;
                 return Ok((fallback_conn, fallback_path));
             }
-            if path != ":memory:" && is_sqlite_recovery_error_message(&primary_err_text) {
+            if allow_recovery
+                && path != ":memory:"
+                && is_sqlite_recovery_error_message(&primary_err_text)
+            {
                 let primary_path = Path::new(path);
                 recover_sqlite_file_with_storage_root(primary_path, storage_root_override).map_err(
                     |recovery_err| {
@@ -5555,13 +5794,52 @@ where
 pub(crate) fn open_db_sync_with_database_url(
     database_url: &str,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
-    open_db_sync_with_database_url_and_storage_root(database_url, None)
+    open_db_sync_with_database_url_with_path(database_url).map(|(conn, _opened_path)| conn)
 }
 
+fn open_db_sync_with_database_url_with_path(
+    database_url: &str,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    open_db_sync_with_database_url_and_storage_root_with_path(database_url, None)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn open_db_sync_with_database_url_and_storage_root(
     database_url: &str,
     storage_root_override: Option<&Path>,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
+    open_db_sync_with_database_url_and_storage_root_with_path(database_url, storage_root_override)
+        .map(|(conn, _opened_path)| conn)
+}
+
+fn open_db_sync_with_database_url_and_storage_root_with_path(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    open_db_sync_with_database_url_and_storage_root_internal(
+        database_url,
+        storage_root_override,
+        true,
+    )
+}
+
+fn open_db_sync_with_database_url_and_storage_root_locked(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
+    open_db_sync_with_database_url_and_storage_root_internal(
+        database_url,
+        storage_root_override,
+        false,
+    )
+    .map(|(conn, _opened_path)| conn)
+}
+
+fn open_db_sync_with_database_url_and_storage_root_internal(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+    acquire_mutation_locks: bool,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -5573,11 +5851,32 @@ fn open_db_sync_with_database_url_and_storage_root(
     if path != ":memory:" {
         ensure_sqlite_parent_dir(Path::new(&path))?;
     }
+    let read_only_open = open_sqlite_read_only_with_fallback(&path);
+    if let Ok((conn, opened_path)) = read_only_open {
+        if opened_path == ":memory:" {
+            return Ok((conn, opened_path));
+        }
+
+        if !sqlite_conn_requires_canonical_init(&conn)? && sqlite_conn_is_healthy(&conn)? {
+            return Ok((conn, opened_path));
+        }
+
+        drop(conn);
+    }
+
+    let _mailbox_mutation_locks = if acquire_mutation_locks {
+        Some(acquire_cli_mailbox_mutation_locks(
+            database_url,
+            storage_root_override,
+        )?)
+    } else {
+        None
+    };
     let (mut conn, mut opened_path) =
         open_sqlite_with_fallback_and_storage_root(&path, storage_root_override)?;
     if opened_path != ":memory:" {
         if !sqlite_conn_requires_canonical_init(&conn)? {
-            return Ok(conn);
+            return Ok((conn, opened_path));
         }
 
         let mut conn_healthy = sqlite_conn_is_healthy(&conn)?;
@@ -5622,15 +5921,15 @@ fn open_db_sync_with_database_url_and_storage_root(
                 return Err(init_error);
             }
         }
-        let (reopened, _resolved_path) = open_sqlite_with_fallback(&opened_path)?;
-        return Ok(reopened);
+        let (reopened, resolved_path) = open_sqlite_with_fallback(&opened_path)?;
+        return Ok((reopened, resolved_path));
     }
 
     // In-memory DBs keep the original Franken init path.
     let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
     conn.execute_raw(&init_sql)
         .map_err(|e| CliError::Other(format!("schema init failed for {opened_path}: {e}")))?;
-    Ok(conn)
+    Ok((conn, opened_path))
 }
 
 pub(crate) fn open_db_sync() -> CliResult<mcp_agent_mail_db::DbConn> {
@@ -5638,9 +5937,14 @@ pub(crate) fn open_db_sync() -> CliResult<mcp_agent_mail_db::DbConn> {
     open_db_sync_with_database_url(&cfg.database_url)
 }
 
-fn open_db_sync_mail_inbox_best_effort_with_database_url(
+fn open_db_sync_while_holding_mailbox_lock() -> CliResult<mcp_agent_mail_db::DbConn> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    open_db_sync_with_database_url_and_storage_root_locked(&cfg.database_url, None)
+}
+
+fn open_db_sync_read_only_with_database_url_and_path(
     database_url: &str,
-) -> CliResult<mcp_agent_mail_db::DbConn> {
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -5649,42 +5953,70 @@ fn open_db_sync_mail_inbox_best_effort_with_database_url(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_path_with_absolute_candidate(&path);
-    let (conn, _opened_path) = open_sqlite_with_fallback(&path)?;
+    open_sqlite_read_only_with_fallback(&path)
+}
+
+fn open_db_sync_read_only_with_database_url(
+    database_url: &str,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
+    open_db_sync_read_only_with_database_url_and_path(database_url).map(|(conn, _opened_path)| conn)
+}
+
+fn resolve_read_only_sqlite_source_path_with_database_url(
+    database_url: &str,
+) -> CliResult<PathBuf> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    if path == ":memory:" || !Path::new(&path).exists() {
+        return Ok(PathBuf::from(path));
+    }
+    let (conn, opened_path) = open_db_sync_read_only_with_database_url_and_path(database_url)?;
+    drop(conn);
+    Ok(PathBuf::from(opened_path))
+}
+
+fn open_db_sync_mail_inbox_best_effort_with_database_url_and_path(
+    database_url: &str,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    let (conn, opened_path) = open_db_sync_read_only_with_database_url_and_path(database_url)?;
     if sqlite_conn_supports_mail_inbox_reads(&conn)? {
-        return Ok(conn);
+        return Ok((conn, opened_path));
     }
     Err(CliError::Other(
         "mail inbox fallback requires the inbox read schema".to_string(),
     ))
 }
 
-pub(crate) fn open_db_sync_mail_inbox_with_database_url(
+pub(crate) fn open_db_sync_mail_inbox_with_database_url_and_path(
     database_url: &str,
-) -> CliResult<mcp_agent_mail_db::DbConn> {
-    if let Ok(conn) = open_db_sync_mail_inbox_best_effort_with_database_url(database_url) {
-        return Ok(conn);
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    if let Ok((conn, opened_path)) =
+        open_db_sync_mail_inbox_best_effort_with_database_url_and_path(database_url)
+    {
+        return Ok((conn, opened_path));
     }
-    match open_db_sync_with_database_url(database_url) {
-        Ok(conn) => Ok(conn),
+    match open_db_sync_with_database_url_with_path(database_url) {
+        Ok((conn, opened_path)) => Ok((conn, opened_path)),
         Err(error) if is_resource_busy_cli_error(&error) => {
-            match open_db_sync_mail_inbox_best_effort_with_database_url(database_url) {
-                Ok(conn) => {
+            match open_db_sync_mail_inbox_best_effort_with_database_url_and_path(database_url) {
+                Ok((conn, opened_path)) => {
                     tracing::warn!(
                         database_url,
                         "mail inbox falling back to best-effort sqlite read after busy init/recovery path"
                     );
-                    Ok(conn)
+                    Ok((conn, opened_path))
                 }
                 Err(_) => Err(error),
             }
         }
         Err(error) => Err(error),
     }
-}
-
-pub(crate) fn open_db_sync_mail_inbox() -> CliResult<mcp_agent_mail_db::DbConn> {
-    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    open_db_sync_mail_inbox_with_database_url(&cfg.database_url)
 }
 
 fn open_db_sync_robot_best_effort_with_database_url(
@@ -5698,7 +6030,7 @@ fn open_db_sync_robot_best_effort_with_database_url(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_path_with_absolute_candidate(&path);
-    let (conn, _opened_path) = open_sqlite_with_fallback(&path)?;
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&path)?;
     if sqlite_conn_supports_robot_reads(&conn)? {
         return Ok(conn);
     }
@@ -5718,7 +6050,7 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_path_with_absolute_candidate(&path);
-    let (conn, _opened_path) = open_sqlite_with_fallback(&path)?;
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&path)?;
     if sqlite_conn_supports_robot_attachment_reads(&conn)? {
         return Ok(conn);
     }
@@ -6956,7 +7288,20 @@ fn flake_triage_missing_artifact_hint(path: &Path) -> String {
 }
 
 fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
-    let conn = open_db_sync()?;
+    let mut mailbox_mutation_locks = None;
+    let conn = if matches!(
+        &action,
+        FileReservationsCommand::Reserve { .. }
+            | FileReservationsCommand::Renew { .. }
+            | FileReservationsCommand::Release { .. }
+    ) {
+        let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+        mailbox_mutation_locks = Some(acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?);
+        open_db_sync_while_holding_mailbox_lock()?
+    } else {
+        open_db_sync()?
+    };
+    let _mailbox_mutation_locks = mailbox_mutation_locks;
     handle_file_reservations_with_conn(&conn, action)
 }
 
@@ -7754,7 +8099,20 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
 }
 
 fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
-    let conn = open_db_sync()?;
+    let mut mailbox_mutation_locks = None;
+    let conn = if matches!(
+        &action,
+        ContactsCommand::Request { .. }
+            | ContactsCommand::Respond { .. }
+            | ContactsCommand::Policy { .. }
+    ) {
+        let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+        mailbox_mutation_locks = Some(acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?);
+        open_db_sync_while_holding_mailbox_lock()?
+    } else {
+        open_db_sync()?
+    };
+    let _mailbox_mutation_locks = mailbox_mutation_locks;
     handle_contacts_with_conn(&conn, action)
 }
 
@@ -8449,11 +8807,17 @@ fn handle_list_acks_with_conn(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
+    let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(database_url, None)?;
+    handle_migrate_with_database_url_locked(database_url)
+}
+
+fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> {
     use asupersync::runtime::RuntimeBuilder;
     use mcp_agent_mail_db::schema;
 
-    let conn = open_db_sync_with_database_url(database_url)?;
+    let conn = open_db_sync_with_database_url_and_storage_root_locked(database_url, None)?;
     conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply base init PRAGMAs: {e}")))?;
 
@@ -8526,6 +8890,7 @@ fn handle_migrate_cmd(
             ));
         }
         let rollback_path = resolve_sqlite_path_with_absolute_candidate(&path);
+        let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
         return handle_migrate_rollback(Path::new(&rollback_path), backup_dir.as_deref(), force);
     }
 
@@ -8542,7 +8907,7 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
-    let (format_conn, opened_path) = open_sqlite_with_fallback(&resolved_path)?;
+    let (format_conn, opened_path) = open_sqlite_read_only_with_fallback(&resolved_path)?;
     resolved_path = opened_path;
     db_path = PathBuf::from(&resolved_path);
     let format = migrate::detect_timestamp_format(&format_conn)
@@ -8578,6 +8943,8 @@ fn handle_migrate_cmd(
         ));
     }
 
+    let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
+
     // Create a pristine backup before schema migration whenever conversion may be attempted.
     let mut backup_path = if needs_conversion_attempt {
         let path = create_db_backup(&db_path, backup_dir.as_deref())?;
@@ -8589,7 +8956,7 @@ fn handle_migrate_cmd(
 
     let mut used_schema_fallback = false;
     // Step 1: Run schema migration first (ensures tables exist)
-    if let Err(schema_err) = handle_migrate_with_database_url(&migrate_database_url) {
+    if let Err(schema_err) = handle_migrate_with_database_url_locked(&migrate_database_url) {
         if let Some(ref snapshot) = backup_path {
             restore_db_from_backup(&db_path, snapshot).map_err(|restore_err| {
                 CliError::Other(format!(
@@ -8614,7 +8981,7 @@ fn handle_migrate_cmd(
     // Step 2: Capture pre-conversion row counts.
     // Reopen without schema-init side effects: fallback path intentionally avoids
     // unstable schema DDL and should proceed directly to timestamp conversion.
-    let (conn, _opened_path) = open_sqlite_with_fallback(&resolved_path)?;
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&resolved_path)?;
     let before_counts = collect_table_row_counts(&conn);
 
     if !needs_conversion_attempt {
@@ -9760,7 +10127,9 @@ struct ClearAndResetOutcome {
 fn handle_clear_and_reset(force: bool, archive: bool, no_archive: bool) -> CliResult<()> {
     let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let db_path = match db_cfg.sqlite_path() {
-        Ok(path) => Some(PathBuf::from(path)),
+        Ok(path) => Some(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+            &path,
+        ))),
         Err(err) => {
             ftui_runtime::ftui_eprintln!(
                 "Warning: failed to parse SQLite database path from DATABASE_URL ({}): {err}",
@@ -9843,15 +10212,28 @@ fn clear_and_reset_everything(
         }
     }
 
+    let source_db_for_archive = source_db_for_archive.map(|path| {
+        PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+            &path.to_string_lossy(),
+        ))
+    });
+    let _storage_root_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(storage_root, false)?;
+    let _sqlite_lock = if let Some(path) = source_db_for_archive.as_deref() {
+        acquire_doctor_mailbox_activity_lock_for_sqlite_path(path, false)?
+    } else {
+        None
+    };
+
     let mut archive_path: Option<PathBuf> = None;
     if should_archive == Some(true) {
         let label = Some("pre-reset".to_string());
         let scrub_preset = "archive".to_string();
         let projects: Vec<String> = Vec::new();
 
-        let archive_result = match source_db_for_archive {
+        let archive_result = match source_db_for_archive.as_deref() {
             Some(source_db) => {
-                archive_save_state(source_db, storage_root, projects, scrub_preset, label)
+                archive_save_state_locked(source_db, storage_root, projects, scrub_preset, label)
             }
             None => Err(CliError::Other(
                 "SQLite database path is empty or in-memory; cannot create archive".to_string(),
@@ -11153,10 +11535,10 @@ fn handle_projects(action: ProjectsCommand) -> CliResult<()> {
             dry_run,
             apply,
         } => {
-            let conn = open_db_sync()?;
+            let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             let config = Config::from_env();
-            handle_projects_adopt_with_conn(
-                &conn,
+            handle_projects_adopt(
+                &db_cfg.database_url,
                 &config,
                 source.to_string_lossy().as_ref(),
                 target.to_string_lossy().as_ref(),
@@ -11165,6 +11547,31 @@ fn handle_projects(action: ProjectsCommand) -> CliResult<()> {
             )
         }
     }
+}
+
+fn handle_projects_adopt(
+    database_url: &str,
+    config: &Config,
+    source: &str,
+    target: &str,
+    dry_run: bool,
+    apply: bool,
+) -> CliResult<()> {
+    let mut mailbox_mutation_locks = None;
+    let conn = if apply {
+        mailbox_mutation_locks = Some(acquire_cli_mailbox_mutation_locks(
+            database_url,
+            Some(&config.storage_root),
+        )?);
+        open_db_sync_with_database_url_and_storage_root_locked(
+            database_url,
+            Some(&config.storage_root),
+        )?
+    } else {
+        open_db_sync_read_only_with_database_url(database_url)?
+    };
+    let _mailbox_mutation_locks = mailbox_mutation_locks;
+    handle_projects_adopt_with_conn(&conn, config, source, target, dry_run, apply)
 }
 
 fn handle_doctor_check(
@@ -18260,14 +18667,16 @@ fn server_inbox_payload_to_cli_json(
 #[cfg(test)]
 mod mail_server_cli_bridge_tests {
     use super::{
-        CliError, ServerToolCall, build_server_fetch_inbox_product_arguments,
-        build_server_reply_message_arguments, build_server_send_message_arguments,
-        classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
-        ensure_message_in_project, fetch_inbox_server_rejection_allows_local_fallback,
-        is_resource_busy_cli_error, mail_server_rejection_allows_local_fallback,
-        product_inbox_row_to_json, server_inbox_payload_to_cli_json,
-        server_message_payload_to_cli_json, sort_product_inbox_items_desc,
-        sqlite_doctor_sanity_with_health_probe,
+        CliError, ServerToolCall, acquire_doctor_mailbox_activity_lock_for_database_url,
+        acquire_doctor_mailbox_activity_lock_for_sqlite_path,
+        acquire_doctor_mailbox_activity_lock_for_storage_root,
+        build_server_fetch_inbox_product_arguments, build_server_reply_message_arguments,
+        build_server_send_message_arguments, classify_server_tool_call, coerce_tool_result_json,
+        coerce_tool_result_json_or_error, ensure_message_in_project,
+        fetch_inbox_server_rejection_allows_local_fallback, is_resource_busy_cli_error,
+        mail_server_rejection_allows_local_fallback, product_inbox_row_to_json,
+        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
     };
 
     #[test]
@@ -18371,6 +18780,52 @@ mod mail_server_cli_bridge_tests {
         assert!(
             is_resource_busy_cli_error(&error),
             "doctor mailbox activity contention should be classified as resource busy: {error}"
+        );
+    }
+
+    #[test]
+    fn doctor_mailbox_activity_lock_uses_resolved_absolute_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("doctor-absolute.sqlite3");
+        std::fs::write(&absolute_db, b"placeholder").expect("create absolute db");
+
+        let relative_path =
+            std::path::PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            &absolute_db,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared lock on absolute candidate");
+
+        let database_url = format!("sqlite:///{}", relative_path.display());
+        let error = acquire_doctor_mailbox_activity_lock_for_database_url(&database_url, false)
+            .expect_err("doctor lock should target the resolved absolute candidate");
+
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "absolute-candidate lock contention should be classified as resource busy: {error}"
+        );
+    }
+
+    #[test]
+    fn doctor_mailbox_storage_root_lock_reports_resource_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("mailbox");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared storage-root mailbox activity lock");
+
+        let error = acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, false)
+            .expect_err("doctor exclusive storage-root lock should fail while shared lock is held");
+
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "storage-root contention should be classified as resource busy: {error}"
         );
     }
 
@@ -20289,6 +20744,48 @@ http_headers = { Authorization = "Bearer secret" }
         })
         .expect_err("limit=0 should be rejected");
         assert!(matches!(error, CliError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn check_inbox_direct_uses_actual_opened_sqlite_path_for_native_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("check-inbox-direct.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("open absolute db");
+        for stmt in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]')",
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender')",
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'Receiver')",
+            r#"INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES (1, 1, 1, 'br-1', 'hello', 'body', 'high', 1, 1743426000000000, '{"to":["Receiver"]}', '[]')"#,
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', NULL, NULL)",
+        ] {
+            seed_conn.execute_raw(stmt).expect("seed inbox statement");
+        }
+        drop(seed_conn);
+
+        let malformed_relative = absolute_db_str.trim_start_matches('/').to_string();
+        let database_url = format!("sqlite://{malformed_relative}");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", database_url.as_str())],
+            || {
+                check_inbox_direct(&CheckInboxDirectConfig {
+                    project_key: "/tmp/p".to_string(),
+                    agent_name: "Receiver".to_string(),
+                    limit: 10,
+                })
+            },
+        )
+        .expect("direct inbox should use the actual opened sqlite path");
+
+        assert_eq!(result.unread_count, 1);
+        assert_eq!(result.urgent_or_high_count, 1);
+        assert_eq!(result.messages[0].subject, "hello");
+        assert_eq!(result.messages[0].from, "Sender");
     }
 
     #[test]
@@ -22993,6 +23490,93 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn migrate_reports_busy_before_mutating_mailbox() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("locked-migrate.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared storage-root lock");
+
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_with_database_url(&database_url),
+        );
+        let error = result.expect_err("migrate should refuse to run while mailbox is active");
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "mailbox lock contention should be surfaced as resource busy: {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "migrate should fail before creating or mutating the database file"
+        );
+    }
+
+    #[test]
+    fn migrate_check_does_not_quarantine_corrupt_db() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("corrupt-migrate.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_cmd(true, false, false, None),
+        );
+        let error = result.expect_err("migrate --check should not auto-recover a corrupt db");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("cannot open DB")
+                || error_text.contains("malformed")
+                || error_text.contains("file is not a database"),
+            "unexpected migrate --check error: {error_text}"
+        );
+
+        let quarantine_count = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| {
+                        name.starts_with("corrupt-migrate.sqlite3.corrupt-")
+                            || name.starts_with("corrupt-migrate.sqlite3.archive-reconcile-")
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            quarantine_count, 0,
+            "migrate --check should not mutate or quarantine the corrupt database"
+        );
+    }
+
+    #[test]
     fn migrate_cleans_fts_tables() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
@@ -23459,6 +24043,103 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn archive_save_state_uses_absolute_candidate_for_malformed_relative_source_db() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use std::io::Read;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let absolute_db = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&absolute_db);
+        let relative_db = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        assert!(
+            !relative_db.exists(),
+            "relative shadow path should be absent so absolute candidate fallback is exercised"
+        );
+
+        let archive_path = archive_save_state(
+            &relative_db,
+            &storage_root,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("abs-fallback".to_string()),
+        )
+        .expect("archive save should resolve absolute candidate");
+        assert!(archive_path.exists(), "archive should be created");
+
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut meta_contents = String::new();
+        zip.by_name(ARCHIVE_METADATA_FILENAME)
+            .unwrap()
+            .read_to_string(&mut meta_contents)
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_contents).unwrap();
+        assert_eq!(
+            meta["database"]["source_path"].as_str(),
+            Some(absolute_db.to_string_lossy().as_ref()),
+            "archive metadata should record the resolved absolute source database path"
+        );
+    }
+
+    #[test]
+    fn archive_save_state_reports_busy_before_creating_archive_when_sqlite_mailbox_locked() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let source_db = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&source_db);
+
+        let _exclusive_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            &source_db,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire exclusive sqlite mailbox lock");
+
+        let error = archive_save_state(
+            &source_db,
+            &storage_root,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("busy".to_string()),
+        )
+        .expect_err("archive save should refuse while sqlite mailbox is active");
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "archive save busy error should be classified as resource busy: {error}"
+        );
+
+        let archive_dir = archive_states_dir(false).expect("archive dir lookup");
+        let archive_count = if archive_dir.exists() {
+            std::fs::read_dir(&archive_dir)
+                .expect("read archive dir")
+                .flatten()
+                .count()
+        } else {
+            0
+        };
+        assert_eq!(
+            archive_count, 0,
+            "busy archive save should fail before creating archive artifacts"
+        );
+    }
+
+    #[test]
     fn rollback_archive_restore_restores_backups_after_partial_restore() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("mailbox.sqlite3");
@@ -23682,6 +24363,59 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(shm_path.exists());
         assert!(storage_root.join("nested/dir/file.txt").exists());
         assert!(storage_root.join(".git/HEAD").exists());
+    }
+
+    #[test]
+    fn clear_and_reset_reports_busy_before_wiping_mailbox() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let db_path = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&db_path);
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        std::fs::write(&wal_path, b"wal").unwrap();
+        std::fs::write(&shm_path, b"shm").unwrap();
+        let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared storage-root lock");
+
+        let error = clear_and_reset_everything(
+            true,
+            Some(false),
+            Some(&db_path),
+            &database_files,
+            &storage_root,
+        )
+        .expect_err("clear-and-reset should refuse to mutate while mailbox is busy");
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "clear-and-reset busy error should be classified as resource busy: {error}"
+        );
+
+        assert!(db_path.exists(), "database file should remain untouched");
+        assert!(wal_path.exists(), "wal file should remain untouched");
+        assert!(shm_path.exists(), "shm file should remain untouched");
+        assert!(
+            storage_root.join("nested/dir/file.txt").exists(),
+            "storage root contents should remain untouched"
+        );
+        assert!(
+            storage_root.join(".git/HEAD").exists(),
+            "storage-root git metadata should remain untouched"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -25654,6 +26388,7 @@ startup_timeout_sec = 42
             .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("archive-normalize.sqlite3");
         let project_dir = storage_root.join("projects").join("demo-project");
         let canonical_dir = project_dir.join("messages").join("2026").join("03");
 
@@ -25676,8 +26411,12 @@ startup_timeout_sec = 42
         .unwrap();
 
         let storage_root_text = storage_root.to_string_lossy().to_string();
+        let database_url = format!("sqlite:///{}", db_path.display());
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", storage_root_text.as_str())],
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", database_url.as_str()),
+            ],
             || {
                 handle_doctor_archive_normalize(false, true, false)
                     .expect("archive normalization should succeed");
@@ -25726,12 +26465,17 @@ startup_timeout_sec = 42
             .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("archive-normalize.sqlite3");
         let project_dir = storage_root.join("projects").join("demo-project");
         std::fs::create_dir_all(project_dir.join("messages").join("2026").join("03")).unwrap();
 
         let storage_root_text = storage_root.to_string_lossy().to_string();
+        let database_url = format!("sqlite:///{}", db_path.display());
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", storage_root_text.as_str())],
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", database_url.as_str()),
+            ],
             || {
                 handle_doctor_archive_normalize(false, true, false)
                     .expect("archive normalization should succeed");
@@ -25985,6 +26729,48 @@ COMMIT;\n";
             err.to_string()
                 .contains("scoped doctor repair is not implemented")
         );
+    }
+
+    #[test]
+    fn doctor_repair_handles_empty_valid_sqlite_without_self_lock_contention() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("empty-valid.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = tmp.path().join("storage");
+        let backup_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            .expect("create empty valid sqlite db");
+
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_doctor_repair(None, false, true, Some(backup_dir.clone())),
+        );
+        assert!(
+            result.is_ok(),
+            "doctor repair should initialize an empty valid sqlite db without self-contention: {result:?}"
+        );
+
+        let verify = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("reopen repaired db");
+        let rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type='table' AND name='projects'",
+                &[],
+            )
+            .expect("query projects table existence");
+        let count: i64 = rows
+            .first()
+            .and_then(|row| row.get_named("cnt").ok())
+            .unwrap_or(-1);
+        assert_eq!(count, 1, "repair should initialize the base schema");
     }
 
     #[test]
@@ -30049,6 +30835,160 @@ COMMIT;\n";
         );
     }
 
+    #[test]
+    fn integration_projects_adopt_apply_reports_busy_before_mutating_mailbox() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let source_human_key = repo_root.join("src-worktree");
+        let target_human_key = repo_root.join("dst-worktree");
+        std::fs::create_dir_all(&source_human_key).unwrap();
+        std::fs::create_dir_all(&target_human_key).unwrap();
+
+        let git_init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "git init should succeed");
+
+        let db_path = dir.path().join("test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let conn = seed_projects_adopt_db(&db_path, &source_human_key, &target_human_key);
+
+        let storage_root = dir.path().join("archive-root");
+        let source_file = storage_root
+            .join("projects")
+            .join("src-proj")
+            .join("messages")
+            .join("m1.md");
+        std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        std::fs::write(&source_file, "# message").unwrap();
+
+        let cfg = Config {
+            database_url: db_url.clone(),
+            storage_root: storage_root.clone(),
+            ..Config::default()
+        };
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared storage-root lock");
+
+        let error = handle_projects_adopt(&db_url, &cfg, "src-proj", "dst-proj", true, true)
+            .expect_err("projects adopt apply should refuse to mutate while mailbox is busy");
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "projects adopt busy error should be classified as resource busy: {error}"
+        );
+
+        let src_agent_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = 1",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        let dst_agent_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = 2",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        let src_msg_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = 1",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        let dst_msg_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = 2",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+
+        assert_eq!(src_agent_count, 1, "source agents should remain untouched");
+        assert_eq!(dst_agent_count, 1, "target agents should remain untouched");
+        assert_eq!(src_msg_count, 1, "source messages should remain untouched");
+        assert_eq!(dst_msg_count, 0, "target messages should remain untouched");
+        assert!(
+            source_file.exists(),
+            "source archive file should remain in place"
+        );
+        assert!(
+            !storage_root
+                .join("projects")
+                .join("dst-proj")
+                .join("messages")
+                .join("m1.md")
+                .exists(),
+            "target archive should not receive moved files on busy failure"
+        );
+    }
+
+    #[test]
+    fn tooling_decommission_fts_reports_busy_before_dropping_triggers() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).unwrap();
+
+        let conn = open_db_sync_with_database_url(&db_url).expect("open test db");
+        for trigger in SEARCH_FTS_TRIGGER_NAMES {
+            conn.execute_raw(&format!(
+                "CREATE TRIGGER IF NOT EXISTS {trigger} AFTER INSERT ON projects BEGIN SELECT 1; END;"
+            ))
+            .unwrap_or_else(|e| panic!("create trigger {trigger}: {e}"));
+        }
+
+        let cfg = Config {
+            database_url: db_url.clone(),
+            storage_root: storage_root.clone(),
+            ..Config::default()
+        };
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared storage-root lock");
+
+        let error = handle_tooling_decommission_fts_with_config(&cfg, true, None, false)
+            .expect_err("decommission should refuse to mutate while mailbox is busy");
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "decommission busy error should be classified as resource busy: {error}"
+        );
+
+        let trigger_names = query_existing_search_fts_triggers(&conn).expect("query triggers");
+        assert_eq!(
+            trigger_names.len(),
+            SEARCH_FTS_TRIGGER_NAMES.len(),
+            "busy failure should leave all FTS triggers intact"
+        );
+    }
+
     // ── br-21gj.4.6: macro command parsing ─────────────────────────────
 
     #[test]
@@ -32144,6 +33084,29 @@ COMMIT;\n";
     }
 
     #[test]
+    fn resolve_auto_clear_db_blockers_sqlite_path_prefers_absolute_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("auto-clear.sqlite3");
+        std::fs::write(&absolute_db, b"seed").expect("write absolute db");
+
+        let relative_path = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        assert!(
+            !relative_path.exists(),
+            "relative shadow path should be absent so auto-clear resolves the absolute candidate"
+        );
+
+        let mut config = Config::from_env();
+        config.database_url = format!("sqlite:///{}", relative_path.display());
+
+        let resolved = resolve_auto_clear_db_blockers_sqlite_path(&config)
+            .expect("resolve auto-clear sqlite path");
+        assert_eq!(
+            resolved, absolute_db,
+            "auto-clear should target the resolved absolute candidate"
+        );
+    }
+
+    #[test]
     fn resolve_sqlite_path_with_absolute_candidate_prefers_existing_absolute_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("resolve_absolute.sqlite3");
@@ -32621,6 +33584,45 @@ COMMIT;\n";
     }
 
     #[test]
+    fn preflight_banner_stats_uses_absolute_candidate_for_missing_relative_database_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("preflight_banner_fallback.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("open absolute db");
+
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY)")
+            .expect("create projects");
+        conn.execute_raw("CREATE TABLE agents(id INTEGER PRIMARY KEY)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create messages");
+        conn.execute_raw("CREATE TABLE file_reservations(id INTEGER PRIMARY KEY)")
+            .expect("create file_reservations");
+        conn.execute_raw("CREATE TABLE agent_links(id INTEGER PRIMARY KEY)")
+            .expect("create agent_links");
+        conn.execute_raw("INSERT INTO projects(id) VALUES (1), (2)")
+            .expect("seed projects");
+        conn.execute_raw("INSERT INTO messages(id) VALUES (1), (2), (3)")
+            .expect("seed messages");
+        drop(conn);
+
+        let relative_path = PathBuf::from(absolute_db_str.trim_start_matches('/'));
+        assert!(
+            !relative_path.exists(),
+            "relative fallback fixture should be absent so banner stats must resolve the absolute candidate"
+        );
+
+        let stats = preflight_banner_stats(&format!("sqlite://{}", relative_path.display()));
+        assert_eq!(stats.projects, 2);
+        assert_eq!(stats.messages, 3);
+        assert!(
+            !relative_path.exists(),
+            "preflight banner stats should not create a stray relative sqlite file"
+        );
+    }
+
+    #[test]
     fn sqlite_corruption_error_message_detection_includes_no_backup_marker() {
         assert!(is_sqlite_corruption_error_message(
             "database file tmp/storage.sqlite3 is malformed and no healthy backup was found"
@@ -32938,7 +33940,7 @@ COMMIT;\n";
         for sql in [
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
-            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]')",
             "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
         ] {
             conn.execute_raw(sql)
@@ -32948,6 +33950,25 @@ COMMIT;\n";
         assert!(
             sqlite_conn_supports_mail_inbox_reads(&conn).expect("mail inbox schema probe"),
             "minimal inbox query schema should be sufficient for best-effort inbox reads"
+        );
+    }
+
+    #[test]
+    fn sqlite_conn_supports_mail_inbox_reads_rejects_missing_native_fetch_columns() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        for sql in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL)",
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+        ] {
+            conn.execute_raw(sql)
+                .expect("create partial mail inbox readable table");
+        }
+
+        assert!(
+            !sqlite_conn_supports_mail_inbox_reads(&conn).expect("mail inbox schema probe"),
+            "missing recipients_json/attachments columns must not be blessed for inbox fallback"
         );
     }
 
@@ -33050,7 +34071,7 @@ COMMIT;\n";
             "PRAGMA foreign_keys = OFF",
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
-            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]')",
             "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
             "INSERT INTO projects (id, slug, human_key) VALUES (1, 'mail-lock', '/tmp/mail-lock')",
             "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender')",
@@ -33090,15 +34111,19 @@ COMMIT;\n";
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         let open_url = db_url.clone();
         let open_thread = std::thread::spawn(move || {
-            let result = open_db_sync_mail_inbox_with_database_url(&open_url).and_then(|conn| {
-                conn.query_sync("SELECT COUNT(*) AS c FROM message_recipients", &[])
-                    .map_err(|e| CliError::Other(format!("message_recipients count failed: {e}")))
-                    .map(|rows| {
-                        rows.first()
-                            .and_then(|row| row.get_named::<i64>("c").ok())
-                            .unwrap_or(0)
-                    })
-            });
+            let result = open_db_sync_mail_inbox_with_database_url_and_path(&open_url).and_then(
+                |(conn, _opened_path)| {
+                    conn.query_sync("SELECT COUNT(*) AS c FROM message_recipients", &[])
+                        .map_err(|e| {
+                            CliError::Other(format!("message_recipients count failed: {e}"))
+                        })
+                        .map(|rows| {
+                            rows.first()
+                                .and_then(|row| row.get_named::<i64>("c").ok())
+                                .unwrap_or(0)
+                        })
+                },
+            );
             result_tx.send(result).expect("send open result");
         });
 
@@ -33413,6 +34438,89 @@ COMMIT;\n";
         assert!(
             quarantine_count >= 1,
             "corrupt DB should be preserved as quarantined artifact"
+        );
+    }
+
+    #[test]
+    fn open_sqlite_read_only_with_fallback_does_not_quarantine_corrupt_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
+
+        let error = match open_sqlite_read_only_with_fallback(db_path.to_string_lossy().as_ref()) {
+            Ok(_) => panic!("read-only best-effort open should not auto-recover corruption"),
+            Err(error) => error,
+        };
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("cannot open DB") || error_text.contains("NOTADB"),
+            "unexpected read-only open error: {error_text}"
+        );
+
+        let quarantine_count = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| {
+                        name.starts_with("storage.sqlite3.corrupt-")
+                            || name.starts_with("storage.sqlite3.archive-reconcile-")
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            quarantine_count, 0,
+            "read-only best-effort open must not mutate/quarantine the mailbox"
+        );
+    }
+
+    #[test]
+    fn open_db_sync_with_database_url_reports_busy_before_mutating_corrupt_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
+
+        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire shared storage-root lock");
+
+        let error =
+            match open_db_sync_with_database_url_and_storage_root(&db_url, Some(&storage_root)) {
+                Ok(_) => {
+                    panic!("full open should refuse mailbox mutation while another owner is active")
+                }
+                Err(error) => error,
+            };
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "mailbox lock contention should be surfaced as resource busy: {error}"
+        );
+
+        let quarantine_count = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| {
+                        name.starts_with("storage.sqlite3.corrupt-")
+                            || name.starts_with("storage.sqlite3.archive-reconcile-")
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            quarantine_count, 0,
+            "busy mailbox should fail before any quarantine or reconstruction side effects"
         );
     }
 
@@ -34869,16 +35977,21 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     validate_share_archive_options(params.zip, &params.age_recipients)?;
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let source_path = cfg
-        .sqlite_path()
-        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let source = std::path::Path::new(&source_path);
+    let config = Config::from_env();
+    let source_candidate = resolve_mailbox_activity_sqlite_path(&cfg.database_url)?;
+    let source_path = source_candidate.display().to_string();
 
-    if !source.exists() {
+    if !source_candidate.exists() {
         return Err(CliError::Other(format!(
             "database not found: {source_path}"
         )));
     }
+
+    let _mailbox_read_locks =
+        acquire_cli_mailbox_read_locks(&cfg.database_url, Some(&config.storage_root))?;
+    let source = resolve_read_only_sqlite_source_path_with_database_url(&cfg.database_url)?;
+    let source_path = source.display().to_string();
+    let source = source.as_path();
 
     ftui_runtime::ftui_println!("Source database: {source_path}");
     ftui_runtime::ftui_println!("Scrub preset:   {}", params.scrub_preset);
@@ -34964,7 +36077,6 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         snap_ctx.scrub_summary.bodies_redacted
     );
 
-    let config = Config::from_env();
     ftui_runtime::ftui_println!("Assembling bundle assets...");
     let export = share::export_bundle_from_snapshot_context(
         &snap_ctx,
@@ -35061,11 +36173,10 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     validate_share_archive_options(params.zip, &params.age_recipients)?;
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let source_path = cfg
-        .sqlite_path()
-        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let source = std::path::Path::new(&source_path);
-    if !source.exists() {
+    let config = Config::from_env();
+    let source_candidate = resolve_mailbox_activity_sqlite_path(&cfg.database_url)?;
+    let source_path = source_candidate.display().to_string();
+    if !source_candidate.exists() {
         return Err(CliError::Other(format!(
             "database not found: {source_path}"
         )));
@@ -35076,6 +36187,11 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         &params.bundle.join("manifest.sig.json"),
         "bundle signature",
     )?;
+    let _mailbox_read_locks =
+        acquire_cli_mailbox_read_locks(&cfg.database_url, Some(&config.storage_root))?;
+    let source = resolve_read_only_sqlite_source_path_with_database_url(&cfg.database_url)?;
+    let source_path = source.display().to_string();
+    let source = source.as_path();
 
     ftui_runtime::ftui_println!("Source database: {source_path}");
     ftui_runtime::ftui_println!("Updating bundle: {}", params.bundle.display());
@@ -35114,7 +36230,6 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         snap_ctx.scrub_summary.bodies_redacted
     );
 
-    let config = Config::from_env();
     ftui_runtime::ftui_println!("Assembling updated bundle...");
     let export = share::export_bundle_from_snapshot_context(
         &snap_ctx,
@@ -35459,14 +36574,14 @@ fn rollback_archive_restore(
     let mut errors = Vec::new();
 
     for entry in backup_entries.iter().rev() {
-        if std::fs::symlink_metadata(&entry.original).is_ok() {
-            if let Err(error) = remove_restore_target_if_exists(&entry.original) {
-                errors.push(format!(
-                    "failed to remove partially restored {}: {error}",
-                    entry.original.display()
-                ));
-                continue;
-            }
+        if std::fs::symlink_metadata(&entry.original).is_ok()
+            && let Err(error) = remove_restore_target_if_exists(&entry.original)
+        {
+            errors.push(format!(
+                "failed to remove partially restored {}: {error}",
+                entry.original.display()
+            ));
+            continue;
         }
         if std::fs::symlink_metadata(&entry.backup).is_ok()
             && let Err(error) = std::fs::rename(&entry.backup, &entry.original)
@@ -35480,13 +36595,13 @@ fn rollback_archive_restore(
     }
 
     for target in cleanup_targets {
-        if std::fs::symlink_metadata(target).is_ok() {
-            if let Err(error) = remove_restore_target_if_exists(target) {
-                errors.push(format!(
-                    "failed to clean partially restored {}: {error}",
-                    target.display()
-                ));
-            }
+        if std::fs::symlink_metadata(target).is_ok()
+            && let Err(error) = remove_restore_target_if_exists(target)
+        {
+            errors.push(format!(
+                "failed to clean partially restored {}: {error}",
+                target.display()
+            ));
         }
     }
 
@@ -35722,6 +36837,34 @@ fn archive_save_state(
     scrub_preset: String,
     label: Option<String>,
 ) -> CliResult<PathBuf> {
+    archive_save_state_internal(source_db, storage_root, projects, scrub_preset, label, true)
+}
+
+fn archive_save_state_locked(
+    source_db: &Path,
+    storage_root: &Path,
+    projects: Vec<String>,
+    scrub_preset: String,
+    label: Option<String>,
+) -> CliResult<PathBuf> {
+    archive_save_state_internal(
+        source_db,
+        storage_root,
+        projects,
+        scrub_preset,
+        label,
+        false,
+    )
+}
+
+fn archive_save_state_internal(
+    source_db: &Path,
+    storage_root: &Path,
+    projects: Vec<String>,
+    scrub_preset: String,
+    label: Option<String>,
+    acquire_mailbox_read_lock: bool,
+) -> CliResult<PathBuf> {
     use chrono::Timelike;
     use std::io::Write;
 
@@ -35730,6 +36873,10 @@ fn archive_save_state(
             "cannot archive an in-memory database (:memory:)".to_string(),
         ));
     }
+
+    let source_db = PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+        &source_db.to_string_lossy(),
+    ));
 
     let preset = match share::normalize_scrub_preset(&scrub_preset) {
         Ok(p) => p,
@@ -35756,6 +36903,14 @@ fn archive_save_state(
         )));
     }
 
+    let _mailbox_read_locks = if acquire_mailbox_read_lock {
+        Some(acquire_cli_mailbox_read_locks_for_paths(
+            &source_db,
+            storage_root,
+        )?)
+    } else {
+        None
+    };
     let archive_dir = archive_states_dir(true)?;
     let timestamp = Utc::now();
     let timestamp = timestamp.with_nanosecond(0).unwrap_or(timestamp);
@@ -35768,7 +36923,7 @@ fn archive_save_state(
     let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
 
     ftui_runtime::ftui_println!("Creating mailbox archive...");
-    let context = share::create_snapshot_context(source_db, &snapshot_path, &projects, preset)?;
+    let context = share::create_snapshot_context(&source_db, &snapshot_path, &projects, preset)?;
 
     let snapshot_size = std::fs::metadata(&snapshot_path)?.len();
     let destination_name = destination
@@ -35921,6 +37076,8 @@ fn archive_restore_state(
     force: bool,
     dry_run: bool,
 ) -> CliResult<()> {
+    // Caller must hold the mailbox activity locks for both the SQLite target
+    // and storage root before invoking this mutating restore.
     let archive_path = resolve_archive_path(&archive_file)?;
     let (meta, meta_error) = load_archive_metadata(&archive_path);
     if let Some(err) = meta_error {
@@ -36361,10 +37518,15 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                     "cannot restore into an in-memory database (:memory:)".to_string(),
                 ));
             }
-            let database_path = PathBuf::from(&db_path);
+            let database_path =
+                PathBuf::from(resolve_sqlite_path_with_absolute_candidate(&db_path));
 
             let config = Config::from_env();
             let storage_root = config.storage_root;
+            let _mailbox_storage_root_lock =
+                acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
+            let _mailbox_sqlite_lock =
+                acquire_doctor_mailbox_activity_lock_for_sqlite_path(&database_path, dry_run)?;
             archive_restore_state(archive_file, &database_path, &storage_root, force, dry_run)
         }
     }
@@ -36467,8 +37629,6 @@ fn handle_doctor_repair(
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let database_url = &cfg.database_url;
     let bak_dir = backup_dir.unwrap_or_else(|| config.storage_root.join("backups"));
-    let _mailbox_activity_lock =
-        acquire_doctor_mailbox_activity_lock_for_database_url(database_url, dry_run)?;
     handle_doctor_repair_with(
         database_url,
         &config.storage_root,
@@ -36487,6 +37647,10 @@ fn handle_doctor_repair_with(
     dry_run: bool,
     yes: bool,
 ) -> CliResult<()> {
+    let _mailbox_storage_root_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(storage_root, dry_run)?;
+    let _mailbox_sqlite_lock =
+        acquire_doctor_mailbox_activity_lock_for_database_url(database_url, dry_run)?;
     if let Some(project) = project
         .as_deref()
         .map(str::trim)
@@ -36552,7 +37716,8 @@ fn handle_doctor_repair_with(
         );
     }
 
-    let conn = open_db_sync_with_database_url_and_storage_root(database_url, Some(storage_root))?;
+    let conn =
+        open_db_sync_with_database_url_and_storage_root_locked(database_url, Some(storage_root))?;
 
     // 1b. Run a full PRAGMA integrity_check (not just quick_check) to detect
     // index-level corruption that quick_check misses.  Report the result but
@@ -36766,6 +37931,7 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, yes: bool) -> CliR
     }
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let config = Config::from_env();
     let dest_path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
@@ -36776,7 +37942,9 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, yes: bool) -> CliR
     }
     let dest_path = resolve_sqlite_path_with_absolute_candidate(&dest_path);
 
-    let _mailbox_activity_lock =
+    let _mailbox_storage_root_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
+    let _mailbox_sqlite_lock =
         acquire_doctor_mailbox_activity_lock_for_sqlite_path(Path::new(&dest_path), dry_run)?;
 
     handle_doctor_restore_to(&backup_path, Path::new(&dest_path), dry_run, yes)
@@ -36823,14 +37991,15 @@ fn handle_doctor_restore_to(
 }
 
 fn handle_doctor_reconstruct(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
+    let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let db_path = PathBuf::from(
-        resolve_sqlite_path_with_absolute_candidate(
-            &cfg.sqlite_path()
-                .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?,
-        ),
-    );
-    let _mailbox_activity_lock =
+    let db_path = PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+        &cfg.sqlite_path()
+            .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?,
+    ));
+    let _mailbox_storage_root_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
+    let _mailbox_sqlite_lock =
         acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, dry_run)?;
     handle_doctor_reconstruct_with(None, None, dry_run, yes, json)
 }
@@ -37347,6 +38516,8 @@ fn handle_doctor_reconstruct_with(
     yes: bool,
     json: bool,
 ) -> CliResult<()> {
+    // Caller must acquire mailbox activity locks before invoking this helper
+    // because it can replace the live SQLite file and reconcile archive state.
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
 
@@ -37825,6 +38996,8 @@ fn handle_doctor_archive_scan(
 fn handle_doctor_archive_normalize(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
     let config = Config::from_env();
     let storage_root = config.storage_root;
+    let _mailbox_storage_root_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
     let report = audit_doctor_archive(&storage_root);
     let mut result = DoctorArchiveNormalizeResult {
         dry_run,
@@ -38595,15 +39768,11 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
         ));
     }
 
-    let conn = mcp_agent_mail_db::guard_db_conn(
-        open_db_sync_mail_inbox()?,
-        "check_inbox_direct metadata connection",
-    );
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let (conn, sqlite_path) = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)?;
+    let conn = mcp_agent_mail_db::guard_db_conn(conn, "check_inbox_direct metadata connection");
     let project_id = crate::context::resolve_project(&conn, &config.project_key)?.id;
     let agent_id = resolve_agent_id_for_inbox_check(&conn, project_id, &config.agent_name)?;
-    let sqlite_path = mcp_agent_mail_db::DbPoolConfig::from_env()
-        .sqlite_path()
-        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let rows = mcp_agent_mail_db::sync::fetch_inbox_native_sqlite_by_ids(
         &sqlite_path,
         project_id,
@@ -38667,18 +39836,11 @@ fn fetch_mail_inbox_direct_with_database_url(
     include_bodies: bool,
 ) -> CliResult<Vec<serde_json::Value>> {
     let validated_limit = validate_mail_inbox_limit(limit)?;
-    let conn = mcp_agent_mail_db::guard_db_conn(
-        open_db_sync_mail_inbox_with_database_url(database_url)?,
-        "fetch_mail_inbox_direct metadata connection",
-    );
+    let (conn, sqlite_path) = open_db_sync_mail_inbox_with_database_url_and_path(database_url)?;
+    let conn =
+        mcp_agent_mail_db::guard_db_conn(conn, "fetch_mail_inbox_direct metadata connection");
     let project = crate::context::resolve_project(&conn, project_key)?;
     let agent = crate::context::resolve_agent(&conn, project.id, agent_name)?;
-    let sqlite_path = mcp_agent_mail_db::DbPoolConfig {
-        database_url: database_url.to_string(),
-        ..Default::default()
-    }
-    .sqlite_path()
-    .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let rows = mcp_agent_mail_db::sync::fetch_inbox_native_sqlite_by_ids(
         &sqlite_path,
         project.id,
@@ -40705,8 +41867,17 @@ fn handle_tooling_decommission_fts(
     format: Option<output::CliOutputFormat>,
     json_mode: bool,
 ) -> CliResult<()> {
-    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let config = Config::from_env();
+    handle_tooling_decommission_fts_with_config(&config, force, format, json_mode)
+}
+
+fn handle_tooling_decommission_fts_with_config(
+    config: &Config,
+    force: bool,
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let search_index_path = std::path::Path::new(&config.storage_root).join("search_index");
     let engine = config.search_rollout.engine.to_string();
     let shadow_mode = config.search_rollout.shadow_mode.to_string();
@@ -40754,12 +41925,21 @@ fn handle_tooling_decommission_fts(
         );
     }
 
-    let conn = open_db_sync_with_database_url(&config.database_url)?;
-    let triggers_before = query_existing_search_fts_triggers(&conn)?;
-
-    let mut dropped_triggers = Vec::new();
     let blocked = !preflight_ok && !force;
-    if !blocked {
+    let (triggers_before, dropped_triggers, triggers_after) = if blocked {
+        let conn = open_db_sync_read_only_with_database_url(&config.database_url)?;
+        let triggers_before = query_existing_search_fts_triggers(&conn)?;
+        warnings.push("preflight failed; rerun with --force to override".to_string());
+        (triggers_before.clone(), Vec::new(), triggers_before)
+    } else {
+        let _mailbox_mutation_locks =
+            acquire_cli_mailbox_mutation_locks(&config.database_url, Some(&config.storage_root))?;
+        let conn = open_db_sync_with_database_url_and_storage_root_locked(
+            &config.database_url,
+            Some(&config.storage_root),
+        )?;
+        let triggers_before = query_existing_search_fts_triggers(&conn)?;
+        let mut dropped_triggers = Vec::new();
         for trigger in SEARCH_FTS_TRIGGER_NAMES {
             let sql = format!("DROP TRIGGER IF EXISTS {trigger}");
             conn.execute_raw(&sql)
@@ -40768,14 +41948,8 @@ fn handle_tooling_decommission_fts(
                 dropped_triggers.push(trigger.to_string());
             }
         }
-    } else {
-        warnings.push("preflight failed; rerun with --force to override".to_string());
-    }
-
-    let triggers_after = if blocked {
-        triggers_before.clone()
-    } else {
-        query_existing_search_fts_triggers(&conn)?
+        let triggers_after = query_existing_search_fts_triggers(&conn)?;
+        (triggers_before, dropped_triggers, triggers_after)
     };
 
     let action = if blocked {
@@ -41871,6 +43045,169 @@ fn run_share_export_reports_encrypted_archive_as_final_output() {
         encrypted_path.exists(),
         "encrypted archive should exist at {}",
         encrypted_path.display()
+    );
+}
+
+#[test]
+fn run_share_export_dry_run_uses_absolute_candidate_for_malformed_relative_source_db() {
+    let _lock = SHARE_EXPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_db = temp.path().join("share-export-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+    seed_share_export_source_db(&source_db);
+
+    let relative_db = source_db
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .to_string();
+    let database_url = format!("sqlite://{relative_db}");
+    let storage_root_text = storage_root.to_string_lossy().to_string();
+    let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text.as_str()),
+        ],
+        || {
+            run_share_export(ShareExportParams {
+                output: temp.path().join("bundle"),
+                projects: vec![],
+                inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+                detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+                scrub_preset: share::ScrubPreset::Standard,
+                chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+                chunk_size: share::DEFAULT_CHUNK_SIZE,
+                dry_run: true,
+                zip: false,
+                signing_key: None,
+                signing_public_out: None,
+                age_recipients: vec![],
+            })
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "share export dry-run should use the absolute sqlite candidate: {result:?}"
+    );
+}
+
+#[test]
+fn run_share_export_reports_busy_before_creating_bundle_when_mailbox_locked() {
+    let _lock = SHARE_EXPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_db = temp.path().join("share-export-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    let output = temp.path().join("bundle");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+    seed_share_export_source_db(&source_db);
+
+    let _exclusive_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+        &storage_root,
+        mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+    )
+    .expect("acquire exclusive storage-root lock");
+
+    let database_url = format!("sqlite:///{}", source_db.display());
+    let storage_root_text = storage_root.to_string_lossy().to_string();
+    let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text.as_str()),
+        ],
+        || {
+            run_share_export(ShareExportParams {
+                output: output.clone(),
+                projects: vec![],
+                inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+                detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+                scrub_preset: share::ScrubPreset::Standard,
+                chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+                chunk_size: share::DEFAULT_CHUNK_SIZE,
+                dry_run: false,
+                zip: false,
+                signing_key: None,
+                signing_public_out: None,
+                age_recipients: vec![],
+            })
+        },
+    );
+
+    let error = result.expect_err("share export should refuse while mailbox storage is active");
+    assert!(
+        is_resource_busy_cli_error(&error),
+        "share export busy error should be classified as resource busy: {error}"
+    );
+    assert!(
+        !output.exists(),
+        "busy share export should fail before creating the output bundle"
+    );
+}
+
+#[test]
+fn run_share_update_reports_busy_before_rewriting_bundle_when_mailbox_locked() {
+    let _lock = SHARE_EXPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_db = temp.path().join("share-export-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    let bundle = temp.path().join("bundle");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+    std::fs::create_dir_all(&bundle).expect("create bundle dir");
+    std::fs::write(bundle.join("manifest.json"), b"old-manifest").expect("seed manifest");
+    seed_share_export_source_db(&source_db);
+
+    let _exclusive_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+        &storage_root,
+        mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+    )
+    .expect("acquire exclusive storage-root lock");
+
+    let database_url = format!("sqlite:///{}", source_db.display());
+    let storage_root_text = storage_root.to_string_lossy().to_string();
+    let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text.as_str()),
+        ],
+        || {
+            run_share_update(ShareUpdateParams {
+                bundle: bundle.clone(),
+                projects: vec![],
+                inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+                detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+                scrub_preset: share::ScrubPreset::Standard,
+                chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+                chunk_size: share::DEFAULT_CHUNK_SIZE,
+                zip: false,
+                signing_key: None,
+                signing_public_out: None,
+                age_recipients: vec![],
+            })
+        },
+    );
+
+    let error = result.expect_err("share update should refuse while mailbox storage is active");
+    assert!(
+        is_resource_busy_cli_error(&error),
+        "share update busy error should be classified as resource busy: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("manifest.json")).expect("read manifest"),
+        "old-manifest",
+        "busy share update should fail before rewriting bundle files"
+    );
+    assert!(
+        !bundle.join("_snapshot.sqlite3").exists(),
+        "busy share update should fail before creating bundle snapshots"
     );
 }
 

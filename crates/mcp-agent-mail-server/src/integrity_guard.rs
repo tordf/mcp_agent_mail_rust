@@ -11,13 +11,11 @@
 #![forbid(unsafe_code)]
 
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_core::disk::{
-    is_sqlite_memory_database_url, sqlite_file_path_from_database_url,
-};
+use mcp_agent_mail_core::disk::is_sqlite_memory_database_url;
 use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, is_corruption_error_message, is_sqlite_recovery_error_message,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -83,6 +81,10 @@ fn take_deferred_proactive_backup() -> bool {
     SKIP_NEXT_PROACTIVE_BACKUP.swap(false, Ordering::AcqRel)
 }
 
+fn resolve_integrity_guard_sqlite_path(config: &Config) -> Option<PathBuf> {
+    crate::resolve_server_database_url_sqlite_path(&config.database_url)
+}
+
 pub fn start(config: &Config) {
     if !config.integrity_check_on_startup {
         return;
@@ -91,7 +93,7 @@ pub fn start(config: &Config) {
         return;
     }
 
-    let Some(sqlite_path) = sqlite_file_path_from_database_url(&config.database_url) else {
+    let Some(sqlite_path) = resolve_integrity_guard_sqlite_path(config) else {
         tracing::warn!(
             database_url = %config.database_url,
             "integrity guard disabled: failed to resolve sqlite path from DATABASE_URL"
@@ -415,6 +417,29 @@ mod tests {
         assert!(
             !take_deferred_proactive_backup(),
             "startup backup deferral should apply only once"
+        );
+    }
+
+    #[test]
+    fn resolve_integrity_guard_sqlite_path_prefers_absolute_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("integrity-guard.sqlite3");
+        std::fs::write(&absolute_db, b"seed").expect("write absolute db");
+
+        let relative_path = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        assert!(
+            !relative_path.exists(),
+            "relative shadow path should be absent so integrity guard resolves the absolute candidate"
+        );
+
+        let mut config = Config::from_env();
+        config.database_url = format!("sqlite:///{}", relative_path.display());
+
+        let resolved =
+            resolve_integrity_guard_sqlite_path(&config).expect("resolve integrity guard db path");
+        assert_eq!(
+            resolved, absolute_db,
+            "integrity guard should monitor the resolved absolute candidate"
         );
     }
 

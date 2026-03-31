@@ -430,7 +430,7 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> usize {
     let cutoff = chrono::Utc::now()
         .checked_sub_signed(max_age)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-    
+
     if let Ok(agents) = std::fs::read_dir(agents_dir) {
         for agent in agents.flatten() {
             let Ok(agent_type) = agent.file_type() else {
@@ -443,7 +443,7 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> usize {
             if !is_real_directory(&inbox) {
                 continue;
             }
-            
+
             let mut stack = vec![inbox];
 
             while let Some(current) = stack.pop() {
