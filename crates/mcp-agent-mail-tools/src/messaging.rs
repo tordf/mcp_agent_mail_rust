@@ -1362,6 +1362,8 @@ pub struct ReplyMessageResponse {
     pub reply_to: i64,
     pub deliveries: Vec<DeliveryResult>,
     pub count: usize,
+    /// Whether the sender's identity was cryptographically verified via `sender_token`.
+    pub verified_sender: bool,
 }
 
 /// Send a message to one or more recipients.
@@ -2210,13 +2212,14 @@ effective_free_bytes={free}"
 /// - `cc`: CC recipients
 /// - `bcc`: BCC recipients
 /// - `subject_prefix`: Prefix for subject (default: "Re:")
+/// - `sender_token`: Registration token for sender identity verification (optional)
 #[allow(
     clippy::too_many_arguments,
     clippy::similar_names,
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Reply to an existing message, preserving or establishing a thread.\n\nBehavior\n--------\n- Inherits original `importance` and `ack_required` flags unless overridden\n- `thread_id` is taken from the original message if present; otherwise, the original id is used\n- Subject is prefixed with `subject_prefix` if not already present\n- Defaults `to` to the original sender if not explicitly provided\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nmessage_id : int\n    The id of the message you are replying to.\nsender_name : str\n    Your agent name (must be registered in the project).\nbody_md : str\n    Reply body in Markdown.\nto, cc, bcc : Optional[list[str]]\n    Recipients by agent name. If omitted, `to` defaults to original sender.\nsubject_prefix : str\n    Prefix to apply (default \"Re:\"). Case-insensitive idempotent.\nimportance : Optional[str]\n    Override importance level {\"low\",\"normal\",\"high\",\"urgent\"}. Inherits from original if omitted.\nack_required : Optional[bool]\n    Override acknowledgement requirement. Inherits from original if omitted.\n\nDo / Don't\n----------\nDo:\n- Keep the subject focused; avoid topic drift within a thread.\n- Reply to the original sender unless new stakeholders are strictly required.\n- Preserve importance/ack flags from the original unless there is a clear reason to change.\n- Use CC for FYI only; BCC sparingly and with intention.\n\nDon't:\n- Change `thread_id` when continuing the same discussion.\n- Escalate to many recipients; prefer targeted replies and start a new thread for new topics.\n- Attach large binaries in replies unless essential; reference prior attachments where possible.\n\nReturns\n-------\ndict\n    Message payload including `thread_id` and `reply_to`.\n\nExamples\n--------\nMinimal reply to original sender:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Questions about the migration plan...\"\n}}}\n```\n\nReply with explicit recipients and CC:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6c\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Looping ops.\",\"to\":[\"GreenCastle\"],\"cc\":[\"RedCat\"],\"subject_prefix\":\"RE:\"\n}}}\n```"
+    description = "Reply to an existing message, preserving or establishing a thread.\n\nBehavior\n--------\n- Inherits original `importance` and `ack_required` flags unless overridden\n- `thread_id` is taken from the original message if present; otherwise, the original id is used\n- Subject is prefixed with `subject_prefix` if not already present\n- Defaults `to` to the original sender if not explicitly provided\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nmessage_id : int\n    The id of the message you are replying to.\nsender_name : str\n    Your agent name (must be registered in the project).\nbody_md : str\n    Reply body in Markdown.\nto, cc, bcc : Optional[list[str]]\n    Recipients by agent name. If omitted, `to` defaults to original sender.\nsubject_prefix : str\n    Prefix to apply (default \"Re:\"). Case-insensitive idempotent.\nimportance : Optional[str]\n    Override importance level {\"low\",\"normal\",\"high\",\"urgent\"}. Inherits from original if omitted.\nack_required : Optional[bool]\n    Override acknowledgement requirement. Inherits from original if omitted.\nsender_token : Optional[str]\n    Registration token for identity verification.\n\nDo / Don't\n----------\nDo:\n- Keep the subject focused; avoid topic drift within a thread.\n- Reply to the original sender unless new stakeholders are strictly required.\n- Preserve importance/ack flags from the original unless there is a clear reason to change.\n- Use CC for FYI only; BCC sparingly and with intention.\n\nDon't:\n- Change `thread_id` when continuing the same discussion.\n- Escalate to many recipients; prefer targeted replies and start a new thread for new topics.\n- Attach large binaries in replies unless essential; reference prior attachments where possible.\n\nReturns\n-------\ndict\n    Message payload including `thread_id` and `reply_to`.\n\nExamples\n--------\nMinimal reply to original sender:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Questions about the migration plan...\"\n}}}\n```\n\nReply with explicit recipients and CC:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6c\",\"method\":\"tools/call\",\"params\":{\"name\":\"reply_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"message_id\":1234,\"sender_name\":\"BlueLake\",\n  \"body_md\":\"Looping ops.\",\"to\":[\"GreenCastle\"],\"cc\":[\"RedCat\"],\"subject_prefix\":\"RE:\"\n}}}\n```"
 )]
 pub async fn reply_message(
     ctx: &McpContext,
@@ -2232,6 +2235,7 @@ pub async fn reply_message(
     ack_required: Option<bool>,
     attachment_paths: Option<Vec<String>>,
     convert_images: Option<bool>,
+    sender_token: Option<String>,
 ) -> McpResult<String> {
     // Normalize names
     let sender_name =
@@ -2348,6 +2352,34 @@ effective_free_bytes={free}"
     )
     .await?;
     let sender_id = sender.id.unwrap_or(0);
+
+    // ── Sender identity verification (issue #42) ──────────────────────
+    let verified_sender = match sender_token.as_deref() {
+        Some(token) => {
+            if let Some(ref stored_token) = sender.registration_token {
+                if mcp_agent_mail_core::setup::constant_time_str_eq(token, stored_token) {
+                    true
+                } else {
+                    return Err(legacy_tool_error(
+                        "SENDER_TOKEN_MISMATCH",
+                        format!(
+                            "sender_token does not match the registered token for agent '{sender_name}'. \
+                             Only the agent's owner (the session that called register_agent) can send \
+                             messages as this agent. Use the registration_token returned by register_agent."
+                        ),
+                        false,
+                        serde_json::json!({
+                            "sender_name": sender_name,
+                            "hint": "Use the registration_token returned by register_agent as sender_token",
+                        }),
+                    ));
+                }
+            } else {
+                false
+            }
+        }
+        None => false,
+    };
 
     // Resolve original sender name for default recipient
     let original_sender = db_outcome_to_mcp_result(
@@ -2954,6 +2986,7 @@ effective_free_bytes={free}"
             payload,
         }],
         count: 1,
+        verified_sender,
     };
 
     tracing::debug!(
