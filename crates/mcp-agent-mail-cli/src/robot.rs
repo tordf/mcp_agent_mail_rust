@@ -1735,6 +1735,14 @@ impl RobotDbHandle {
     }
 
     fn open_archive_snapshot(storage_root: &Path) -> Result<Self, CliError> {
+        let _mailbox_read_lock = if storage_root.is_dir() {
+            crate::acquire_cli_mailbox_activity_lock_for_storage_root(
+                storage_root,
+                mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+            )?
+        } else {
+            None
+        };
         let snapshot_dir = tempfile::tempdir()
             .map_err(|e| CliError::Other(format!("robot archive snapshot tempdir failed: {e}")))?;
         let db_path = snapshot_dir.path().join("robot-archive-snapshot.sqlite3");
@@ -10526,6 +10534,31 @@ mod tests {
         assert!(
             err.to_string().contains("ambiguous agent name"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_archive_snapshot_reports_busy_when_storage_root_is_locked() {
+        let storage_root = tempfile::tempdir().expect("storage root");
+        std::fs::create_dir_all(storage_root.path().join("projects")).expect("create projects dir");
+
+        let _exclusive_lock =
+            mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+                storage_root.path(),
+                mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+            )
+            .expect("acquire exclusive storage lock")
+            .expect("storage lock guard");
+
+        let err = match RobotDbHandle::open_archive_snapshot(storage_root.path()) {
+            Ok(_) => panic!("locked archive snapshot should fail"),
+            Err(err) => err,
+        };
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("temporarily busy")
+                || err_text.contains("mailbox activity lock is busy"),
+            "unexpected error: {err_text}"
         );
     }
 
