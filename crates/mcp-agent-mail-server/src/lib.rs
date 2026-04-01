@@ -1186,13 +1186,32 @@ pub fn acquire_mailbox_activity_lock(
     acquire_mailbox_activity_lock_for_storage_root(&config.storage_root, mode)
 }
 
+struct RuntimeMailboxActivityLocks {
+    _storage_root_lock: Option<MailboxActivityLockGuard>,
+    _sqlite_lock: Option<MailboxActivityLockGuard>,
+}
+
+fn acquire_runtime_mailbox_activity_locks(
+    config: &mcp_agent_mail_core::Config,
+) -> std::io::Result<RuntimeMailboxActivityLocks> {
+    let storage_root_lock =
+        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
+    let sqlite_lock = acquire_mailbox_activity_lock_for_database_url(
+        &config.database_url,
+        MailboxActivityLockMode::Shared,
+    )?;
+    Ok(RuntimeMailboxActivityLocks {
+        _storage_root_lock: storage_root_lock,
+        _sqlite_lock: sqlite_lock,
+    })
+}
+
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
-    let _mailbox_activity_lock =
-        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
     // Check for resource collisions (e.g. another am process holding locks)
     let probe_report = startup_checks::run_stdio_startup_probes(config);
@@ -2118,8 +2137,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
-    let _mailbox_activity_lock =
-        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
     prepare_http_runtime_startup(config)?;
     log_active_database(config);
@@ -2189,8 +2207,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
-    let _mailbox_activity_lock =
-        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
@@ -11513,6 +11530,39 @@ mod tests {
             MailboxActivityLockMode::Exclusive,
         )
         .expect_err("second exclusive storage-root lock should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            error.to_string().contains("mailbox activity lock is busy"),
+            "unexpected contention error: {error}"
+        );
+    }
+
+    #[test]
+    fn runtime_mailbox_activity_locks_hold_sqlite_guard_across_storage_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("storage.sqlite3");
+        let storage_root = temp.path().join("storage-root-a");
+        let other_storage_root = temp.path().join("storage-root-b");
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            ..Default::default()
+        };
+
+        let _runtime_locks =
+            acquire_runtime_mailbox_activity_locks(&config).expect("acquire runtime locks");
+        let _other_root_lock = acquire_mailbox_activity_lock_for_storage_root(
+            &other_storage_root,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect("different storage root should not contend");
+
+        let error = acquire_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect_err("runtime sqlite guard should block cross-root exclusive sqlite lock");
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert!(
