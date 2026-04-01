@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn root_reservation_conflicts_with_everything() {
-        let idx = ReservationIndex::build(vec![("".to_string(), make_ref(1))].into_iter());
+        let idx = ReservationIndex::build(vec![(String::new(), make_ref(1))].into_iter());
 
         // Exact request
         let req_exact = CompiledPattern::new("src/main.rs");

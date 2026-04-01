@@ -2456,20 +2456,17 @@ exit 1
     }
 
     #[test]
-    fn matches_pattern_double_wildcard_falls_through_to_substring() {
-        // "*guard*" splits into 3 parts so the 2-part wildcard logic doesn't apply
-        // Falls through to substring check: name.contains("*guard*") which is false
-        assert!(!SuiteRegistry::matches_pattern(
+    fn matches_pattern_double_wildcard_matches_substring_glob() {
+        assert!(SuiteRegistry::matches_pattern(
             "test_guard_extra",
             "*guard*"
         ));
     }
 
     #[test]
-    fn matches_pattern_multiple_wildcards_falls_through() {
-        // pattern "a*b*c" has 3 parts, split('*') len==3 so the if parts.len()==2 doesn't match
-        // Falls through to substring check: name.contains("a*b*c") which is false
-        assert!(!SuiteRegistry::matches_pattern("axbxc", "a*b*c"));
+    fn matches_pattern_multiple_wildcards_match_ordered_segments() {
+        assert!(SuiteRegistry::matches_pattern("axbxc", "a*b*c"));
+        assert!(!SuiteRegistry::matches_pattern("axbyd", "a*b*c"));
     }
 
     #[test]

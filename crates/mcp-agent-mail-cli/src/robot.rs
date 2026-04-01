@@ -3633,38 +3633,7 @@ fn build_reservations(
 
 /// Check whether two reservation path patterns can overlap.
 fn glob_matches(pattern: &str, path: &str) -> bool {
-    if pattern == path {
-        return true;
-    }
-
-    let options = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: true,
-        require_literal_leading_dot: false,
-    };
-    if glob::Pattern::new(pattern)
-        .ok()
-        .is_some_and(|compiled| compiled.matches_with(path, options))
-    {
-        return true;
-    }
-    if glob::Pattern::new(path)
-        .ok()
-        .is_some_and(|compiled| compiled.matches_with(pattern, options))
-    {
-        return true;
-    }
-
-    if !pattern.is_empty() && !path.is_empty() {
-        if path.starts_with(pattern) && path.as_bytes().get(pattern.len()) == Some(&b'/') {
-            return true;
-        }
-        if pattern.starts_with(path) && pattern.as_bytes().get(path.len()) == Some(&b'/') {
-            return true;
-        }
-    }
-
-    false
+    mcp_agent_mail_core::pattern_overlap::patterns_overlap(pattern, path)
 }
 
 // ── Timeline command implementation ─────────────────────────────────────────
@@ -8093,6 +8062,7 @@ mod tests {
         assert!(glob_matches("src/auth/jwt.rs", "src/auth/jwt.rs"));
         assert!(!glob_matches("src/auth/jwt.rs", "src/auth/other.rs"));
         assert!(glob_matches("src/**/*.rs", "src/*/main.rs"));
+        assert!(glob_matches("src/*/foo.rs", "src/bar/*.rs"));
         assert!(!glob_matches("src/**/*.rs", "docs/**/*.md"));
     }
 
@@ -11235,6 +11205,35 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    #[test]
+    fn build_reservations_detects_glob_vs_glob_conflicts() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (?, 1, 1, 'src/*/foo.rs', 1, 'a', 0, ?, NULL),
+                (?, 1, 2, 'src/bar/*.rs', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert glob reservations");
+
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, false, false, Some(10))
+            .expect("build reservations");
+
+        assert_eq!(data.conflicts.len(), 1);
+        assert_eq!(data.conflicts[0].agent_a, "Alice");
+        assert_eq!(data.conflicts[0].path_a, "src/*/foo.rs");
+        assert_eq!(data.conflicts[0].agent_b, "Bob");
+        assert_eq!(data.conflicts[0].path_b, "src/bar/*.rs");
     }
 
     #[test]

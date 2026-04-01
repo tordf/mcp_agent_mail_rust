@@ -5078,11 +5078,10 @@ where
         Ok(v) => v,
         Err(e) => {
             let msg = e.to_string();
-            if mcp_agent_mail_db::is_lock_error(&msg) || is_snapshot_conflict_cli_error(&e) {
-                return Err(sqlite_doctor_busy_error(selected_path.as_path(), &msg));
-            }
-            if is_sqlite_recovery_error_message(&msg) {
+            if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
                 false
+            } else if mcp_agent_mail_db::is_lock_error(&msg) {
+                return Err(sqlite_doctor_busy_error(selected_path.as_path(), &msg));
             } else {
                 return Err(CliError::Other(format!(
                     "database health probe failed for {}: {msg}",
@@ -5107,10 +5106,10 @@ where
             Ok(false) => {}
             Err(e) => {
                 let msg = e.to_string();
-                if mcp_agent_mail_db::is_lock_error(&msg) {
+                if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
+                } else if mcp_agent_mail_db::is_lock_error(&msg) {
                     return Err(sqlite_doctor_busy_error(selected_path.as_path(), &msg));
-                }
-                if !is_sqlite_recovery_error_message(&msg) {
+                } else {
                     return Err(CliError::Other(format!(
                         "database health probe failed for absolute fallback {}: {msg}",
                         absolute_path.display()
@@ -7309,6 +7308,29 @@ fn active_reservation_predicate_sql(table_ref: &str) -> String {
     mcp_agent_mail_db::queries::active_reservation_predicate_for(table_ref)
 }
 
+fn reservation_patterns_overlap(left: &str, right: &str) -> bool {
+    let left = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(left);
+    let right = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(right);
+    left.overlaps(right.as_ref())
+}
+
+fn cli_reservation_path_filter_matches(row_path_pattern: &str, filter_paths: &[String]) -> bool {
+    filter_paths.is_empty()
+        || filter_paths
+            .iter()
+            .any(|pat| reservation_patterns_overlap(row_path_pattern, pat))
+}
+
+fn cli_reservation_target_matches(
+    row_id: i64,
+    row_path_pattern: &str,
+    filter_paths: &[String],
+    filter_ids: &[i64],
+) -> bool {
+    (filter_ids.is_empty() || filter_ids.contains(&row_id))
+        && cli_reservation_path_filter_matches(row_path_pattern, filter_paths)
+}
+
 /// Resolve a project identifier (slug or human_key path) to the canonical
 /// slug stored in the database.  This mirrors the dual-lookup that
 /// `resolve_project` in the MCP tool layer performs: if the identifier
@@ -7571,37 +7593,36 @@ fn handle_file_reservations_with_conn(
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             // Check conflicts: find active exclusive reservations that overlap.
-            let mut conflicts: Vec<serde_json::Value> = Vec::new();
             let active_reservation_predicate = active_reservation_predicate_sql("fr");
+            let active_rows = conn
+                .query_sync(
+                    &format!(
+                        "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                                fr.expires_ts, a.name AS agent_name \
+                         FROM file_reservations fr \
+                         JOIN agents a ON a.id = fr.agent_id \
+                         WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
+                           AND fr.expires_ts > ? AND fr.agent_id != ?"
+                    ),
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(now_us),
+                        sqlmodel_core::Value::BigInt(agent_id),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let mut conflicts: Vec<serde_json::Value> = Vec::new();
             for path in &paths {
-                let sql = format!(
-                    "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                            fr.expires_ts, a.name AS agent_name \
-                     FROM file_reservations fr \
-                     JOIN agents a ON a.id = fr.agent_id \
-                     WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
-                       AND fr.expires_ts > ? AND fr.agent_id != ? \
-                       AND (fr.\"exclusive\" = 1 OR ? = 1) \
-                       AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
-                            OR ? GLOB fr.path_pattern)"
-                );
-                let overlap_rows = conn
-                    .query_sync(
-                        &sql,
-                        &[
-                            sqlmodel_core::Value::BigInt(project_id),
-                            sqlmodel_core::Value::BigInt(now_us),
-                            sqlmodel_core::Value::BigInt(agent_id),
-                            sqlmodel_core::Value::BigInt(if exclusive_val { 1 } else { 0 }),
-                            sqlmodel_core::Value::Text(path.clone()),
-                            sqlmodel_core::Value::Text(format!("{}%", path)),
-                            sqlmodel_core::Value::Text(path.clone()),
-                        ],
-                    )
-                    .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-                for r in &overlap_rows {
+                for r in &active_rows {
+                    let holder_is_exclusive: bool = r.get_named("exclusive").unwrap_or(true);
+                    if !exclusive_val && !holder_is_exclusive {
+                        continue;
+                    }
                     let holder: String = r.get_named("agent_name").unwrap_or_default();
                     let pattern: String = r.get_named("path_pattern").unwrap_or_default();
+                    if !reservation_patterns_overlap(path, &pattern) {
+                        continue;
+                    }
                     let rid: i64 = r.get_named("id").unwrap_or(0);
                     conflicts.push(serde_json::json!({
                         "path": path,
@@ -7700,63 +7721,47 @@ fn handle_file_reservations_with_conn(
             let base_where = format!(
                 "project_id = ? AND agent_id = ? AND ({active_reservation_predicate}) AND expires_ts > ?"
             );
-            let (sql, params) = if !ids.is_empty() {
-                let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let sql = format!(
-                    "UPDATE file_reservations SET expires_ts = expires_ts + ? \
-                     WHERE {base_where} AND id IN ({placeholders}) \
-                     RETURNING id, path_pattern, expires_ts"
-                );
-                let mut params: Vec<sqlmodel_core::Value> = vec![
-                    sqlmodel_core::Value::BigInt(extend_us),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(agent_id),
-                    sqlmodel_core::Value::BigInt(now_us),
-                ];
-                for id in &ids {
-                    params.push(sqlmodel_core::Value::BigInt(*id));
-                }
-                (sql, params)
-            } else if !paths.is_empty() {
-                let placeholders: String = paths.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let sql = format!(
-                    "UPDATE file_reservations SET expires_ts = expires_ts + ? \
-                     WHERE {base_where} AND path_pattern IN ({placeholders}) \
-                     RETURNING id, path_pattern, expires_ts"
-                );
-                let mut params: Vec<sqlmodel_core::Value> = vec![
-                    sqlmodel_core::Value::BigInt(extend_us),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(agent_id),
-                    sqlmodel_core::Value::BigInt(now_us),
-                ];
-                for p in &paths {
-                    params.push(sqlmodel_core::Value::Text(p.clone()));
-                }
-                (sql, params)
-            } else {
-                let sql = format!(
-                    "UPDATE file_reservations SET expires_ts = expires_ts + ? \
-                     WHERE {base_where} \
-                     RETURNING id, path_pattern, expires_ts"
-                );
-                let params = vec![
-                    sqlmodel_core::Value::BigInt(extend_us),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(agent_id),
-                    sqlmodel_core::Value::BigInt(now_us),
-                ];
-                (sql, params)
-            };
+            let candidate_rows = conn
+                .query_sync(
+                    &format!("SELECT id, path_pattern FROM file_reservations WHERE {base_where}"),
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(agent_id),
+                        sqlmodel_core::Value::BigInt(now_us),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let target_ids: Vec<i64> = candidate_rows
+                .iter()
+                .filter_map(|row| {
+                    let id: i64 = row.get_named("id").ok()?;
+                    let path_pattern: String = row.get_named("path_pattern").ok()?;
+                    cli_reservation_target_matches(id, &path_pattern, &paths, &ids).then_some(id)
+                })
+                .collect();
+            if target_ids.is_empty() {
+                output::empty_result(false, "No matching reservations to renew.");
+                return Ok(());
+            }
+            let placeholders: String = target_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE file_reservations SET expires_ts = expires_ts + ? \
+                 WHERE {base_where} AND id IN ({placeholders}) \
+                 RETURNING id, path_pattern, expires_ts"
+            );
+            let mut params: Vec<sqlmodel_core::Value> = vec![
+                sqlmodel_core::Value::BigInt(extend_us),
+                sqlmodel_core::Value::BigInt(project_id),
+                sqlmodel_core::Value::BigInt(agent_id),
+                sqlmodel_core::Value::BigInt(now_us),
+            ];
+            for id in &target_ids {
+                params.push(sqlmodel_core::Value::BigInt(*id));
+            }
 
             let rows = conn
                 .query_sync(&sql, &params)
                 .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
-
-            if rows.is_empty() {
-                output::empty_result(false, "No matching reservations to renew.");
-                return Ok(());
-            }
 
             let mut table = output::CliTable::new(vec!["ID", "PATTERN", "NEW EXPIRES"]);
             for r in &rows {
@@ -7800,52 +7805,44 @@ fn handle_file_reservations_with_conn(
                 active_reservation_predicate_sql("file_reservations");
             let base_where =
                 format!("project_id = ? AND agent_id = ? AND ({active_reservation_predicate})");
-            let (sql, params) = if !ids.is_empty() {
-                let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let sql = format!(
-                    "UPDATE file_reservations SET released_ts = ? \
-                     WHERE {base_where} AND id IN ({placeholders}) \
-                     RETURNING id"
-                );
-                let mut params: Vec<sqlmodel_core::Value> = vec![
-                    sqlmodel_core::Value::BigInt(now_us),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(agent_id),
-                ];
-                for id in &ids {
-                    params.push(sqlmodel_core::Value::BigInt(*id));
-                }
-                (sql, params)
-            } else if !paths.is_empty() {
-                let placeholders: String = paths.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let sql = format!(
-                    "UPDATE file_reservations SET released_ts = ? \
-                     WHERE {base_where} AND path_pattern IN ({placeholders}) \
-                     RETURNING id"
-                );
-                let mut params: Vec<sqlmodel_core::Value> = vec![
-                    sqlmodel_core::Value::BigInt(now_us),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(agent_id),
-                ];
-                for p in &paths {
-                    params.push(sqlmodel_core::Value::Text(p.clone()));
-                }
-                (sql, params)
-            } else {
-                // Release all active reservations for this agent.
-                let sql = format!(
-                    "UPDATE file_reservations SET released_ts = ? \
-                     WHERE {base_where} \
-                     RETURNING id"
-                );
-                let params = vec![
-                    sqlmodel_core::Value::BigInt(now_us),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(agent_id),
-                ];
-                (sql, params)
-            };
+            let candidate_rows = conn
+                .query_sync(
+                    &format!("SELECT id, path_pattern FROM file_reservations WHERE {base_where}"),
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(agent_id),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let target_ids: Vec<i64> = candidate_rows
+                .iter()
+                .filter_map(|row| {
+                    let id: i64 = row.get_named("id").ok()?;
+                    let path_pattern: String = row.get_named("path_pattern").ok()?;
+                    cli_reservation_target_matches(id, &path_pattern, &paths, &ids).then_some(id)
+                })
+                .collect();
+            if target_ids.is_empty() {
+                output::success(&format!(
+                    "Released 0 reservation(s) for {} in {}.",
+                    agent, project
+                ));
+                return Ok(());
+            }
+            let placeholders: String = target_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE file_reservations SET released_ts = ? \
+                 WHERE {base_where} AND id IN ({placeholders}) \
+                 RETURNING id"
+            );
+            let mut params: Vec<sqlmodel_core::Value> = vec![
+                sqlmodel_core::Value::BigInt(now_us),
+                sqlmodel_core::Value::BigInt(project_id),
+                sqlmodel_core::Value::BigInt(agent_id),
+            ];
+            for id in &target_ids {
+                params.push(sqlmodel_core::Value::BigInt(*id));
+            }
 
             let rows = conn
                 .query_sync(&sql, &params)
@@ -7873,32 +7870,29 @@ fn handle_file_reservations_with_conn(
 
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
             let active_reservation_predicate = active_reservation_predicate_sql("fr");
+            let active_rows = conn
+                .query_sync(
+                    &format!(
+                        "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                                fr.expires_ts, a.name AS agent_name \
+                         FROM file_reservations fr \
+                         JOIN agents a ON a.id = fr.agent_id \
+                         WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
+                           AND fr.expires_ts > ? AND fr.\"exclusive\" = 1"
+                    ),
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(now_us),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
             for path in &paths {
-                let sql = format!(
-                    "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                            fr.expires_ts, a.name AS agent_name \
-                     FROM file_reservations fr \
-                     JOIN agents a ON a.id = fr.agent_id \
-                     WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
-                       AND fr.expires_ts > ? AND fr.\"exclusive\" = 1 \
-                       AND (fr.path_pattern = ? OR fr.path_pattern LIKE ? \
-                            OR ? LIKE fr.path_pattern)"
-                );
-                let overlap_rows = conn
-                    .query_sync(
-                        &sql,
-                        &[
-                            sqlmodel_core::Value::BigInt(project_id),
-                            sqlmodel_core::Value::BigInt(now_us),
-                            sqlmodel_core::Value::Text(path.clone()),
-                            sqlmodel_core::Value::Text(format!("{}%", path)),
-                            sqlmodel_core::Value::Text(path.clone()),
-                        ],
-                    )
-                    .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-                for r in &overlap_rows {
+                for r in &active_rows {
                     let holder: String = r.get_named("agent_name").unwrap_or_default();
                     let pattern: String = r.get_named("path_pattern").unwrap_or_default();
+                    if !reservation_patterns_overlap(path, &pattern) {
+                        continue;
+                    }
                     let rid: i64 = r.get_named("id").unwrap_or(0);
                     let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
                     conflicts.push(serde_json::json!({
@@ -30116,6 +30110,39 @@ COMMIT;\n";
     }
 
     #[test]
+    fn integration_file_reservations_reserve_detects_glob_overlap_conflicts() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Reserve {
+                project: "test-proj".to_string(),
+                agent: "RedFox".to_string(),
+                paths: vec!["src/**/*.rs".to_string()],
+                ttl: 3600,
+                exclusive: true,
+                shared: false,
+                reason: "glob overlap test".to_string(),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "reserve with glob conflict failed: {result:?}"
+        );
+        assert!(
+            output.contains("\"conflicts\"") && output.contains("src/api/*.rs"),
+            "expected overlap with held glob, got: {output}"
+        );
+    }
+
+    #[test]
     fn integration_file_reservations_renew_extends_ttl() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -30160,6 +30187,53 @@ COMMIT;\n";
     }
 
     #[test]
+    fn integration_file_reservations_renew_paths_use_overlap_matching() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "UPDATE file_reservations SET path_pattern = ? WHERE id = 1",
+            &[sqlmodel_core::Value::Text("src/**/*.rs".to_string())],
+        )
+        .unwrap();
+
+        let before = conn
+            .query_sync("SELECT expires_ts FROM file_reservations WHERE id = 1", &[])
+            .unwrap();
+        let orig_expires: i64 = before.first().unwrap().get_named("expires_ts").unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 1800,
+                paths: vec!["src/api/*.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "renew with overlap path failed: {result:?}");
+        assert!(
+            output.contains("Renewed") && output.contains("src/**/*.rs"),
+            "expected overlap-based renewal output, got: {output}"
+        );
+
+        let after = conn
+            .query_sync("SELECT expires_ts FROM file_reservations WHERE id = 1", &[])
+            .unwrap();
+        let new_expires: i64 = after.first().unwrap().get_named("expires_ts").unwrap();
+        assert!(
+            new_expires > orig_expires,
+            "expires must increase after overlap renewal: {orig_expires} -> {new_expires}"
+        );
+    }
+
+    #[test]
     fn integration_file_reservations_release_sets_released_ts() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -30194,6 +30268,53 @@ COMMIT;\n";
             .unwrap();
         let released: Option<i64> = rows.first().unwrap().get_named("released_ts").ok();
         assert!(released.is_some(), "released_ts must be set");
+    }
+
+    #[test]
+    fn integration_file_reservations_release_paths_use_overlap_matching() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "UPDATE file_reservations SET path_pattern = ? WHERE id = 1",
+            &[sqlmodel_core::Value::Text("src/**/*.rs".to_string())],
+        )
+        .unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["src/api/*.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "release with overlap path failed: {result:?}"
+        );
+        assert!(
+            output.contains("Released 1 reservation(s)"),
+            "expected overlap-based release output, got: {output}"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT released_ts FROM file_reservations WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let released: Option<i64> = rows.first().unwrap().get_named("released_ts").ok();
+        assert!(
+            released.is_some(),
+            "released_ts must be set after overlap release"
+        );
     }
 
     #[test]
@@ -30257,6 +30378,66 @@ COMMIT;\n";
         assert!(
             output.contains("conflict") && output.contains("BlueLake"),
             "expected conflict with BlueLake, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_conflicts_detects_glob_overlap() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Conflicts {
+                project: "test-proj".to_string(),
+                paths: vec!["src/**/*.rs".to_string()],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "glob conflicts check failed: {result:?}");
+        assert!(
+            output.contains("src/**/*.rs") && output.contains("src/api/*.rs"),
+            "expected glob overlap conflict, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_conflicts_ignores_deeper_exact_for_single_level_glob() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "UPDATE file_reservations SET path_pattern = ? WHERE id = 1",
+            &[sqlmodel_core::Value::Text(
+                "src/auth/sub/file.rs".to_string(),
+            )],
+        )
+        .unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Conflicts {
+                project: "test-proj".to_string(),
+                paths: vec!["src/auth/*".to_string()],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "single-level glob no-conflict check failed: {result:?}"
+        );
+        assert!(
+            output.contains("No conflicts"),
+            "expected no conflict for deeper exact path, got: {output}"
         );
     }
 

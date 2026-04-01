@@ -3657,12 +3657,11 @@ pub(crate) fn reservation_compute_pattern_activity(
                     fs_latest = latest;
                 }
                 // Fallback to directory mtime if scan found nothing or failed
-                if fs_latest.is_none() {
-                    if let Ok(meta) = std::fs::metadata(&candidate)
-                        && let Ok(modified) = meta.modified()
-                    {
-                        fs_latest = reservation_system_time_to_micros(modified);
-                    }
+                if fs_latest.is_none()
+                    && let Ok(meta) = std::fs::metadata(&candidate)
+                    && let Ok(modified) = meta.modified()
+                {
+                    fs_latest = reservation_system_time_to_micros(modified);
                 }
             } else if let Ok(meta) = std::fs::metadata(&candidate)
                 && let Ok(modified) = meta.modified()

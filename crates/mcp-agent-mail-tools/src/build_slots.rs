@@ -69,10 +69,7 @@ fn slot_dir(project_root: &Path, slot: &str) -> PathBuf {
 }
 
 fn holder_identity(agent_name: &str, branch: Option<&str>) -> String {
-    match branch {
-        Some(b) => format!("{agent_name}:::{b}"),
-        None => agent_name.to_string(),
-    }
+    branch.map_or_else(|| agent_name.to_string(), |b| format!("{agent_name}:::{b}"))
 }
 
 fn lease_path_for_holder(slot_path: &Path, agent_name: &str, branch: Option<&str>) -> PathBuf {

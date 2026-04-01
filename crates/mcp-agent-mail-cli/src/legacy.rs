@@ -1416,18 +1416,21 @@ fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResul
 
 fn resolve_legacy_database_url_path(db_path: &Path, search_root: &Path) -> PathBuf {
     let db_path_text = db_path.to_string_lossy();
-    if db_path.is_absolute() || db_path_text.starts_with("./") || db_path_text.starts_with("../") {
+    if db_path.is_absolute() {
         return db_path.to_path_buf();
     }
 
-    let joined = search_root.join(db_path);
+    let joined = normalize_input_path(&db_path_text, search_root);
     if joined.exists() {
         return joined;
     }
 
-    let absolute_candidate = Path::new("/").join(db_path);
-    if absolute_candidate.exists() {
-        return absolute_candidate;
+    let explicit_relative = db_path_text.starts_with("./") || db_path_text.starts_with("../");
+    if !explicit_relative {
+        let absolute_candidate = Path::new("/").join(db_path);
+        if absolute_candidate.exists() {
+            return absolute_candidate;
+        }
     }
 
     joined
@@ -1452,7 +1455,7 @@ fn parse_database_value(
         })?;
         resolve_legacy_database_url_path(&db_path, search_root)
     } else {
-        search_root.join(value)
+        normalize_input_path(value, search_root)
     };
     Ok(ResolvedPath {
         exists: path.exists(),
@@ -1848,6 +1851,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, absolute_db);
+    }
+
+    #[test]
+    fn parse_database_value_keeps_explicit_relative_sqlite_url_under_search_root() {
+        let search_root = tempfile::tempdir().unwrap();
+        let expected = search_root.path().join("legacy.db");
+
+        let parsed = parse_database_value(
+            "sqlite+aiosqlite:///./legacy.db",
+            search_root.path(),
+            ResolvedSource::Default,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.path, expected);
     }
 
     #[test]

@@ -8,7 +8,6 @@
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -888,19 +887,7 @@ fn open_sync_connection_with_path(database_url: &str) -> Option<(DbConn, String)
         database_url: database_url.to_string(),
         ..Default::default()
     };
-    let mut path = cfg.sqlite_path().ok()?;
-    let parsed = Path::new(&path);
-    if !parsed.is_absolute() && !path.starts_with("./") && !path.starts_with("../") {
-        let absolute_candidate = Path::new("/").join(parsed);
-        if !parsed.exists() && absolute_candidate.exists() {
-            tracing::warn!(
-                relative_path = %parsed.display(),
-                absolute_candidate = %absolute_candidate.display(),
-                "detected malformed sqlite URL path; using absolute fallback"
-            );
-            path = absolute_candidate.to_string_lossy().into_owned();
-        }
-    }
+    let path = crate::resolve_server_sync_sqlite_path(&cfg.sqlite_path().ok()?);
     match path.as_str() {
         ":memory:" => None,
         _ => crate::open_best_effort_sync_db_connection(&path)
@@ -2768,6 +2755,50 @@ mod tests {
         assert!(
             matches!(update, Some(DbPollSnapshotUpdate::Snapshot(_))),
             "healthy empty sqlite should still yield a real first snapshot"
+        );
+    }
+
+    #[test]
+    fn open_sync_connection_with_path_uses_shared_server_resolver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("poller_fallback.sqlite3");
+        let conn = DbConn::open_file(absolute_db.to_string_lossy().as_ref()).expect("open");
+        create_empty_mail_schema(&conn);
+        drop(conn);
+
+        let tempdir_name = dir
+            .path()
+            .file_name()
+            .expect("tempdir basename")
+            .to_string_lossy()
+            .into_owned();
+        let relative_path = format!("tmp/{tempdir_name}/poller_fallback.sqlite3");
+        let shadow_root = std::env::current_dir()
+            .expect("cwd")
+            .join("tmp")
+            .join(&tempdir_name);
+        struct ShadowRootCleanup(std::path::PathBuf);
+        impl Drop for ShadowRootCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = ShadowRootCleanup(shadow_root.clone());
+        std::fs::create_dir_all(&shadow_root).expect("create relative shadow root");
+        std::fs::write(
+            shadow_root.join("poller_fallback.sqlite3"),
+            b"not a sqlite database",
+        )
+        .expect("write corrupt shadow");
+
+        let db_url = format!("sqlite:///{relative_path}");
+        let (_conn, sqlite_path) =
+            open_sync_connection_with_path(&db_url).expect("open poller fallback db");
+
+        assert_eq!(
+            sqlite_path,
+            absolute_db.to_string_lossy(),
+            "poller sync opens should use the shared resolver and prefer the healthy absolute candidate"
         );
     }
 

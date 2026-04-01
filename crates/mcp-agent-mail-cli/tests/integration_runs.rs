@@ -1269,8 +1269,12 @@ fn config_set_port_creates_env_file() {
     );
     let body = std::fs::read_to_string(&env_path).expect("read .env");
     assert!(
-        body.contains("AGENT_MAIL_HTTP_PORT=9876"),
-        "expected port in .env:\n{body}"
+        body.contains("HTTP_PORT=9876"),
+        "expected canonical port in .env:\n{body}"
+    );
+    assert!(
+        !body.contains("AGENT_MAIL_HTTP_PORT="),
+        "legacy AGENT_MAIL_HTTP_PORT should not be written:\n{body}"
     );
 }
 
@@ -1294,8 +1298,8 @@ fn config_set_port_updates_existing_env_file() {
     assert!(out.status.success(), "expected success");
     let body = std::fs::read_to_string(&env_path).expect("read .env");
     assert!(
-        body.contains("AGENT_MAIL_HTTP_PORT=5555"),
-        "expected updated port in .env:\n{body}"
+        body.contains("HTTP_PORT=5555"),
+        "expected updated canonical port in .env:\n{body}"
     );
     assert!(
         body.contains("SOME_VAR=foo"),
@@ -1304,6 +1308,10 @@ fn config_set_port_updates_existing_env_file() {
     assert!(
         !body.contains("AGENT_MAIL_HTTP_PORT=1111"),
         "old port should be replaced:\n{body}"
+    );
+    assert!(
+        !body.contains("AGENT_MAIL_HTTP_PORT="),
+        "legacy AGENT_MAIL_HTTP_PORT should be removed:\n{body}"
     );
 }
 
