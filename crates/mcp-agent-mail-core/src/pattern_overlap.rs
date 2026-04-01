@@ -75,7 +75,7 @@ pub struct CompiledPattern {
 #[derive(Debug, Clone)]
 pub enum PatternSegment {
     Literal(String),
-    Glob(GlobMatcher),
+    Glob { raw: String, matcher: GlobMatcher },
     Recursive, // "**"
 }
 
@@ -89,7 +89,7 @@ impl PatternSegment {
                     l == literal
                 }
             }
-            Self::Glob(m) => m.is_match(literal),
+            Self::Glob { matcher, .. } => matcher.is_match(literal),
             Self::Recursive => true,
         }
     }
@@ -103,10 +103,103 @@ impl PatternSegment {
                     l1 == l2
                 }
             }
-            (Self::Glob(m), Self::Literal(l)) | (Self::Literal(l), Self::Glob(m)) => m.is_match(l),
-            (Self::Recursive, _) | (_, Self::Recursive) | (Self::Glob(_), Self::Glob(_)) => true,
+            (Self::Glob { matcher, .. }, Self::Literal(l))
+            | (Self::Literal(l), Self::Glob { matcher, .. }) => matcher.is_match(l),
+            (
+                Self::Glob {
+                    raw: left_raw,
+                    matcher: _,
+                },
+                Self::Glob {
+                    raw: right_raw,
+                    matcher: _,
+                },
+            ) => simple_glob_patterns_overlap(left_raw, right_raw).unwrap_or(true),
+            (Self::Recursive, _) | (_, Self::Recursive) => true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimpleGlobToken {
+    Literal(char),
+    AnyChar,
+    AnyString,
+}
+
+fn fold_ascii_case(ch: char) -> char {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        ch.to_ascii_lowercase()
+    } else {
+        ch
+    }
+}
+
+fn parse_simple_glob_tokens(segment: &str) -> Option<Vec<SimpleGlobToken>> {
+    let mut tokens = Vec::with_capacity(segment.len());
+    for ch in segment.chars() {
+        match ch {
+            '*' => {
+                if tokens.last() != Some(&SimpleGlobToken::AnyString) {
+                    tokens.push(SimpleGlobToken::AnyString);
+                }
+            }
+            '?' => tokens.push(SimpleGlobToken::AnyChar),
+            '[' | ']' | '{' | '}' => return None,
+            other => tokens.push(SimpleGlobToken::Literal(fold_ascii_case(other))),
+        }
+    }
+    Some(tokens)
+}
+
+fn simple_glob_tokens_overlap(left: &[SimpleGlobToken], right: &[SimpleGlobToken]) -> bool {
+    fn visit(
+        left: &[SimpleGlobToken],
+        right: &[SimpleGlobToken],
+        i: usize,
+        j: usize,
+        memo: &mut [Vec<Option<bool>>],
+    ) -> bool {
+        if let Some(cached) = memo[i][j] {
+            return cached;
+        }
+
+        let overlaps = match (left.get(i), right.get(j)) {
+            (None, None) => true,
+            (Some(SimpleGlobToken::AnyString), None) => visit(left, right, i + 1, j, memo),
+            (None, Some(SimpleGlobToken::AnyString)) => visit(left, right, i, j + 1, memo),
+            (None, Some(_)) | (Some(_), None) => false,
+            (Some(SimpleGlobToken::AnyString), Some(SimpleGlobToken::AnyString)) => {
+                visit(left, right, i + 1, j, memo) || visit(left, right, i, j + 1, memo)
+            }
+            (Some(SimpleGlobToken::AnyString), Some(_)) => {
+                visit(left, right, i + 1, j, memo) || visit(left, right, i, j + 1, memo)
+            }
+            (Some(_), Some(SimpleGlobToken::AnyString)) => {
+                visit(left, right, i, j + 1, memo) || visit(left, right, i + 1, j, memo)
+            }
+            (Some(SimpleGlobToken::AnyChar), Some(SimpleGlobToken::AnyChar))
+            | (Some(SimpleGlobToken::AnyChar), Some(SimpleGlobToken::Literal(_)))
+            | (Some(SimpleGlobToken::Literal(_)), Some(SimpleGlobToken::AnyChar)) => {
+                visit(left, right, i + 1, j + 1, memo)
+            }
+            (Some(SimpleGlobToken::Literal(left_char)), Some(SimpleGlobToken::Literal(right_char))) => {
+                left_char == right_char && visit(left, right, i + 1, j + 1, memo)
+            }
+        };
+
+        memo[i][j] = Some(overlaps);
+        overlaps
+    }
+
+    let mut memo = vec![vec![None; right.len() + 1]; left.len() + 1];
+    visit(left, right, 0, 0, &mut memo)
+}
+
+fn simple_glob_patterns_overlap(left: &str, right: &str) -> Option<bool> {
+    let left_tokens = parse_simple_glob_tokens(left)?;
+    let right_tokens = parse_simple_glob_tokens(right)?;
+    Some(simple_glob_tokens_overlap(&left_tokens, &right_tokens))
 }
 
 /// Returns `true` if the string contains glob metacharacters (`*`, `?`, `[`, `{`).
@@ -177,7 +270,10 @@ impl CompiledPattern {
                         .map(|g| g.compile_matcher());
                     m.map_or_else(
                         || PatternSegment::Literal(s.to_string()),
-                        PatternSegment::Glob,
+                        |matcher| PatternSegment::Glob {
+                            raw: s.to_string(),
+                            matcher,
+                        },
                     )
                 } else {
                     PatternSegment::Literal(s.to_string())
@@ -310,9 +406,10 @@ impl CompiledPattern {
 
 /// Heuristic check for overlap between two glob patterns.
 ///
-/// This is conservative for segment-vs-segment glob checks, but it still respects
-/// path depth: `*` only covers a single segment, while `**` can absorb arbitrary
-/// depth mismatches.
+/// This precisely handles `*`/`?` segment globs and still respects path depth:
+/// `*` only covers a single segment, while `**` can absorb arbitrary depth
+/// mismatches. More complex segment syntax like classes/alternation remains
+/// conservative.
 fn segments_overlap(s1: &[PatternSegment], s2: &[PatternSegment]) -> bool {
     fn visit(
         s1: &[PatternSegment],
@@ -574,19 +671,18 @@ mod tests {
     }
 
     #[test]
-    fn overlaps_conservative_for_intersecting_globs() {
-        // Both globs in same directory, conservative heuristic returns true
+    fn overlaps_detects_intersecting_simple_globs() {
         let a = CompiledPattern::new("src/a*");
         let b = CompiledPattern::new("src/*b");
         assert!(a.overlaps(&b));
     }
 
     #[test]
-    fn overlaps_recursive_glob_always_overlaps() {
+    fn overlaps_recursive_globs_with_disjoint_suffixes_do_not_overlap() {
         let a = CompiledPattern::new("src/**/*.rs");
         let b = CompiledPattern::new("src/**/*.txt");
-        // ** triggers conservative overlap assumption
-        assert!(a.overlaps(&b));
+        assert!(!a.overlaps(&b));
+        assert!(!b.overlaps(&a));
     }
 
     #[test]
@@ -627,10 +723,16 @@ mod tests {
     }
 
     #[test]
-    fn segments_overlap_same_depth_matching() {
-        // Same depth, all segments compatible
+    fn segments_overlap_same_depth_disjoint_simple_globs() {
         let a = CompiledPattern::new("src/*.rs");
         let b = CompiledPattern::new("src/*.txt");
+        assert!(!segments_overlap(a.segments(), b.segments()));
+    }
+
+    #[test]
+    fn segments_overlap_same_depth_intersecting_simple_globs() {
+        let a = CompiledPattern::new("src/a*");
+        let b = CompiledPattern::new("src/*b");
         assert!(segments_overlap(a.segments(), b.segments()));
     }
 
@@ -652,33 +754,57 @@ mod tests {
     }
 
     #[test]
-    fn segment_pair_both_globs_conservative() {
-        let s1 = PatternSegment::Glob(
-            GlobBuilder::new("*.rs")
+    fn segment_pair_both_globs_detects_disjoint_simple_patterns() {
+        let s1 = PatternSegment::Glob {
+            raw: "*.rs".to_string(),
+            matcher: GlobBuilder::new("*.rs")
                 .literal_separator(true)
                 .build()
                 .unwrap()
                 .compile_matcher(),
-        );
-        let s2 = PatternSegment::Glob(
-            GlobBuilder::new("*.txt")
+        };
+        let s2 = PatternSegment::Glob {
+            raw: "*.txt".to_string(),
+            matcher: GlobBuilder::new("*.txt")
                 .literal_separator(true)
                 .build()
                 .unwrap()
                 .compile_matcher(),
-        );
+        };
+        assert!(!s1.overlaps(&s2));
+    }
+
+    #[test]
+    fn segment_pair_both_globs_detects_intersection_when_witness_exists() {
+        let s1 = PatternSegment::Glob {
+            raw: "a*".to_string(),
+            matcher: GlobBuilder::new("a*")
+                .literal_separator(true)
+                .build()
+                .unwrap()
+                .compile_matcher(),
+        };
+        let s2 = PatternSegment::Glob {
+            raw: "*b".to_string(),
+            matcher: GlobBuilder::new("*b")
+                .literal_separator(true)
+                .build()
+                .unwrap()
+                .compile_matcher(),
+        };
         assert!(s1.overlaps(&s2));
     }
 
     #[test]
     fn segment_pair_glob_matches_literal() {
-        let s1 = PatternSegment::Glob(
-            GlobBuilder::new("*.rs")
+        let s1 = PatternSegment::Glob {
+            raw: "*.rs".to_string(),
+            matcher: GlobBuilder::new("*.rs")
                 .literal_separator(true)
                 .build()
                 .unwrap()
                 .compile_matcher(),
-        );
+        };
         let s2 = PatternSegment::Literal("main.rs".to_string());
         assert!(s1.overlaps(&s2));
         assert!(s2.overlaps(&s1));
@@ -686,13 +812,14 @@ mod tests {
 
     #[test]
     fn segment_pair_glob_no_match_literal() {
-        let s1 = PatternSegment::Glob(
-            GlobBuilder::new("*.rs")
+        let s1 = PatternSegment::Glob {
+            raw: "*.rs".to_string(),
+            matcher: GlobBuilder::new("*.rs")
                 .literal_separator(true)
                 .build()
                 .unwrap()
                 .compile_matcher(),
-        );
+        };
         let s2 = PatternSegment::Literal("readme.md".to_string());
         assert!(!s1.overlaps(&s2));
         assert!(!s2.overlaps(&s1));
@@ -727,6 +854,12 @@ mod tests {
     fn patterns_overlap_respects_single_level_glob_depth() {
         assert!(!patterns_overlap("src/auth/*", "src/auth/sub/file.rs"));
         assert!(patterns_overlap("src/*/foo.rs", "src/bar/*.rs"));
+    }
+
+    #[test]
+    fn patterns_overlap_rejects_disjoint_simple_sibling_globs() {
+        assert!(!patterns_overlap("src/*.rs", "src/*.txt"));
+        assert!(!patterns_overlap("src/**/*.rs", "src/**/*.txt"));
     }
 
     #[test]

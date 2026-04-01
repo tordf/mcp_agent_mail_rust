@@ -30442,6 +30442,39 @@ COMMIT;\n";
     }
 
     #[test]
+    fn integration_file_reservations_conflicts_ignores_disjoint_simple_globs() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "UPDATE file_reservations SET path_pattern = ? WHERE id = 1",
+            &[sqlmodel_core::Value::Text("src/*.rs".to_string())],
+        )
+        .unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Conflicts {
+                project: "test-proj".to_string(),
+                paths: vec!["src/*.txt".to_string()],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "simple glob no-conflict check failed: {result:?}"
+        );
+        assert!(
+            output.contains("No conflicts"),
+            "expected no conflict for disjoint sibling globs, got: {output}"
+        );
+    }
+
+    #[test]
     fn integration_file_reservations_conflicts_no_overlap() {
         let _guard = stdio_capture_lock()
             .lock()

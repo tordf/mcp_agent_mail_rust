@@ -3378,6 +3378,313 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
     )
 }
 
+#[derive(Debug)]
+struct HealthProbeAssessment {
+    probe: HealthProbe,
+    unhealthy: bool,
+    degraded: bool,
+}
+
+fn summarize_db_file_sanity_probe(database_url: &str) -> HealthProbeAssessment {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let sqlite_path = match cfg.sqlite_path() {
+        Ok(path) => path,
+        Err(error) => {
+            return HealthProbeAssessment {
+                probe: HealthProbe {
+                    name: "db_file_sanity".into(),
+                    status: "fail".into(),
+                    latency_ms: 0.0,
+                    detail: format!("Cannot resolve sqlite path for health probe: {error}"),
+                },
+                unhealthy: true,
+                degraded: false,
+            };
+        }
+    };
+
+    if sqlite_path == ":memory:" {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "db_file_sanity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: "Skipped live sqlite file sanity probe for in-memory database".into(),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+
+    match crate::sqlite_doctor_file_sanity(&sqlite_path) {
+        Ok((healthy, detail, used_absolute_fallback, _fallback_due_to_missing_configured_path)) => {
+            let (status, unhealthy, degraded) = if healthy {
+                if used_absolute_fallback {
+                    ("warn", false, true)
+                } else {
+                    ("ok", false, false)
+                }
+            } else {
+                ("fail", true, false)
+            };
+            HealthProbeAssessment {
+                probe: HealthProbe {
+                    name: "db_file_sanity".into(),
+                    status: status.into(),
+                    latency_ms: 0.0,
+                    detail,
+                },
+                unhealthy,
+                degraded,
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let status = if crate::is_resource_busy_cli_error(&error) {
+                "warn"
+            } else {
+                "fail"
+            };
+            HealthProbeAssessment {
+                probe: HealthProbe {
+                    name: "db_file_sanity".into(),
+                    status: status.into(),
+                    latency_ms: 0.0,
+                    detail: format!("Live sqlite health probe failed: {message}"),
+                },
+                unhealthy: status == "fail",
+                degraded: status == "warn",
+            }
+        }
+    }
+}
+
+fn summarize_db_schema_probe(conn: Option<&DbConn>) -> HealthProbeAssessment {
+    let Some(conn) = conn else {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "db_schema".into(),
+                status: "fail".into(),
+                latency_ms: 0.0,
+                detail: "Skipped because db_connectivity failed".into(),
+            },
+            unhealthy: true,
+            degraded: false,
+        };
+    };
+
+    match crate::doctor_required_tables(conn) {
+        Ok(missing_tables) if missing_tables.is_empty() => HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "db_schema".into(),
+                status: "ok".into(),
+                latency_ms: 0.0,
+                detail: "Core SQLite schema tables are present".into(),
+            },
+            unhealthy: false,
+            degraded: false,
+        },
+        Ok(missing_tables) => HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "db_schema".into(),
+                status: "fail".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "Core SQLite schema tables missing: {}",
+                    missing_tables.join(", ")
+                ),
+            },
+            unhealthy: true,
+            degraded: false,
+        },
+        Err(error) => HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "db_schema".into(),
+                status: "fail".into(),
+                latency_ms: 0.0,
+                detail: format!("SQLite schema probe failed: {error}"),
+            },
+            unhealthy: true,
+            degraded: false,
+        },
+    }
+}
+
+fn summarize_archive_db_parity_probe(
+    conn: Option<&DbConn>,
+    storage_root: &Path,
+) -> HealthProbeAssessment {
+    let projects_root = storage_root.join("projects");
+    if !storage_root.exists() {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "Skipped: storage root missing at {}",
+                    storage_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+    if !crate::path_is_real_directory(&projects_root) {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "Skipped: no canonical archive projects directory found under {}",
+                    projects_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+
+    let report = crate::audit_doctor_archive(storage_root);
+    let archive = &report.inventory;
+    if archive.projects == 0 && archive.agents == 0 && archive.messages == 0 {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "No canonical archive content found under {}",
+                    projects_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+
+    let Some(conn) = conn else {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "fail".into(),
+                latency_ms: 0.0,
+                detail: "Skipped because db_connectivity failed".into(),
+            },
+            unhealthy: true,
+            degraded: false,
+        };
+    };
+
+    match crate::doctor_required_tables(conn) {
+        Ok(missing_tables) if !missing_tables.is_empty() => {
+            return HealthProbeAssessment {
+                probe: HealthProbe {
+                    name: "archive_db_parity".into(),
+                    status: "fail".into(),
+                    latency_ms: 0.0,
+                    detail: format!(
+                        "Skipped because db_schema failed (missing core tables: {})",
+                        missing_tables.join(", ")
+                    ),
+                },
+                unhealthy: true,
+                degraded: false,
+            };
+        }
+        Err(error) => {
+            return HealthProbeAssessment {
+                probe: HealthProbe {
+                    name: "archive_db_parity".into(),
+                    status: "fail".into(),
+                    latency_ms: 0.0,
+                    detail: format!("SQLite schema probe failed during parity check: {error}"),
+                },
+                unhealthy: true,
+                degraded: false,
+            };
+        }
+        Ok(_) => {}
+    }
+
+    match crate::collect_doctor_db_inventory(conn) {
+        Ok(db) => {
+            if let Some(detail) = crate::doctor_archive_db_drift_detail(archive, &db) {
+                return HealthProbeAssessment {
+                    probe: HealthProbe {
+                        name: "archive_db_parity".into(),
+                        status: "fail".into(),
+                        latency_ms: 0.0,
+                        detail: format!(
+                            "{detail}; archive(projects={}, agents={}, messages={}), db(projects={}, agents={}, messages={}){}",
+                            archive.projects,
+                            archive.agents,
+                            archive.messages,
+                            db.counts.projects,
+                            db.counts.agents,
+                            db.counts.messages,
+                            crate::doctor_archive_inventory_suffix(archive)
+                        ),
+                    },
+                    unhealthy: true,
+                    degraded: false,
+                };
+            }
+
+            let aligned_detail = format!(
+                "Archive and SQLite inventory are aligned enough for recovery checks: archive(projects={}, agents={}, messages={}), db(projects={}, agents={}, messages={}){}",
+                archive.projects,
+                archive.agents,
+                archive.messages,
+                db.counts.projects,
+                db.counts.agents,
+                db.counts.messages,
+                crate::doctor_archive_inventory_suffix(archive)
+            );
+            if report.finding_count() > 0 || archive.unparseable_canonical_message_files > 0 {
+                HealthProbeAssessment {
+                    probe: HealthProbe {
+                        name: "archive_db_parity".into(),
+                        status: "warn".into(),
+                        latency_ms: 0.0,
+                        detail: format!(
+                            "{aligned_detail}; archive audit findings={}",
+                            report.finding_count()
+                        ),
+                    },
+                    unhealthy: false,
+                    degraded: true,
+                }
+            } else {
+                HealthProbeAssessment {
+                    probe: HealthProbe {
+                        name: "archive_db_parity".into(),
+                        status: "ok".into(),
+                        latency_ms: 0.0,
+                        detail: aligned_detail,
+                    },
+                    unhealthy: false,
+                    degraded: false,
+                }
+            }
+        }
+        Err(error) => HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "fail".into(),
+                latency_ms: 0.0,
+                detail: format!("Archive/DB inventory probe failed: {error}"),
+            },
+            unhealthy: true,
+            degraded: false,
+        },
+    }
+}
+
 // ── Reservations command implementation ─────────────────────────────────────
 
 /// Conflict between two reservations.
@@ -6411,27 +6718,67 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Health => {
             let mut probes: Vec<HealthProbe> = Vec::new();
+            let config = mcp_agent_mail_core::Config::from_env();
+            let mut db_conn: Option<DbConn> = None;
 
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
-            let db_ok = match crate::open_db_sync() {
-                Ok(conn) => {
+            let db_ok = match crate::open_db_sync_read_only_with_database_url_and_path(
+                &config.database_url,
+            ) {
+                Ok((conn, opened_path)) => {
                     // Verify canonical DB reachability with a lightweight query.
-                    conn.query_sync("SELECT 1", &[]).is_ok()
+                    let query_ok = conn.query_sync("SELECT 1", &[]).is_ok();
+                    if query_ok {
+                        db_conn = Some(conn);
+                    }
+                    let detail = if query_ok {
+                        format!("SQLite read-only connection healthy at {opened_path}")
+                    } else {
+                        format!("SQLite read-only query failed at {opened_path}")
+                    };
+                    probes.push(HealthProbe {
+                        name: "db_connectivity".into(),
+                        status: if query_ok { "ok" } else { "fail" }.into(),
+                        latency_ms: 0.0,
+                        detail,
+                    });
+                    query_ok
                 }
-                Err(_) => false,
+                Err(error) => {
+                    probes.push(HealthProbe {
+                        name: "db_connectivity".into(),
+                        status: "fail".into(),
+                        latency_ms: 0.0,
+                        detail: format!("Cannot open database read-only: {error}"),
+                    });
+                    false
+                }
             };
             let db_ms = db_start.elapsed().as_secs_f64() * 1000.0;
-            probes.push(HealthProbe {
-                name: "db_connectivity".into(),
-                status: if db_ok { "ok" } else { "fail" }.into(),
-                latency_ms: (db_ms * 100.0).round() / 100.0,
-                detail: if db_ok {
-                    "SQLite connection healthy".into()
-                } else {
-                    "Cannot connect to database".into()
-                },
-            });
+            if let Some(probe) = probes.last_mut()
+                && probe.name == "db_connectivity"
+            {
+                probe.latency_ms = (db_ms * 100.0).round() / 100.0;
+            }
+
+            // 1b. Live sqlite file sanity probe (non-mutating).
+            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
+            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
+            let db_file_sanity_degraded = db_file_sanity.degraded;
+            probes.push(db_file_sanity.probe);
+
+            // 1c. Core schema presence probe.
+            let db_schema = summarize_db_schema_probe(db_conn.as_ref());
+            let db_schema_unhealthy = db_schema.unhealthy;
+            probes.push(db_schema.probe);
+
+            // 1d. Canonical archive inventory vs SQLite inventory.
+            let archive_db_parity =
+                summarize_archive_db_parity_probe(db_conn.as_ref(), &config.storage_root);
+            let archive_db_parity_unhealthy = archive_db_parity.unhealthy;
+            let archive_db_parity_degraded = archive_db_parity.degraded;
+            probes.push(archive_db_parity.probe);
 
             // 2. Circuit breaker status
             let db_health = mcp_agent_mail_db::db_health_status();
@@ -6487,7 +6834,6 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             probes.push(integrity_probe);
 
             // 5. Disk space probe
-            let config = mcp_agent_mail_core::Config::from_env();
             let disk = mcp_agent_mail_core::disk::sample_disk(&config);
             let disk_probe_failed = !disk.errors.is_empty();
             let disk_status = if disk_probe_failed {
@@ -6511,9 +6857,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             });
 
             // Overall health
-            let overall = if !db_ok || backpressure_unhealthy {
+            let overall = if !db_ok
+                || db_file_sanity_unhealthy
+                || db_schema_unhealthy
+                || archive_db_parity_unhealthy
+                || backpressure_unhealthy
+            {
                 "unhealthy"
-            } else if !integrity_ok
+            } else if db_file_sanity_degraded
+                || archive_db_parity_degraded
+                || !integrity_ok
                 || !circuits_ok
                 || backpressure_degraded
                 || disk_probe_failed
@@ -6555,6 +6908,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             if !db_ok {
                 env = env.with_alert("error", "Database connectivity probe failed", None);
             }
+            if db_file_sanity_unhealthy {
+                env = env.with_alert("error", "Live sqlite file sanity probe failed", None);
+            } else if db_file_sanity_degraded {
+                env = env.with_alert(
+                    "warn",
+                    "Live sqlite file sanity probe required fallback or hit a busy mailbox",
+                    None,
+                );
+            }
+            if db_schema_unhealthy {
+                env = env.with_alert("error", "Core SQLite schema tables are missing", None);
+            }
+            if archive_db_parity_unhealthy {
+                env = env.with_alert(
+                    "error",
+                    "Canonical archive data is not fully represented in SQLite",
+                    None,
+                );
+            } else if archive_db_parity_degraded {
+                env = env.with_alert(
+                    "warn",
+                    "Archive parity could not be fully proven from the current mailbox state",
+                    None,
+                );
+            }
             if !circuits_ok && let Some(rec) = &db_health.recommendation {
                 env = env.with_alert("error", rec, None);
             }
@@ -6590,6 +6968,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // Actions
             if !db_ok {
                 env = env.with_action("Check DATABASE_URL env var and SQLite file accessibility");
+            }
+            if db_schema_unhealthy || archive_db_parity_unhealthy {
+                env = env.with_action(
+                    "Run `am doctor check` and reconstruct from the Git archive before trusting mailbox reads",
+                );
             }
             if config.integrity_check_interval_hours > 0
                 && mcp_agent_mail_db::is_full_check_due(config.integrity_check_interval_hours)
@@ -6947,6 +7330,7 @@ mod tests {
     use std::sync::Mutex;
 
     static NAVIGATE_RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static ROBOT_COMMAND_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_navigate_resource_env<F, T>(database_url: &str, storage_root: &str, f: F) -> T
     where
@@ -6962,6 +7346,27 @@ mod tests {
             ],
             f,
         )
+    }
+
+    fn run_robot_json_capture(args: RobotArgs, database_url: &str, storage_root: &str) -> Value {
+        let _lock = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url),
+                ("STORAGE_ROOT", storage_root),
+            ],
+            || handle_robot(args),
+        );
+        let output = capture.drain_to_string();
+        result.expect("robot command should succeed");
+        let payload = output
+            .lines()
+            .find(|line| line.trim_start().starts_with('{'))
+            .expect("json payload line");
+        serde_json::from_str(payload).expect("parse robot json output")
     }
 
     #[derive(Debug, Serialize)]
@@ -11152,6 +11557,108 @@ mod tests {
         release_tx.send(()).expect("release lock thread");
         lock_thread.join().expect("join lock thread");
         assert!(robot_result.is_ok(), "{robot_result:?}");
+    }
+
+    #[test]
+    fn robot_health_is_non_mutating_for_uninitialized_sqlite() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_uninitialized.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let value = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health,
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        assert_eq!(value["overall"], "unhealthy");
+        let schema_probe = value["probes"]
+            .as_array()
+            .expect("probes array")
+            .iter()
+            .find(|probe| probe["name"] == "db_schema")
+            .expect("db_schema probe");
+        assert_eq!(schema_probe["status"], "fail");
+
+        let verify_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
+        let rows = verify_conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                &[],
+            )
+            .expect("inspect schema");
+        assert!(
+            rows.is_empty(),
+            "robot health should not initialize schema tables in an uninitialized sqlite file"
+        );
+    }
+
+    #[test]
+    fn robot_health_reports_archive_db_drift_as_unhealthy() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_parity.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        crate::handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let storage_root = temp_dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        let agent_dir = project_dir.join("agents").join("BlueLake");
+        let canonical_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/data/projects/demo-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+        std::fs::write(
+            canonical_dir.join("2026-04-01T13-00-00Z__hello__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Hello\"}\n---\nbody\n",
+        )
+        .expect("write canonical message");
+
+        let value = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health,
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        assert_eq!(value["overall"], "unhealthy");
+        let parity_probe = value["probes"]
+            .as_array()
+            .expect("probes array")
+            .iter()
+            .find(|probe| probe["name"] == "archive_db_parity")
+            .expect("archive_db_parity probe");
+        assert_eq!(parity_probe["status"], "fail");
+        assert!(
+            parity_probe["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Archive canonical data is not fully represented in the SQLite DB"),
+            "expected archive parity failure detail: {parity_probe:?}"
+        );
     }
 
     #[test]
