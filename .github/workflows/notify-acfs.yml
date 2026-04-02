@@ -1,0 +1,46 @@
+# .github/workflows/notify-acfs.yml
+#
+# Notifies ACFS when installer scripts change, triggering checksum updates.
+# This eliminates the 15-minute polling window — ACFS updates within seconds.
+#
+name: Notify ACFS of Installer Changes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'install.sh'
+  release:
+    types: [published]
+  workflow_dispatch:  # Manual trigger for testing
+
+env:
+  # Must match the installer key in ACFS checksums.yaml
+  TOOL_NAME: "mcp_agent_mail"
+
+jobs:
+  notify-acfs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger ACFS checksum update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
+          repository: Dicklesworthstone/agentic_coding_flywheel_setup
+          event-type: upstream-changed
+          client-payload: |
+            {
+              "tool": "${{ env.TOOL_NAME }}",
+              "source_repo": "${{ github.repository }}",
+              "ref": "${{ github.ref }}",
+              "sha": "${{ github.sha }}",
+              "actor": "${{ github.actor }}",
+              "timestamp": "${{ github.event.head_commit.timestamp || github.event.release.published_at }}"
+            }
+
+      - name: Log dispatch
+        run: |
+          echo "Dispatched upstream-changed event to ACFS"
+          echo "  Tool: ${{ env.TOOL_NAME }}"
+          echo "  SHA: ${{ github.sha }}"
+          echo "  Triggered by: ${{ github.actor }}"
