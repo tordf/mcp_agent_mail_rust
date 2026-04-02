@@ -226,7 +226,8 @@ impl AdaptationEngine {
             // an extreme weight swing from a single observation.
             let p = self.trackers[idx].selection_probability.max(1e-10);
             let loss_hat = (loss / p).min(10.0); // cap at 10× to prevent variance blowup
-            self.trackers[idx].log_weight -= self.eta * loss_hat;
+            self.trackers[idx].log_weight =
+                self.eta.mul_add(-loss_hat, self.trackers[idx].log_weight);
         }
 
         // Note: In standard EXP3, non-selected arms receive 0 estimated loss.

@@ -2552,10 +2552,8 @@ fn extract_inline_comment(line: &str) -> Option<&str> {
             b'\\' => escaped = true,
             b'\'' if !in_double_quote => in_single_quote = true,
             b'"' => in_double_quote = !in_double_quote,
-            b'#' if !in_double_quote => {
-                if i == 0 || bytes[i - 1].is_ascii_whitespace() {
-                    return Some(&line[i..]);
-                }
+            b'#' if !in_double_quote && (i == 0 || bytes[i - 1].is_ascii_whitespace()) => {
+                return Some(&line[i..]);
             }
             _ => {}
         }

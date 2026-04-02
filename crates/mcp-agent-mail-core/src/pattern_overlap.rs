@@ -127,7 +127,7 @@ enum SimpleGlobToken {
     AnyString,
 }
 
-fn fold_ascii_case(ch: char) -> char {
+const fn fold_ascii_case(ch: char) -> char {
     if cfg!(any(target_os = "macos", target_os = "windows")) {
         ch.to_ascii_lowercase()
     } else {
@@ -169,23 +169,23 @@ fn simple_glob_tokens_overlap(left: &[SimpleGlobToken], right: &[SimpleGlobToken
             (Some(SimpleGlobToken::AnyString), None) => visit(left, right, i + 1, j, memo),
             (None, Some(SimpleGlobToken::AnyString)) => visit(left, right, i, j + 1, memo),
             (None, Some(_)) | (Some(_), None) => false,
-            (Some(SimpleGlobToken::AnyString), Some(SimpleGlobToken::AnyString)) => {
-                visit(left, right, i + 1, j, memo) || visit(left, right, i, j + 1, memo)
-            }
             (Some(SimpleGlobToken::AnyString), Some(_)) => {
                 visit(left, right, i + 1, j, memo) || visit(left, right, i, j + 1, memo)
             }
             (Some(_), Some(SimpleGlobToken::AnyString)) => {
                 visit(left, right, i, j + 1, memo) || visit(left, right, i + 1, j, memo)
             }
-            (Some(SimpleGlobToken::AnyChar), Some(SimpleGlobToken::AnyChar))
-            | (Some(SimpleGlobToken::AnyChar), Some(SimpleGlobToken::Literal(_)))
-            | (Some(SimpleGlobToken::Literal(_)), Some(SimpleGlobToken::AnyChar)) => {
+            (
+                Some(SimpleGlobToken::AnyChar | SimpleGlobToken::Literal(_)),
+                Some(SimpleGlobToken::AnyChar),
+            )
+            | (Some(SimpleGlobToken::AnyChar), Some(SimpleGlobToken::Literal(_))) => {
                 visit(left, right, i + 1, j + 1, memo)
             }
-            (Some(SimpleGlobToken::Literal(left_char)), Some(SimpleGlobToken::Literal(right_char))) => {
-                left_char == right_char && visit(left, right, i + 1, j + 1, memo)
-            }
+            (
+                Some(SimpleGlobToken::Literal(left_char)),
+                Some(SimpleGlobToken::Literal(right_char)),
+            ) => left_char == right_char && visit(left, right, i + 1, j + 1, memo),
         };
 
         memo[i][j] = Some(overlaps);

@@ -686,7 +686,7 @@ impl ConfidenceSequence {
         let delta = advantage - self.running_mean;
         self.running_mean += delta / self.n_observations as f64;
         let delta2 = advantage - self.running_mean;
-        self.running_m2 += delta * delta2;
+        self.running_m2 = delta.mul_add(delta2, self.running_m2);
 
         // Adaptively set lambda for the NEXT observation.
         if self.n_observations >= 10 {
