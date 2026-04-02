@@ -26,7 +26,6 @@ use std::time::Instant;
 
 use asupersync::Outcome;
 use mcp_agent_mail_core::config::SearchEngine;
-use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::search_planner::{
     DocKind, Importance, RankingMode, RecoverySuggestion, SearchQuery, ZeroResultGuidance,
 };
@@ -574,6 +573,12 @@ struct SearchDegradedDiagnostics {
     budget_tier: Option<String>,
     budget_exhausted: Option<bool>,
     remediation_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchExecutionSignature {
+    raw_query: String,
+    facet_signature: String,
 }
 
 type DetailCacheKey = (i64, &'static str, &'static str, u64);
@@ -1202,6 +1207,8 @@ pub struct SearchCockpitScreen {
 
     // Search state
     db_conn: Option<DbConn>,
+    _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
+    metadata_db_conn: Option<DbConn>,
     db_conn_attempted: bool,
     db_context_unavailable: bool,
     last_query: String,
@@ -1219,6 +1226,8 @@ pub struct SearchCockpitScreen {
     facet_rebuild_count: u64,
     /// Last facet signature observed at execution time.
     last_facet_signature: String,
+    /// Last search signature that successfully populated the result surface.
+    last_loaded_search_signature: Option<SearchExecutionSignature>,
     /// Detail-cache generation; increments only when detail context changes.
     detail_cache_generation: u64,
     /// Last signature used to derive `detail_cache_generation`.
@@ -1315,6 +1324,8 @@ impl SearchCockpitScreen {
             query_help_visible: false,
             query_lab_visible: false,
             db_conn: None,
+            _db_snapshot_dir: None,
+            metadata_db_conn: None,
             db_conn_attempted: false,
             db_context_unavailable: false,
             last_query: String::new(),
@@ -1326,6 +1337,7 @@ impl SearchCockpitScreen {
             search_exec_count: 0,
             facet_rebuild_count: 0,
             last_facet_signature: String::new(),
+            last_loaded_search_signature: None,
             detail_cache_generation: 0,
             last_detail_cache_signature: String::new(),
             preview_markdown_render_count: Cell::new(0),
@@ -1824,23 +1836,41 @@ impl SearchCockpitScreen {
         });
     }
 
-    /// Ensure we have a DB connection.
+    fn ensure_metadata_db_conn(&mut self, state: &TuiSharedState) {
+        if self.metadata_db_conn.is_some() {
+            return;
+        }
+
+        let cfg = state.config_snapshot();
+        self.metadata_db_conn = crate::open_live_metadata_sync_db_connection(&cfg.raw_database_url);
+    }
+
+    /// Ensure we have DB connections.
     fn ensure_db_conn(&mut self, state: &TuiSharedState) {
         if self.db_conn.is_some() || self.db_conn_attempted {
+            self.ensure_metadata_db_conn(state);
+            self.ensure_recipes_loaded();
             return;
         }
         self.db_conn_attempted = true;
-        let db_url = &state.config_snapshot().raw_database_url;
-        let cfg = DbPoolConfig {
-            database_url: db_url.clone(),
-            ..Default::default()
-        };
-        if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
-            if self.db_conn.is_some() {
-                self.ensure_recipes_loaded();
+        let cfg = state.config_snapshot();
+        match crate::open_observability_sync_db_connection(
+            &cfg.raw_database_url,
+            std::path::Path::new(&cfg.storage_root),
+            "search screen",
+        ) {
+            Ok(Some(db)) => {
+                let (conn, _, snapshot_dir) = db.into_parts();
+                self.db_conn = Some(conn);
+                self._db_snapshot_dir = snapshot_dir;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "search screen db bind failed");
             }
         }
+        self.ensure_metadata_db_conn(state);
+        self.ensure_recipes_loaded();
         self.db_context_unavailable = self.db_conn.is_none();
     }
 
@@ -1886,8 +1916,10 @@ impl SearchCockpitScreen {
     fn execute_search(&mut self, state: &TuiSharedState) {
         let started = Instant::now();
         let raw = self.query_input.value().trim().to_string();
+        let previous_diagnostics = self.last_diagnostics.clone();
         self.search_exec_count = self.search_exec_count.saturating_add(1);
         let facet_signature = self.facet_signature();
+        let search_signature = self.current_search_signature();
         if !self.last_facet_signature.is_empty() && facet_signature != self.last_facet_signature {
             self.facet_rebuild_count = self.facet_rebuild_count.saturating_add(1);
         }
@@ -1898,15 +1930,9 @@ impl SearchCockpitScreen {
         if self.last_error.is_some() {
             self.query_assistance = None;
             self.highlight_terms.clear();
-            self.results.clear();
-            self.result_rows.clear();
-            self.total_sql_rows = 0;
-            self.guidance = None;
-            self.cursor = 0;
-            self.detail_scroll.set(0);
+            self.clear_search_results_state();
             self.search_dirty = false;
             self.last_search_ms = None;
-            self.refresh_detail_cache_generation();
             return;
         }
 
@@ -1924,41 +1950,78 @@ impl SearchCockpitScreen {
         self.highlight_terms = extract_query_terms(&raw);
 
         self.ensure_db_conn(state);
+        let cfg = state.config_snapshot();
         let Some(conn) = self.db_conn.take() else {
-            self.results.clear();
-            self.result_rows.clear();
-            self.cursor = 0;
-            self.total_sql_rows = 0;
+            let preserved_stale = self.can_preserve_previous_results_on_failure(&search_signature);
+            if preserved_stale {
+                self.last_diagnostics = previous_diagnostics;
+            } else {
+                self.last_diagnostics = None;
+                self.clear_search_results_state();
+                self.last_search_ms = None;
+            }
             self.search_dirty = false;
             self.db_context_unavailable = true;
             self.db_conn_attempted = false; // allow retry on next tick
-            self.refresh_detail_cache_generation();
-            self.emit_db_unavailable_diagnostic(state, "database connection unavailable");
+            self.emit_db_unavailable_diagnostic(
+                state,
+                "database connection unavailable",
+                preserved_stale,
+            );
             return;
         };
         self.db_context_unavailable = false;
 
-        if self.doc_kind_filter == DocKindFilter::All {
-            // Run all three kinds and merge
+        let search_result = if self.doc_kind_filter == DocKindFilter::All {
             let mut all_results = Vec::new();
-            for kind in &[DocKind::Message, DocKind::Agent, DocKind::Project] {
-                let results = self.run_kind_search(&conn, *kind, &raw);
-                all_results.extend(results);
+            let mut search_error = None;
+            for kind in [DocKind::Message, DocKind::Agent, DocKind::Project] {
+                match self.run_kind_search(&conn, kind, &raw, &cfg) {
+                    Ok(results) => all_results.extend(results),
+                    Err(error) => {
+                        search_error = Some(error);
+                        break;
+                    }
+                }
             }
-            sort_results(&mut all_results, self.sort_direction);
-            all_results.truncate(MAX_RESULTS);
-            self.total_sql_rows = all_results.len();
-            self.results = all_results;
+            if let Some(error) = search_error {
+                Err(error)
+            } else {
+                sort_results(&mut all_results, self.sort_direction);
+                all_results.truncate(MAX_RESULTS);
+                Ok(all_results)
+            }
         } else {
             let kind = self.doc_kind_filter.doc_kind().unwrap_or(DocKind::Message);
-            let results = self.run_kind_search(&conn, kind, &raw);
-            let mut results = results;
-            sort_results(&mut results, self.sort_direction);
-            self.total_sql_rows = results.len();
-            self.results = results;
-        }
-
+            self.run_kind_search(&conn, kind, &raw, &cfg)
+                .map(|mut results| {
+                    sort_results(&mut results, self.sort_direction);
+                    results
+                })
+        };
         self.db_conn = Some(conn);
+
+        let results = match search_result {
+            Ok(results) => results,
+            Err(error) => {
+                self.last_error = Some(error);
+                let preserved_stale =
+                    self.can_preserve_previous_results_on_failure(&search_signature);
+                if preserved_stale {
+                    self.last_diagnostics = previous_diagnostics;
+                } else {
+                    self.last_diagnostics = None;
+                    self.clear_search_results_state();
+                    self.last_search_ms = None;
+                }
+                self.search_dirty = false;
+                return;
+            }
+        };
+
+        self.total_sql_rows = results.len();
+        self.results = results;
+        self.last_loaded_search_signature = Some(search_signature);
         self.refresh_detail_cache_generation();
 
         // Generate zero-result guidance from TUI facet state
@@ -1983,7 +2046,6 @@ impl SearchCockpitScreen {
         let raw_count = u64::try_from(self.total_sql_rows).unwrap_or(u64::MAX);
         let rendered_count = u64::try_from(self.results.len()).unwrap_or(u64::MAX);
         let dropped_count = raw_count.saturating_sub(rendered_count);
-        let cfg = state.config_snapshot();
         let transport_mode = cfg.transport_mode().to_string();
         state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
             screen: "search".to_string(),
@@ -2011,17 +2073,34 @@ impl SearchCockpitScreen {
     }
 
     #[allow(clippy::unused_self)] // consistent signature across screens
-    fn emit_db_unavailable_diagnostic(&self, state: &TuiSharedState, reason: &str) {
+    fn emit_db_unavailable_diagnostic(
+        &self,
+        state: &TuiSharedState,
+        reason: &str,
+        preserved_stale: bool,
+    ) {
         let reason = sanitize_diagnostic_value(reason);
         let cfg = state.config_snapshot();
         let transport_mode = cfg.transport_mode().to_string();
+        let raw_count = if preserved_stale {
+            u64::try_from(self.total_sql_rows).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        let rendered_count = if preserved_stale {
+            u64::try_from(self.results.len()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
         state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
             screen: "search".to_string(),
             scope: "search_cockpit.db_unavailable".to_string(),
-            query_params: format!("filter=db_context_unavailable;reason={reason}"),
-            raw_count: 0,
-            rendered_count: 0,
-            dropped_count: 0,
+            query_params: format!(
+                "filter=db_context_unavailable;reason={reason};preserved_stale={preserved_stale}"
+            ),
+            raw_count,
+            rendered_count,
+            dropped_count: raw_count.saturating_sub(rendered_count),
             timestamp_micros: chrono::Utc::now().timestamp_micros(),
             db_url: cfg.database_url,
             storage_root: cfg.storage_root,
@@ -2090,16 +2169,27 @@ impl SearchCockpitScreen {
     }
 
     /// Run a search for a single doc kind.
-    fn run_kind_search(&mut self, conn: &DbConn, kind: DocKind, raw: &str) -> Vec<ResultEntry> {
+    fn run_kind_search(
+        &mut self,
+        conn: &DbConn,
+        kind: DocKind,
+        raw: &str,
+        cfg: &crate::tui_bridge::ConfigSnapshot,
+    ) -> Result<Vec<ResultEntry>, String> {
         match kind {
-            DocKind::Message | DocKind::Thread => self.search_messages(conn, raw),
-            DocKind::Agent => Self::search_agents(conn, raw),
-            DocKind::Project => Self::search_projects(conn, raw),
+            DocKind::Message | DocKind::Thread => self.search_messages(conn, raw, cfg),
+            DocKind::Agent => Self::search_agents(conn, raw, cfg),
+            DocKind::Project => Self::search_projects(conn, raw, cfg),
         }
     }
 
     /// Search messages via the unified search service for non-empty queries.
-    fn search_messages(&mut self, conn: &DbConn, raw: &str) -> Vec<ResultEntry> {
+    fn search_messages(
+        &mut self,
+        conn: &DbConn,
+        raw: &str,
+        cfg: &crate::tui_bridge::ConfigSnapshot,
+    ) -> Result<Vec<ResultEntry>, String> {
         if raw.is_empty() {
             return self.search_messages_recent(conn);
         }
@@ -2129,21 +2219,23 @@ impl SearchCockpitScreen {
             query.thread_id = Some(tid.clone());
         }
 
-        match run_unified_search(&query, self.search_mode) {
+        match run_unified_search(
+            &query,
+            self.search_mode,
+            &cfg.raw_database_url,
+            &cfg.storage_root,
+        ) {
             Ok(resp) => {
                 self.last_diagnostics =
                     derive_tui_degraded_diagnostics(resp.explain.as_ref(), self.search_mode);
-                map_unified_results(resp.results, &self.highlight_terms)
+                Ok(map_unified_results(resp.results, &self.highlight_terms))
             }
-            Err(e) => {
-                self.last_error = Some(format!("Search failed: {e}"));
-                Vec::new()
-            }
+            Err(e) => Err(format!("Search failed: {e}")),
         }
     }
 
     /// Recent messages view (empty query).
-    fn search_messages_recent(&mut self, conn: &DbConn) -> Vec<ResultEntry> {
+    fn search_messages_recent(&mut self, conn: &DbConn) -> Result<Vec<ResultEntry>, String> {
         self.last_diagnostics = derive_tui_degraded_diagnostics(None, self.search_mode);
         let mut where_clauses: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
@@ -2183,16 +2275,17 @@ impl SearchCockpitScreen {
         params.push(Value::BigInt(i64::try_from(MAX_RESULTS).unwrap_or(50)));
 
         match query_message_rows(conn, &sql, &params, &self.highlight_terms) {
-            Ok(results) => results,
-            Err(e) => {
-                self.last_error = Some(format!("Search failed: {e}"));
-                Vec::new()
-            }
+            Ok(results) => Ok(results),
+            Err(e) => Err(format!("Search failed: {e}")),
         }
     }
 
     /// Search agents.
-    fn search_agents(conn: &DbConn, raw: &str) -> Vec<ResultEntry> {
+    fn search_agents(
+        conn: &DbConn,
+        raw: &str,
+        cfg: &crate::tui_bridge::ConfigSnapshot,
+    ) -> Result<Vec<ResultEntry>, String> {
         if raw.is_empty() {
             let sql = "SELECT id, name, task_description, project_id, 0.0 AS score \
                        FROM agents ORDER BY name LIMIT 100";
@@ -2205,14 +2298,23 @@ impl SearchCockpitScreen {
             limit: Some(MAX_RESULTS),
             ..Default::default()
         };
-        match run_unified_search(&query, SearchModeFilter::Auto) {
-            Ok(resp) => map_unified_results(resp.results, &[]),
-            Err(_) => Vec::new(),
+        match run_unified_search(
+            &query,
+            SearchModeFilter::Auto,
+            &cfg.raw_database_url,
+            &cfg.storage_root,
+        ) {
+            Ok(resp) => Ok(map_unified_results(resp.results, &[])),
+            Err(e) => Err(format!("Search failed: {e}")),
         }
     }
 
     /// Search projects.
-    fn search_projects(conn: &DbConn, raw: &str) -> Vec<ResultEntry> {
+    fn search_projects(
+        conn: &DbConn,
+        raw: &str,
+        cfg: &crate::tui_bridge::ConfigSnapshot,
+    ) -> Result<Vec<ResultEntry>, String> {
         if raw.is_empty() {
             let sql = "SELECT id, slug, human_key, 0.0 AS score \
                        FROM projects ORDER BY slug LIMIT 100";
@@ -2225,9 +2327,14 @@ impl SearchCockpitScreen {
             limit: Some(MAX_RESULTS),
             ..Default::default()
         };
-        match run_unified_search(&query, SearchModeFilter::Auto) {
-            Ok(resp) => map_unified_results(resp.results, &[]),
-            Err(_) => Vec::new(),
+        match run_unified_search(
+            &query,
+            SearchModeFilter::Auto,
+            &cfg.raw_database_url,
+            &cfg.storage_root,
+        ) {
+            Ok(resp) => Ok(map_unified_results(resp.results, &[])),
+            Err(e) => Err(format!("Search failed: {e}")),
         }
     }
 
@@ -2436,10 +2543,29 @@ impl SearchCockpitScreen {
         if self.recipes_loaded {
             return;
         }
-        self.recipes_loaded = true;
-        if let Some(ref conn) = self.db_conn {
-            self.saved_recipes = list_recipes(conn).unwrap_or_default();
-            self.query_history = list_recent_history(conn, 50).unwrap_or_default();
+        let Some(conn) = self.metadata_db_conn.as_ref() else {
+            return;
+        };
+        let recipes = list_recipes(conn);
+        let history = list_recent_history(conn, 50);
+        if let Ok(saved_recipes) = recipes.as_ref() {
+            self.saved_recipes = saved_recipes.clone();
+        }
+        if let Ok(query_history) = history.as_ref() {
+            self.query_history = query_history.clone();
+        }
+        match (recipes, history) {
+            (Ok(_), Ok(_)) => {
+                self.recipes_loaded = true;
+            }
+            (recipes_result, history_result) => {
+                if let Err(error) = recipes_result {
+                    tracing::warn!(error = %error, "search screen failed loading saved recipes");
+                }
+                if let Err(error) = history_result {
+                    tracing::warn!(error = %error, "search screen failed loading query history");
+                }
+            }
         }
     }
 
@@ -2458,7 +2584,7 @@ impl SearchCockpitScreen {
             executed_ts: now_micros(),
             ..Default::default()
         };
-        if let Some(ref conn) = self.db_conn {
+        if let Some(ref conn) = self.metadata_db_conn {
             let _ = insert_history(conn, &entry);
         }
         // Prepend to in-memory history
@@ -2485,7 +2611,7 @@ impl SearchCockpitScreen {
             thread_filter: self.thread_filter.clone(),
             ..Default::default()
         };
-        if let Some(ref conn) = self.db_conn
+        if let Some(ref conn) = self.metadata_db_conn
             && let Ok(id) = insert_recipe(conn, &recipe)
         {
             let mut saved = recipe;
@@ -2528,7 +2654,7 @@ impl SearchCockpitScreen {
         self.debounce_remaining = 0;
 
         // Touch the recipe's use count
-        if let (Some(conn), Some(id)) = (&self.db_conn, recipe.id) {
+        if let (Some(conn), Some(id)) = (&self.metadata_db_conn, recipe.id) {
             let _ = touch_recipe(conn, id);
         }
     }
@@ -2576,6 +2702,30 @@ impl SearchCockpitScreen {
             search_mode,
             explain,
         )
+    }
+
+    fn current_search_signature(&self) -> SearchExecutionSignature {
+        SearchExecutionSignature {
+            raw_query: self.query_input.value().trim().to_string(),
+            facet_signature: self.facet_signature(),
+        }
+    }
+
+    fn can_preserve_previous_results_on_failure(
+        &self,
+        signature: &SearchExecutionSignature,
+    ) -> bool {
+        !self.results.is_empty() && self.last_loaded_search_signature.as_ref() == Some(signature)
+    }
+
+    fn clear_search_results_state(&mut self) {
+        self.results.clear();
+        self.result_rows.clear();
+        self.total_sql_rows = 0;
+        self.guidance = None;
+        self.cursor = 0;
+        self.detail_scroll.set(0);
+        self.refresh_detail_cache_generation();
     }
 
     fn detail_cache_signature(&self) -> String {
@@ -3645,17 +3795,17 @@ impl MailScreen for SearchCockpitScreen {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// DB query helpers
-// ──────────────────────────────────────────────────────────────────────
-
 fn run_unified_search(
     query: &SearchQuery,
     mode: SearchModeFilter,
+    database_url: &str,
+    storage_root: &str,
 ) -> Result<mcp_agent_mail_db::search_planner::SearchResponse, String> {
-    let pool_cfg = DbPoolConfig::from_env();
-    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
-        .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
+    let observed_pool = crate::open_observability_db_pool(
+        database_url,
+        std::path::Path::new(storage_root),
+        "tui unified search",
+    )?;
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| format!("failed to initialize async runtime: {e}"))?;
@@ -3667,7 +3817,13 @@ fn run_unified_search(
         search_engine: Some(mode.search_engine()),
     };
     match runtime.block_on(async {
-        mcp_agent_mail_db::search_service::execute_search(&cx, &pool, query, &options).await
+        mcp_agent_mail_db::search_service::execute_search(
+            &cx,
+            observed_pool.pool(),
+            query,
+            &options,
+        )
+        .await
     }) {
         Outcome::Ok(scoped) => Ok(mcp_agent_mail_db::search_planner::SearchResponse {
             results: scoped.results.into_iter().map(|row| row.result).collect(),
@@ -3920,9 +4076,13 @@ fn query_message_rows(
         })
 }
 
-fn query_agent_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultEntry> {
+fn query_agent_rows(
+    conn: &DbConn,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<ResultEntry>, String> {
     conn.query_sync(sql, params)
-        .ok()
+        .map_err(|error| error.to_string())
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
@@ -3952,12 +4112,15 @@ fn query_agent_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultEnt
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
-fn query_project_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultEntry> {
+fn query_project_rows(
+    conn: &DbConn,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<ResultEntry>, String> {
     conn.query_sync(sql, params)
-        .ok()
+        .map_err(|error| error.to_string())
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
@@ -3986,7 +4149,6 @@ fn query_project_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<ResultE
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Truncate a string to `max_chars`, adding ellipsis if needed.
@@ -5699,6 +5861,49 @@ mod tests {
     use super::*;
     use ftui_harness::buffer_to_text;
 
+    fn write_archive_message(
+        storage_root: &std::path::Path,
+        thread_id: &str,
+        subject: &str,
+        body: &str,
+    ) {
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let message_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&message_dir).expect("create message dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-04-01T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            message_dir.join("2026-04-01T12-00-00Z__search__1.md"),
+            format!(
+                r#"---json
+{{
+  "id": 1,
+  "thread_id": "{thread_id}",
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "{subject}",
+  "importance": "normal",
+  "created_ts": "2026-04-01T12:00:00Z"
+}}
+---
+
+{body}
+"#
+            ),
+        )
+        .expect("write canonical message");
+    }
+
     #[test]
     fn screen_defaults() {
         let screen = SearchCockpitScreen::new();
@@ -5782,6 +5987,149 @@ mod tests {
         assert_eq!(f, AckFilter::NotRequired);
         f = f.next();
         assert_eq!(f, AckFilter::Any);
+    }
+
+    #[test]
+    fn run_unified_search_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("search-stale.sqlite3");
+        write_archive_message(
+            &storage_root,
+            "thread-search-only",
+            "Archive-only search result",
+            "archive-search-token",
+        );
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let query = SearchQuery {
+            text: "archive-search-token".to_string(),
+            doc_kind: DocKind::Message,
+            limit: Some(10),
+            ..Default::default()
+        };
+        let response = run_unified_search(
+            &query,
+            SearchModeFilter::Auto,
+            &format!("sqlite:///{}", db_path.display()),
+            storage_root.to_string_lossy().as_ref(),
+        )
+        .expect("search response");
+        assert!(
+            response
+                .results
+                .iter()
+                .any(|result| result.thread_id.as_deref() == Some("thread-search-only")),
+            "unified search should query the archive-backed snapshot when the live db is stale"
+        );
+    }
+
+    #[test]
+    fn search_screen_uses_live_metadata_db_when_results_conn_uses_archive_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("search-stale.sqlite3");
+        write_archive_message(
+            &storage_root,
+            "thread-search-only",
+            "Archive-only search result",
+            "archive-search-token",
+        );
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+            .expect("init full schema");
+        let existing_recipe_id = insert_recipe(
+            &conn,
+            &SearchRecipe {
+                name: "Existing Recipe".to_string(),
+                query_text: "seed".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("insert recipe");
+        let seed_history_query = "seed history".to_string();
+        insert_history(
+            &conn,
+            &QueryHistoryEntry {
+                query_text: seed_history_query.clone(),
+                executed_ts: now_micros().saturating_sub(1),
+                ..Default::default()
+            },
+        )
+        .expect("insert history");
+        drop(conn);
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+
+        let mut screen = SearchCockpitScreen::new();
+        screen.query_input.set_value("archive-search-token");
+        screen.execute_search(&state);
+
+        assert!(
+            screen._db_snapshot_dir.is_some(),
+            "search results should use an archive-backed snapshot when the live db is stale"
+        );
+        assert!(screen.metadata_db_conn.is_some());
+        assert!(
+            screen
+                .results
+                .iter()
+                .any(|result| result.thread_id.as_deref() == Some("thread-search-only")),
+            "search results should include the archive-only thread"
+        );
+        assert!(
+            screen
+                .saved_recipes
+                .iter()
+                .any(|recipe| recipe.id == Some(existing_recipe_id)),
+            "saved recipes should load from the live configured db"
+        );
+        assert!(
+            screen
+                .query_history
+                .iter()
+                .any(|entry| entry.query_text == seed_history_query),
+            "query history should load from the live configured db"
+        );
+
+        screen.save_current_as_recipe("New Recipe".to_string());
+        let existing_recipe = screen
+            .saved_recipes
+            .iter()
+            .find(|recipe| recipe.id == Some(existing_recipe_id))
+            .cloned()
+            .expect("existing recipe");
+        screen.load_recipe(&existing_recipe);
+
+        let live_conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+        let live_recipes = list_recipes(&live_conn).expect("list recipes");
+        let live_history = list_recent_history(&live_conn, 10).expect("list history");
+        assert!(
+            live_recipes
+                .iter()
+                .any(|recipe| recipe.name == "New Recipe"),
+            "new recipes should persist into the live configured db"
+        );
+        assert!(
+            live_recipes
+                .iter()
+                .any(|recipe| recipe.id == Some(existing_recipe_id) && recipe.use_count >= 1),
+            "loading a recipe should touch the live configured db"
+        );
+        assert!(
+            live_history
+                .iter()
+                .any(|entry| entry.query_text == "archive-search-token"),
+            "query history writes should persist into the live configured db"
+        );
     }
 
     #[test]
@@ -6630,6 +6978,130 @@ mod tests {
         assert!(screen.query_history.is_empty());
         assert!(screen.history_cursor.is_none());
         assert!(!screen.recipes_loaded);
+    }
+
+    #[test]
+    fn ensure_recipes_loaded_preserves_stale_data_and_retries_after_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("search-metadata-retry.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let mut screen = SearchCockpitScreen::new();
+        screen.metadata_db_conn = crate::open_live_metadata_sync_db_connection(&db_url)
+            .map(Some)
+            .expect("open metadata db");
+        screen.saved_recipes = vec![SearchRecipe {
+            id: Some(7),
+            name: "stale recipe".to_string(),
+            ..Default::default()
+        }];
+        screen.query_history = vec![QueryHistoryEntry {
+            query_text: "stale query".to_string(),
+            executed_ts: now_micros(),
+            ..Default::default()
+        }];
+
+        screen.ensure_recipes_loaded();
+
+        assert!(
+            !screen.recipes_loaded,
+            "failed metadata reads must not latch recipes_loaded=true"
+        );
+        assert_eq!(screen.saved_recipes.len(), 1, "stale recipe should survive");
+        assert_eq!(
+            screen.saved_recipes[0].name, "stale recipe",
+            "failed load must preserve stale saved recipe state"
+        );
+        assert_eq!(
+            screen.query_history.len(),
+            1,
+            "stale history should survive"
+        );
+        assert_eq!(
+            screen.query_history[0].query_text, "stale query",
+            "failed load must preserve stale query history"
+        );
+
+        let recipe_id = {
+            let conn = screen
+                .metadata_db_conn
+                .as_ref()
+                .expect("metadata connection should remain available");
+            conn.execute_raw(
+                "CREATE TABLE search_recipes ( \
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                     name TEXT NOT NULL, \
+                     description TEXT NOT NULL DEFAULT '', \
+                     query_text TEXT NOT NULL DEFAULT '', \
+                     doc_kind TEXT NOT NULL DEFAULT 'messages', \
+                     scope_mode TEXT NOT NULL DEFAULT 'global', \
+                     scope_id INTEGER, \
+                     importance_filter TEXT NOT NULL DEFAULT '', \
+                     ack_filter TEXT NOT NULL DEFAULT 'any', \
+                     sort_mode TEXT NOT NULL DEFAULT 'newest', \
+                     thread_filter TEXT, \
+                     created_ts INTEGER NOT NULL, \
+                     updated_ts INTEGER NOT NULL, \
+                     pinned INTEGER NOT NULL DEFAULT 0, \
+                     use_count INTEGER NOT NULL DEFAULT 0 \
+                 )",
+            )
+            .expect("create search_recipes");
+            conn.execute_raw(
+                "CREATE TABLE query_history ( \
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                     query_text TEXT NOT NULL, \
+                     doc_kind TEXT NOT NULL DEFAULT 'messages', \
+                     scope_mode TEXT NOT NULL DEFAULT 'global', \
+                     scope_id INTEGER, \
+                     result_count INTEGER NOT NULL DEFAULT 0, \
+                     executed_ts INTEGER NOT NULL \
+                 )",
+            )
+            .expect("create query_history");
+
+            let recipe_id = insert_recipe(
+                conn,
+                &SearchRecipe {
+                    name: "fresh recipe".to_string(),
+                    query_text: "fresh".to_string(),
+                    updated_ts: now_micros(),
+                    created_ts: now_micros(),
+                    ..Default::default()
+                },
+            )
+            .expect("insert recipe");
+            insert_history(
+                conn,
+                &QueryHistoryEntry {
+                    query_text: "fresh query".to_string(),
+                    executed_ts: now_micros(),
+                    ..Default::default()
+                },
+            )
+            .expect("insert history");
+            recipe_id
+        };
+
+        screen.ensure_recipes_loaded();
+
+        assert!(
+            screen.recipes_loaded,
+            "successful retry should latch loaded state"
+        );
+        assert!(
+            screen
+                .saved_recipes
+                .iter()
+                .any(|recipe| recipe.id == Some(recipe_id) && recipe.name == "fresh recipe"),
+            "successful retry should replace stale recipes with DB-backed recipes"
+        );
+        assert!(
+            screen
+                .query_history
+                .iter()
+                .any(|entry| entry.query_text == "fresh query"),
+            "successful retry should replace stale history with DB-backed history"
+        );
     }
 
     #[test]
@@ -7601,9 +8073,105 @@ mod tests {
         let search_diag = diags
             .iter()
             .find(|(_, d)| d.screen == "search" && d.scope.contains("db_unavailable"));
+        let (_, diag) = search_diag.expect("should emit db_unavailable diagnostic");
         assert!(
-            search_diag.is_some(),
-            "should emit db_unavailable diagnostic"
+            diag.query_params.contains("preserved_stale=false"),
+            "diagnostic should report non-preserved stale state: {}",
+            diag.query_params
+        );
+        assert_eq!(diag.rendered_count, 0);
+    }
+
+    #[test]
+    fn b8_search_run_search_without_conn_preserves_previous_results_for_same_signature() {
+        let state = broken_db_state();
+        let mut screen = SearchCockpitScreen::new();
+        screen.results = vec![make_msg_entry()];
+        screen.total_sql_rows = screen.results.len();
+        screen.rebuild_result_rows();
+        screen.cursor = 0;
+        screen.detail_scroll.set(4);
+        screen.last_loaded_search_signature = Some(screen.current_search_signature());
+
+        screen.execute_search(&state);
+
+        assert!(screen.db_context_unavailable);
+        assert_eq!(screen.results.len(), 1);
+        assert_eq!(screen.result_rows.len(), 1);
+        assert_eq!(screen.cursor, 0);
+        assert_eq!(screen.detail_scroll.get(), 4);
+
+        let diags = state.screen_diagnostics_since(0);
+        let (_, diag) = diags
+            .iter()
+            .find(|(_, d)| d.screen == "search" && d.scope.contains("db_unavailable"))
+            .expect("should emit db_unavailable diagnostic");
+        assert!(
+            diag.query_params.contains("preserved_stale=true"),
+            "diagnostic should report preserved stale state: {}",
+            diag.query_params
+        );
+        assert_eq!(diag.rendered_count, 1);
+    }
+
+    #[test]
+    fn b8_search_run_search_without_conn_clears_previous_results_for_new_signature() {
+        let state = broken_db_state();
+        let mut screen = SearchCockpitScreen::new();
+        screen.results = vec![make_msg_entry()];
+        screen.total_sql_rows = screen.results.len();
+        screen.rebuild_result_rows();
+        screen.cursor = 0;
+        screen.detail_scroll.set(4);
+        screen.last_loaded_search_signature = Some(screen.current_search_signature());
+        screen.query_input.set_value("fresh query");
+
+        screen.execute_search(&state);
+
+        assert!(screen.db_context_unavailable);
+        assert!(screen.results.is_empty());
+        assert!(screen.result_rows.is_empty());
+        assert_eq!(screen.cursor, 0);
+        assert_eq!(screen.detail_scroll.get(), 0);
+    }
+
+    #[test]
+    fn search_failure_preserves_previous_results_for_same_signature() {
+        let state = crate::tui_bridge::TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = SearchCockpitScreen::new();
+        screen.db_conn = Some(DbConn::open_memory().expect("open in-memory sqlite"));
+        screen.db_conn_attempted = true;
+        screen.results = vec![make_msg_entry()];
+        screen.total_sql_rows = screen.results.len();
+        screen.rebuild_result_rows();
+        screen.cursor = 0;
+        screen.detail_scroll.set(5);
+        screen.last_loaded_search_signature = Some(screen.current_search_signature());
+        screen.last_diagnostics = Some(SearchDegradedDiagnostics {
+            degraded: true,
+            fallback_mode: Some("previous".to_string()),
+            timeout_stage: None,
+            budget_tier: None,
+            budget_exhausted: None,
+            remediation_hint: Some("keep stale".to_string()),
+        });
+        let previous_diagnostics = screen.last_diagnostics.clone();
+
+        screen.execute_search(&state);
+
+        assert!(!screen.db_context_unavailable);
+        assert_eq!(screen.results.len(), 1);
+        assert_eq!(screen.result_rows.len(), 1);
+        assert_eq!(screen.cursor, 0);
+        assert_eq!(screen.detail_scroll.get(), 5);
+        assert_eq!(screen.last_diagnostics, previous_diagnostics);
+        assert!(
+            screen
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Search failed:")),
+            "expected propagated search failure, got {:?}",
+            screen.last_error
         );
     }
 

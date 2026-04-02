@@ -44,7 +44,28 @@ pub fn dispatch(
     // Cx::for_testing() was previously used here, which provides no
     // timeout enforcement and could let slow queries block indefinitely.
     let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
-    let pool = get_pool()?;
+    let read_pool_owner = if method == "GET" {
+        open_mail_ui_read_pool()?
+    } else {
+        None
+    };
+    let live_pool_owner = if method == "GET" && read_pool_owner.is_some() {
+        None
+    } else {
+        Some(get_pool()?)
+    };
+    let live_pool = live_pool_owner.as_ref().map_or_else(
+        || {
+            read_pool_owner
+                .as_ref()
+                .map(crate::ObservabilityDbPool::pool)
+                .expect("GET requests with no live pool fallback must already have a read pool")
+        },
+        |pool| pool,
+    );
+    let read_pool = read_pool_owner
+        .as_ref()
+        .map_or(live_pool, crate::ObservabilityDbPool::pool);
 
     // Strip leading "/mail" prefix.
     let sub = path.strip_prefix("/mail").unwrap_or(path);
@@ -56,18 +77,36 @@ pub fn dispatch(
             let filter_importance = extract_query_str(query, "filter_importance");
             render_unified_inbox(
                 &cx,
-                &pool,
+                read_pool,
                 limit,
                 filter_importance.as_deref(),
                 is_static_export_request(query),
             )
         }
         // Explicit projects list route (legacy Python: GET /mail/projects).
-        "/projects" => render_projects_list(&cx, &pool),
-        _ if sub.starts_with("/api/") => handle_api_route(sub, query, method, body, &cx, &pool),
-        _ if sub.starts_with("/archive/") => render_archive_route(sub, query, method, &cx, &pool),
-        _ => dispatch_project_route(sub, method, body, &cx, &pool, query),
+        "/projects" => render_projects_list(&cx, read_pool),
+        _ if sub.starts_with("/api/") => {
+            handle_api_route(sub, query, method, body, &cx, read_pool, &live_pool)
+        }
+        _ if sub.starts_with("/archive/") => {
+            render_archive_route(sub, query, method, &cx, read_pool)
+        }
+        _ => dispatch_project_route(sub, method, body, &cx, read_pool, &live_pool, query),
     }
+}
+
+fn open_mail_ui_read_pool() -> Result<Option<crate::ObservabilityDbPool>, (u16, String)> {
+    let config = Config::from_env();
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return Ok(None);
+    }
+    crate::open_observability_db_pool(
+        &config.database_url,
+        &config.storage_root,
+        "mail ui read route",
+    )
+    .map(Some)
+    .map_err(|err| (500, format!("Mail UI read pool unavailable: {err}")))
 }
 
 #[cfg(test)]
@@ -93,7 +132,9 @@ mod route_regressions {
     use super::*;
     use asupersync::Outcome;
     use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
         match outcome {
@@ -113,6 +154,65 @@ mod route_regressions {
 
     fn make_test_pool(label: &str) -> DbPool {
         initialized_test_pool(label)
+    }
+
+    fn write_archive_ahead_fixture(base: &Path) -> (PathBuf, PathBuf) {
+        let storage_root = base.join("storage");
+        let db_path = base.join("mail-ui-stale.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+        (storage_root, db_path)
+    }
+
+    fn with_mail_ui_env<T>(storage_root: &Path, database_path: &Path, f: impl FnOnce() -> T) -> T {
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("mail ui storage root utf-8")
+            .to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            f,
+        )
     }
 
     #[test]
@@ -181,6 +281,67 @@ mod route_regressions {
             payload["excerpt"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    fn dispatch_project_get_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+
+        with_mail_ui_env(&storage_root, &db_path, || {
+            let html = dispatch("/mail/ahead-project", "", "GET", "")
+                .expect("dispatch should succeed")
+                .expect("route should return html");
+            assert!(html.contains("ahead-project"), "{html}");
+            assert!(html.contains("Alice"), "{html}");
+        });
+    }
+
+    #[test]
+    fn dispatch_project_get_fails_closed_when_archive_snapshot_setup_fails() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let tmpdir_file = dir.path().join("tmpdir-file");
+        std::fs::write(&tmpdir_file, "not a directory").expect("write tmpdir file");
+        let tmpdir = tmpdir_file
+            .to_str()
+            .expect("tmpdir override utf-8")
+            .to_string();
+
+        with_mail_ui_env(&storage_root, &db_path, || {
+            let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("TMPDIR", tmpdir.as_str())],
+                || dispatch("/mail/ahead-project", "", "GET", ""),
+            )
+            .expect_err("dispatch should fail closed when archive snapshot setup fails");
+            assert_eq!(err.0, 500);
+            assert!(err.1.contains("Mail UI read pool unavailable"), "{}", err.1);
+        });
+    }
+
+    #[test]
+    fn load_recipes_uses_live_metadata_db_when_archive_is_ahead() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let live_conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open db");
+        mcp_agent_mail_db::search_recipes::insert_recipe(
+            &live_conn,
+            &mcp_agent_mail_db::search_recipes::SearchRecipe {
+                name: "Live saved recipe".to_string(),
+                query_text: "First".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("insert recipe");
+        drop(live_conn);
+
+        let recipes = with_mail_ui_env(&storage_root, &db_path, load_recipes);
+        assert!(
+            recipes
+                .iter()
+                .any(|recipe| recipe.name == "Live saved recipe")
         );
     }
 
@@ -259,6 +420,71 @@ mod route_regressions {
         assert_eq!(attachments[0].path.as_deref(), Some("attachments/demo.txt"));
         assert_eq!(attachments[0].media_type.as_deref(), Some("text/plain"));
         assert_eq!(attachments[0].bytes, Some(128));
+    }
+
+    #[test]
+    fn parse_attachment_views_preserves_malformed_entries_with_placeholder_labels() {
+        let attachments = parse_attachment_views(r#"[{},null,17]"#);
+        assert_eq!(attachments.len(), 3);
+        assert_eq!(
+            attachments[0].name.as_deref(),
+            Some("[unknown-attachment-1]")
+        );
+        assert_eq!(
+            attachments[1].name.as_deref(),
+            Some("[unknown-attachment-2]")
+        );
+        assert_eq!(
+            attachments[2].name.as_deref(),
+            Some("[unknown-attachment-3]")
+        );
+    }
+
+    #[test]
+    fn render_attachments_preserves_messages_with_malformed_attachment_json() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("attachments-malformed");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-attachments-malformed-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+        )));
+
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            "Malformed attachment delivery",
+            "See attached artifact",
+            Some("br-attachments-malformed"),
+            "normal",
+            false,
+            "[{}]",
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+
+        let html = render_attachments(&cx, &pool, &project.slug)
+            .expect("attachments render should succeed")
+            .expect("attachments route should return html");
+        assert!(html.contains("[unknown-attachment-1]"), "{html}");
+        assert!(html.contains("Malformed attachment delivery"), "{html}");
     }
 
     #[test]
@@ -1085,7 +1311,7 @@ mod route_hardening_tests {
     fn dispatch_project_rejects_path_traversal_slug() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
-        let result = dispatch_project_route("/../../etc/passwd", "GET", "", &cx, &pool, "");
+        let result = dispatch_project_route("/../../etc/passwd", "GET", "", &cx, &pool, &pool, "");
         let (status, _msg) = result.expect_err("path traversal slug should be rejected");
         assert_eq!(status, 400);
     }
@@ -1094,7 +1320,7 @@ mod route_hardening_tests {
     fn dispatch_project_rejects_dot_dot_slug() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
-        let result = dispatch_project_route("/..", "GET", "", &cx, &pool, "");
+        let result = dispatch_project_route("/..", "GET", "", &cx, &pool, &pool, "");
         let (status, _msg) = result.expect_err(".. slug should be rejected");
         assert_eq!(status, 400);
     }
@@ -1104,7 +1330,7 @@ mod route_hardening_tests {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
         for bad_slug in &["/foo bar", "/slug;drop", "/slug'inject", "/slug<xss>"] {
-            let result = dispatch_project_route(bad_slug, "GET", "", &cx, &pool, "");
+            let result = dispatch_project_route(bad_slug, "GET", "", &cx, &pool, &pool, "");
             let (status, _msg) =
                 result.expect_err(&format!("slug {bad_slug:?} should be rejected"));
             assert_eq!(status, 400, "slug {bad_slug:?} should return 400");
@@ -1116,7 +1342,7 @@ mod route_hardening_tests {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
         // Valid slug format passes validation (may then 404 on project lookup).
-        let result = dispatch_project_route("/my-project_1", "GET", "", &cx, &pool, "");
+        let result = dispatch_project_route("/my-project_1", "GET", "", &cx, &pool, &pool, "");
         // Should not be a 400 — either Ok or a different error from DB lookup.
         if let Err((400, _)) = result {
             panic!("valid slug should not be rejected as 400");
@@ -1133,6 +1359,7 @@ mod route_hardening_tests {
             "GET",
             "",
             &cx,
+            &pool,
             &pool,
             "",
         );
@@ -1153,6 +1380,7 @@ mod route_hardening_tests {
             "GET",
             "",
             &cx,
+            &pool,
             &pool,
             "",
         );
@@ -1202,7 +1430,7 @@ mod auth_route_hardening_regression_suite {
         // Slugs containing non-alphanumeric/hyphen/underscore chars → 400.
         for slug in &["..%2F..%2Fetc", ".hidden", "slug with space"] {
             let path = format!("/{slug}");
-            let result = dispatch_project_route(&path, "GET", "", &cx, &pool, "");
+            let result = dispatch_project_route(&path, "GET", "", &cx, &pool, &pool, "");
             match result {
                 Err((400, _)) => {} // expected
                 other => panic!("slug {slug:?} should yield 400, got {other:?}"),
@@ -1217,7 +1445,7 @@ mod auth_route_hardening_regression_suite {
         // "foo/../bar" → slug="foo" (valid), rest="../bar" (unknown route → 404).
         // Path traversal in the rest segment can't escape because routes are
         // matched by exact string, not filesystem paths.
-        let result = dispatch_project_route("/foo/../bar", "GET", "", &cx, &pool, "");
+        let result = dispatch_project_route("/foo/../bar", "GET", "", &cx, &pool, &pool, "");
         let (status, _) = result.expect_err("cross-project tampering must be rejected");
         assert_eq!(status, 404);
     }
@@ -1263,6 +1491,7 @@ mod auth_route_hardening_regression_suite {
             "",
             &cx,
             &pool,
+            &pool,
             "",
         );
         let (status, _) = result.expect_err("unknown POST inbox action should be rejected");
@@ -1273,7 +1502,7 @@ mod auth_route_hardening_regression_suite {
     fn regression_archive_routes_reject_post_method() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
-        let result = dispatch_project_route("/archive/guide", "", "POST", &cx, &pool, "");
+        let result = dispatch_project_route("/archive/guide", "", "POST", &cx, &pool, &pool, "");
         let (status, _) = result.expect_err("POST to archive should be 405");
         assert_eq!(status, 405);
     }
@@ -1282,7 +1511,8 @@ mod auth_route_hardening_regression_suite {
     fn regression_unknown_archive_subpath_returns_none() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
-        let result = dispatch_project_route("/archive/nonexistent", "", "GET", &cx, &pool, "");
+        let result =
+            dispatch_project_route("/archive/nonexistent", "", "GET", &cx, &pool, &pool, "");
         assert_eq!(
             result.unwrap(),
             None,
@@ -1327,7 +1557,8 @@ mod auth_route_hardening_regression_suite {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
         // message/{mid} where mid is not numeric → 404 (invalid parse returns None).
-        let result = dispatch_project_route("/my-project/message/abc", "GET", "", &cx, &pool, "");
+        let result =
+            dispatch_project_route("/my-project/message/abc", "GET", "", &cx, &pool, &pool, "");
         // Non-numeric message IDs should gracefully fail (Ok(None) or Err(400/404)).
         match result {
             Ok(None) | Err((400 | 404, _)) => {} // acceptable
@@ -1371,7 +1602,7 @@ mod auth_route_hardening_regression_suite {
             project.slug,
             percent_encode_path_segment(thread_id)
         );
-        let html = dispatch_project_route(&route, "GET", "", &cx, &pool, "")
+        let html = dispatch_project_route(&route, "GET", "", &cx, &pool, &pool, "")
             .expect("thread route should succeed")
             .expect("thread route should return html");
 
@@ -1395,6 +1626,7 @@ mod auth_route_hardening_regression_suite {
             "",
             &cx,
             &pool,
+            &pool,
             "",
         );
         // GET on a POST-only action should return Ok(None) from the ("GET", _) arm.
@@ -1410,7 +1642,15 @@ mod auth_route_hardening_regression_suite {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
         // GET /mail/{project}/overseer/send → should not render (only POST accepted).
-        let result = dispatch_project_route("/my-project/overseer/send", "GET", "", &cx, &pool, "");
+        let result = dispatch_project_route(
+            "/my-project/overseer/send",
+            "GET",
+            "",
+            &cx,
+            &pool,
+            &pool,
+            "",
+        );
         assert_eq!(
             result.unwrap(),
             None,
@@ -2251,7 +2491,8 @@ mod message_route_authorization_tests {
         let message_id = message.id.expect("message id should be present");
 
         let in_scope_route = format!("/{}/message/{message_id}", project_a.slug);
-        let in_scope_result = dispatch_project_route(&in_scope_route, "GET", "", &cx, &pool, "");
+        let in_scope_result =
+            dispatch_project_route(&in_scope_route, "GET", "", &cx, &pool, &pool, "");
         assert!(
             matches!(in_scope_result, Ok(Some(_))),
             "same-project route should render message: {in_scope_result:?}"
@@ -2259,7 +2500,7 @@ mod message_route_authorization_tests {
 
         let cross_scope_route = format!("/{}/message/{message_id}", project_b.slug);
         let cross_scope_result =
-            dispatch_project_route(&cross_scope_route, "GET", "", &cx, &pool, "");
+            dispatch_project_route(&cross_scope_route, "GET", "", &cx, &pool, &pool, "");
         let (status, detail) =
             cross_scope_result.expect_err("cross-project tampering must be rejected");
         assert_eq!(status, 404);
@@ -2667,7 +2908,7 @@ fn render_search(
     let agents: Vec<AgentView> = agents_rows.iter().map(agent_view).collect();
 
     // ── Load saved recipes ──────────────────────────────────────────
-    let recipes = load_recipes(pool);
+    let recipes = load_recipes();
 
     let result_count = results.len();
     let deep_link = build_search_deep_link(project_slug, query_str);
@@ -2700,13 +2941,14 @@ fn render_search(
     )
 }
 
-/// Load saved search recipes from the DB (best-effort, returns empty on error).
-fn load_recipes(pool: &DbPool) -> Vec<RecipeView> {
-    let path = pool.sqlite_path();
-    if path == ":memory:" {
-        return Vec::new();
-    }
-    let Ok(conn) = crate::open_interactive_sync_db_connection(path) else {
+/// Load saved search recipes from the live configured DB (best-effort).
+///
+/// Recipes are operator-local metadata, not archive-backed state, so they must
+/// come from the configured live sqlite file even when the rest of the page is
+/// rendered from an archive-backed observability snapshot.
+fn load_recipes() -> Vec<RecipeView> {
+    let config = Config::from_env();
+    let Some(conn) = crate::open_live_metadata_sync_db_connection(&config.database_url) else {
         return Vec::new();
     };
     let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();
@@ -2839,64 +3081,75 @@ struct AttachmentView {
     bytes: Option<u64>,
 }
 
+fn attachment_display_name_from_path(path: Option<&str>) -> Option<String> {
+    path.and_then(|attachment_path| {
+        Path::new(attachment_path)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_string)
+    })
+}
+
+fn unknown_attachment_label(index: usize) -> String {
+    format!("[unknown-attachment-{}]", index.saturating_add(1))
+}
+
 fn parse_attachment_views(attachments_json: &str) -> Vec<AttachmentView> {
-    serde_json::from_str::<Vec<serde_json::Value>>(attachments_json)
-        .map(|attachments| {
-            attachments
-                .into_iter()
-                .filter_map(|attachment| {
-                    let media_type = attachment
-                        .get("media_type")
-                        .or_else(|| attachment.get("content_type"))
-                        .and_then(serde_json::Value::as_str)
-                        .or_else(|| {
-                            attachment
-                                .get("type")
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|kind| !matches!(*kind, "file" | "inline" | "auto"))
-                        })
-                        .map(str::to_string);
-                    let path = attachment
+    match serde_json::from_str::<Vec<serde_json::Value>>(attachments_json) {
+        Ok(attachments) => attachments
+            .into_iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                let media_type = attachment
+                    .get("media_type")
+                    .or_else(|| attachment.get("content_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        attachment
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|kind| !matches!(*kind, "file" | "inline" | "auto"))
+                    })
+                    .map(str::to_string);
+                let path = attachment.as_str().map(str::to_string).or_else(|| {
+                    attachment
                         .get("path")
                         .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
-                    let name = attachment
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
                         .map(str::to_string)
-                        .or_else(|| {
-                            path.as_deref().and_then(|attachment_path| {
-                                Path::new(attachment_path)
-                                    .file_name()
-                                    .and_then(std::ffi::OsStr::to_str)
-                                    .map(str::to_string)
-                            })
-                        });
-                    let bytes = attachment
-                        .get("bytes")
-                        .and_then(serde_json::Value::as_u64)
-                        .or_else(|| attachment.get("size").and_then(serde_json::Value::as_u64))
-                        .or_else(|| {
-                            attachment
-                                .get("size")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|raw| raw.parse::<u64>().ok())
-                        });
+                });
+                let name = attachment
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| attachment_display_name_from_path(path.as_deref()))
+                    .or_else(|| Some(unknown_attachment_label(index)));
+                let bytes = attachment
+                    .get("bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .or_else(|| attachment.get("size").and_then(serde_json::Value::as_u64))
+                    .or_else(|| {
+                        attachment
+                            .get("size")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|raw| raw.parse::<u64>().ok())
+                    });
 
-                    if media_type.is_none() && path.is_none() && name.is_none() && bytes.is_none() {
-                        None
-                    } else {
-                        Some(AttachmentView {
-                            name,
-                            media_type,
-                            path,
-                            bytes,
-                        })
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+                AttachmentView {
+                    name,
+                    media_type,
+                    path,
+                    bytes,
+                }
+            })
+            .collect(),
+        Err(_) if attachments_json.trim().is_empty() => Vec::new(),
+        Err(_) => vec![AttachmentView {
+            name: Some("[malformed-attachments-json]".to_string()),
+            media_type: None,
+            path: None,
+            bytes: None,
+        }],
+    }
 }
 
 fn render_attachments(
@@ -3001,7 +3254,8 @@ fn dispatch_project_route(
     method: &str,
     body: &str,
     cx: &Cx,
-    pool: &DbPool,
+    read_pool: &DbPool,
+    live_pool: &DbPool,
     query: &str,
 ) -> Result<Option<String>, (u16, String)> {
     // sub starts with "/" and has at least the project slug.
@@ -3018,12 +3272,14 @@ fn dispatch_project_route(
     }
 
     match rest {
-        "" => render_project(cx, pool, project_slug, is_static_export_request(query)),
-        "search" => render_search(cx, pool, project_slug, query),
-        "file_reservations" => render_file_reservations(cx, pool, project_slug),
-        "attachments" => render_attachments(cx, pool, project_slug),
-        "overseer/compose" => render_overseer_compose(cx, pool, project_slug),
-        "overseer/send" if method == "POST" => handle_overseer_send(cx, pool, project_slug, body),
+        "" => render_project(cx, read_pool, project_slug, is_static_export_request(query)),
+        "search" => render_search(cx, read_pool, project_slug, query),
+        "file_reservations" => render_file_reservations(cx, read_pool, project_slug),
+        "attachments" => render_attachments(cx, read_pool, project_slug),
+        "overseer/compose" => render_overseer_compose(cx, read_pool, project_slug),
+        "overseer/send" if method == "POST" => {
+            handle_overseer_send(cx, live_pool, project_slug, body)
+        }
         _ if rest.starts_with("inbox/") => {
             let agent_rest = rest.strip_prefix("inbox/").unwrap_or("");
             if agent_rest.is_empty() {
@@ -3037,9 +3293,11 @@ fn dispatch_project_route(
             }
 
             match (method, action) {
-                ("POST", "mark-read") => handle_mark_read(cx, pool, project_slug, agent_name, body),
+                ("POST", "mark-read") => {
+                    handle_mark_read(cx, live_pool, project_slug, agent_name, body)
+                }
                 ("POST", "mark-all-read") => {
-                    handle_mark_all_read(cx, pool, project_slug, agent_name)
+                    handle_mark_all_read(cx, live_pool, project_slug, agent_name)
                 }
                 // F3: Only accept GET on the inbox root, not unknown sub-paths.
                 ("GET", "") => {
@@ -3047,7 +3305,7 @@ fn dispatch_project_route(
                     let page = extract_query_int(query, "page", 1);
                     render_inbox(
                         cx,
-                        pool,
+                        read_pool,
                         project_slug,
                         agent_name,
                         limit,
@@ -3064,7 +3322,7 @@ fn dispatch_project_route(
             let mid: i64 = mid_str
                 .parse()
                 .map_err(|_| (400, format!("Invalid message ID: {mid_str}")))?;
-            render_message(cx, pool, project_slug, mid)
+            render_message(cx, read_pool, project_slug, mid)
         }
         _ if rest.starts_with("thread/") => {
             let encoded_thread_id = rest.strip_prefix("thread/").unwrap_or("");
@@ -3072,7 +3330,7 @@ fn dispatch_project_route(
             if thread_id.is_empty() {
                 return Err((400, "Missing thread ID".to_string()));
             }
-            render_thread(cx, pool, project_slug, &thread_id)
+            render_thread(cx, read_pool, project_slug, &thread_id)
         }
         _ => Ok(None),
     }
@@ -3088,11 +3346,12 @@ fn handle_api_route(
     method: &str,
     body: &str,
     cx: &Cx,
-    pool: &DbPool,
+    read_pool: &DbPool,
+    live_pool: &DbPool,
 ) -> Result<Option<String>, (u16, String)> {
     // /api/unified-inbox → JSON
     if sub == "/api/unified-inbox" {
-        return render_api_unified_inbox(cx, pool, query);
+        return render_api_unified_inbox(cx, read_pool, query);
     }
     // /api/projects/{project_id}/siblings/{other_id} → POST (sibling suggestion)
     if let Some(rest) = sub.strip_prefix("/api/projects/") {
@@ -3105,13 +3364,13 @@ fn handle_api_route(
                 let other_id: i64 = siblings_rest
                     .parse()
                     .map_err(|_| (400, "Invalid sibling project ID".to_string()))?;
-                return handle_sibling_update(cx, pool, project_id, other_id, body);
+                return handle_sibling_update(cx, live_pool, project_id, other_id, body);
             }
             return Err((405, "Method Not Allowed".to_string()));
         }
         // /api/projects/{project}/agents → JSON
         if let Some(project_slug) = rest.strip_suffix("/agents") {
-            return render_api_project_agents(cx, pool, project_slug);
+            return render_api_project_agents(cx, read_pool, project_slug);
         }
     }
     // Other API routes handled elsewhere (e.g., /mail/api/locks is in handle_special_routes).

@@ -203,6 +203,16 @@ struct RecipientStatus {
     ack_ts: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExplorerQuerySignature {
+    agent_filter: String,
+    direction: Direction,
+    sort_mode: SortMode,
+    group_mode: GroupMode,
+    ack_filter: AckFilter,
+    text_filter: String,
+}
+
 /// Wrapper for `VirtualizedList` rendering of explorer results.
 #[derive(Debug, Clone)]
 struct ExplorerDisplayRow {
@@ -376,6 +386,7 @@ pub struct MailExplorerScreen {
 
     // DB/search state
     db_conn: Option<DbConn>,
+    _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
     db_conn_attempted: bool,
     db_context_unavailable: bool,
     last_error: Option<String>,
@@ -401,6 +412,8 @@ pub struct MailExplorerScreen {
     /// Cached text filter IDs: (`search_text`, result).
     /// Avoids re-creating pool/runtime/Cx when only direction/sort/ack changed.
     cached_text_filter: Option<(String, Option<std::collections::HashSet<i64>>)>,
+    /// Query/filter signature that produced the last successfully loaded DB-backed result set.
+    last_loaded_query_signature: Option<ExplorerQuerySignature>,
     /// Cursor position at last `sync_focused_event` call, avoids rebuild when unchanged.
     last_synced_cursor: Option<usize>,
 }
@@ -425,6 +438,7 @@ impl MailExplorerScreen {
             focus: Focus::ResultList,
             active_filter: FilterSlot::Direction,
             db_conn: None,
+            _db_snapshot_dir: None,
             db_conn_attempted: false,
             db_context_unavailable: false,
             last_error: None,
@@ -441,6 +455,7 @@ impl MailExplorerScreen {
             detail_visible: true,
             last_data_gen: super::DataGeneration::stale(),
             cached_text_filter: None,
+            last_loaded_query_signature: None,
             last_synced_cursor: None,
         }
     }
@@ -490,33 +505,69 @@ impl MailExplorerScreen {
             return;
         }
         self.db_conn_attempted = true;
-        let db_url = &state.config_snapshot().raw_database_url;
-        let cfg = DbPoolConfig {
-            database_url: db_url.clone(),
-            ..Default::default()
-        };
-        if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
+        let cfg = state.config_snapshot();
+        match crate::open_observability_sync_db_connection(
+            &cfg.raw_database_url,
+            std::path::Path::new(&cfg.storage_root),
+            "explorer screen",
+        ) {
+            Ok(Some(db)) => {
+                let (conn, _, snapshot_dir) = db.into_parts();
+                self.db_conn = Some(conn);
+                self._db_snapshot_dir = snapshot_dir;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "explorer screen db bind failed");
+            }
         }
         self.db_context_unavailable = self.db_conn.is_none();
     }
 
+    fn current_query_signature(&self) -> ExplorerQuerySignature {
+        ExplorerQuerySignature {
+            agent_filter: self.agent_filter.clone(),
+            direction: self.direction,
+            sort_mode: self.sort_mode,
+            group_mode: self.group_mode,
+            ack_filter: self.ack_filter,
+            text_filter: self.search_input.value().trim().to_string(),
+        }
+    }
+
+    fn can_preserve_previous_entries_on_db_unavailable(
+        &self,
+        query_signature: &ExplorerQuerySignature,
+    ) -> bool {
+        !self.entries.is_empty()
+            && self.last_loaded_query_signature.as_ref() == Some(query_signature)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_query(&mut self, state: &TuiSharedState) {
+        let query_signature = self.current_query_signature();
         self.ensure_db_conn(state);
         let Some(conn) = self.db_conn.take() else {
-            self.entries.clear();
-            self.cursor = 0;
-            self.detail_scroll = 0;
+            let preserve_previous =
+                self.can_preserve_previous_entries_on_db_unavailable(&query_signature);
+            if !preserve_previous {
+                self.entries.clear();
+                self.cursor = 0;
+                self.detail_scroll = 0;
+            }
             self.search_dirty = false;
             self.db_context_unavailable = true;
             self.db_conn_attempted = false; // allow retry on next tick
-            self.emit_db_unavailable_diagnostic(state, "database connection unavailable");
+            self.emit_db_unavailable_diagnostic(
+                state,
+                "database connection unavailable",
+                preserve_previous,
+            );
             return;
         };
         self.db_context_unavailable = false;
 
-        let text_filter = self.search_input.value().trim().to_string();
+        let text_filter = query_signature.text_filter.clone();
 
         // Use cached text filter IDs when the search text hasn't changed,
         // avoiding expensive pool/runtime/Cx recreation on direction/sort/ack changes.
@@ -632,21 +683,35 @@ impl MailExplorerScreen {
         self.detail_scroll = 0;
         self.last_error = None;
         self.search_dirty = false;
+        self.last_loaded_query_signature = Some(query_signature);
         self.last_synced_cursor = None; // force focused event rebuild with new entries
         self.db_conn = Some(conn);
     }
 
     #[allow(clippy::unused_self)] // consistent signature across screens
-    fn emit_db_unavailable_diagnostic(&self, state: &TuiSharedState, reason: &str) {
+    fn emit_db_unavailable_diagnostic(
+        &self,
+        state: &TuiSharedState,
+        reason: &str,
+        preserved_stale: bool,
+    ) {
         let reason = sanitize_diagnostic_value(reason);
+        let rendered_count = if preserved_stale {
+            self.entries.len()
+        } else {
+            0
+        };
+        let rendered_count = u64::try_from(rendered_count).unwrap_or(u64::MAX);
         let cfg = state.config_snapshot();
         let transport_mode = cfg.transport_mode().to_string();
         state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
             screen: "explorer".to_string(),
             scope: "mailbox.explorer.db_unavailable".to_string(),
-            query_params: format!("filter=db_context_unavailable;reason={reason}"),
+            query_params: format!(
+                "filter=db_context_unavailable;reason={reason};preserved_stale={preserved_stale}"
+            ),
             raw_count: 0,
-            rendered_count: 0,
+            rendered_count,
             dropped_count: 0,
             timestamp_micros: chrono::Utc::now().timestamp_micros(),
             db_url: cfg.database_url,
@@ -705,6 +770,7 @@ impl MailExplorerScreen {
             self.emit_db_unavailable_diagnostic(
                 state,
                 "database connection unavailable (pressure)",
+                false,
             );
             return;
         };
@@ -736,15 +802,16 @@ impl MailExplorerScreen {
     fn query_overdue_acks(conn: &DbConn, now: i64) -> Result<Vec<AckPressureCard>, String> {
         let threshold = now - ACK_SLA_THRESHOLD_MICROS;
 
-        let sql = "SELECT a.name AS agent_name, p.slug AS project_slug, \
+        let sql = "SELECT r.agent_id AS raw_agent_id, m.project_id AS raw_project_id, \
+                   a.name AS agent_name, p.slug AS project_slug, \
                    COUNT(*) AS cnt, MIN(m.created_ts) AS oldest_ts \
                    FROM message_recipients r \
                    JOIN messages m ON m.id = r.message_id \
-                   JOIN agents a ON a.id = r.agent_id \
-                   JOIN projects p ON p.id = m.project_id \
+                   LEFT JOIN agents a ON a.id = r.agent_id \
+                   LEFT JOIN projects p ON p.id = m.project_id \
                    WHERE m.ack_required = 1 AND r.ack_ts IS NULL \
                    AND m.created_ts < ?1 \
-                   GROUP BY a.name, p.slug \
+                   GROUP BY r.agent_id, m.project_id, a.name, p.slug \
                    ORDER BY oldest_ts ASC \
                    LIMIT 50";
 
@@ -757,8 +824,8 @@ impl MailExplorerScreen {
                         let oldest_ts: i64 = row.get_named("oldest_ts").ok()?;
                         let age_micros = now.saturating_sub(oldest_ts);
                         Some(AckPressureCard {
-                            agent_name: row.get_named("agent_name").unwrap_or_default(),
-                            project_slug: row.get_named("project_slug").unwrap_or_default(),
+                            agent_name: read_agent_label(&row, "agent_name", "raw_agent_id"),
+                            project_slug: read_project_slug(&row, "project_slug", "raw_project_id"),
                             count: row
                                 .get_named::<i64>("cnt")
                                 .ok()
@@ -773,14 +840,15 @@ impl MailExplorerScreen {
     }
 
     fn query_unread_hotspots(conn: &DbConn) -> Result<Vec<UnreadPressureCard>, String> {
-        let sql = "SELECT a.name AS agent_name, p.slug AS project_slug, \
+        let sql = "SELECT r.agent_id AS raw_agent_id, m.project_id AS raw_project_id, \
+                   a.name AS agent_name, p.slug AS project_slug, \
                    COUNT(CASE WHEN r.read_ts IS NULL THEN 1 END) AS unread_count, \
                    COUNT(*) AS total_inbound \
                    FROM message_recipients r \
                    JOIN messages m ON m.id = r.message_id \
-                   JOIN agents a ON a.id = r.agent_id \
-                   JOIN projects p ON p.id = m.project_id \
-                   GROUP BY a.name, p.slug \
+                   LEFT JOIN agents a ON a.id = r.agent_id \
+                   LEFT JOIN projects p ON p.id = m.project_id \
+                   GROUP BY r.agent_id, m.project_id, a.name, p.slug \
                    HAVING unread_count > 0 \
                    ORDER BY unread_count DESC \
                    LIMIT 50";
@@ -790,8 +858,8 @@ impl MailExplorerScreen {
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| UnreadPressureCard {
-                        agent_name: row.get_named("agent_name").unwrap_or_default(),
-                        project_slug: row.get_named("project_slug").unwrap_or_default(),
+                        agent_name: read_agent_label(&row, "agent_name", "raw_agent_id"),
+                        project_slug: read_project_slug(&row, "project_slug", "raw_project_id"),
                         unread_count: row
                             .get_named::<i64>("unread_count")
                             .ok()
@@ -813,10 +881,11 @@ impl MailExplorerScreen {
     ) -> Result<Vec<ReservationPressureCard>, String> {
         let sql = format!(
             "SELECT fr.path_pattern, fr.\"exclusive\", fr.expires_ts, \
+               fr.agent_id AS raw_agent_id, fr.project_id AS raw_project_id, \
                a.name AS agent_name, p.slug AS project_slug \
                FROM file_reservations fr \
-               JOIN agents a ON a.id = fr.agent_id \
-               JOIN projects p ON p.id = fr.project_id \
+               LEFT JOIN agents a ON a.id = fr.agent_id \
+               LEFT JOIN projects p ON p.id = fr.project_id \
                WHERE ({}) AND fr.expires_ts > ?1 \
                ORDER BY fr.expires_ts ASC \
                LIMIT 50",
@@ -832,8 +901,8 @@ impl MailExplorerScreen {
                         let expires_ts: i64 = row.get_named("expires_ts").ok()?;
                         let remaining_micros = expires_ts.saturating_sub(now);
                         Some(ReservationPressureCard {
-                            agent_name: row.get_named("agent_name").unwrap_or_default(),
-                            project_slug: row.get_named("project_slug").unwrap_or_default(),
+                            agent_name: read_agent_label(&row, "agent_name", "raw_agent_id"),
+                            project_slug: read_project_slug(&row, "project_slug", "raw_project_id"),
                             path_pattern: row.get_named("path_pattern").unwrap_or_default(),
                             ttl_remaining_minutes: remaining_micros / 60_000_000,
                             exclusive: row
@@ -894,11 +963,12 @@ impl MailExplorerScreen {
 
         let sql = format!(
             "SELECT DISTINCT m.id, m.subject, m.body_md, m.importance, m.ack_required, \
-             m.created_ts, m.thread_id, s.name AS sender_name, p.slug AS project_slug \
+             m.created_ts, m.thread_id, m.sender_id AS raw_sender_id, \
+             m.project_id AS raw_project_id, s.name AS sender_name, p.slug AS project_slug \
              FROM message_recipients r \
              JOIN messages m ON m.id = r.message_id \
-             JOIN agents s ON s.id = m.sender_id \
-             JOIN projects p ON p.id = m.project_id \
+             LEFT JOIN agents s ON s.id = m.sender_id \
+             LEFT JOIN projects p ON p.id = m.project_id \
              WHERE 1=1{where_clause} \
              ORDER BY m.created_ts DESC \
              LIMIT {MAX_ENTRIES}"
@@ -961,10 +1031,11 @@ impl MailExplorerScreen {
 
         let sql = format!(
             "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts, \
-             m.thread_id, s.name AS sender_name, p.slug AS project_slug \
+             m.thread_id, m.sender_id AS raw_sender_id, m.project_id AS raw_project_id, \
+             s.name AS sender_name, p.slug AS project_slug \
              FROM messages m \
-             JOIN agents s ON s.id = m.sender_id \
-             JOIN projects p ON p.id = m.project_id \
+             LEFT JOIN agents s ON s.id = m.sender_id \
+             LEFT JOIN projects p ON p.id = m.project_id \
              WHERE 1=1{where_clause} \
              ORDER BY m.created_ts DESC \
              LIMIT {MAX_ENTRIES}"
@@ -1260,21 +1331,30 @@ fn recipient_names_by_message(
     }
     let where_clause = format!(" WHERE {}", conditions.join(" AND "));
     let sql = format!(
-        "SELECT mr.message_id, COALESCE(GROUP_CONCAT(DISTINCT a.name), '') AS to_agents \
+        "SELECT mr.message_id, mr.agent_id AS raw_agent_id, a.name AS agent_name \
          FROM message_recipients mr \
-         JOIN agents a ON a.id = mr.agent_id{where_clause} \
-         GROUP BY mr.message_id"
+         LEFT JOIN agents a ON a.id = mr.agent_id{where_clause} \
+         ORDER BY mr.message_id ASC, mr.id ASC"
     );
 
     conn.query_sync(&sql, &params)
         .map_err(|e| format!("Recipient lookup query: {e}"))
         .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let message_id = row.get_named::<i64>("message_id").ok()?;
-                    let to_agents = row.get_named::<String>("to_agents").ok()?;
-                    Some((message_id, to_agents))
-                })
+            let mut grouped: std::collections::HashMap<i64, Vec<String>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let Ok(message_id) = row.get_named::<i64>("message_id") else {
+                    continue;
+                };
+                let agent_name = read_agent_label(&row, "agent_name", "raw_agent_id");
+                let names = grouped.entry(message_id).or_default();
+                if !names.iter().any(|existing| existing == &agent_name) {
+                    names.push(agent_name);
+                }
+            }
+            grouped
+                .into_iter()
+                .map(|(message_id, names)| (message_id, names.join(", ")))
                 .collect()
         })
 }
@@ -1703,8 +1783,8 @@ fn map_entry(
 
     Some(DisplayEntry {
         message_id,
-        project_slug: row.get_named("project_slug").unwrap_or_default(),
-        sender_name: row.get_named("sender_name").unwrap_or_default(),
+        project_slug: read_project_slug(row, "project_slug", "raw_project_id"),
+        sender_name: read_agent_label(row, "sender_name", "raw_sender_id"),
         to_agents,
         subject: row.get_named("subject").unwrap_or_default(),
         body_md: body,
@@ -1719,6 +1799,24 @@ fn map_entry(
         read_ts,
         ack_ts,
     })
+}
+
+fn read_non_empty_text(row: &Row, value_column: &str) -> Option<String> {
+    row.get_named::<String>(value_column)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_agent_label(row: &Row, value_column: &str, id_column: &str) -> String {
+    let agent_id = row.get_named::<i64>(id_column).unwrap_or(0);
+    read_non_empty_text(row, value_column).unwrap_or_else(|| format!("[unknown-agent-{agent_id}]"))
+}
+
+fn read_project_slug(row: &Row, value_column: &str, id_column: &str) -> String {
+    let project_id = row.get_named::<i64>(id_column).unwrap_or(0);
+    read_non_empty_text(row, value_column)
+        .unwrap_or_else(|| format!("[unknown-project-{project_id}]"))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2489,6 +2587,24 @@ mod tests {
             )",
         )
         .expect("create recipients");
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT,
+                \"exclusive\" INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+        )
+        .expect("create reservations");
+        conn.execute_raw(
+            "CREATE TABLE file_reservation_releases (
+                reservation_id INTEGER NOT NULL
+            )",
+        )
+        .expect("create reservation release ledger");
     }
 
     #[test]
@@ -2591,6 +2707,97 @@ mod tests {
         assert!(entry.to_agents.contains("RedFox"));
         assert_eq!(entry.read_ts, None);
         assert_eq!(entry.ack_ts, None);
+    }
+
+    #[test]
+    fn fetch_inbound_keeps_rows_with_missing_sender_project_and_recipient_joins() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO agents (id, name) VALUES (2, 'BlueLake');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
+             VALUES
+                (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
+             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
+                (1, 10, 2, NULL, NULL),
+                (2, 10, 99, NULL, NULL);",
+        )
+        .expect("seed inbound rows");
+
+        let screen = MailExplorerScreen::new();
+        let entries = screen.fetch_inbound(&conn, None).expect("fetch inbound");
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.sender_name, "[unknown-agent-1]");
+        assert_eq!(entry.project_slug, "[unknown-project-1]");
+        assert!(entry.to_agents.contains("BlueLake"));
+        assert!(entry.to_agents.contains("[unknown-agent-99]"));
+    }
+
+    #[test]
+    fn fetch_outbound_keeps_rows_with_missing_sender_or_project_join() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO agents (id, name) VALUES (2, 'BlueLake');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
+             VALUES
+                (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
+             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
+                (1, 10, 2, NULL, NULL);",
+        )
+        .expect("seed outbound rows");
+
+        let screen = MailExplorerScreen::new();
+        let entries = screen.fetch_outbound(&conn, None).expect("fetch outbound");
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.sender_name, "[unknown-agent-1]");
+        assert_eq!(entry.project_slug, "[unknown-project-1]");
+        assert!(entry.to_agents.contains("BlueLake"));
+    }
+
+    #[test]
+    fn pressure_queries_keep_rows_with_missing_agent_or_project_joins() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO messages
+                (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
+             VALUES
+                (10, 1, 7, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
+             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
+                (1, 10, 99, NULL, NULL);
+             INSERT INTO file_reservations
+                (id, project_id, agent_id, path_pattern, \"exclusive\", expires_ts, released_ts)
+             VALUES
+                (1, 1, 77, 'src/**', 1, 5_000_000_000, NULL);",
+        )
+        .expect("seed pressure rows");
+
+        let now = 2_000_000_000;
+        let overdue = MailExplorerScreen::query_overdue_acks(&conn, now).expect("overdue query");
+        let unread =
+            MailExplorerScreen::query_unread_hotspots(&conn).expect("unread hotspots query");
+        let reservations = MailExplorerScreen::query_reservation_pressure(&conn, now)
+            .expect("reservation pressure query");
+
+        assert_eq!(overdue.len(), 1);
+        assert_eq!(overdue[0].agent_name, "[unknown-agent-99]");
+        assert_eq!(overdue[0].project_slug, "[unknown-project-1]");
+
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].agent_name, "[unknown-agent-99]");
+        assert_eq!(unread[0].project_slug, "[unknown-project-1]");
+
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].agent_name, "[unknown-agent-77]");
+        assert_eq!(reservations[0].project_slug, "[unknown-project-1]");
+        assert_eq!(reservations[0].path_pattern, "src/**");
     }
 
     #[test]
@@ -3340,6 +3547,13 @@ mod tests {
             explorer_diag.is_some(),
             "should emit db_unavailable diagnostic"
         );
+        let (_, diag) = explorer_diag.expect("missing db_unavailable diagnostic");
+        assert!(
+            diag.query_params.contains("preserved_stale=false"),
+            "fresh unavailable diagnostic should report preserved_stale=false, got {:?}",
+            diag.query_params
+        );
+        assert_eq!(diag.rendered_count, 0);
     }
 
     #[test]
@@ -3356,6 +3570,99 @@ mod tests {
             !screen.db_conn_attempted,
             "db_conn_attempted should be reset after failure to allow retry"
         );
+    }
+
+    #[test]
+    fn b8_explorer_execute_query_without_conn_preserves_previous_entries_for_same_query_signature()
+    {
+        let config = broken_db_config();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+        screen.entries = vec![
+            test_entry(10, 1_000, Direction::Inbound),
+            test_entry(11, 2_000, Direction::Outbound),
+        ];
+        screen.cursor = 1;
+        screen.detail_scroll = 3;
+        screen.agent_filter = "BlueLake".to_string();
+        screen.direction = Direction::Inbound;
+        screen.sort_mode = SortMode::ImportanceDesc;
+        screen.group_mode = GroupMode::Thread;
+        screen.ack_filter = AckFilter::PendingAck;
+        screen.search_input.set_value("stale view");
+        screen.last_loaded_query_signature = Some(screen.current_query_signature());
+
+        screen.execute_query(&state);
+
+        assert!(screen.db_context_unavailable);
+        assert_eq!(
+            screen.entries.len(),
+            2,
+            "same-query stale results should survive"
+        );
+        assert_eq!(screen.entries[0].message_id, 10);
+        assert_eq!(screen.entries[1].message_id, 11);
+        assert_eq!(
+            screen.cursor, 1,
+            "cursor should stay on preserved stale results"
+        );
+        assert_eq!(
+            screen.detail_scroll, 3,
+            "detail scroll should stay when preserving stale results"
+        );
+
+        let diags = state.screen_diagnostics_since(0);
+        let (_, diag) = diags
+            .iter()
+            .find(|(_, d)| d.screen == "explorer" && d.scope.contains("db_unavailable"))
+            .expect("missing db_unavailable diagnostic");
+        assert!(
+            diag.query_params.contains("preserved_stale=true"),
+            "same-query stale preservation should be reported, got {:?}",
+            diag.query_params
+        );
+        assert_eq!(diag.rendered_count, 2);
+    }
+
+    #[test]
+    fn b8_explorer_execute_query_without_conn_clears_previous_entries_for_new_query_signature() {
+        let config = broken_db_config();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = MailExplorerScreen::new();
+        screen.entries = vec![test_entry(10, 1_000, Direction::Inbound)];
+        screen.cursor = 0;
+        screen.detail_scroll = 2;
+        screen.last_loaded_query_signature = Some(ExplorerQuerySignature {
+            agent_filter: String::new(),
+            direction: Direction::All,
+            sort_mode: SortMode::DateDesc,
+            group_mode: GroupMode::None,
+            ack_filter: AckFilter::All,
+            text_filter: String::new(),
+        });
+        screen.search_input.set_value("fresh query");
+
+        screen.execute_query(&state);
+
+        assert!(screen.db_context_unavailable);
+        assert!(
+            screen.entries.is_empty(),
+            "new-query unavailable state should not preserve stale results"
+        );
+        assert_eq!(screen.cursor, 0);
+        assert_eq!(screen.detail_scroll, 0);
+
+        let diags = state.screen_diagnostics_since(0);
+        let (_, diag) = diags
+            .iter()
+            .find(|(_, d)| d.screen == "explorer" && d.scope.contains("db_unavailable"))
+            .expect("missing db_unavailable diagnostic");
+        assert!(
+            diag.query_params.contains("preserved_stale=false"),
+            "new-query unavailable diagnostic should not claim stale preservation, got {:?}",
+            diag.query_params
+        );
+        assert_eq!(diag.rendered_count, 0);
     }
 
     #[test]

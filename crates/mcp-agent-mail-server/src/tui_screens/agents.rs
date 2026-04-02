@@ -13,7 +13,6 @@ use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_db::pool::DbPoolConfig;
 
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
@@ -166,14 +165,23 @@ fn sanitize_diagnostic_value(value: &str) -> String {
         .join(" ")
 }
 
-fn recover_agent_rows_from_sqlite(database_url: &str) -> Option<Vec<AgentRow>> {
-    let cfg = DbPoolConfig {
-        database_url: database_url.to_string(),
-        ..Default::default()
+fn recover_agent_rows_from_sqlite(
+    database_url: &str,
+    storage_root: &std::path::Path,
+) -> Option<Vec<AgentRow>> {
+    let db = match crate::open_observability_sync_db_connection(
+        database_url,
+        storage_root,
+        "agents screen recovery",
+    ) {
+        Ok(Some(db)) => db,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(error = %error, "agents screen recovery db open failed");
+            return None;
+        }
     };
-    let path = cfg.sqlite_path().ok()?;
-    let conn = crate::open_best_effort_sync_db_connection(&path).ok()?;
-    Some(fetch_agent_rows_from_sqlite(&conn))
+    Some(fetch_agent_rows_from_sqlite(db.conn()))
 }
 
 fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
@@ -190,6 +198,8 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
                JOIN message_recipients mr ON mr.agent_id = a.id \
              ) \
              SELECT \
+               a.id AS raw_agent_id, \
+               a.project_id AS raw_project_id, \
                COALESCE(p.slug, '') AS project_slug, \
                a.name, \
                a.program, \
@@ -199,7 +209,7 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
              FROM agents a \
              LEFT JOIN projects p ON p.id = a.project_id \
              LEFT JOIN agent_messages am ON am.agent_id = a.id \
-             GROUP BY a.id, project_slug, a.name, a.program, a.model, a.last_active_ts \
+             GROUP BY a.id, a.project_id, project_slug, a.name, a.program, a.model, a.last_active_ts \
              ORDER BY {last_active_sort} DESC, a.id DESC \
              LIMIT {SQLITE_AGENT_RECOVERY_LIMIT}"
         ),
@@ -209,23 +219,40 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
     .map(|rows| {
         rows.into_iter()
             .filter_map(|row| {
+                let agent_id = row
+                    .get_named::<i64>("raw_agent_id")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(0).ok())?;
+                let project_id = row
+                    .get_named::<i64>("raw_project_id")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(1).ok())
+                    .unwrap_or(0);
                 let project = row
                     .get_named::<String>("project_slug")
                     .ok()
-                    .or_else(|| row.get_as::<String>(0).ok())
-                    .unwrap_or_default();
+                    .or_else(|| row.get_as::<String>(2).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
                 let name = row
                     .get_named::<String>("name")
                     .ok()
-                    .or_else(|| row.get_as::<String>(1).ok())?;
+                    .or_else(|| row.get_as::<String>(3).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("[unknown-agent-{agent_id}]"));
                 let program = row
                     .get_named::<String>("program")
                     .ok()
-                    .or_else(|| row.get_as::<String>(2).ok())?;
+                    .or_else(|| row.get_as::<String>(4).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "[unknown-program]".to_string());
                 let model = row
                     .get_named::<String>("model")
                     .ok()
-                    .or_else(|| row.get_as::<String>(3).ok())
+                    .or_else(|| row.get_as::<String>(5).ok())
                     .unwrap_or_default();
                 Some(AgentRow {
                     identity: AgentIdentity::new(project.clone(), name.clone()),
@@ -237,7 +264,7 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
                     message_count: row
                         .get_named::<i64>("cnt")
                         .ok()
-                        .or_else(|| row.get_as::<i64>(5).ok())
+                        .or_else(|| row.get_as::<i64>(7).ok())
                         .and_then(|count| u64::try_from(count.max(0)).ok())
                         .unwrap_or(0),
                 })
@@ -265,6 +292,64 @@ fn assert_agents_list_cardinality(total_db_agents: u64, rendered_count: usize, f
              but rendered list is empty with no active filter — data pipeline dropped all rows"
         );
     }
+}
+
+fn unique_previous_agent_row<'a, F>(
+    previous_rows: &'a [AgentRow],
+    mut predicate: F,
+) -> Option<&'a AgentRow>
+where
+    F: FnMut(&AgentRow) -> bool,
+{
+    let mut matching = previous_rows.iter().filter(|row| predicate(row));
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+fn enrich_lossy_agent_summary_rows_from_previous(
+    rows: &mut [AgentRow],
+    previous_rows: &[AgentRow],
+) {
+    if rows.is_empty() || previous_rows.is_empty() {
+        return;
+    }
+
+    for row in rows {
+        if !row.project.is_empty() {
+            continue;
+        }
+        let previous = unique_previous_agent_row(previous_rows, |candidate| {
+            candidate.name == row.name
+                && candidate.program == row.program
+                && candidate.last_active_ts == row.last_active_ts
+        })
+        .or_else(|| {
+            unique_previous_agent_row(previous_rows, |candidate| {
+                candidate.name == row.name && candidate.program == row.program
+            })
+        })
+        .or_else(|| {
+            unique_previous_agent_row(previous_rows, |candidate| candidate.name == row.name)
+        });
+        let Some(previous) = previous else {
+            continue;
+        };
+        row.identity = previous.identity.clone();
+        row.project = previous.project.clone();
+        if row.model.is_empty() {
+            row.model = previous.model.clone();
+        }
+        row.message_count = row.message_count.max(previous.message_count);
+    }
+}
+
+fn should_preserve_previous_agent_rows(
+    total_db_agents: u64,
+    rows: &[AgentRow],
+    previous_rows: &[AgentRow],
+    filter: &str,
+) -> bool {
+    total_db_agents > 0 && rows.is_empty() && filter.trim().is_empty() && !previous_rows.is_empty()
 }
 
 fn reduced_motion_enabled() -> bool {
@@ -413,12 +498,17 @@ impl AgentsScreen {
         let cfg = state.config_snapshot();
         let total_rows = db.agents;
         let raw_count = u64::try_from(db.agents_list.len()).unwrap_or(u64::MAX);
+        let previous_rows = self.agents.clone();
         let previous_selection = self.table_state.selected;
         let previous_selected_identity = previous_selection
             .and_then(|index| self.agents.get(index))
             .map(|agent| agent.identity.clone());
         let recovered_rows = if total_rows > 0 {
-            recover_agent_rows_from_sqlite(&cfg.raw_database_url).unwrap_or_default()
+            recover_agent_rows_from_sqlite(
+                &cfg.raw_database_url,
+                std::path::Path::new(&cfg.storage_root),
+            )
+            .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -453,6 +543,16 @@ impl AgentsScreen {
                 })
                 .collect()
         };
+
+        enrich_lossy_agent_summary_rows_from_previous(&mut rows, &previous_rows);
+        if !recovered_rows_usable {
+            if should_preserve_previous_agent_rows(total_rows, &rows, &previous_rows, &self.filter)
+            {
+                // Keep the last good roster instead of surfacing a false empty state or
+                // collapsing project-scoped rows into blank placeholder identities.
+                rows = previous_rows.clone();
+            }
+        }
 
         // Apply filter
         let filter_text = self.filter.trim().to_ascii_lowercase();
@@ -1993,6 +2093,42 @@ mod tests {
     }
 
     #[test]
+    fn enrich_lossy_agent_summary_rows_from_previous_restores_unique_project_scope() {
+        let mut rows = vec![test_agent_row("RedFox", "", "claude-code", "", 200, 2)];
+        let previous_rows = vec![test_agent_row(
+            "RedFox",
+            "alpha",
+            "claude-code",
+            "opus-4.6",
+            100,
+            7,
+        )];
+
+        enrich_lossy_agent_summary_rows_from_previous(&mut rows, &previous_rows);
+
+        assert_eq!(rows[0].identity, agent_identity("alpha", "RedFox"));
+        assert_eq!(rows[0].project, "alpha");
+        assert_eq!(rows[0].model, "opus-4.6");
+        assert_eq!(rows[0].message_count, 7);
+    }
+
+    #[test]
+    fn enrich_lossy_agent_summary_rows_from_previous_restores_duplicate_names_with_program_match() {
+        let mut rows = vec![test_agent_row("RedFox", "", "codex-cli", "", 200, 2)];
+        let previous_rows = vec![
+            test_agent_row("RedFox", "alpha", "claude-code", "opus-4.6", 100, 7),
+            test_agent_row("RedFox", "beta", "codex-cli", "gpt-5", 200, 3),
+        ];
+
+        enrich_lossy_agent_summary_rows_from_previous(&mut rows, &previous_rows);
+
+        assert_eq!(rows[0].identity, agent_identity("beta", "RedFox"));
+        assert_eq!(rows[0].project, "beta");
+        assert_eq!(rows[0].model, "gpt-5");
+        assert_eq!(rows[0].message_count, 3);
+    }
+
+    #[test]
     fn agents_cardinality_catches_false_empty_state() {
         let result = std::panic::catch_unwind(|| {
             assert_agents_list_cardinality(100, 0, "");
@@ -2440,6 +2576,49 @@ mod tests {
     }
 
     #[test]
+    fn fetch_agent_rows_from_sqlite_preserves_unknown_project_and_program_labels() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("agents-unknown-labels.sqlite3");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open sqlite");
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT, program TEXT, model TEXT, last_active_ts INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT)",
+            &[],
+        )
+        .expect("create message_recipients");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES (7, 99, 'RiverFox', '', NULL, 100)",
+            &[],
+        )
+        .expect("insert agent");
+
+        let rows = fetch_agent_rows_from_sqlite(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "RiverFox");
+        assert_eq!(rows[0].project, "[unknown-project-99]");
+        assert_eq!(rows[0].program, "[unknown-program]");
+        assert_eq!(
+            rows[0].identity,
+            agent_identity("[unknown-project-99]", "RiverFox")
+        );
+    }
+
+    #[test]
     fn rebuild_uses_sqlite_message_counts_when_event_counts_are_empty() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("agents-rebuild-message-counts.sqlite3");
@@ -2635,6 +2814,117 @@ mod tests {
         assert_eq!(alpha.model, "opus-4.6");
         assert_eq!(beta.model, "gpt-5");
         assert_ne!(alpha.identity, beta.identity);
+    }
+
+    #[test]
+    fn rebuild_preserves_previous_rows_when_db_reports_agents_but_roster_is_temporarily_empty() {
+        let broken_db_root = tempdir().expect("tempdir");
+        let state = test_state();
+        set_database_url(
+            &state,
+            format!("sqlite://{}", broken_db_root.path().to_string_lossy()),
+        );
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 1,
+            agents_list: Vec::new(),
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.agents = vec![test_agent_row(
+            "RedFox",
+            "alpha",
+            "claude-code",
+            "opus-4.6",
+            100,
+            7,
+        )];
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.agents.len(), 1);
+        assert_eq!(screen.agents[0].identity, agent_identity("alpha", "RedFox"));
+        assert_eq!(screen.agents[0].project, "alpha");
+        assert_eq!(screen.agents[0].model, "opus-4.6");
+        assert_eq!(screen.agents[0].message_count, 7);
+    }
+
+    #[test]
+    fn rebuild_recovered_rows_still_restore_previous_scope_when_sqlite_rows_are_lossy() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("agents-lossy-recovery.sqlite3");
+        let db_path_str = db_path.display().to_string();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open sqlite");
+        conn.execute_raw(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            )",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT,
+                last_active_ts INTEGER NOT NULL
+            )",
+        )
+        .expect("create agents");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                sender_id INTEGER NOT NULL
+            )",
+        )
+        .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL
+            )",
+        )
+        .expect("create message recipients");
+        conn.execute_raw(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES (1, 99, 'RedFox', 'claude-code', NULL, 100)",
+        )
+        .expect("insert lossy agent");
+
+        let state = test_state();
+        set_database_url(&state, format!("sqlite://{}", db_path.to_string_lossy()));
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 1,
+            agents_list: vec![crate::tui_events::AgentSummary {
+                name: "RedFox".to_string(),
+                program: "claude-code".to_string(),
+                last_active_ts: 100,
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.agents = vec![test_agent_row(
+            "RedFox",
+            "alpha",
+            "claude-code",
+            "opus-4.6",
+            100,
+            7,
+        )];
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.agents.len(), 1);
+        assert_eq!(screen.agents[0].identity, agent_identity("alpha", "RedFox"));
+        assert_eq!(screen.agents[0].project, "alpha");
+        assert_eq!(screen.agents[0].model, "opus-4.6");
+        assert_eq!(screen.agents[0].message_count, 7);
     }
 
     #[test]

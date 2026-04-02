@@ -1048,6 +1048,8 @@ pub struct MessageBrowserScreen {
     search_dirty: bool,
     /// Lazy-opened DB connection for message queries.
     db_conn: Option<DbConn>,
+    /// Holds the temp snapshot directory alive when this screen binds to an archive snapshot.
+    _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
     /// Whether we attempted to open the DB connection.
     db_conn_attempted: bool,
     /// Total result count (may be more than `results.len()`).
@@ -1138,6 +1140,7 @@ impl MessageBrowserScreen {
             debounce_remaining: 0,
             search_dirty: true, // Initial load
             db_conn: None,
+            _db_snapshot_dir: None,
             db_conn_attempted: false,
             total_results: 0,
             last_refresh: None,
@@ -1181,6 +1184,25 @@ impl MessageBrowserScreen {
     #[must_use]
     pub fn new() -> Self {
         Self::build(None)
+    }
+
+    fn bind_observability_db(
+        &mut self,
+        database_url: &str,
+        storage_root: &std::path::Path,
+        context: &str,
+    ) {
+        match crate::open_observability_sync_db_connection(database_url, storage_root, context) {
+            Ok(Some(db)) => {
+                let (conn, _, snapshot_dir) = db.into_parts();
+                self.db_conn = Some(conn);
+                self._db_snapshot_dir = snapshot_dir;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, context, "messages screen db bind failed");
+            }
+        }
     }
 
     fn update_urgent_pulse(&self, tick_count: u64) {
@@ -1254,11 +1276,13 @@ impl MessageBrowserScreen {
             if let Some(state) = state {
                 self.ensure_db_conn(state);
             } else {
-                let cfg = DbPoolConfig::from_env();
-                if let Ok(path) = cfg.sqlite_path() {
-                    self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
-                    self.db_conn_attempted = true;
-                }
+                let config = mcp_agent_mail_core::Config::from_env();
+                self.bind_observability_db(
+                    &config.database_url,
+                    &config.storage_root,
+                    "messages compose modal",
+                );
+                self.db_conn_attempted = true;
             }
         }
         let project_slug = if let Some(project_slug) = self.compose_project_slug_from_context() {
@@ -1313,11 +1337,37 @@ impl MessageBrowserScreen {
                 return;
             }
         }
-        let cfg = DbPoolConfig::from_env();
-        if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
-            self.db_conn_attempted = true;
+        let config = mcp_agent_mail_core::Config::from_env();
+        self.bind_observability_db(
+            &config.database_url,
+            &config.storage_root,
+            "messages modal context",
+        );
+        self.db_conn_attempted = true;
+    }
+
+    fn runtime_config_from_state(state: Option<&TuiSharedState>) -> mcp_agent_mail_core::Config {
+        match state {
+            Some(shared) => {
+                let snapshot = shared.config_snapshot();
+                let mut config = mcp_agent_mail_core::Config::from_env();
+                config.database_url = snapshot.raw_database_url;
+                config.storage_root = PathBuf::from(snapshot.storage_root);
+                config
+            }
+            None => mcp_agent_mail_core::Config::from_env(),
         }
+    }
+
+    fn open_live_mutation_db_connection(state: Option<&TuiSharedState>) -> Result<DbConn, String> {
+        let config = Self::runtime_config_from_state(state);
+        let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
+            .ok_or_else(|| "Database connection unavailable".to_string())?;
+        if !sqlite_path.exists() {
+            return Err("Database connection unavailable".to_string());
+        }
+        crate::open_interactive_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
+            .map_err(|e| format!("Database connection unavailable: {e}"))
     }
 
     fn fetch_message_entry_by_id(
@@ -1372,10 +1422,12 @@ impl MessageBrowserScreen {
         self.open_quick_reply_modal_for_entry(&entry)
     }
 
-    fn ensure_compose_sender(&self, project_slug: &str) -> Result<(), String> {
-        let Some(conn) = &self.db_conn else {
-            return Err("Database connection unavailable".to_string());
-        };
+    fn ensure_compose_sender(
+        &self,
+        project_slug: &str,
+        state: Option<&TuiSharedState>,
+    ) -> Result<(), String> {
+        let conn = Self::open_live_mutation_db_connection(state)?;
         let project_sql = "SELECT id FROM projects WHERE slug = ? LIMIT 1";
         let project_id = conn
             .query_sync(project_sql, &[Value::Text(project_slug.to_string())])
@@ -1385,40 +1437,72 @@ impl MessageBrowserScreen {
             .and_then(|row| row.get_named::<i64>("id").ok())
             .ok_or_else(|| format!("Project not found: {project_slug}"))?;
 
-        let sender_sql = format!(
-            "SELECT id FROM agents WHERE project_id = {project_id} AND name = '{COMPOSE_SENDER_NAME}' LIMIT 1"
-        );
-        let sender_exists = conn
-            .query_sync(&sender_sql, &[])
+        let existing_sender = conn
+            .query_sync(
+                "SELECT id, inception_ts FROM agents WHERE project_id = ? AND name = ? LIMIT 1",
+                &[
+                    Value::BigInt(project_id),
+                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
+                ],
+            )
             .map_err(|e| format!("Failed to check compose sender: {e}"))?
             .into_iter()
-            .next()
-            .and_then(|row| row.get_named::<i64>("id").ok())
-            .is_some();
+            .next();
         let now = unix_epoch_micros_now().unwrap_or(0);
-        if sender_exists {
-            let touch_sql = format!(
-                "UPDATE agents SET last_active_ts = {now} \
-                 WHERE project_id = {project_id} AND name = '{COMPOSE_SENDER_NAME}'"
-            );
-            conn.execute_sync(&touch_sql, &[])
-                .map_err(|e| format!("Failed to update compose sender activity: {e}"))?;
-            return Ok(());
-        }
-
-        let insert_sql = format!(
-            "INSERT INTO agents \
-             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-             VALUES \
-             ({project_id}, '{COMPOSE_SENDER_NAME}', 'am-tui', 'human', \
-              'Human operator composing messages in TUI', {now}, {now}, 'auto', 'auto')"
-        );
-        conn.execute_sync(&insert_sql, &[])
+        let inception_ts = if let Some(row) = existing_sender {
+            let existing_inception = row.get_named::<i64>("inception_ts").unwrap_or(now);
+            conn.execute_sync(
+                "UPDATE agents SET last_active_ts = ? WHERE project_id = ? AND name = ?",
+                &[
+                    Value::BigInt(now),
+                    Value::BigInt(project_id),
+                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
+                ],
+            )
+            .map_err(|e| format!("Failed to update compose sender activity: {e}"))?;
+            existing_inception
+        } else {
+            conn.execute_sync(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(project_id),
+                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
+                    Value::Text("am-tui".to_string()),
+                    Value::Text("human".to_string()),
+                    Value::Text("Human operator composing messages in TUI".to_string()),
+                    Value::BigInt(now),
+                    Value::BigInt(now),
+                    Value::Text("auto".to_string()),
+                    Value::Text("auto".to_string()),
+                ],
+            )
             .map_err(|e| format!("Failed to create compose sender: {e}"))?;
+            now
+        };
+
+        let config = Self::runtime_config_from_state(state);
+        if let Ok(Some(archive)) = mcp_agent_mail_storage::open_archive(&config, project_slug) {
+            let agent_json = serde_json::json!({
+                "name": COMPOSE_SENDER_NAME,
+                "program": "am-tui",
+                "model": "human",
+                "task_description": "Human operator composing messages in TUI",
+                "inception_ts": micros_to_iso(inception_ts),
+                "last_active_ts": micros_to_iso(now),
+                "attachments_policy": "auto",
+            });
+            let _ = mcp_agent_mail_storage::write_agent_profile_with_config(
+                &archive,
+                &config,
+                &agent_json,
+            );
+        }
         Ok(())
     }
 
-    fn submit_compose_form(&mut self) -> Cmd<MailScreenMsg> {
+    fn submit_compose_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
         let (payload, errors) = match self.compose_form.as_ref() {
             Some(form) => match validate_compose_form(form) {
                 Ok(payload) => (Some(payload), ComposeValidationErrors::default()),
@@ -1440,7 +1524,7 @@ impl MessageBrowserScreen {
             payload.thread_id = Some(format!("tui-{micros}"));
         }
 
-        if let Err(err) = self.ensure_compose_sender(&payload.project_slug) {
+        if let Err(err) = self.ensure_compose_sender(&payload.project_slug, state) {
             if let Some(form) = self.compose_form.as_mut() {
                 form.errors.general = Some(err.clone());
             }
@@ -1515,7 +1599,7 @@ impl MessageBrowserScreen {
         }
     }
 
-    fn submit_quick_reply_form(&mut self) -> Cmd<MailScreenMsg> {
+    fn submit_quick_reply_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
         let (body_md, errors) = match self.quick_reply_form.as_ref() {
             Some(form) => match validate_quick_reply_form(form) {
                 Ok(body) => (Some(body), QuickReplyValidationErrors::default()),
@@ -1540,8 +1624,8 @@ impl MessageBrowserScreen {
             return Cmd::None;
         };
 
-        self.ensure_modal_db_conn(None);
-        if let Err(err) = self.ensure_compose_sender(&context.project_slug) {
+        self.ensure_modal_db_conn(state);
+        if let Err(err) = self.ensure_compose_sender(&context.project_slug, state) {
             if let Some(form) = self.quick_reply_form.as_mut() {
                 form.errors.general = Some(err.clone());
             }
@@ -1605,7 +1689,11 @@ impl MessageBrowserScreen {
         }
     }
 
-    fn handle_quick_reply_event(&mut self, event: &Event) -> Cmd<MailScreenMsg> {
+    fn handle_quick_reply_event(
+        &mut self,
+        event: &Event,
+        state: &TuiSharedState,
+    ) -> Cmd<MailScreenMsg> {
         if self.quick_reply_form.is_none() {
             return Cmd::None;
         }
@@ -1633,7 +1721,7 @@ impl MessageBrowserScreen {
             return Cmd::None;
         }
         if ctrl_enter || matches!(key.code, KeyCode::F(5)) {
-            return self.submit_quick_reply_form();
+            return self.submit_quick_reply_form(Some(state));
         }
 
         let Some(form) = self.quick_reply_form.as_mut() else {
@@ -1666,7 +1754,11 @@ impl MessageBrowserScreen {
         Cmd::None
     }
 
-    fn handle_compose_event(&mut self, event: &Event) -> Cmd<MailScreenMsg> {
+    fn handle_compose_event(
+        &mut self,
+        event: &Event,
+        state: &TuiSharedState,
+    ) -> Cmd<MailScreenMsg> {
         if self.compose_form.is_none() {
             return Cmd::None;
         }
@@ -1694,7 +1786,7 @@ impl MessageBrowserScreen {
             return Cmd::None;
         }
         if ctrl_enter || matches!(key.code, KeyCode::F(5)) {
-            return self.submit_compose_form();
+            return self.submit_compose_form(Some(state));
         }
 
         let Some(form) = self.compose_form.as_mut() else {
@@ -2519,14 +2611,51 @@ impl MessageBrowserScreen {
             return;
         }
         self.db_conn_attempted = true;
-        let db_url = &state.config_snapshot().raw_database_url;
-        let cfg = DbPoolConfig {
-            database_url: db_url.clone(),
-            ..Default::default()
-        };
-        if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
+        let cfg = state.config_snapshot();
+        self.bind_observability_db(
+            &cfg.raw_database_url,
+            std::path::Path::new(&cfg.storage_root),
+            "messages screen",
+        );
+    }
+
+    fn can_preserve_previous_results_for_live_fallback(
+        &self,
+        query: &str,
+        show_project: bool,
+        project_filter: Option<&str>,
+    ) -> bool {
+        if self.results.is_empty() || self.search_method == SearchMethod::Live {
+            return false;
         }
+        let same_query =
+            (query.is_empty() && self.last_search.is_empty()) || self.last_search == query;
+        same_query
+            && self
+                .results
+                .iter()
+                .all(|entry| entry.show_project == show_project)
+            && project_filter
+                .is_none_or(|slug| self.results.iter().all(|entry| entry.project_slug == slug))
+    }
+
+    fn merge_live_results_into_previous_results(
+        previous_results: &[MessageEntry],
+        live_results: Vec<MessageEntry>,
+    ) -> Vec<MessageEntry> {
+        let mut merged = previous_results.to_vec();
+        let mut known_ids: std::collections::HashSet<i64> = previous_results
+            .iter()
+            .filter_map(|entry| (entry.id > 0).then_some(entry.id))
+            .collect();
+        for entry in live_results {
+            if entry.id > 0 && !known_ids.insert(entry.id) {
+                continue;
+            }
+            merged.push(entry);
+        }
+        merged.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_micros));
+        merged
     }
 
     /// Execute a search query against the database, merging live event results.
@@ -2546,11 +2675,23 @@ impl MessageBrowserScreen {
         };
 
         let Some(conn) = &self.db_conn else {
+            let previous_results = self.results.clone();
+            let previous_total = self.total_results;
+            let preserve_previous = self.can_preserve_previous_results_for_live_fallback(
+                &query,
+                show_project,
+                project_filter,
+            );
             let mut results = Self::search_live_events(state, &query, show_project);
             if let Some(slug) = project_filter {
                 results.retain(|entry| entry.project_slug == slug);
             }
-            results.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_micros));
+            if preserve_previous {
+                results =
+                    Self::merge_live_results_into_previous_results(&previous_results, results);
+            } else {
+                results.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_micros));
+            }
 
             if query.is_empty() {
                 self.last_search.clear();
@@ -2562,7 +2703,11 @@ impl MessageBrowserScreen {
             self.results = results;
             self.results_generation = self.results_generation.wrapping_add(1);
             self.prune_selection_to_visible();
-            self.total_results = self.results.len();
+            self.total_results = if preserve_previous {
+                previous_total.max(self.results.len())
+            } else {
+                self.results.len()
+            };
 
             if self.results.is_empty() {
                 self.cursor = 0;
@@ -2745,10 +2890,10 @@ impl MailScreen for MessageBrowserScreen {
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         if self.quick_reply_form.is_some() {
-            return self.handle_quick_reply_event(event);
+            return self.handle_quick_reply_event(event, state);
         }
         if self.compose_form.is_some() {
-            return self.handle_compose_event(event);
+            return self.handle_compose_event(event, state);
         }
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
@@ -3768,19 +3913,26 @@ fn project_slugs_by_id(
 
     let placeholders = vec!["?"; dedup.len()].join(", ");
     let sql = format!("SELECT id, slug FROM projects WHERE id IN ({placeholders})");
-    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
-    conn.query_sync(&sql, &params)
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let id = row.get_named::<i64>("id").ok()?;
-                    let slug = row.get_named::<String>("slug").ok()?;
-                    Some((id, slug))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let params: Vec<Value> = dedup.iter().copied().map(Value::BigInt).collect();
+    let mut slugs = std::collections::HashMap::new();
+    if let Ok(rows) = conn.query_sync(&sql, &params) {
+        for row in rows {
+            let Ok(id) = row.get_named::<i64>("id") else {
+                continue;
+            };
+            let slug = row
+                .get_named::<String>("slug")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| unknown_project_label(id));
+            slugs.insert(id, slug);
+        }
+    }
+    for id in dedup {
+        slugs.entry(id).or_insert_with(|| unknown_project_label(id));
+    }
+    slugs
 }
 
 fn recipient_names_by_message(
@@ -3798,22 +3950,37 @@ fn recipient_names_by_message(
 
     let placeholders = vec!["?"; dedup.len()].join(", ");
     let sql = format!(
-        "SELECT mr.message_id, COALESCE(GROUP_CONCAT(DISTINCT a.name), '') AS to_agents \
+        "SELECT mr.message_id, mr.agent_id AS raw_agent_id, a.name AS agent_name \
          FROM message_recipients mr \
-         JOIN agents a ON a.id = mr.agent_id \
+         LEFT JOIN agents a ON a.id = mr.agent_id \
          WHERE mr.message_id IN ({placeholders}) \
-         GROUP BY mr.message_id"
+         ORDER BY mr.message_id ASC, mr.agent_id ASC"
     );
     let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
     conn.query_sync(&sql, &params)
         .ok()
         .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let message_id = row.get_named::<i64>("message_id").ok()?;
-                    let to_agents = row.get_named::<String>("to_agents").ok()?;
-                    Some((message_id, to_agents))
-                })
+            let mut grouped: std::collections::HashMap<i64, Vec<String>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let Ok(message_id) = row.get_named::<i64>("message_id") else {
+                    continue;
+                };
+                let agent_id = row.get_named::<i64>("raw_agent_id").unwrap_or(0);
+                let agent_name = row
+                    .get_named::<String>("agent_name")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("[unknown-agent-{agent_id}]"));
+                let names = grouped.entry(message_id).or_default();
+                if !names.iter().any(|existing| existing == &agent_name) {
+                    names.push(agent_name);
+                }
+            }
+            grouped
+                .into_iter()
+                .map(|(message_id, names)| (message_id, names.join(", ")))
                 .collect()
         })
         .unwrap_or_default()
@@ -3874,12 +4041,12 @@ fn message_entries_from_rows(
             from_agent: sender_name_map
                 .get(&row.sender_id)
                 .cloned()
-                .unwrap_or_default(),
+                .unwrap_or_else(|| unknown_agent_label(row.sender_id)),
             to_agents: recipient_names_from_json(&row.recipients_json),
             project_slug: project_slug_map
                 .get(&row.project_id)
                 .cloned()
-                .unwrap_or_default(),
+                .unwrap_or_else(|| unknown_project_label(row.project_id)),
             thread_id: row.thread_id,
             timestamp_iso: micros_to_iso(row.created_ts),
             timestamp_micros: row.created_ts,
@@ -3904,19 +4071,34 @@ fn agent_names_by_id(conn: &DbConn, agent_ids: &[i64]) -> std::collections::Hash
 
     let placeholders = vec!["?"; dedup.len()].join(", ");
     let sql = format!("SELECT id, name FROM agents WHERE id IN ({placeholders})");
-    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
-    conn.query_sync(&sql, &params)
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let id = row.get_named::<i64>("id").ok()?;
-                    let name = row.get_named::<String>("name").ok()?;
-                    Some((id, name))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let params: Vec<Value> = dedup.iter().copied().map(Value::BigInt).collect();
+    let mut names = std::collections::HashMap::new();
+    if let Ok(rows) = conn.query_sync(&sql, &params) {
+        for row in rows {
+            let Ok(id) = row.get_named::<i64>("id") else {
+                continue;
+            };
+            let name = row
+                .get_named::<String>("name")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| unknown_agent_label(id));
+            names.insert(id, name);
+        }
+    }
+    for id in dedup {
+        names.entry(id).or_insert_with(|| unknown_agent_label(id));
+    }
+    names
+}
+
+fn unknown_agent_label(agent_id: i64) -> String {
+    format!("[unknown-agent-{agent_id}]")
+}
+
+fn unknown_project_label(project_id: i64) -> String {
+    format!("[unknown-project-{project_id}]")
 }
 
 fn recipient_names_from_json(raw: &str) -> String {
@@ -5746,6 +5928,7 @@ fn truncate_str(s: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     fn test_message_entry(id: i64, thread_id: &str, subject: &str) -> MessageEntry {
@@ -5772,6 +5955,138 @@ mod tests {
             y,
             modifiers: ftui::Modifiers::empty(),
         })
+    }
+
+    fn write_archive_ahead_fixture(base: &Path) -> (PathBuf, PathBuf) {
+        let storage_root = base.join("storage");
+        let db_path = base.join("stale-messages.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+        (storage_root, db_path)
+    }
+
+    #[test]
+    fn messages_screen_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: storage_root.clone(),
+            ..Default::default()
+        });
+        let mut screen = MessageBrowserScreen::new();
+
+        screen.ensure_db_conn(&state);
+
+        assert!(screen.db_conn.is_some(), "screen should bind a readable db");
+        assert!(
+            screen._db_snapshot_dir.is_some(),
+            "screen should hold the archive snapshot directory when the live db lags"
+        );
+        assert_eq!(
+            screen.latest_project_slug().as_deref(),
+            Some("ahead-project")
+        );
+    }
+
+    #[test]
+    fn ensure_compose_sender_uses_live_mailbox_when_screen_reads_archive_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let live_conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        live_conn
+            .execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    Value::BigInt(1),
+                    Value::Text("ahead-project".to_string()),
+                    Value::Text("/ahead-project".to_string()),
+                    Value::BigInt(0),
+                ],
+            )
+            .expect("insert live project");
+        drop(live_conn);
+
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: storage_root.clone(),
+            ..Default::default()
+        });
+        let mut screen = MessageBrowserScreen::new();
+        screen.ensure_db_conn(&state);
+        assert!(
+            screen._db_snapshot_dir.is_some(),
+            "screen should be in archive-snapshot mode for this regression"
+        );
+
+        screen
+            .ensure_compose_sender("ahead-project", Some(&state))
+            .expect("ensure compose sender");
+
+        let live_conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+        let sender_count = live_conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM agents WHERE project_id = ? AND name = ?",
+                &[
+                    Value::BigInt(1),
+                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
+                ],
+            )
+            .expect("count compose sender")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            sender_count, 1,
+            "compose sender should be created in the live configured db, not only the archive snapshot"
+        );
+
+        let profile_path = storage_root
+            .join("projects")
+            .join("ahead-project")
+            .join("agents")
+            .join(COMPOSE_SENDER_NAME)
+            .join("profile.json");
+        assert!(
+            profile_path.exists(),
+            "compose sender profile should be mirrored into the archive"
+        );
     }
 
     fn ctrl_key(code: KeyCode) -> Event {
@@ -7553,6 +7868,103 @@ mod tests {
     }
 
     #[test]
+    fn execute_search_without_db_preserves_previous_db_results_for_same_query() {
+        use crate::tui_events::{EventSource, MailEvent};
+
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::with_event_capacity(&config, 8);
+        let _ = state.push_event(MailEvent::MessageSent {
+            seq: 0,
+            timestamp_micros: 1_700_000_000_000_000,
+            source: EventSource::Mail,
+            redacted: false,
+            id: 77,
+            from: "BluePeak".to_string(),
+            to: vec!["RedLake".to_string()],
+            subject: "fresh live".to_string(),
+            thread_id: "t-live".to_string(),
+            project: "proj".to_string(),
+            body_md: "New body".to_string(),
+        });
+
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn_attempted = true;
+        screen.search_method = SearchMethod::Recent;
+        screen.total_results = 3;
+        screen.results = vec![
+            test_message_entry(1, "thread-a", "persisted one"),
+            test_message_entry(2, "thread-b", "persisted two"),
+        ];
+
+        screen.execute_search(&state);
+
+        assert_eq!(screen.search_method, SearchMethod::Live);
+        assert_eq!(screen.total_results, 3);
+        assert_eq!(screen.results.len(), 3);
+        assert_eq!(screen.results[0].id, 77);
+        assert!(screen.results.iter().any(|entry| entry.id == 1));
+        assert!(screen.results.iter().any(|entry| entry.id == 2));
+    }
+
+    #[test]
+    fn execute_search_without_db_does_not_preserve_previous_results_for_new_query() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::with_event_capacity(&config, 8);
+
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn_attempted = true;
+        screen.search_method = SearchMethod::Recent;
+        screen.total_results = 1;
+        screen.results = vec![test_message_entry(1, "thread-a", "persisted one")];
+        screen.search_input.set_value("fresh");
+
+        screen.execute_search(&state);
+
+        assert_eq!(screen.search_method, SearchMethod::Live);
+        assert!(screen.results.is_empty());
+        assert_eq!(screen.total_results, 0);
+    }
+
+    #[test]
+    fn execute_search_without_db_does_not_preserve_previous_results_across_scope_change() {
+        use crate::tui_events::{EventSource, MailEvent};
+
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::with_event_capacity(&config, 8);
+        let _ = state.push_event(MailEvent::MessageSent {
+            seq: 0,
+            timestamp_micros: 1_700_000_000_000_000,
+            source: EventSource::Mail,
+            redacted: false,
+            id: 88,
+            from: "BluePeak".to_string(),
+            to: vec!["RedLake".to_string()],
+            subject: "fresh live".to_string(),
+            thread_id: "t-live".to_string(),
+            project: "proj-b".to_string(),
+            body_md: "New body".to_string(),
+        });
+
+        let mut previous = test_message_entry(1, "thread-a", "persisted one");
+        previous.project_slug = "proj-a".to_string();
+        previous.show_project = true;
+
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn_attempted = true;
+        screen.search_method = SearchMethod::Recent;
+        screen.total_results = 1;
+        screen.results = vec![previous];
+        screen.inbox_mode = InboxMode::Local("proj-b".to_string());
+
+        screen.execute_search(&state);
+
+        assert_eq!(screen.search_method, SearchMethod::Live);
+        assert_eq!(screen.results.len(), 1);
+        assert_eq!(screen.results[0].id, 88);
+        assert_eq!(screen.results[0].project_slug, "proj-b");
+    }
+
+    #[test]
     fn render_search_bar_with_metadata_no_panic() {
         let input = TextInput::new().with_placeholder("Search...");
         let mut pool = ftui::GraphemePool::new();
@@ -8044,6 +8456,62 @@ mod tests {
 
         let disabled = compute_shimmer_progresses(&entries, false);
         assert!(disabled.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn recipient_names_by_message_keeps_missing_agent_rows() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create agents");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL
+            )",
+        )
+        .expect("create recipients");
+        conn.execute_raw(
+            "INSERT INTO agents (id, name) VALUES (1, 'BlueLake');
+             INSERT INTO message_recipients (message_id, agent_id) VALUES
+                (10, 1),
+                (10, 99)",
+        )
+        .expect("seed recipients");
+
+        let names = recipient_names_by_message(&conn, &[10]);
+        let to_agents = names.get(&10).expect("message recipients");
+        assert!(to_agents.contains("BlueLake"));
+        assert!(to_agents.contains("[unknown-agent-99]"));
+    }
+
+    #[test]
+    fn message_entries_from_rows_preserve_unknown_sender_and_project_labels() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
+            .expect("create projects");
+
+        let entries = message_entries_from_rows(
+            &conn,
+            vec![RawMessageRow {
+                id: 42,
+                subject: "Subject".to_string(),
+                body_md: "Body".to_string(),
+                thread_id: "thread-42".to_string(),
+                importance: "normal".to_string(),
+                ack_required: false,
+                created_ts: 1_700_000_000_000_000,
+                sender_id: 99,
+                project_id: 77,
+                recipients_json: r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#.to_string(),
+            }],
+            true,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].from_agent, "[unknown-agent-99]");
+        assert_eq!(entries[0].project_slug, "[unknown-project-77]");
     }
 
     #[test]

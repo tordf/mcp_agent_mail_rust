@@ -1459,6 +1459,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
 
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
+        storage_root: Some(config.storage_root.clone()),
         min_connections: 1,
         max_connections: 1,
         run_migrations: false,
@@ -1637,6 +1638,7 @@ fn probe_auth(config: &Config) -> ProbeResult {
 fn probe_consistency(config: &Config) -> ProbeResult {
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
+        storage_root: Some(config.storage_root.clone()),
         run_migrations: false,
         ..DbPoolConfig::default()
     };

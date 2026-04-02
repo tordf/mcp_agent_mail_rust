@@ -596,7 +596,8 @@ impl ReservationsScreen {
     }
 
     fn refresh_from_db_fallback(&mut self, state: &TuiSharedState) -> bool {
-        let database_url = state.config_snapshot().database_url;
+        let cfg = state.config_snapshot();
+        let database_url = cfg.database_url;
         if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&database_url) {
             self.fallback_issue = Some(
                 "DB snapshots are unavailable for :memory: SQLite URLs; use a file-backed DATABASE_URL for reservations visibility."
@@ -605,39 +606,35 @@ impl ReservationsScreen {
             return false;
         }
 
-        let db_cfg = mcp_agent_mail_db::DbPoolConfig {
-            database_url,
-            ..Default::default()
-        };
-        let path = match db_cfg.sqlite_path() {
-            Ok(path) => path,
-            Err(err) => {
+        let db = match crate::open_observability_sync_db_connection(
+            &database_url,
+            std::path::Path::new(&cfg.storage_root),
+            "reservations screen fallback",
+        ) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                self.fallback_issue = Some(
+                    "Unable to open an archive-aware DB snapshot for reservations fallback."
+                        .to_string(),
+                );
+                return false;
+            }
+            Err(error) => {
                 self.fallback_issue = Some(format!(
-                    "Unable to parse SQLite path for reservations fallback: {err}"
+                    "Unable to open an archive-aware DB snapshot for reservations fallback: {error}"
                 ));
                 return false;
             }
         };
-
-        let conn = match crate::open_interactive_sync_db_connection(&path) {
-            Ok(conn) => conn,
-            Err(err) => {
-                self.fallback_issue = Some(format!(
-                    "Unable to open DB for reservations fallback ({path}): {err}",
-                ));
-                return false;
-            }
-        };
+        let (conn, path, _snapshot_dir) = db.into_parts();
 
         let rows =
             crate::tui_poller::fetch_reservation_snapshots_with_path(&conn, Some(path.as_str()));
-        if rows.is_empty() {
-            self.fallback_issue =
-                Some("Direct DB fallback returned no active reservation rows.".to_string());
-            return false;
-        }
-
-        self.fallback_issue = None;
+        self.fallback_issue = if rows.is_empty() {
+            Some("Direct DB fallback returned no active reservation rows.".to_string())
+        } else {
+            None
+        };
         let fallback_snapshot = DbStatSnapshot {
             timestamp_micros: chrono::Utc::now().timestamp_micros(),
             file_reservations: u64::try_from(rows.len()).unwrap_or(u64::MAX),
@@ -3382,6 +3379,48 @@ mod tests {
         assert_eq!(screen.reservations.len(), 1);
 
         // Second consecutive empty snapshot confirms the clear.
+        let second_empty_changed = screen.apply_db_snapshot(&DbStatSnapshot {
+            reservation_snapshots: vec![],
+            file_reservations: 0,
+            timestamp_micros: 102,
+            ..Default::default()
+        });
+        assert!(second_empty_changed);
+        assert!(screen.reservations.is_empty());
+    }
+
+    #[test]
+    fn empty_direct_fallback_rows_follow_transient_empty_hold_policy() {
+        let mut screen = ReservationsScreen::new();
+        screen.reservations.insert(
+            reservation_key("proj", "BlueLake", "src/**"),
+            ActiveReservation {
+                reservation_id: Some(10),
+                agent: "BlueLake".into(),
+                path_pattern: "src/**".into(),
+                exclusive: true,
+                granted_ts: 2_000_000,
+                ttl_s: 6,
+                project: "proj".into(),
+                released: false,
+            },
+        );
+
+        screen.fallback_issue =
+            Some("Direct DB fallback returned no active reservation rows.".into());
+        let first_empty_changed = screen.apply_db_snapshot(&DbStatSnapshot {
+            reservation_snapshots: vec![],
+            file_reservations: 0,
+            timestamp_micros: 101,
+            ..Default::default()
+        });
+        assert!(!first_empty_changed);
+        assert_eq!(screen.reservations.len(), 1);
+        assert_eq!(
+            screen.fallback_issue.as_deref(),
+            Some("Direct DB fallback returned no active reservation rows.")
+        );
+
         let second_empty_changed = screen.apply_db_snapshot(&DbStatSnapshot {
             reservation_snapshots: vec![],
             file_reservations: 0,

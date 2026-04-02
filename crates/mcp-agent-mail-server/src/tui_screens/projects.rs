@@ -14,7 +14,6 @@ use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_db::pool::DbPoolConfig;
 
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{MailEvent, ProjectSummary};
@@ -66,24 +65,94 @@ fn assert_projects_list_cardinality(total_db_projects: u64, rendered_count: usiz
     }
 }
 
-fn recover_projects_list_from_sqlite(database_url: &str) -> Option<Vec<ProjectSummary>> {
-    let cfg = DbPoolConfig {
-        database_url: database_url.to_string(),
-        ..Default::default()
+fn unique_previous_project_row<'a, F>(
+    previous_rows: &'a [ProjectSummary],
+    mut predicate: F,
+) -> Option<&'a ProjectSummary>
+where
+    F: FnMut(&ProjectSummary) -> bool,
+{
+    let mut matching = previous_rows.iter().filter(|row| predicate(row));
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+fn enrich_zero_count_projects_from_previous(
+    rows: &mut [ProjectSummary],
+    previous_rows: &[ProjectSummary],
+    restore_agent_counts: bool,
+    restore_message_counts: bool,
+    restore_reservation_counts: bool,
+) {
+    if rows.is_empty() || previous_rows.is_empty() {
+        return;
+    }
+
+    for row in rows {
+        let previous = unique_previous_project_row(previous_rows, |candidate| {
+            candidate.slug == row.slug && candidate.human_key == row.human_key
+        })
+        .or_else(|| {
+            unique_previous_project_row(previous_rows, |candidate| candidate.slug == row.slug)
+        });
+        let Some(previous) = previous else {
+            continue;
+        };
+        if row.created_at == 0 {
+            row.created_at = previous.created_at;
+        }
+        if restore_agent_counts && row.agent_count == 0 {
+            row.agent_count = previous.agent_count;
+        }
+        if restore_message_counts && row.message_count == 0 {
+            row.message_count = previous.message_count;
+        }
+        if restore_reservation_counts && row.reservation_count == 0 {
+            row.reservation_count = previous.reservation_count;
+        }
+    }
+}
+
+fn should_preserve_previous_project_rows(
+    total_db_projects: u64,
+    rows: &[ProjectSummary],
+    previous_rows: &[ProjectSummary],
+    filter: &str,
+) -> bool {
+    total_db_projects > 0
+        && rows.is_empty()
+        && filter.trim().is_empty()
+        && !previous_rows.is_empty()
+}
+
+fn recover_projects_list_from_sqlite(
+    database_url: &str,
+    storage_root: &std::path::Path,
+) -> Option<Vec<ProjectSummary>> {
+    let db = match crate::open_observability_sync_db_connection(
+        database_url,
+        storage_root,
+        "projects screen recovery",
+    ) {
+        Ok(Some(db)) => db,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(error = %error, "projects screen recovery db open failed");
+            return None;
+        }
     };
-    let path = cfg.sqlite_path().ok()?;
-    let conn = crate::open_best_effort_sync_db_connection(&path).ok()?;
-    let mut projects = fetch_recent_projects_minimal(&conn);
+    let mut projects = fetch_recent_projects_minimal(db.conn());
     if projects.is_empty() {
         return Some(projects);
     }
 
     let project_ids: Vec<i64> = projects.iter().map(|project| project.id).collect();
-    let agent_counts = crate::tui_poller::fetch_project_count_map(&conn, "agents", &project_ids);
+    let agent_counts =
+        crate::tui_poller::fetch_project_count_map(db.conn(), "agents", &project_ids);
     let message_counts =
-        crate::tui_poller::fetch_project_count_map(&conn, "messages", &project_ids);
+        crate::tui_poller::fetch_project_count_map(db.conn(), "messages", &project_ids);
     let reservation_counts = crate::tui_poller::fetch_active_reservation_counts_by_project(
-        &conn,
+        db.conn(),
         chrono::Utc::now().timestamp_micros(),
     );
     for project in &mut projects {
@@ -107,19 +176,26 @@ fn fetch_recent_projects_minimal(conn: &DbConn) -> Vec<ProjectSummary> {
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
+                    let id = row
+                        .get_named::<i64>("id")
+                        .ok()
+                        .or_else(|| row.get_as::<i64>(0).ok())?;
                     Some(ProjectSummary {
-                        id: row
-                            .get_named::<i64>("id")
-                            .ok()
-                            .or_else(|| row.get_as::<i64>(0).ok())?,
+                        id,
                         slug: row
                             .get_named::<String>("slug")
                             .ok()
-                            .or_else(|| row.get_as::<String>(1).ok())?,
+                            .or_else(|| row.get_as::<String>(1).ok())
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| format!("[unknown-project-{id}]")),
                         human_key: row
                             .get_named::<String>("human_key")
                             .ok()
-                            .or_else(|| row.get_as::<String>(2).ok())?,
+                            .or_else(|| row.get_as::<String>(2).ok())
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| format!("[unknown-human-key-{id}]")),
                         created_at: parse_recovered_created_at(&row),
                         ..ProjectSummary::default()
                     })
@@ -226,15 +302,19 @@ impl ProjectsScreen {
         let cfg = state.config_snapshot();
         let total_rows = db.projects;
         let raw_count = u64::try_from(db.projects_list.len()).unwrap_or(u64::MAX);
+        let previous_rows = self.projects.clone();
         let mut rows: Vec<ProjectSummary> = db.projects_list;
         let zero_only_counts = !rows.is_empty()
             && ((db.agents > 0 && rows.iter().all(|project| project.agent_count == 0))
                 || (db.messages > 0 && rows.iter().all(|project| project.message_count == 0))
                 || (db.file_reservations > 0
                     && rows.iter().all(|project| project.reservation_count == 0)));
-        let detail_recovered = if total_rows > 0
-            && (rows.is_empty() || zero_only_counts)
-            && let Some(recovered) = recover_projects_list_from_sqlite(&cfg.raw_database_url)
+        let recovery_attempted = total_rows > 0 && (rows.is_empty() || zero_only_counts);
+        let detail_recovered = if recovery_attempted
+            && let Some(recovered) = recover_projects_list_from_sqlite(
+                &cfg.raw_database_url,
+                std::path::Path::new(&cfg.storage_root),
+            )
             && !recovered.is_empty()
         {
             rows = recovered;
@@ -242,6 +322,27 @@ impl ProjectsScreen {
         } else {
             false
         };
+        if recovery_attempted {
+            enrich_zero_count_projects_from_previous(
+                &mut rows,
+                &previous_rows,
+                db.agents > 0,
+                db.messages > 0,
+                db.file_reservations > 0,
+            );
+            if !detail_recovered
+                && should_preserve_previous_project_rows(
+                    total_rows,
+                    &rows,
+                    &previous_rows,
+                    &self.filter,
+                )
+            {
+                // Keep the last good project roster instead of publishing a false-empty
+                // screen when the richer sqlite recovery path is temporarily unavailable.
+                rows = previous_rows.clone();
+            }
+        }
 
         // Apply filter
         let filter_text = self.filter.trim().to_ascii_lowercase();
@@ -1515,6 +1616,31 @@ mod tests {
         assert_eq!(screen.cached_totals, (2, 8, 30, 3));
     }
 
+    #[test]
+    fn fetch_recent_projects_minimal_preserves_unknown_slug_and_human_key_labels() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT,
+                human_key TEXT,
+                created_at INTEGER
+            )",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (5, '', '', 100)",
+        )
+        .expect("insert project");
+
+        let rows = fetch_recent_projects_minimal(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 5);
+        assert_eq!(rows[0].slug, "[unknown-project-5]");
+        assert_eq!(rows[0].human_key, "[unknown-human-key-5]");
+    }
+
     // ── B5: Cardinality truth assertions ────────────────────────────
 
     #[test]
@@ -1541,6 +1667,32 @@ mod tests {
             result.is_err(),
             "should panic when DB has projects but rendered list is empty without filter"
         );
+    }
+
+    #[test]
+    fn enrich_zero_count_projects_from_previous_restores_known_counts() {
+        let mut rows = vec![ProjectSummary {
+            slug: "alpha".to_string(),
+            human_key: "/tmp/alpha".to_string(),
+            created_at: 0,
+            ..Default::default()
+        }];
+        let previous_rows = vec![ProjectSummary {
+            slug: "alpha".to_string(),
+            human_key: "/tmp/alpha".to_string(),
+            created_at: 100,
+            agent_count: 3,
+            message_count: 5,
+            reservation_count: 2,
+            ..Default::default()
+        }];
+
+        enrich_zero_count_projects_from_previous(&mut rows, &previous_rows, true, true, true);
+
+        assert_eq!(rows[0].created_at, 100);
+        assert_eq!(rows[0].agent_count, 3);
+        assert_eq!(rows[0].message_count, 5);
+        assert_eq!(rows[0].reservation_count, 2);
     }
 
     // ── G6: Project scope audit tests ───────────────────────────────
@@ -1819,6 +1971,83 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_preserves_previous_projects_when_db_reports_rows_but_recovery_fails() {
+        let broken_db_root = tempdir().expect("tempdir");
+        let state = test_state();
+        set_database_url(
+            &state,
+            format!("sqlite://{}", broken_db_root.path().to_string_lossy()),
+        );
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            projects_list: Vec::new(),
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.projects = vec![ProjectSummary {
+            slug: "alpha".to_string(),
+            human_key: "/tmp/alpha".to_string(),
+            created_at: 100,
+            agent_count: 3,
+            message_count: 5,
+            reservation_count: 2,
+            ..Default::default()
+        }];
+
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.projects.len(), 1);
+        assert_eq!(screen.projects[0].slug, "alpha");
+        assert_eq!(screen.projects[0].human_key, "/tmp/alpha");
+        assert_eq!(screen.projects[0].agent_count, 3);
+        assert_eq!(screen.projects[0].message_count, 5);
+        assert_eq!(screen.projects[0].reservation_count, 2);
+    }
+
+    #[test]
+    fn rebuild_preserves_previous_project_counts_when_snapshot_zeroes_them() {
+        let broken_db_root = tempdir().expect("tempdir");
+        let state = test_state();
+        set_database_url(
+            &state,
+            format!("sqlite://{}", broken_db_root.path().to_string_lossy()),
+        );
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            agents: 3,
+            messages: 5,
+            file_reservations: 2,
+            projects_list: vec![ProjectSummary {
+                slug: "alpha".to_string(),
+                human_key: "/tmp/alpha".to_string(),
+                created_at: 100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.projects = vec![ProjectSummary {
+            slug: "alpha".to_string(),
+            human_key: "/tmp/alpha".to_string(),
+            created_at: 100,
+            agent_count: 3,
+            message_count: 5,
+            reservation_count: 2,
+            ..Default::default()
+        }];
+
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.projects.len(), 1);
+        assert_eq!(screen.projects[0].slug, "alpha");
+        assert_eq!(screen.projects[0].agent_count, 3);
+        assert_eq!(screen.projects[0].message_count, 5);
+        assert_eq!(screen.projects[0].reservation_count, 2);
+    }
+
+    #[test]
     fn rebuild_recovers_zero_only_project_counts_from_sqlite() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("projects-zero-count-recovery.sqlite3");
@@ -1904,6 +2133,65 @@ mod tests {
         assert_eq!(screen.projects[0].agent_count, 2);
         assert_eq!(screen.projects[0].message_count, 3);
         assert_eq!(screen.projects[0].reservation_count, 1);
+    }
+
+    #[test]
+    fn rebuild_recovered_projects_still_preserves_previous_counts_when_backfill_queries_fail() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("projects-recovery-count-failure.sqlite3");
+        let db_path_str = db_path.display().to_string();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open sqlite");
+        conn.execute_raw(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'demo', '/tmp/demo', 100)",
+        )
+        .expect("insert project");
+
+        let state = test_state();
+        set_database_url(&state, format!("sqlite:///{db_path_str}"));
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            agents: 2,
+            messages: 3,
+            file_reservations: 1,
+            projects_list: Vec::new(),
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.projects = vec![ProjectSummary {
+            id: 1,
+            slug: "demo".into(),
+            human_key: "/tmp/demo".into(),
+            created_at: 100,
+            agent_count: 2,
+            message_count: 3,
+            reservation_count: 1,
+        }];
+
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.projects.len(), 1);
+        assert_eq!(screen.projects[0].slug, "demo");
+        assert_eq!(screen.projects[0].agent_count, 2);
+        assert_eq!(screen.projects[0].message_count, 3);
+        assert_eq!(screen.projects[0].reservation_count, 1);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics.last().expect("diagnostic expected");
+        assert!(
+            diag.query_params.contains("recovered=true"),
+            "direct sqlite recovery should still be recorded"
+        );
     }
 
     // ── B8: DB context binding guardrail regression tests ─────────────

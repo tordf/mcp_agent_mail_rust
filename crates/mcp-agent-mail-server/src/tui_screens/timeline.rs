@@ -962,8 +962,7 @@ impl TimelineScreen {
         if let Some(ref rx) = self.commit_refresh_rx {
             match rx.try_recv() {
                 Ok(result) => {
-                    self.commit_entries = result.commits;
-                    self.commit_stats = result.stats;
+                    self.apply_commit_refresh_result(result);
                     self.commit_refresh_rx = None;
                     if self.pane.follow {
                         self.cursor_end();
@@ -1068,6 +1067,22 @@ impl TimelineScreen {
             })
             .ok();
         self.commit_refresh_rx = Some(rx);
+    }
+
+    fn apply_commit_refresh_result(&mut self, result: CommitRefreshResult) {
+        if result.commits.is_empty()
+            && result.stats.refresh_errors > 0
+            && !self.commit_entries.is_empty()
+        {
+            self.commit_stats.refresh_errors = self
+                .commit_stats
+                .refresh_errors
+                .saturating_add(result.stats.refresh_errors);
+            return;
+        }
+
+        self.commit_entries = result.commits;
+        self.commit_stats = result.stats;
     }
 
     fn combined_rows(&self) -> std::cell::Ref<'_, Vec<CombinedTimelineRow>> {
@@ -3902,6 +3917,83 @@ mod tests {
         // it returns Ok(empty_vec) because the archive repo still opens, just no
         // matching path prefix. So refresh_errors may be 0 here.
         // The error path is exercised when the repo itself is unreachable.
+    }
+
+    #[test]
+    fn commit_refresh_preserves_stale_entries_when_repo_refresh_fails() {
+        let dir = tempfile::tempdir().expect("create timeline repo tempdir");
+        seed_timeline_repo(dir.path());
+        commit_project_fixture(
+            dir.path(),
+            "proj-a",
+            "messages/2026/03/msg.md",
+            "mail: BluePuma -> SilentOwl | hello",
+        );
+        let config = mcp_agent_mail_core::Config {
+            storage_root: dir.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let mut screen = TimelineScreen::new();
+        screen.view_mode = TimelineViewMode::Commits;
+
+        let mut new_stats = crate::tui_events::DbStatSnapshot::default();
+        new_stats.projects_list.push(project_summary(1, "proj-a"));
+        state.update_db_stats(new_stats);
+
+        drive_commit_refresh(&mut screen, &state, 120);
+        let previous_entries = screen.commit_entries.clone();
+        let previous_stats = screen.commit_stats.clone();
+
+        let mut broken_snapshot = state.config_snapshot();
+        broken_snapshot.storage_root = dir.path().join("missing-root").display().to_string();
+        state.update_config_snapshot(broken_snapshot);
+
+        screen.last_visible_at.set(Some(Instant::now()));
+        screen.last_commit_refresh_tick = 0;
+        screen.last_commit_refresh_at = None;
+        screen.refresh_commit_entries(1_000, &state);
+        assert!(
+            screen.commit_refresh_rx.is_some(),
+            "expected background refresh to start"
+        );
+
+        for _ in 0..120 {
+            screen.refresh_commit_entries(1_001, &state);
+            if screen.commit_refresh_rx.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            screen.commit_refresh_rx.is_none(),
+            "commit refresh should settle after repo failure"
+        );
+        assert_eq!(screen.commit_entries.len(), previous_entries.len());
+        assert_eq!(
+            screen
+                .commit_entries
+                .iter()
+                .map(|entry| (&entry.project_slug, &entry.short_sha, &entry.subject))
+                .collect::<Vec<_>>(),
+            previous_entries
+                .iter()
+                .map(|entry| (&entry.project_slug, &entry.short_sha, &entry.subject))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            screen.commit_stats.total_commits,
+            previous_stats.total_commits
+        );
+        assert_eq!(
+            screen.commit_stats.active_projects,
+            previous_stats.active_projects
+        );
+        assert!(
+            screen.commit_stats.refresh_errors > previous_stats.refresh_errors,
+            "repo refresh failure should surface as an error without clearing stale entries"
+        );
     }
 
     #[test]

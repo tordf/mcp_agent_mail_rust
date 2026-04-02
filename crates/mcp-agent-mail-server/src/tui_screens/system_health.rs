@@ -272,6 +272,43 @@ pub struct SystemHealthScreen {
     last_data_gen: super::DataGeneration,
 }
 
+fn system_health_worker_spawn_failure_message(error: &std::io::Error) -> String {
+    format!("System health diagnostics worker failed to start ({error})")
+}
+
+fn diagnostics_worker_spawn_failure_snapshot(
+    state: &TuiSharedState,
+    error: &std::io::Error,
+) -> DiagnosticsSnapshot {
+    let cfg = state.config_snapshot();
+    let env_cfg = Config::from_env();
+    let mut snapshot = DiagnosticsSnapshot {
+        checked_at: Some(Utc::now()),
+        endpoint: cfg.endpoint.clone(),
+        web_ui_url: cfg.web_ui_url.clone(),
+        auth_enabled: cfg.auth_enabled,
+        localhost_unauth_allowed: env_cfg.http_allow_localhost_unauthenticated,
+        token_present: env_cfg.http_bearer_token.is_some(),
+        token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
+        atc: crate::atc_operator_snapshot(),
+        ..Default::default()
+    };
+
+    if let Ok(parsed) = parse_http_endpoint(&cfg) {
+        snapshot.http_host = parsed.host;
+        snapshot.http_port = parsed.port;
+        snapshot.configured_path = parsed.path;
+    }
+
+    snapshot.lines.push(ProbeLine {
+        level: Level::Fail,
+        name: "diagnostics-worker",
+        detail: system_health_worker_spawn_failure_message(error),
+        remediation: Some("Inspect thread/process limits and restart the TUI session.".into()),
+    });
+    snapshot
+}
+
 impl SystemHealthScreen {
     #[must_use]
     pub fn new(state: Arc<TuiSharedState>) -> Self {
@@ -281,18 +318,21 @@ impl SystemHealthScreen {
         let stop = Arc::new(AtomicBool::new(false));
 
         let worker = {
-            let state = state;
-            let snapshot = Arc::clone(&snapshot);
-            let refresh_requested = Arc::clone(&refresh_requested);
+            let state_for_spawn = Arc::clone(&state);
+            let snapshot_for_spawn = Arc::clone(&snapshot);
+            let refresh_for_spawn = Arc::clone(&refresh_requested);
             let last_visible_at = Arc::clone(&last_visible_at);
             let stop = Arc::clone(&stop);
+            let state_for_failure = Arc::clone(&state);
+            let snapshot_for_failure = Arc::clone(&snapshot);
+            let refresh_for_failure = Arc::clone(&refresh_requested);
             thread::Builder::new()
                 .name("am-system-health".to_string())
                 .spawn(move || {
                     diagnostics_worker_loop(
-                        &state,
-                        &snapshot,
-                        &refresh_requested,
+                        &state_for_spawn,
+                        &snapshot_for_spawn,
+                        &refresh_for_spawn,
                         &last_visible_at,
                         &stop,
                     );
@@ -303,6 +343,15 @@ impl SystemHealthScreen {
                             error = %error,
                             "failed to spawn system health diagnostics worker"
                         );
+                        let failure_snapshot =
+                            diagnostics_worker_spawn_failure_snapshot(&state_for_failure, &error);
+                        emit_screen_diagnostic(&state_for_failure, &failure_snapshot);
+                        if let Ok(mut guard) = snapshot_for_failure.lock() {
+                            *guard = failure_snapshot;
+                        }
+                        refresh_for_failure.store(false, Ordering::Relaxed);
+                        state_for_failure
+                            .push_console_log(system_health_worker_spawn_failure_message(&error));
                         None
                     },
                     Some,
@@ -3238,6 +3287,26 @@ mod tests {
         ));
         assert!(diagnostics_probe_in_progress(&checked, true));
         assert!(!diagnostics_probe_in_progress(&checked, false));
+    }
+
+    #[test]
+    fn diagnostics_worker_spawn_failure_snapshot_is_terminal_failure_not_loading() {
+        let state = test_state();
+        let error = std::io::Error::other("resource temporarily unavailable");
+        let snapshot = diagnostics_worker_spawn_failure_snapshot(&state, &error);
+
+        assert!(snapshot.checked_at.is_some());
+        assert_eq!(snapshot.lines.len(), 1);
+        assert_eq!(snapshot.lines[0].level, Level::Fail);
+        assert_eq!(snapshot.lines[0].name, "diagnostics-worker");
+        assert!(
+            snapshot.lines[0]
+                .detail
+                .contains("System health diagnostics worker failed to start"),
+            "unexpected failure detail: {}",
+            snapshot.lines[0].detail
+        );
+        assert!(!diagnostics_probe_in_progress(&snapshot, false));
     }
 
     #[test]

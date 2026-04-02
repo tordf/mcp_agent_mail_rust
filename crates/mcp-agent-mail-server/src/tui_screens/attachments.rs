@@ -11,7 +11,6 @@ use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
 
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
@@ -232,6 +231,8 @@ pub struct AttachmentExplorerScreen {
     focused_synthetic: Option<crate::tui_events::MailEvent>,
     /// Previous attachment counts for `MetricTrend` computation.
     prev_attachment_counts: (u64, u64, u64, u64),
+    /// Holds the temp snapshot directory alive when this screen binds to an archive snapshot.
+    _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
 }
 
 impl AttachmentExplorerScreen {
@@ -257,6 +258,7 @@ impl AttachmentExplorerScreen {
             last_data_gen: super::DataGeneration::stale(),
             focused_synthetic: None,
             prev_attachment_counts: (0, 0, 0, 0),
+            _db_snapshot_dir: None,
         }
     }
 
@@ -265,13 +267,21 @@ impl AttachmentExplorerScreen {
             return;
         }
         self.db_conn_attempted = true;
-        let db_url = &state.config_snapshot().raw_database_url;
-        let cfg = DbPoolConfig {
-            database_url: db_url.clone(),
-            ..Default::default()
-        };
-        if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
+        let cfg = state.config_snapshot();
+        match crate::open_observability_sync_db_connection(
+            &cfg.raw_database_url,
+            std::path::Path::new(&cfg.storage_root),
+            "attachments screen",
+        ) {
+            Ok(Some(db)) => {
+                let (conn, _, snapshot_dir) = db.into_parts();
+                self.db_conn = Some(conn);
+                self._db_snapshot_dir = snapshot_dir;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "attachments screen db bind failed");
+            }
         }
         self.db_context_unavailable = self.db_conn.is_none();
     }
@@ -281,19 +291,25 @@ impl AttachmentExplorerScreen {
         let Some(conn) = self.db_conn.take() else {
             // Connection open can fail transiently (startup race, WAL recovery in
             // progress, temporary FS hiccup). Allow future retries.
+            let preserved_stale = !self.entries.is_empty() || !self.display_indices.is_empty();
             self.db_conn_attempted = false;
             self.db_context_unavailable = true;
             self.data_dirty = false;
-            self.emit_db_unavailable_diagnostic(state, "database connection unavailable");
+            self.emit_db_unavailable_diagnostic(
+                state,
+                "database connection unavailable",
+                preserved_stale,
+            );
             return;
         };
         self.db_context_unavailable = false;
 
         let sql = "SELECT m.id AS message_id, m.subject, m.attachments, m.created_ts, \
-                   m.thread_id, a.name AS sender_name, p.slug AS project_slug \
+                   m.thread_id, m.sender_id AS raw_sender_id, m.project_id AS raw_project_id, \
+                   a.name AS sender_name, p.slug AS project_slug \
                    FROM messages m \
-                   JOIN agents a ON a.id = m.sender_id \
-                   JOIN projects p ON p.id = m.project_id \
+                   LEFT JOIN agents a ON a.id = m.sender_id \
+                   LEFT JOIN projects p ON p.id = m.project_id \
                    WHERE m.attachments != '[]' AND length(m.attachments) > 2 \
                    ORDER BY m.created_ts DESC \
                    LIMIT ?1";
@@ -310,8 +326,20 @@ impl AttachmentExplorerScreen {
                     let attachments_json: String = row.get_named("attachments").unwrap_or_default();
                     let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
                     let thread_id: Option<String> = row.get_named("thread_id").ok();
-                    let sender_name: String = row.get_named("sender_name").unwrap_or_default();
-                    let project_slug: String = row.get_named("project_slug").unwrap_or_default();
+                    let sender_id: i64 = row.get_named("raw_sender_id").unwrap_or(0);
+                    let project_id: i64 = row.get_named("raw_project_id").unwrap_or(0);
+                    let sender_name = row
+                        .get_named::<String>("sender_name")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| format!("[unknown-agent-{sender_id}]"));
+                    let project_slug = row
+                        .get_named::<String>("project_slug")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
 
                     // Parse attachment JSON array
                     if let Ok(attachments) =
@@ -407,17 +435,26 @@ impl AttachmentExplorerScreen {
     }
 
     #[allow(clippy::unused_self)] // consistent signature across screens
-    fn emit_db_unavailable_diagnostic(&self, state: &TuiSharedState, reason: &str) {
+    fn emit_db_unavailable_diagnostic(
+        &self,
+        state: &TuiSharedState,
+        reason: &str,
+        preserved_stale: bool,
+    ) {
         let reason = sanitize_diagnostic_value(reason);
+        let raw_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        let rendered_count = u64::try_from(self.display_indices.len()).unwrap_or(u64::MAX);
         let cfg = state.config_snapshot();
         let transport_mode = cfg.transport_mode().to_string();
         state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
             screen: "attachments".to_string(),
             scope: "attachment_explorer.db_unavailable".to_string(),
-            query_params: format!("filter=db_context_unavailable;reason={reason}"),
-            raw_count: 0,
-            rendered_count: 0,
-            dropped_count: 0,
+            query_params: format!(
+                "filter=db_context_unavailable;reason={reason};preserved_stale={preserved_stale}"
+            ),
+            raw_count,
+            rendered_count,
+            dropped_count: raw_count.saturating_sub(rendered_count),
             timestamp_micros: chrono::Utc::now().timestamp_micros(),
             db_url: cfg.database_url,
             storage_root: cfg.storage_root,
@@ -1105,7 +1142,10 @@ impl MailScreen for AttachmentExplorerScreen {
             let current_gen = state.data_generation();
             let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
             self.last_data_gen = current_gen;
-            dirty.db_stats || dirty.events
+            dirty.db_stats
+                || dirty.events
+                || self.db_context_unavailable
+                || self.last_error.is_some()
         } else {
             false
         };
@@ -1734,6 +1774,66 @@ mod tests {
         assert!(!screen.db_conn_attempted);
     }
 
+    #[test]
+    fn load_attachments_keeps_rows_with_missing_sender_or_project_join() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                sender_id INTEGER,
+                project_id INTEGER,
+                subject TEXT,
+                attachments TEXT,
+                thread_id TEXT,
+                created_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "INSERT INTO messages
+                (id, sender_id, project_id, subject, attachments, thread_id, created_ts)
+             VALUES
+                (
+                    7,
+                    101,
+                    202,
+                    'Missing joins',
+                    '[{\"type\":\"file\",\"path\":\"docs/test.txt\",\"sha1\":\"abc123\",\"bytes\":12}]',
+                    'thread-7',
+                    1000
+                )",
+            &[],
+        )
+        .expect("insert message");
+
+        screen.db_conn = Some(conn);
+        screen.load_attachments(&state);
+
+        assert_eq!(screen.entries.len(), 1);
+        assert_eq!(screen.entries[0].sender_name, "[unknown-agent-101]");
+        assert_eq!(screen.entries[0].project_slug, "[unknown-project-202]");
+        assert_eq!(screen.entries[0].path.as_deref(), Some("docs/test.txt"));
+    }
+
     // ── B8: DB context binding guardrail regression tests ─────────────
 
     fn broken_db_state() -> std::sync::Arc<TuiSharedState> {
@@ -1760,7 +1860,86 @@ mod tests {
         let att_diag = diags
             .iter()
             .find(|(_, d)| d.screen == "attachments" && d.scope.contains("db_unavailable"));
-        assert!(att_diag.is_some(), "should emit db_unavailable diagnostic");
+        let (_, diag) = att_diag.expect("should emit db_unavailable diagnostic");
+        assert!(
+            diag.query_params.contains("preserved_stale=false"),
+            "fresh unavailable diagnostic should report preserved_stale=false: {}",
+            diag.query_params
+        );
+        assert_eq!(diag.raw_count, 0);
+        assert_eq!(diag.rendered_count, 0);
+    }
+
+    #[test]
+    fn b8_attachments_db_unavailable_preserves_truthful_stale_counts() {
+        let state = broken_db_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.entries.push(AttachmentEntry {
+            media_type: "image/webp".to_string(),
+            bytes: 100,
+            sha1: "abc".to_string(),
+            width: 16,
+            height: 16,
+            mode: "inline".to_string(),
+            path: None,
+            message_id: 1,
+            sender_name: "Alice".to_string(),
+            subject: "Hello".to_string(),
+            thread_id: None,
+            created_ts: 1_000_000,
+            project_slug: "proj".to_string(),
+        });
+        screen.entries.push(AttachmentEntry {
+            media_type: "application/pdf".to_string(),
+            bytes: 200,
+            sha1: "def".to_string(),
+            width: 0,
+            height: 0,
+            mode: "file".to_string(),
+            path: Some("docs/file.pdf".to_string()),
+            message_id: 2,
+            sender_name: "Bob".to_string(),
+            subject: "World".to_string(),
+            thread_id: None,
+            created_ts: 2_000_000,
+            project_slug: "proj".to_string(),
+        });
+        screen.display_indices = vec![1];
+
+        screen.load_attachments(&state);
+
+        let diags = state.screen_diagnostics_since(0);
+        let (_, diag) = diags
+            .iter()
+            .find(|(_, d)| d.screen == "attachments" && d.scope.contains("db_unavailable"))
+            .expect("should emit db_unavailable diagnostic");
+        assert!(
+            diag.query_params.contains("preserved_stale=true"),
+            "stale unavailable diagnostic should report preserved_stale=true: {}",
+            diag.query_params
+        );
+        assert_eq!(diag.raw_count, 2);
+        assert_eq!(diag.rendered_count, 1);
+        assert_eq!(diag.dropped_count, 1);
+    }
+
+    #[test]
+    fn b8_attachments_tick_retries_after_unavailable_without_data_change() {
+        let broken = broken_db_state();
+        let healthy = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+
+        screen.tick(1, &broken);
+        assert!(
+            screen.db_context_unavailable,
+            "initial failed tick should mark db_context_unavailable"
+        );
+
+        screen.tick(RELOAD_INTERVAL_TICKS + 2, &healthy);
+        assert!(
+            !screen.db_context_unavailable,
+            "interval retry should recover once healthy even without new data generation"
+        );
     }
 
     #[test]

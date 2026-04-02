@@ -71,6 +71,14 @@ struct AnalyticsVizSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsFeedSource {
+    Bootstrap,
+    Quick,
+    Persisted,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalyticsSeverityFilter {
     All,
     HighAndUp,
@@ -154,6 +162,7 @@ impl AnalyticsFocus {
 
 pub struct AnalyticsScreen {
     feed: InsightFeed,
+    feed_source: AnalyticsFeedSource,
     selected: usize,
     table_state: TableState,
     detail_scroll: u16,
@@ -181,15 +190,18 @@ impl AnalyticsScreen {
     #[must_use]
     pub fn new() -> Self {
         let mut feed = quick_insight_feed();
+        let mut feed_source = AnalyticsFeedSource::Quick;
         if feed.cards.is_empty() {
             feed = InsightFeed {
                 cards: vec![build_bootstrap_card()],
                 alerts_processed: 0,
                 cards_produced: 1,
             };
+            feed_source = AnalyticsFeedSource::Bootstrap;
         }
         let this = Self {
             feed,
+            feed_source,
             selected: 0,
             table_state: TableState::default(),
             detail_scroll: 0,
@@ -209,26 +221,71 @@ impl AnalyticsScreen {
         this
     }
 
-    fn refresh_feed(&mut self, state: Option<&TuiSharedState>) {
-        self.feed = quick_insight_feed();
-        if self.feed.cards.is_empty()
-            && let Some(state) = state
-        {
+    fn set_bootstrap_feed(&mut self) {
+        self.feed = InsightFeed {
+            cards: vec![build_bootstrap_card()],
+            alerts_processed: 0,
+            cards_produced: 1,
+        };
+        self.feed_source = AnalyticsFeedSource::Bootstrap;
+    }
+
+    fn refresh_feed(
+        &mut self,
+        state: &TuiSharedState,
+        runtime_snapshot: &AnalyticsVizSnapshot,
+        runtime_has_live_signal: bool,
+        runtime_preserved_previous: bool,
+    ) {
+        let quick = quick_insight_feed();
+        if !quick.cards.is_empty() {
+            self.feed = quick;
+            self.feed_source = AnalyticsFeedSource::Quick;
+        } else {
             let persisted = build_persisted_insight_feed(state);
-            if persisted.cards.is_empty() {
-                self.feed = build_runtime_insight_feed(state);
-            } else {
+            if !persisted.cards.is_empty() {
                 self.feed = persisted;
+                self.feed_source = AnalyticsFeedSource::Persisted;
+            } else if runtime_preserved_previous
+                && self.feed_source == AnalyticsFeedSource::Runtime
+                && !self.feed.cards.is_empty()
+            {
+                // Keep the last good runtime-derived feed rather than replacing it with a
+                // fabricated empty-metrics placeholder during transient gaps.
+            } else if runtime_has_live_signal {
+                self.feed = build_runtime_insight_feed_from_snapshot(runtime_snapshot);
+                self.feed_source = AnalyticsFeedSource::Runtime;
+            } else {
+                self.set_bootstrap_feed();
             }
         }
         if self.feed.cards.is_empty() {
-            self.feed = InsightFeed {
-                cards: vec![build_bootstrap_card()],
-                alerts_processed: 0,
-                cards_produced: 1,
-            };
+            self.set_bootstrap_feed();
         }
         self.clamp_selected_to_active_cards();
+    }
+
+    fn refresh_from_state(&mut self, state: &TuiSharedState) {
+        let runtime_metrics = mcp_agent_mail_tools::tool_metrics_snapshot_full();
+        let runtime_has_live_signal = runtime_metrics_have_signal(&runtime_metrics);
+        let runtime_preserved_previous =
+            !runtime_has_live_signal && analytics_viz_has_live_signal(&self.cached_viz);
+        let runtime_snapshot = if runtime_preserved_previous {
+            self.cached_viz.clone()
+        } else {
+            build_runtime_viz_snapshot_from_metrics(
+                state,
+                &runtime_metrics,
+                !runtime_has_live_signal,
+            )
+        };
+        self.refresh_feed(
+            state,
+            &runtime_snapshot,
+            runtime_has_live_signal,
+            runtime_preserved_previous,
+        );
+        self.cached_viz = runtime_snapshot;
     }
 
     fn selected_card(&self) -> Option<&InsightCard> {
@@ -729,10 +786,29 @@ fn build_persisted_insight_feed(state: &TuiSharedState) -> InsightFeed {
     build_persisted_insight_feed_from_rows(&rows, persisted_samples)
 }
 
+fn runtime_metrics_have_signal(snapshots: &[mcp_agent_mail_tools::MetricsSnapshotEntry]) -> bool {
+    snapshots
+        .iter()
+        .any(|entry| entry.calls > 0 || entry.errors > 0 || entry.latency.is_some())
+}
+
+fn analytics_viz_has_live_signal(snapshot: &AnalyticsVizSnapshot) -> bool {
+    snapshot.total_calls > 0
+        || snapshot.total_errors > 0
+        || snapshot.active_tools > 0
+        || snapshot.slow_tools > 0
+        || snapshot.avg_latency_ms > 0.0
+        || snapshot.p95_latency_ms > 0.0
+        || snapshot.p99_latency_ms > 0.0
+}
+
 #[allow(clippy::cast_precision_loss)]
-fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
+fn build_runtime_viz_snapshot_from_metrics(
+    state: &TuiSharedState,
+    snapshots: &[mcp_agent_mail_tools::MetricsSnapshotEntry],
+    allow_placeholders: bool,
+) -> AnalyticsVizSnapshot {
     let cfg = state.config_snapshot();
-    let snapshots = mcp_agent_mail_tools::tool_metrics_snapshot_full();
     let persisted_samples = crate::tool_metrics::persisted_metric_store_size(&cfg.raw_database_url);
 
     let active_tools = snapshots.iter().filter(|entry| entry.calls > 0).count();
@@ -747,7 +823,7 @@ fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
     let mut weighted_latency_calls = 0.0_f64;
     let mut p95_latency_ms = 0.0_f64;
     let mut p99_latency_ms = 0.0_f64;
-    for entry in &snapshots {
+    for entry in snapshots {
         if let Some(latency) = &entry.latency {
             p95_latency_ms = p95_latency_ms.max(latency.p95_ms);
             p99_latency_ms = p99_latency_ms.max(latency.p99_ms);
@@ -763,7 +839,10 @@ fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
         0.0
     };
 
-    let mut call_rank = snapshots.clone();
+    let mut call_rank = snapshots
+        .iter()
+        .filter(|entry| entry.calls > 0)
+        .collect::<Vec<_>>();
     call_rank.sort_by(|left, right| {
         right
             .calls
@@ -771,11 +850,11 @@ fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
             .then_with(|| left.name.cmp(&right.name))
     });
     let mut top_call_tools = call_rank
-        .iter()
+        .into_iter()
         .take(ANALYTICS_VIZ_TOP_TOOLS)
         .map(|entry| (entry.name.clone(), entry.calls as f64))
         .collect::<Vec<_>>();
-    if top_call_tools.is_empty() {
+    if top_call_tools.is_empty() && allow_placeholders {
         let baseline = (total_calls.max(1) as f64).max(3.0);
         top_call_tools = vec![
             ("dispatch".to_string(), (baseline * 0.48).max(1.0)),
@@ -803,7 +882,7 @@ fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
         .into_iter()
         .take(ANALYTICS_VIZ_TOP_TOOLS)
         .collect::<Vec<_>>();
-    if top_latency_tools.is_empty() {
+    if top_latency_tools.is_empty() && allow_placeholders {
         let baseline = p95_latency_ms.max(avg_latency_ms).max(1.0);
         top_latency_tools = vec![
             ("dispatch".to_string(), baseline.max(1.0)),
@@ -816,7 +895,7 @@ fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
     if sparkline.len() > 90 {
         sparkline = sparkline[sparkline.len() - 90..].to_vec();
     }
-    if sparkline.is_empty() {
+    if sparkline.is_empty() && allow_placeholders {
         sparkline = top_latency_tools.iter().map(|(_, value)| *value).collect();
     }
     if sparkline.is_empty() {
@@ -839,8 +918,7 @@ fn build_runtime_viz_snapshot(state: &TuiSharedState) -> AnalyticsVizSnapshot {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn build_runtime_insight_feed(state: &TuiSharedState) -> InsightFeed {
-    let snapshot = build_runtime_viz_snapshot(state);
+fn build_runtime_insight_feed_from_snapshot(snapshot: &AnalyticsVizSnapshot) -> InsightFeed {
     let mut alerts = Vec::new();
 
     let error_rate = if snapshot.total_calls > 0 {
@@ -2189,7 +2267,7 @@ impl MailScreen for AnalyticsScreen {
             }
             KeyCode::Enter => self.navigate_deep_link(),
             KeyCode::Char('r') => {
-                self.refresh_feed(Some(state));
+                self.refresh_from_state(state);
                 Cmd::None
             }
             KeyCode::Char('s') => {
@@ -2768,9 +2846,7 @@ impl MailScreen for AnalyticsScreen {
             .last_refresh_tick
             .is_none_or(|last| tick_count.wrapping_sub(last) >= REFRESH_INTERVAL_TICKS);
         if should_refresh && self.pending_refresh {
-            self.refresh_feed(Some(state));
-            // Rebuild viz snapshot here (in tick) so view() never does I/O.
-            self.cached_viz = build_runtime_viz_snapshot(state);
+            self.refresh_from_state(state);
             self.last_refresh_tick = Some(tick_count);
             self.pending_refresh = false;
 
@@ -2867,6 +2943,8 @@ impl MailScreen for AnalyticsScreen {
 mod tests {
     use super::*;
     use crate::tui_screens::MailScreenId;
+    use mcp_agent_mail_core::kpi_reset_samples;
+    use mcp_agent_mail_tools::{record_call, record_latency, reset_tool_metrics};
 
     fn frame_text(frame: &Frame<'_>) -> String {
         let mut text = String::new();
@@ -3684,6 +3762,87 @@ mod tests {
         assert!((snap.avg_latency_ms).abs() < f64::EPSILON);
         assert!(snap.top_call_tools.is_empty());
         assert!(snap.sparkline.is_empty());
+    }
+
+    #[test]
+    fn runtime_viz_ignores_zero_call_tools_when_placeholders_disabled() {
+        reset_tool_metrics();
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let runtime_metrics = mcp_agent_mail_tools::tool_metrics_snapshot_full();
+        let snapshot = build_runtime_viz_snapshot_from_metrics(&state, &runtime_metrics, false);
+
+        assert!(snapshot.top_call_tools.is_empty());
+        reset_tool_metrics();
+    }
+
+    #[test]
+    fn refresh_preserves_runtime_feed_and_viz_when_metrics_go_empty() {
+        reset_tool_metrics();
+        kpi_reset_samples();
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut screen = AnalyticsScreen::new();
+
+        record_call("send_message");
+        record_latency("send_message", 850_000);
+        screen.refresh_from_state(&state);
+
+        assert_eq!(screen.feed_source, AnalyticsFeedSource::Runtime);
+        assert_eq!(
+            screen
+                .cached_viz
+                .top_call_tools
+                .first()
+                .map(|(name, _)| name.as_str()),
+            Some("send_message")
+        );
+        assert_eq!(
+            screen
+                .cached_viz
+                .top_latency_tools
+                .first()
+                .map(|(name, _)| name.as_str()),
+            Some("send_message")
+        );
+        assert!(
+            screen
+                .feed
+                .cards
+                .iter()
+                .any(|card| { card.primary_alert.explanation.contains("send_message") })
+        );
+
+        reset_tool_metrics();
+        kpi_reset_samples();
+        screen.refresh_from_state(&state);
+
+        assert_eq!(screen.feed_source, AnalyticsFeedSource::Runtime);
+        assert_eq!(
+            screen
+                .cached_viz
+                .top_call_tools
+                .first()
+                .map(|(name, _)| name.as_str()),
+            Some("send_message")
+        );
+        assert_eq!(
+            screen
+                .cached_viz
+                .top_latency_tools
+                .first()
+                .map(|(name, _)| name.as_str()),
+            Some("send_message")
+        );
+        assert!(
+            screen
+                .feed
+                .cards
+                .iter()
+                .any(|card| { card.primary_alert.explanation.contains("send_message") })
+        );
+        reset_tool_metrics();
+        kpi_reset_samples();
     }
 
     // ── Home / End keys ────────────────────────────────────────────────

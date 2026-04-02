@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use asupersync::Cx;
 use fastmcp_core::block_on;
+use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_db::pool::DbPool;
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
 use mcp_agent_mail_share::scan_for_secrets;
@@ -81,7 +82,20 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
     ensure_real_directory(&config.output_dir)
         .map_err(|e| format!("create output dir {}: {e}", config.output_dir.display()))?;
 
-    let pool = get_pool()?;
+    let read_pool_owner = open_static_export_read_pool()?;
+    let live_pool_owner = if read_pool_owner.is_some() {
+        None
+    } else {
+        Some(get_pool()?)
+    };
+    let pool = read_pool_owner.as_ref().map_or_else(
+        || {
+            live_pool_owner
+                .as_ref()
+                .expect("static export live pool fallback should exist when no read pool exists")
+        },
+        crate::ObservabilityDbPool::pool,
+    );
     // Use infinite budget — static export is a batch CLI operation, not a
     // request-scoped handler. Individual DB queries have their own timeouts
     // via pool acquire. Using for_request_with_budget (not for_testing) to
@@ -237,6 +251,20 @@ fn resolve_requested_project_slugs(
 fn get_pool() -> Result<DbPool, String> {
     let cfg = DbPoolConfig::from_env();
     get_or_create_pool(&cfg).map_err(|e| format!("Database error: {e}"))
+}
+
+fn open_static_export_read_pool() -> Result<Option<crate::ObservabilityDbPool>, String> {
+    let config = Config::from_env();
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return Ok(None);
+    }
+    crate::open_observability_db_pool(
+        &config.database_url,
+        &config.storage_root,
+        "static export read route",
+    )
+    .map(Some)
+    .map_err(|err| format!("static export read pool unavailable: {err}"))
 }
 
 /// Block on an async outcome, converting errors to String.
@@ -853,7 +881,70 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn write_archive_ahead_fixture(base: &Path) -> (PathBuf, PathBuf) {
+        let storage_root = base.join("storage");
+        let db_path = base.join("static-export-stale.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+        (storage_root, db_path)
+    }
+
+    fn with_static_export_env<T>(
+        storage_root: &Path,
+        database_path: &Path,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("static export storage root utf-8")
+            .to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            f,
+        )
+    }
 
     #[test]
     fn sanitize_filename_replaces_slashes() {
@@ -1063,6 +1154,73 @@ mod tests {
         let err = export_static_site(&config)
             .expect_err("symlinked parent path should be rejected before any DB work");
         assert!(err.contains("symlinked export directory"));
+    }
+
+    #[test]
+    fn export_static_site_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let output_dir = dir.path().join("export");
+        let config = ExportConfig {
+            output_dir: output_dir.clone(),
+            projects: Vec::new(),
+            include_archive: false,
+            include_search_index: true,
+        };
+
+        let manifest = with_static_export_env(&storage_root, &db_path, || {
+            export_static_site(&config).expect("static export should succeed")
+        });
+
+        assert!(
+            manifest.files.contains_key("mail/ahead-project/index.html"),
+            "{manifest:?}"
+        );
+        let project_html =
+            std::fs::read_to_string(output_dir.join("mail/ahead-project/index.html"))
+                .expect("read exported project page");
+        assert!(project_html.contains("ahead-project"), "{project_html}");
+        assert!(project_html.contains("Alice"), "{project_html}");
+
+        let search_index = std::fs::read_to_string(output_dir.join("search-index.json"))
+            .expect("read search index");
+        assert!(
+            search_index.contains("\"project\": \"ahead-project\""),
+            "{search_index}"
+        );
+        assert!(
+            search_index.contains("\"from_agent\": \"Alice\""),
+            "{search_index}"
+        );
+    }
+
+    #[test]
+    fn export_static_site_fails_closed_when_archive_snapshot_setup_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let output_dir = dir.path().join("export");
+        let config = ExportConfig {
+            output_dir,
+            projects: Vec::new(),
+            include_archive: false,
+            include_search_index: true,
+        };
+        let tmpdir_file = dir.path().join("tmpdir-file");
+        std::fs::write(&tmpdir_file, "not a directory").expect("write tmpdir file");
+        let tmpdir = tmpdir_file
+            .to_str()
+            .expect("tmpdir override utf-8")
+            .to_string();
+
+        let err = with_static_export_env(&storage_root, &db_path, || {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("TMPDIR", tmpdir.as_str())],
+                || export_static_site(&config),
+            )
+        })
+        .expect_err("static export should fail closed when snapshot setup fails");
+
+        assert!(err.contains("static export read pool unavailable"), "{err}");
     }
 
     #[test]

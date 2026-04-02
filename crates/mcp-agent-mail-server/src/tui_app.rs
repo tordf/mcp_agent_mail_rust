@@ -5215,112 +5215,123 @@ struct AmbientEventSignalSummary {
     last_event_ts: i64,
 }
 
-fn query_palette_agent_metadata(
+fn query_palette_db_data(
     state: &TuiSharedState,
-    limit: usize,
-) -> HashMap<String, (String, String)> {
+    agent_limit: usize,
+    message_limit: usize,
+) -> Result<
+    (
+        HashMap<String, (String, String)>,
+        Vec<PaletteMessageSummary>,
+    ),
+    String,
+> {
     let snapshot = state.config_snapshot();
-    let cfg = DbPoolConfig {
-        database_url: snapshot.raw_database_url,
-        ..Default::default()
+    let Some(db) = crate::open_observability_sync_db_connection(
+        &snapshot.raw_database_url,
+        std::path::Path::new(&snapshot.storage_root),
+        "command palette db data",
+    )?
+    else {
+        return Ok((HashMap::new(), Vec::new()));
     };
-    let Ok(path) = cfg.sqlite_path() else {
-        return HashMap::new();
+    let (conn, _, _snapshot_dir) = db.into_parts();
+
+    let unknown_agent_label = |agent_id: i64| {
+        if agent_id > 0 {
+            format!("[unknown-agent-{agent_id}]")
+        } else {
+            "[unknown-agent]".to_string()
+        }
     };
-    let Ok(conn) = crate::open_interactive_sync_db_connection(&path) else {
-        return HashMap::new();
+    let unknown_project_label = |project_id: i64| {
+        if project_id > 0 {
+            format!("[unknown-project-{project_id}]")
+        } else {
+            "[unknown-project]".to_string()
+        }
+    };
+    let read_trimmed_text = |row: &mcp_agent_mail_db::sqlmodel_core::Row, name: &str| {
+        row.get_named::<String>(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     };
 
-    conn.query_sync(
-        &format!(
-            "SELECT a.name, a.model, p.slug AS project_slug \
-             FROM agents a \
-             JOIN projects p ON p.id = a.project_id \
-             ORDER BY a.last_active_ts DESC \
-             LIMIT {limit}"
-        ),
-        &[],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .filter_map(|row| {
-                Some((
-                    row.get_named::<String>("name").ok()?,
-                    (
-                        row.get_named::<String>("model").ok().unwrap_or_default(),
-                        row.get_named::<String>("project_slug")
-                            .ok()
-                            .unwrap_or_default(),
-                    ),
-                ))
+    let agent_metadata = conn
+        .query_sync(
+            &format!(
+                "SELECT a.id AS raw_agent_id, a.project_id AS raw_project_id, \
+                        a.name, a.model, p.slug AS project_slug \
+                 FROM agents a \
+                 LEFT JOIN projects p ON p.id = a.project_id \
+                 ORDER BY a.last_active_ts DESC \
+                 LIMIT {agent_limit}"
+            ),
+            &[],
+        )
+        .map_err(|error| format!("failed to query command palette agent metadata: {error}"))?
+        .into_iter()
+        .map(|row| {
+            let agent_id = row.get_named::<i64>("raw_agent_id").ok().unwrap_or(0);
+            let project_id = row.get_named::<i64>("raw_project_id").ok().unwrap_or(0);
+            (
+                read_trimmed_text(&row, "name").unwrap_or_else(|| unknown_agent_label(agent_id)),
+                (
+                    read_trimmed_text(&row, "model")
+                        .unwrap_or_else(|| "[unknown-model]".to_string()),
+                    read_trimmed_text(&row, "project_slug")
+                        .unwrap_or_else(|| unknown_project_label(project_id)),
+                ),
+            )
+        })
+        .collect();
+
+    let messages = conn
+        .query_sync(
+            &format!(
+                "SELECT m.id, m.sender_id AS raw_sender_id, \
+                 m.subject, m.thread_id, m.created_ts, \
+                 COALESCE(SUBSTR(m.body_md, 1, 150), '') AS body_snippet, \
+                 a_sender.name AS from_agent, \
+                 COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+                 FROM messages m \
+                 LEFT JOIN agents a_sender ON a_sender.id = m.sender_id \
+                 LEFT JOIN message_recipients mr ON mr.message_id = m.id \
+                 LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
+                 GROUP BY m.id \
+                 ORDER BY m.created_ts DESC \
+                 LIMIT {message_limit}"
+            ),
+            &[],
+        )
+        .map_err(|error| format!("failed to query command palette recent messages: {error}"))?
+        .into_iter()
+        .filter_map(|row| {
+            let sender_id = row.get_named::<i64>("raw_sender_id").ok().unwrap_or(0);
+            Some(PaletteMessageSummary {
+                id: row.get_named::<i64>("id").ok()?,
+                subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                from_agent: read_trimmed_text(&row, "from_agent")
+                    .unwrap_or_else(|| unknown_agent_label(sender_id)),
+                to_agents: row
+                    .get_named::<String>("to_agents")
+                    .ok()
+                    .unwrap_or_default(),
+                thread_id: row
+                    .get_named::<String>("thread_id")
+                    .ok()
+                    .unwrap_or_default(),
+                timestamp_micros: row.get_named::<i64>("created_ts").ok().unwrap_or(0),
+                body_snippet: row
+                    .get_named::<String>("body_snippet")
+                    .ok()
+                    .unwrap_or_default(),
             })
-            .collect()
-    })
-    .unwrap_or_default()
-}
+        })
+        .collect();
 
-fn query_palette_recent_messages(
-    state: &TuiSharedState,
-    limit: usize,
-) -> Vec<PaletteMessageSummary> {
-    let snapshot = state.config_snapshot();
-    let cfg = DbPoolConfig {
-        database_url: snapshot.raw_database_url,
-        ..Default::default()
-    };
-    let Ok(path) = cfg.sqlite_path() else {
-        return Vec::new();
-    };
-    let Ok(conn) = crate::open_interactive_sync_db_connection(&path) else {
-        return Vec::new();
-    };
-
-    conn.query_sync(
-        &format!(
-            "SELECT m.id, m.subject, m.thread_id, m.created_ts, \
-             COALESCE(SUBSTR(m.body_md, 1, 150), '') AS body_snippet, \
-             a_sender.name AS from_agent, \
-             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
-             FROM messages m \
-             JOIN agents a_sender ON a_sender.id = m.sender_id \
-             LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-             LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-             GROUP BY m.id \
-             ORDER BY m.created_ts DESC \
-             LIMIT {limit}"
-        ),
-        &[],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .filter_map(|row| {
-                Some(PaletteMessageSummary {
-                    id: row.get_named::<i64>("id").ok()?,
-                    subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
-                    from_agent: row
-                        .get_named::<String>("from_agent")
-                        .ok()
-                        .unwrap_or_default(),
-                    to_agents: row
-                        .get_named::<String>("to_agents")
-                        .ok()
-                        .unwrap_or_default(),
-                    thread_id: row
-                        .get_named::<String>("thread_id")
-                        .ok()
-                        .unwrap_or_default(),
-                    timestamp_micros: row.get_named::<i64>("created_ts").ok().unwrap_or(0),
-                    body_snippet: row
-                        .get_named::<String>("body_snippet")
-                        .ok()
-                        .unwrap_or_default(),
-                })
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    Ok((agent_metadata, messages))
 }
 
 fn fetch_palette_db_data(
@@ -5351,17 +5362,40 @@ fn fetch_palette_db_data(
             );
         }
     }
+    let stale_cache = cache.lock().ok().and_then(|guard| {
+        (guard.database_url == database_url).then(|| {
+            (
+                guard
+                    .agent_metadata
+                    .iter()
+                    .take(agent_limit)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                guard.messages.iter().take(message_limit).cloned().collect(),
+            )
+        })
+    });
 
-    let agent_metadata = query_palette_agent_metadata(state, agent_limit);
-    let messages = query_palette_recent_messages(state, message_limit);
-    if let Ok(mut guard) = cache.lock() {
-        guard.database_url = database_url;
-        guard.fetched_at_micros = now;
-        guard.source_db_stats_gen = bridge_state.db_stats_gen;
-        guard.agent_metadata.clone_from(&agent_metadata);
-        guard.messages.clone_from(&messages);
+    match query_palette_db_data(state, agent_limit, message_limit) {
+        Ok((agent_metadata, messages)) => {
+            if let Ok(mut guard) = cache.lock() {
+                guard.database_url = database_url;
+                guard.fetched_at_micros = now;
+                guard.source_db_stats_gen = bridge_state.db_stats_gen;
+                guard.agent_metadata.clone_from(&agent_metadata);
+                guard.messages.clone_from(&messages);
+            }
+            (agent_metadata, messages)
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                database_url,
+                "command palette db refresh failed; reusing stale cached palette data when available"
+            );
+            stale_cache.unwrap_or_else(|| (HashMap::new(), Vec::new()))
+        }
     }
-    (agent_metadata, messages)
 }
 
 fn format_timestamp_micros(micros: i64) -> String {
@@ -9085,6 +9119,89 @@ mod tests {
     }
 
     #[test]
+    fn query_palette_db_data_preserves_unknown_agent_metadata_labels() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("palette-agent-metadata.sqlite3");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, model TEXT, last_active_ts INTEGER)",
+        )
+        .expect("create agents");
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
+            .expect("create projects");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, model, last_active_ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(7),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(99),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(String::new()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(String::new()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+            ],
+        )
+        .expect("insert degraded agent");
+        drop(conn);
+
+        let config = Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: dir.path().join("storage"),
+            ..Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let (agent_metadata, _) = query_palette_db_data(&state, 10, 10).expect("query palette");
+        assert_eq!(
+            agent_metadata.get("[unknown-agent-7]"),
+            Some(&(
+                "[unknown-model]".to_string(),
+                "[unknown-project-99]".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn query_palette_db_data_preserves_unknown_message_sender_labels() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("palette-message-sender.sqlite3");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER, subject TEXT, thread_id TEXT, created_ts INTEGER, body_md TEXT)",
+        )
+        .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, ack_ts INTEGER, read_ts INTEGER)",
+        )
+        .expect("create message recipients");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create agents");
+        conn.execute_sync(
+            "INSERT INTO messages (id, sender_id, subject, thread_id, created_ts, body_md) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(41),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(123),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Palette message".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("thread-41".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1_700_000_000_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+            ],
+        )
+        .expect("insert message");
+        drop(conn);
+
+        let config = Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: dir.path().join("storage"),
+            ..Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let (_, messages) = query_palette_db_data(&state, 10, 10).expect("query palette");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, 41);
+        assert_eq!(messages[0].from_agent, "[unknown-agent-123]");
+    }
+
+    #[test]
     fn thread_palette_entries_include_message_count_and_participants() {
         let model = test_model();
         assert!(model.state.push_event(MailEvent::message_sent(
@@ -9244,6 +9361,120 @@ mod tests {
         let (agent_metadata, messages) = fetch_palette_db_data(&state, 10, 10);
         assert!(agent_metadata.is_empty());
         assert!(messages.is_empty());
+
+        if let Ok(mut guard) = cache.lock() {
+            *guard = PaletteDbCache::default();
+        }
+    }
+
+    #[test]
+    fn palette_db_cache_reuses_stale_data_when_refresh_fails() {
+        let _serial = PALETTE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
+        if let Ok(mut guard) = cache.lock() {
+            *guard = PaletteDbCache::default();
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("palette-stale.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let config = Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: storage_root.clone(),
+            ..Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let bridge_state = palette_cache_bridge_state(&state);
+        let db_url = state.config_snapshot().raw_database_url;
+        let expected = PaletteMessageSummary {
+            id: 41,
+            subject: "cached subject".to_string(),
+            from_agent: "BlueLake".to_string(),
+            to_agents: "RedFox".to_string(),
+            thread_id: "br-41".to_string(),
+            timestamp_micros: now_micros(),
+            body_snippet: "cached snippet".to_string(),
+        };
+
+        {
+            let mut guard = cache.lock().expect("cache lock");
+            guard.database_url = db_url.clone();
+            guard.fetched_at_micros = now_micros() - PALETTE_DB_CACHE_TTL_MICROS - 1;
+            guard.source_db_stats_gen = bridge_state.db_stats_gen;
+            guard.agent_metadata.insert(
+                "BlueLake".to_string(),
+                ("gpt-5".to_string(), "proj-a".to_string()),
+            );
+            guard.messages = vec![expected.clone()];
+        }
+
+        let tmpdir_file = dir.path().join("tmpdir-file");
+        std::fs::write(&tmpdir_file, "not a directory").expect("write tmpdir file");
+        let tmpdir = tmpdir_file
+            .to_str()
+            .expect("tmpdir override utf-8")
+            .to_string();
+
+        let (agent_metadata, messages) =
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("TMPDIR", tmpdir.as_str())],
+                || fetch_palette_db_data(&state, 10, 10),
+            );
+
+        assert_eq!(
+            agent_metadata.get("BlueLake"),
+            Some(&("gpt-5".to_string(), "proj-a".to_string()))
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, expected.id);
+        assert_eq!(messages[0].subject, expected.subject);
+
+        let guard = cache.lock().expect("cache lock");
+        assert_eq!(guard.messages.len(), 1);
+        assert_eq!(guard.messages[0].id, expected.id);
+        assert!(guard.agent_metadata.contains_key("BlueLake"));
+        drop(guard);
 
         if let Ok(mut guard) = cache.lock() {
             *guard = PaletteDbCache::default();

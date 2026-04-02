@@ -352,7 +352,13 @@ fn prune_old_snapshot_rows(conn: &DbConn, collected_ts: i64) {
 }
 
 fn decode_metric_row(row: &mcp_agent_mail_db::sqlmodel_core::Row) -> Option<PersistedToolMetric> {
-    let tool_name = row.get_named::<String>("tool_name").ok()?;
+    let collected_ts = row.get_named::<i64>("collected_ts").ok().unwrap_or(0);
+    let tool_name = row
+        .get_named::<String>("tool_name")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| unknown_tool_label(collected_ts));
     let calls = row
         .get_named::<i64>("calls")
         .ok()
@@ -379,7 +385,6 @@ fn decode_metric_row(row: &mcp_agent_mail_db::sqlmodel_core::Row) -> Option<Pers
         .get_named::<i64>("latency_is_slow")
         .ok()
         .is_some_and(|v| v != 0);
-    let collected_ts = row.get_named::<i64>("collected_ts").ok().unwrap_or(0);
 
     Some(PersistedToolMetric {
         tool_name,
@@ -394,6 +399,14 @@ fn decode_metric_row(row: &mcp_agent_mail_db::sqlmodel_core::Row) -> Option<Pers
         is_slow,
         collected_ts,
     })
+}
+
+fn unknown_tool_label(collected_ts: i64) -> String {
+    if collected_ts > 0 {
+        format!("[unknown-tool-{collected_ts}]")
+    } else {
+        "[unknown-tool]".to_string()
+    }
 }
 
 fn is_missing_metrics_table_error(err: &impl std::fmt::Display) -> bool {
@@ -421,12 +434,8 @@ pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<Pe
                LIMIT ?";
     let rows = match conn.query_sync(sql, &[Value::BigInt(limit_i64)]) {
         Ok(rows) => rows,
-        Err(err) if is_missing_metrics_table_error(&err) => {
-            // Fast path avoids DDL on every read; recover lazily when schema is missing.
-            ensure_metrics_schema(&conn);
-            conn.query_sync(sql, &[Value::BigInt(limit_i64)])
-                .unwrap_or_default()
-        }
+        // Read-only observers must not create schema in the live mailbox.
+        Err(err) if is_missing_metrics_table_error(&err) => Vec::new(),
         Err(_) => Vec::new(),
     };
     rows.iter().filter_map(decode_metric_row).collect()
@@ -440,11 +449,8 @@ pub fn persisted_metric_store_size(database_url: &str) -> u64 {
     let sql = format!("SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}");
     let rows = match conn.query_sync(&sql, &[]) {
         Ok(rows) => rows,
-        Err(err) if is_missing_metrics_table_error(&err) => {
-            // Fast path avoids DDL on every read; recover lazily when schema is missing.
-            ensure_metrics_schema(&conn);
-            conn.query_sync(&sql, &[]).unwrap_or_default()
-        }
+        // Read-only observers must not create schema in the live mailbox.
+        Err(err) if is_missing_metrics_table_error(&err) => Vec::new(),
         Err(_) => Vec::new(),
     };
     rows.into_iter()
@@ -912,6 +918,63 @@ mod tests {
     }
 
     #[test]
+    fn load_latest_persisted_metrics_missing_table_is_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing_metrics_table_read_only.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+
+        let rows = load_latest_persisted_metrics(&database_url, 50);
+        assert!(rows.is_empty(), "missing table should read as empty");
+
+        let schema_count = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'tool_metrics_snapshots'",
+                &[],
+            )
+            .expect("query sqlite_master")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            schema_count, 0,
+            "read-only load must not create tool_metrics_snapshots"
+        );
+    }
+
+    #[test]
+    fn persisted_metric_store_size_missing_table_is_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing_metrics_store_size_read_only.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+
+        assert_eq!(
+            persisted_metric_store_size(&database_url),
+            0,
+            "missing table should report zero persisted samples"
+        );
+
+        let schema_count = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'tool_metrics_snapshots'",
+                &[],
+            )
+            .expect("query sqlite_master")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            schema_count, 0,
+            "read-only store-size check must not create tool_metrics_snapshots"
+        );
+    }
+
+    #[test]
     fn missing_metrics_table_error_detection_matches_target_table() {
         assert!(is_missing_metrics_table_error(
             &"no such table: tool_metrics_snapshots"
@@ -1037,6 +1100,45 @@ mod tests {
             "should respect limit, got {}",
             limited.len()
         );
+    }
+
+    #[test]
+    fn load_latest_persisted_metrics_preserves_blank_tool_name_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("blank_tool_name.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open");
+        ensure_metrics_schema(&conn);
+        conn.execute_sync(
+            "INSERT INTO tool_metrics_snapshots (
+                 collected_ts, tool_name, calls, errors, cluster, capabilities_json, complexity,
+                 latency_avg_ms, latency_min_ms, latency_max_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms,
+                 latency_is_slow
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            &[
+                Value::BigInt(123),
+                Value::Text(String::new()),
+                Value::BigInt(7),
+                Value::BigInt(1),
+                Value::Text("unknown".to_string()),
+                Value::Text("[]".to_string()),
+                Value::Text("unknown".to_string()),
+                Value::Double(1.0),
+                Value::Double(1.0),
+                Value::Double(1.0),
+                Value::Double(1.0),
+                Value::Double(1.0),
+                Value::Double(1.0),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert malformed persisted row");
+        drop(conn);
+
+        let rows = load_latest_persisted_metrics(&database_url, 50);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool_name, "[unknown-tool-123]");
+        assert_eq!(rows[0].calls, 7);
     }
 
     #[test]

@@ -179,6 +179,16 @@ pub struct ContactsScreen {
     db_context_banner: &'static str,
     /// Latest `db_stats` generation that this screen has actually rebuilt from.
     applied_db_stats_gen: u64,
+    /// Tracks the last query/view inputs that produced the current contacts list.
+    last_query_signature: Option<ContactsQuerySignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContactsQuerySignature {
+    filter: String,
+    status_filter: StatusFilter,
+    sort_col: usize,
+    sort_asc: bool,
 }
 
 impl ContactsScreen {
@@ -213,13 +223,36 @@ impl ContactsScreen {
             db_context_unavailable: false,
             db_context_banner: super::POLLER_DB_WAITING_BANNER,
             applied_db_stats_gen: 0,
+            last_query_signature: None,
+        }
+    }
+
+    fn current_query_signature(&self) -> ContactsQuerySignature {
+        ContactsQuerySignature {
+            filter: self.filter.clone(),
+            status_filter: self.status_filter,
+            sort_col: self.sort_col,
+            sort_asc: self.sort_asc,
         }
     }
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
         let (db, db_stats_gen) = state.db_stats_snapshot_with_generation();
-        let total_rows = u64::try_from(db.contacts_list.len()).unwrap_or(u64::MAX);
-        let mut rows: Vec<ContactSummary> = db.contacts_list;
+        let query_signature = self.current_query_signature();
+        let preserve_stale = db.contact_links > 0
+            && db.contacts_list.is_empty()
+            && !self.contacts.is_empty()
+            && self.last_query_signature.as_ref() == Some(&query_signature);
+        let total_rows = if preserve_stale {
+            db.contact_links
+        } else {
+            u64::try_from(db.contacts_list.len()).unwrap_or(u64::MAX)
+        };
+        let mut rows: Vec<ContactSummary> = if preserve_stale {
+            self.contacts.clone()
+        } else {
+            db.contacts_list
+        };
 
         // Apply status filter
         let sf = self.status_filter;
@@ -275,7 +308,7 @@ impl ContactsScreen {
             screen: "contacts".to_string(),
             scope: "db_stats.contacts_list".to_string(),
             query_params: format!(
-                "filter={filter};status_filter={};sort_col={sort_label};sort_asc={};list_rows={total_rows};total_rows={total_rows};rebuilds={};table_transforms={};layout_recomputes={};row_churn_last={};row_churn_total={}",
+                "filter={filter};status_filter={};sort_col={sort_label};sort_asc={};list_rows={total_rows};total_rows={total_rows};rebuilds={};table_transforms={};layout_recomputes={};row_churn_last={};row_churn_total={};preserved_stale={preserve_stale}",
                 self.status_filter.label(),
                 self.sort_asc,
                 self.rebuild_count,
@@ -304,6 +337,7 @@ impl ContactsScreen {
                 Some(self.contacts.len() - 1)
             };
         }
+        self.last_query_signature = Some(query_signature);
         self.applied_db_stats_gen = db_stats_gen;
     }
 
@@ -2132,6 +2166,64 @@ mod tests {
         ));
         screen.rebuild_from_state(&state);
         assert_eq!(screen.graph_metrics.edge_weight("Alpha", "Beta"), 1);
+    }
+
+    #[test]
+    fn rebuild_preserves_stale_contacts_when_db_false_empties_with_same_query() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contact_links: 1,
+            contacts_list: vec![ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+        let original = screen.contacts.clone();
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contact_links: 1,
+            contacts_list: Vec::new(),
+            ..Default::default()
+        });
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.contacts, original);
+    }
+
+    #[test]
+    fn rebuild_clears_contacts_when_query_changed_before_db_false_empty() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contact_links: 1,
+            contacts_list: vec![ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        screen.filter = "beta".to_string();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contact_links: 1,
+            contacts_list: Vec::new(),
+            ..Default::default()
+        });
+        screen.rebuild_from_state(&state);
+
+        assert!(screen.contacts.is_empty());
     }
 
     #[test]

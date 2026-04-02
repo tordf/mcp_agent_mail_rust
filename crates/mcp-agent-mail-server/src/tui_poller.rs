@@ -160,8 +160,9 @@ impl<'a> DbStatQueryBatcher<'a> {
     fn fetch_snapshot(&self, previous: Option<&DbStatSnapshot>) -> DbStatSnapshot {
         let now = now_micros();
         let reservation_bundle =
-            fetch_reservation_snapshot_bundle(self.conn, now, self.sqlite_path);
-        let counts = self.fetch_counts_with_reservation_count(reservation_bundle.active_count);
+            fetch_reservation_snapshot_bundle(self.conn, now, self.sqlite_path, previous);
+        let counts =
+            self.fetch_counts_with_reservation_count(reservation_bundle.active_count, previous);
         let mut snapshot = DbStatSnapshot {
             projects: counts.projects,
             agents: counts.agents,
@@ -184,6 +185,12 @@ impl<'a> DbStatQueryBatcher<'a> {
             self.sqlite_path,
             &reservation_bundle.active_counts_by_project,
         );
+        restore_missing_project_rollup_counts_from_previous(
+            previous,
+            &mut snapshot,
+            self.sqlite_path,
+        );
+        restore_missing_contact_rows_from_previous(previous, &mut snapshot, self.sqlite_path);
         snapshot
     }
 
@@ -191,10 +198,14 @@ impl<'a> DbStatQueryBatcher<'a> {
     fn fetch_counts(&self) -> DbSnapshotCounts {
         let now = now_micros();
         let reservation_count = self.count_active_reservations(now);
-        self.fetch_counts_with_reservation_count(reservation_count)
+        self.fetch_counts_with_reservation_count(reservation_count, None)
     }
 
-    fn fetch_counts_with_reservation_count(&self, reservation_count: u64) -> DbSnapshotCounts {
+    fn fetch_counts_with_reservation_count(
+        &self,
+        reservation_count: u64,
+        previous: Option<&DbStatSnapshot>,
+    ) -> DbSnapshotCounts {
         let core_counts_sql = "SELECT \
              (SELECT COUNT(*) FROM projects) AS projects_count, \
              (SELECT COUNT(*) FROM agents) AS agents_count, \
@@ -228,32 +239,37 @@ impl<'a> DbStatQueryBatcher<'a> {
             });
 
         if let Some(mut counts) = batched {
-            counts.ack_pending = self.fetch_ack_pending_count().unwrap_or(0);
+            counts.ack_pending = self
+                .fetch_ack_pending_count()
+                .unwrap_or_else(|| previous_count(previous, |snapshot| snapshot.ack_pending));
             return counts;
         }
 
-        self.fetch_counts_fallback_with_reservation_count(reservation_count)
+        self.fetch_counts_fallback_with_reservation_count(reservation_count, previous)
     }
 
     fn fetch_counts_fallback_with_reservation_count(
         &self,
         reservation_count: u64,
+        previous: Option<&DbStatSnapshot>,
     ) -> DbSnapshotCounts {
         DbSnapshotCounts {
             projects: self
                 .run_count_query("SELECT COUNT(*) AS c FROM projects", &[])
-                .unwrap_or(0),
+                .unwrap_or_else(|| previous_count(previous, |snapshot| snapshot.projects)),
             agents: self
                 .run_count_query("SELECT COUNT(*) AS c FROM agents", &[])
-                .unwrap_or(0),
+                .unwrap_or_else(|| previous_count(previous, |snapshot| snapshot.agents)),
             messages: self
                 .run_count_query("SELECT COUNT(*) AS c FROM messages", &[])
-                .unwrap_or(0),
+                .unwrap_or_else(|| previous_count(previous, |snapshot| snapshot.messages)),
             file_reservations: reservation_count,
             contact_links: self
                 .run_count_query("SELECT COUNT(*) AS c FROM agent_links", &[])
-                .unwrap_or(0),
-            ack_pending: self.fetch_ack_pending_count().unwrap_or(0),
+                .unwrap_or_else(|| previous_count(previous, |snapshot| snapshot.contact_links)),
+            ack_pending: self
+                .fetch_ack_pending_count()
+                .unwrap_or_else(|| previous_count(previous, |snapshot| snapshot.ack_pending)),
         }
     }
 
@@ -340,6 +356,7 @@ pub struct DbPoller {
 struct PollerConnectionState {
     conn: DbConn,
     sqlite_path: String,
+    _snapshot_dir: Option<crate::SnapshotDirGuard>,
     last_data_version: Option<i64>,
     last_reservation_snapshot_gap_refresh_micros: i64,
     /// Tracks last full snapshot time for the fallback path when
@@ -442,7 +459,11 @@ impl DbPoller {
             let snapshot_update = if allow_poll {
                 if let Ok(snapshot) = catch_optional_panic(std::panic::AssertUnwindSafe(|| {
                     if connection_state.is_none() {
-                        connection_state = open_poller_connection_state(&self.database_url);
+                        let config = self.state.config_snapshot();
+                        connection_state = open_poller_connection_state(
+                            &self.database_url,
+                            std::path::Path::new(&config.storage_root),
+                        );
                     }
                     connection_state
                         .as_mut()
@@ -608,11 +629,16 @@ fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
     Some(DbStatQueryBatcher::new_with_path(&conn, &sqlite_path).fetch_snapshot(None))
 }
 
-fn open_poller_connection_state(database_url: &str) -> Option<PollerConnectionState> {
-    let (conn, sqlite_path) = open_sync_connection_with_path(database_url)?;
+fn open_poller_connection_state(
+    database_url: &str,
+    storage_root: &std::path::Path,
+) -> Option<PollerConnectionState> {
+    let (conn, sqlite_path, snapshot_dir) =
+        open_sync_connection_with_path_and_storage_root(database_url, storage_root)?;
     Some(PollerConnectionState {
         conn,
         sqlite_path,
+        _snapshot_dir: snapshot_dir,
         last_data_version: None,
         last_reservation_snapshot_gap_refresh_micros: 0,
         last_full_snapshot_micros: 0,
@@ -779,13 +805,21 @@ fn table_has_required_columns(
     }
     let available_columns: std::collections::HashSet<String> = rows
         .into_iter()
-        .filter_map(|row| row.get_named::<String>("name").ok())
+        .filter_map(|row| pragma_table_info_column_name(&row))
         .collect();
     Some(
         required_columns
             .iter()
             .all(|column_name| available_columns.contains(*column_name)),
     )
+}
+
+fn pragma_table_info_column_name(row: &Row) -> Option<String> {
+    row.get_named::<String>("name")
+        .ok()
+        .or_else(|| row.get_as::<String>(1).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn refresh_reservation_time_sensitive_snapshot(
@@ -818,8 +852,33 @@ fn apply_reservation_bundle_to_snapshot(
             .unwrap_or(0);
     }
     snapshot.reservation_snapshots = bundle.snapshots;
+    restore_missing_reservation_snapshots_from_previous(previous, &mut snapshot);
     snapshot.timestamp_micros = now_micros;
     snapshot
+}
+
+fn restore_missing_reservation_snapshots_from_previous(
+    previous: &DbStatSnapshot,
+    snapshot: &mut DbStatSnapshot,
+) {
+    if snapshot.file_reservations == 0 || snapshot.file_reservations > MAX_RESERVATIONS as u64 {
+        return;
+    }
+    let expected_rows = usize::try_from(snapshot.file_reservations).unwrap_or(MAX_RESERVATIONS);
+    if snapshot.reservation_snapshots.len() >= expected_rows
+        || previous.file_reservations != snapshot.file_reservations
+        || previous.reservation_snapshots.len() != expected_rows
+    {
+        return;
+    }
+
+    let current_rows = snapshot.reservation_snapshots.len();
+    snapshot.reservation_snapshots = previous.reservation_snapshots.clone();
+    tracing::warn!(
+        current_rows,
+        expected_rows,
+        "tui poller reservation snapshot rows came back partially truncated while the uncapped active count stayed stable; preserving previous reservation detail rows"
+    );
 }
 
 const fn update_reservation_snapshot_gap_refresh_state(
@@ -874,6 +933,25 @@ pub fn open_sync_connection_pub(database_url: &str) -> Option<DbConn> {
 /// Open a sync `SQLite` connection from a database URL.
 fn open_sync_connection(database_url: &str) -> Option<DbConn> {
     open_sync_connection_with_path(database_url).map(|(conn, _)| conn)
+}
+
+fn open_sync_connection_with_path_and_storage_root(
+    database_url: &str,
+    storage_root: &std::path::Path,
+) -> Option<(DbConn, String, Option<crate::SnapshotDirGuard>)> {
+    match crate::open_observability_sync_db_connection(database_url, storage_root, "tui db poller")
+    {
+        Ok(db) => db.map(crate::ObservabilitySyncDb::into_parts),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                database_url,
+                storage_root = %storage_root.display(),
+                "tui db poller observability snapshot unavailable"
+            );
+            None
+        }
+    }
 }
 
 fn open_sync_connection_with_path(database_url: &str) -> Option<(DbConn, String)> {
@@ -937,6 +1015,7 @@ fn restore_missing_detail_lists_from_previous(
     maybe_reuse_previous_detail_list(
         "agents",
         snapshot.agents,
+        MAX_AGENTS,
         &mut snapshot.agents_list,
         &previous.agents_list,
         sqlite_path,
@@ -944,6 +1023,7 @@ fn restore_missing_detail_lists_from_previous(
     maybe_reuse_previous_detail_list(
         "projects",
         snapshot.projects,
+        MAX_PROJECTS,
         &mut snapshot.projects_list,
         &previous.projects_list,
         sqlite_path,
@@ -951,9 +1031,128 @@ fn restore_missing_detail_lists_from_previous(
     maybe_reuse_previous_detail_list(
         "contacts",
         snapshot.contact_links,
+        MAX_CONTACTS,
         &mut snapshot.contacts_list,
         &previous.contacts_list,
         sqlite_path,
+    );
+}
+
+fn unique_previous_project_summary<'a, F>(
+    previous_rows: &'a [ProjectSummary],
+    mut predicate: F,
+) -> Option<&'a ProjectSummary>
+where
+    F: FnMut(&ProjectSummary) -> bool,
+{
+    let mut matching = previous_rows.iter().filter(|row| predicate(row));
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+fn restore_missing_project_rollup_counts_from_previous(
+    previous: Option<&DbStatSnapshot>,
+    snapshot: &mut DbStatSnapshot,
+    sqlite_path: Option<&str>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if snapshot.projects_list.is_empty() || previous.projects_list.is_empty() {
+        return;
+    }
+
+    let restore_agent_counts = snapshot.agents > 0
+        && snapshot
+            .projects_list
+            .iter()
+            .all(|project| project.agent_count == 0);
+    let restore_message_counts = snapshot.messages > 0
+        && snapshot
+            .projects_list
+            .iter()
+            .all(|project| project.message_count == 0);
+    let restore_reservation_counts = snapshot.file_reservations > 0
+        && snapshot
+            .projects_list
+            .iter()
+            .all(|project| project.reservation_count == 0);
+    if !(restore_agent_counts || restore_message_counts || restore_reservation_counts) {
+        return;
+    }
+
+    let mut restored_agent_rows = 0_usize;
+    let mut restored_message_rows = 0_usize;
+    let mut restored_reservation_rows = 0_usize;
+    for row in &mut snapshot.projects_list {
+        let previous_row = unique_previous_project_summary(&previous.projects_list, |candidate| {
+            candidate.slug == row.slug && candidate.human_key == row.human_key
+        })
+        .or_else(|| {
+            unique_previous_project_summary(&previous.projects_list, |candidate| {
+                candidate.slug == row.slug
+            })
+        });
+        let Some(previous_row) = previous_row else {
+            continue;
+        };
+        if row.created_at == 0 {
+            row.created_at = previous_row.created_at;
+        }
+        if restore_agent_counts && row.agent_count == 0 {
+            row.agent_count = previous_row.agent_count;
+            restored_agent_rows += 1;
+        }
+        if restore_message_counts && row.message_count == 0 {
+            row.message_count = previous_row.message_count;
+            restored_message_rows += 1;
+        }
+        if restore_reservation_counts && row.reservation_count == 0 {
+            row.reservation_count = previous_row.reservation_count;
+            restored_reservation_rows += 1;
+        }
+    }
+
+    if restored_agent_rows > 0 || restored_message_rows > 0 || restored_reservation_rows > 0 {
+        tracing::warn!(
+            path = sqlite_path.unwrap_or("<unknown>"),
+            restored_agent_rows,
+            restored_message_rows,
+            restored_reservation_rows,
+            "tui poller project rollup counts came back false-zero while summary totals remained nonzero; preserving previous per-project counts"
+        );
+    }
+}
+
+fn restore_missing_contact_rows_from_previous(
+    previous: Option<&DbStatSnapshot>,
+    snapshot: &mut DbStatSnapshot,
+    sqlite_path: Option<&str>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if snapshot.contacts_list.is_empty() || previous.contacts_list.is_empty() {
+        return;
+    }
+    if snapshot.contact_links == 0 || snapshot.contact_links > MAX_CONTACTS as u64 {
+        return;
+    }
+
+    let expected_rows = usize::try_from(snapshot.contact_links).unwrap_or(MAX_CONTACTS);
+    if snapshot.contacts_list.len() >= expected_rows
+        || previous.contacts_list.len() != expected_rows
+    {
+        return;
+    }
+
+    let current_rows = snapshot.contacts_list.len();
+    snapshot.contacts_list = previous.contacts_list.clone();
+    tracing::warn!(
+        path = sqlite_path.unwrap_or("<unknown>"),
+        current_rows,
+        expected_rows,
+        "tui poller contacts list came back partially truncated while summary count stayed within the uncapped window; preserving previous contact rows"
     );
 }
 
@@ -987,19 +1186,41 @@ fn refill_missing_detail_lists_from_sqlite(
 fn maybe_reuse_previous_detail_list<T: Clone>(
     label: &str,
     total_count: u64,
+    max_rows: usize,
     current_rows: &mut Vec<T>,
     previous_rows: &[T],
     sqlite_path: Option<&str>,
 ) {
-    if total_count == 0 || !current_rows.is_empty() || previous_rows.is_empty() {
+    if total_count == 0 || previous_rows.is_empty() {
         return;
     }
+    if current_rows.is_empty() {
+        tracing::warn!(
+            path = sqlite_path.unwrap_or("<unknown>"),
+            list = label,
+            total_count,
+            preserved_rows = previous_rows.len(),
+            "tui poller detail list came back empty while summary count remained nonzero; preserving previous rows"
+        );
+        *current_rows = previous_rows.to_vec();
+        return;
+    }
+
+    if total_count > max_rows as u64 {
+        return;
+    }
+    let expected_rows = usize::try_from(total_count).unwrap_or(max_rows);
+    if current_rows.len() >= expected_rows || previous_rows.len() != expected_rows {
+        return;
+    }
+    let current_row_count = current_rows.len();
     tracing::warn!(
         path = sqlite_path.unwrap_or("<unknown>"),
         list = label,
         total_count,
+        current_row_count,
         preserved_rows = previous_rows.len(),
-        "tui poller detail list came back empty while summary count remained nonzero; preserving previous rows"
+        "tui poller detail list came back partially truncated while the uncapped summary count stayed stable; preserving previous rows"
     );
     *current_rows = previous_rows.to_vec();
 }
@@ -1037,7 +1258,7 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
     let last_active_sort = timestamp_sort_expr("last_active_ts");
     conn.query_sync(
         &format!(
-            "SELECT name, program, last_active_ts FROM agents \
+            "SELECT id, name, program, last_active_ts FROM agents \
              ORDER BY {last_active_sort} DESC, id DESC LIMIT {MAX_AGENTS}"
         ),
         &[],
@@ -1046,9 +1267,24 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
     .map(|rows| {
         rows.into_iter()
             .filter_map(|row| {
+                let agent_id = row
+                    .get_named::<i64>("id")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(0).ok())?;
+                let name = row
+                    .get_named::<String>("name")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(1).ok())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| format!("[unknown-agent-{agent_id}]"));
+                let program = row
+                    .get_named::<String>("program")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(2).ok())
+                    .unwrap_or_default();
                 Some(AgentSummary {
-                    name: row.get_named::<String>("name").ok()?,
-                    program: row.get_named::<String>("program").ok()?,
+                    name,
+                    program,
                     last_active_ts: parse_raw_ts(&row, "last_active_ts"),
                 })
             })
@@ -1177,16 +1413,22 @@ fn parse_project_summary_rows(
                 .get_named::<i64>("id")
                 .ok()
                 .or_else(|| row.get_as::<i64>(0).ok())?;
+            let slug = row
+                .get_named::<String>("slug")
+                .ok()
+                .or_else(|| row.get_as::<String>(1).ok())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
+            let human_key = row
+                .get_named::<String>("human_key")
+                .ok()
+                .or_else(|| row.get_as::<String>(2).ok())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("[missing-human-key-{project_id}]"));
             Some(ProjectSummary {
                 id: project_id,
-                slug: row
-                    .get_named::<String>("slug")
-                    .ok()
-                    .or_else(|| row.get_as::<String>(1).ok())?,
-                human_key: row
-                    .get_named::<String>("human_key")
-                    .ok()
-                    .or_else(|| row.get_as::<String>(2).ok())?,
+                slug,
+                human_key,
                 agent_count: row
                     .get_named::<i64>("agent_count")
                     .ok()
@@ -1315,14 +1557,17 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
     conn.query_sync(
         &format!(
             "SELECT \
+             al.id, \
+             al.a_agent_id AS raw_from_agent_id, al.b_agent_id AS raw_to_agent_id, \
+             al.a_project_id AS raw_from_project_id, al.b_project_id AS raw_to_project_id, \
              a1.name AS from_agent, a2.name AS to_agent, \
              p1.slug AS from_project, p2.slug AS to_project, \
              al.status, al.reason, al.updated_ts, al.expires_ts \
              FROM agent_links al \
-             JOIN agents a1 ON a1.id = al.a_agent_id \
-             JOIN agents a2 ON a2.id = al.b_agent_id \
-             JOIN projects p1 ON p1.id = al.a_project_id \
-             JOIN projects p2 ON p2.id = al.b_project_id \
+             LEFT JOIN agents a1 ON a1.id = al.a_agent_id \
+             LEFT JOIN agents a2 ON a2.id = al.b_agent_id \
+             LEFT JOIN projects p1 ON p1.id = al.a_project_id \
+             LEFT JOIN projects p2 ON p2.id = al.b_project_id \
              ORDER BY {updated_sort} DESC, al.id DESC \
              LIMIT {MAX_CONTACTS}"
         ),
@@ -1332,12 +1577,35 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
     .map(|rows| {
         rows.into_iter()
             .filter_map(|row| {
+                let read_raw_id = |name: &str, index: usize| {
+                    row.get_named::<i64>(name)
+                        .ok()
+                        .or_else(|| row.get_as::<i64>(index).ok())
+                        .unwrap_or(0)
+                };
+                let from_agent_id = read_raw_id("raw_from_agent_id", 1);
+                let to_agent_id = read_raw_id("raw_to_agent_id", 2);
+                let from_project_id = read_raw_id("raw_from_project_id", 3);
+                let to_project_id = read_raw_id("raw_to_project_id", 4);
+                let read_text = |name: &str, fallback: String| {
+                    row.get_named::<String>(name)
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(fallback)
+                };
                 Some(ContactSummary {
-                    from_agent: row.get_named::<String>("from_agent").ok()?,
-                    to_agent: row.get_named::<String>("to_agent").ok()?,
-                    from_project_slug: row.get_named::<String>("from_project").ok()?,
-                    to_project_slug: row.get_named::<String>("to_project").ok()?,
-                    status: row.get_named::<String>("status").ok()?,
+                    from_agent: read_text("from_agent", format!("[unknown-agent-{from_agent_id}]")),
+                    to_agent: read_text("to_agent", format!("[unknown-agent-{to_agent_id}]")),
+                    from_project_slug: read_text(
+                        "from_project",
+                        format!("[unknown-project-{from_project_id}]"),
+                    ),
+                    to_project_slug: read_text(
+                        "to_project",
+                        format!("[unknown-project-{to_project_id}]"),
+                    ),
+                    status: read_text("status", "[unknown-status]".to_string()),
                     reason: row.get_named::<String>("reason").ok().unwrap_or_default(),
                     updated_ts: parse_raw_ts(&row, "updated_ts"),
                     expires_ts: parse_optional_raw_ts(&row, "expires_ts"),
@@ -1866,8 +2134,33 @@ fn fetch_reservation_snapshot_bundle(
     conn: &DbConn,
     now: i64,
     sqlite_path: Option<&str>,
+    previous: Option<&DbStatSnapshot>,
 ) -> ReservationSnapshotBundle {
-    try_fetch_reservation_snapshot_bundle(conn, now, sqlite_path).unwrap_or_default()
+    try_fetch_reservation_snapshot_bundle(conn, now, sqlite_path)
+        .unwrap_or_else(|| previous_reservation_snapshot_bundle(previous))
+}
+
+fn previous_reservation_snapshot_bundle(
+    previous: Option<&DbStatSnapshot>,
+) -> ReservationSnapshotBundle {
+    previous.map_or_else(ReservationSnapshotBundle::default, |snapshot| {
+        ReservationSnapshotBundle {
+            active_count: snapshot.file_reservations,
+            active_counts_by_project: snapshot
+                .projects_list
+                .iter()
+                .map(|project| (project.id, project.reservation_count))
+                .collect(),
+            snapshots: snapshot.reservation_snapshots.clone(),
+        }
+    })
+}
+
+fn previous_count(
+    previous: Option<&DbStatSnapshot>,
+    selector: impl FnOnce(&DbStatSnapshot) -> u64,
+) -> u64 {
+    previous.map_or(0, selector)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1948,18 +2241,25 @@ fn try_fetch_reservation_snapshot_bundle(
         let Some(id) = parse_raw_i64(&row, "id") else {
             continue;
         };
-        let Some(path_pattern) = row.get_named::<String>("path_pattern").ok() else {
-            continue;
-        };
+        let path_pattern = row
+            .get_named::<String>("path_pattern")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("[missing-path-pattern-{id}]"));
         let snapshot = ReservationSnapshot {
             id,
             project_slug: row
                 .get_named::<String>("project_slug")
                 .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "[unknown-project]".to_string()),
             agent_name: row
                 .get_named::<String>("agent_name")
                 .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "[unknown-agent]".to_string()),
             path_pattern,
             exclusive: row
@@ -2084,18 +2384,25 @@ fn try_fetch_reservation_snapshot_bundle_fast(
         let Some(id) = parse_raw_i64(&row, "id") else {
             continue;
         };
-        let Some(path_pattern) = row.get_named::<String>("path_pattern").ok() else {
-            continue;
-        };
+        let path_pattern = row
+            .get_named::<String>("path_pattern")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("[missing-path-pattern-{id}]"));
         snapshots.push(ReservationSnapshot {
             id,
             project_slug: row
                 .get_named::<String>("project_slug")
                 .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "[unknown-project]".to_string()),
             agent_name: row
                 .get_named::<String>("agent_name")
                 .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "[unknown-agent]".to_string()),
             path_pattern,
             exclusive: row
@@ -2133,7 +2440,7 @@ pub(crate) fn fetch_reservation_snapshots_with_path(
     conn: &DbConn,
     sqlite_path: Option<&str>,
 ) -> Vec<ReservationSnapshot> {
-    fetch_reservation_snapshot_bundle(conn, now_micros(), sqlite_path).snapshots
+    fetch_reservation_snapshot_bundle(conn, now_micros(), sqlite_path, None).snapshots
 }
 
 /// Read `CONSOLE_POLL_INTERVAL_MS` from environment, default 2000ms.
@@ -2407,6 +2714,16 @@ mod tests {
     }
 
     #[test]
+    fn pragma_table_info_column_name_uses_index_fallback() {
+        let conn = DbConn::open_memory().expect("open");
+        let rows = conn
+            .query_sync("SELECT 0 AS cid, 'slug' AS other", &[])
+            .expect("query rows");
+        let name = pragma_table_info_column_name(&rows[0]);
+        assert_eq!(name.as_deref(), Some("slug"));
+    }
+
+    #[test]
     fn poller_interval_override_clamps_zero() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
@@ -2657,7 +2974,7 @@ mod tests {
         let db_url = format!("sqlite:///{}", db_path.display());
 
         assert!(
-            open_poller_connection_state(&db_url).is_none(),
+            open_poller_connection_state(&db_url, dir.path()).is_none(),
             "non-sqlite startup file should not produce a poller connection state"
         );
     }
@@ -2746,6 +3063,7 @@ mod tests {
         let mut state = PollerConnectionState {
             conn,
             sqlite_path,
+            _snapshot_dir: None,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
@@ -2803,6 +3121,64 @@ mod tests {
     }
 
     #[test]
+    fn open_sync_connection_with_path_and_storage_root_uses_archive_snapshot_when_live_db_is_stale()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("poller-stale.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        create_empty_mail_schema(&conn);
+        drop(conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let (conn, sqlite_path, snapshot_dir) =
+            open_sync_connection_with_path_and_storage_root(&db_url, &storage_root)
+                .expect("open poller snapshot db");
+        assert!(
+            snapshot_dir.is_some(),
+            "poller should hold an archive-backed snapshot when the live db lags"
+        );
+        assert_ne!(
+            sqlite_path,
+            db_path.to_string_lossy(),
+            "poller should switch away from the stale live sqlite file"
+        );
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("query snapshot messages");
+        assert_eq!(rows[0].get_named::<i64>("c").unwrap_or(0), 1);
+    }
+
+    #[test]
     fn fetch_db_stats_with_connection_rejects_empty_missing_schema_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("wrong_schema_startup.db");
@@ -2817,6 +3193,7 @@ mod tests {
         let mut state = PollerConnectionState {
             conn,
             sqlite_path,
+            _snapshot_dir: None,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
@@ -2860,6 +3237,7 @@ mod tests {
         let mut state = PollerConnectionState {
             conn,
             sqlite_path,
+            _snapshot_dir: None,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
@@ -2950,6 +3328,7 @@ mod tests {
         let mut state = PollerConnectionState {
             conn,
             sqlite_path,
+            _snapshot_dir: None,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
@@ -3153,6 +3532,7 @@ mod tests {
         let state = PollerConnectionState {
             conn,
             sqlite_path: ":memory:".to_string(),
+            _snapshot_dir: None,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
@@ -3186,6 +3566,70 @@ mod tests {
 
         assert_eq!(refreshed.file_reservations, previous.file_reservations);
         assert_eq!(refreshed.projects_list, previous.projects_list);
+        assert_eq!(
+            refreshed.reservation_snapshots,
+            previous.reservation_snapshots
+        );
+        assert_eq!(refreshed.timestamp_micros, 250);
+    }
+
+    #[test]
+    fn apply_reservation_bundle_preserves_previous_snapshots_when_detail_rows_are_partial() {
+        let previous = DbStatSnapshot {
+            file_reservations: 2,
+            projects_list: vec![ProjectSummary {
+                id: 1,
+                slug: "alpha".to_string(),
+                human_key: "/tmp/alpha".to_string(),
+                agent_count: 0,
+                message_count: 0,
+                reservation_count: 2,
+                created_at: 10,
+            }],
+            reservation_snapshots: vec![
+                ReservationSnapshot {
+                    id: 7,
+                    project_slug: "alpha".to_string(),
+                    agent_name: "BlueLake".to_string(),
+                    path_pattern: "src/**".to_string(),
+                    exclusive: true,
+                    granted_ts: 10,
+                    expires_ts: 20,
+                    released_ts: None,
+                },
+                ReservationSnapshot {
+                    id: 8,
+                    project_slug: "alpha".to_string(),
+                    agent_name: "RedStone".to_string(),
+                    path_pattern: "tests/**".to_string(),
+                    exclusive: false,
+                    granted_ts: 11,
+                    expires_ts: 21,
+                    released_ts: None,
+                },
+            ],
+            timestamp_micros: 100,
+            ..DbStatSnapshot::default()
+        };
+        let bundle = ReservationSnapshotBundle {
+            active_count: 2,
+            active_counts_by_project: HashMap::from([(1, 2)]),
+            snapshots: vec![ReservationSnapshot {
+                id: 7,
+                project_slug: "alpha".to_string(),
+                agent_name: "BlueLake".to_string(),
+                path_pattern: "src/**".to_string(),
+                exclusive: true,
+                granted_ts: 10,
+                expires_ts: 20,
+                released_ts: None,
+            }],
+        };
+
+        let refreshed = apply_reservation_bundle_to_snapshot(&previous, bundle, 250);
+
+        assert_eq!(refreshed.file_reservations, 2);
+        assert_eq!(refreshed.projects_list[0].reservation_count, 2);
         assert_eq!(
             refreshed.reservation_snapshots,
             previous.reservation_snapshots
@@ -3295,6 +3739,262 @@ mod tests {
                 ack_pending: 1,
             }
         );
+    }
+
+    #[test]
+    fn db_stat_query_batcher_reuses_previous_snapshot_when_busy_lock_blocks_queries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("poller_busy_snapshot.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let conn = DbConn::open_file(&db_path_str).expect("open");
+        create_empty_mail_schema(&conn);
+        conn.execute_sync("ALTER TABLE messages ADD COLUMN ack_required INTEGER", &[])
+            .expect("add ack_required");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'proj-a', 'hk-a', 100)",
+            &[],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, last_active_ts) VALUES (1, 1, 'BlueLake', 'codex', 100)",
+            &[],
+        )
+        .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, ack_required) VALUES (10, 1, 1)",
+            &[],
+        )
+        .expect("insert message");
+        conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, \"exclusive\", created_ts, expires_ts, released_ts) VALUES (20, 1, 1, 'src/**', 1, 10, 4102444800000000, NULL)",
+            &[],
+        )
+        .expect("insert reservation");
+        conn.execute_sync(
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, a_project_id, b_project_id, status, reason, updated_ts, expires_ts) VALUES (30, 1, 1, 1, 1, 'accepted', '', 0, NULL)",
+            &[],
+        )
+        .expect("insert link");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (id, message_id, ack_ts) VALUES (40, 10, NULL)",
+            &[],
+        )
+        .expect("insert recipient");
+
+        let previous = DbStatQueryBatcher::new_with_path(&conn, &db_path_str).fetch_snapshot(None);
+
+        let lock_conn = DbConn::open_file(&db_path_str).expect("open lock conn");
+        lock_conn
+            .execute_sync("BEGIN EXCLUSIVE", &[])
+            .expect("acquire exclusive lock");
+
+        let read_conn = DbConn::open_file(&db_path_str).expect("open read conn");
+        read_conn
+            .execute_sync("PRAGMA busy_timeout = 1", &[])
+            .expect("set busy timeout");
+
+        let snapshot = DbStatQueryBatcher::new_with_path(&read_conn, &db_path_str)
+            .fetch_snapshot(Some(&previous));
+
+        lock_conn
+            .execute_sync("ROLLBACK", &[])
+            .expect("release lock");
+
+        assert_eq!(snapshot.projects, previous.projects);
+        assert_eq!(snapshot.agents, previous.agents);
+        assert_eq!(snapshot.messages, previous.messages);
+        assert_eq!(snapshot.file_reservations, previous.file_reservations);
+        assert_eq!(snapshot.contact_links, previous.contact_links);
+        assert_eq!(snapshot.ack_pending, previous.ack_pending);
+        assert_eq!(snapshot.agents_list.len(), previous.agents_list.len());
+        assert_eq!(snapshot.projects_list.len(), previous.projects_list.len());
+        assert_eq!(snapshot.contacts_list.len(), previous.contacts_list.len());
+        assert_eq!(
+            snapshot.reservation_snapshots.len(),
+            previous.reservation_snapshots.len()
+        );
+        assert_eq!(
+            snapshot.projects_list[0].reservation_count,
+            previous.projects_list[0].reservation_count
+        );
+        assert_eq!(
+            snapshot.reservation_snapshots[0].path_pattern,
+            previous.reservation_snapshots[0].path_pattern
+        );
+    }
+
+    #[test]
+    fn fetch_snapshot_preserves_previous_project_rollups_when_group_count_queries_fail() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'proj-a', 'hk-a', 100)",
+            &[],
+        )
+        .expect("insert project");
+
+        let previous = DbStatSnapshot {
+            projects: 1,
+            agents: 2,
+            messages: 3,
+            projects_list: vec![ProjectSummary {
+                id: 1,
+                slug: "proj-a".to_string(),
+                human_key: "hk-a".to_string(),
+                agent_count: 2,
+                message_count: 3,
+                reservation_count: 0,
+                created_at: 100,
+            }],
+            timestamp_micros: 50,
+            ..DbStatSnapshot::default()
+        };
+
+        let snapshot = DbStatQueryBatcher::new(&conn).fetch_snapshot(Some(&previous));
+
+        assert_eq!(snapshot.projects, 1);
+        assert_eq!(snapshot.agents, previous.agents);
+        assert_eq!(snapshot.messages, previous.messages);
+        assert_eq!(snapshot.projects_list.len(), 1);
+        assert_eq!(snapshot.projects_list[0].slug, "proj-a");
+        assert_eq!(snapshot.projects_list[0].agent_count, 2);
+        assert_eq!(snapshot.projects_list[0].message_count, 3);
+    }
+
+    #[test]
+    fn fetch_snapshot_preserves_previous_agents_list_when_current_rows_are_partially_truncated() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                program TEXT,
+                last_active_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts) VALUES
+                (1, 'BlueLake', 'codex', 100),
+                (2, 'RedStone', NULL, 90)",
+            &[],
+        )
+        .expect("insert agents");
+
+        let previous = DbStatSnapshot {
+            agents: 2,
+            agents_list: vec![
+                AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "codex".to_string(),
+                    last_active_ts: 100,
+                },
+                AgentSummary {
+                    name: "RedStone".to_string(),
+                    program: "claude".to_string(),
+                    last_active_ts: 90,
+                },
+            ],
+            timestamp_micros: 50,
+            ..DbStatSnapshot::default()
+        };
+
+        let snapshot = DbStatQueryBatcher::new(&conn).fetch_snapshot(Some(&previous));
+
+        assert_eq!(snapshot.agents, 2);
+        assert_eq!(snapshot.agents_list, previous.agents_list);
+    }
+
+    #[test]
+    fn fetch_snapshot_preserves_previous_contacts_when_join_backfill_drops_uncapped_rows() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync("CREATE TABLE messages (id INTEGER PRIMARY KEY)", &[])
+            .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE agent_links (
+                id INTEGER PRIMARY KEY,
+                a_agent_id INTEGER NOT NULL,
+                b_agent_id INTEGER NOT NULL,
+                a_project_id INTEGER NOT NULL,
+                b_project_id INTEGER NOT NULL,
+                status TEXT,
+                reason TEXT,
+                updated_ts INTEGER,
+                expires_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create agent_links");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug) VALUES (1, 'alpha'), (2, 'beta')",
+            &[],
+        )
+        .expect("insert projects");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name) VALUES
+                (1, 'BlueLake'),
+                (2, 'RedStone'),
+                (3, 'GreenField')",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO agent_links
+                (id, a_agent_id, b_agent_id, a_project_id, b_project_id, status, reason, updated_ts, expires_ts)
+             VALUES
+                (1, 1, 2, 1, 2, 'accepted', 'ok', 100, NULL),
+                (2, 1, 3, 1, 99, 'pending', 'missing project join', 90, NULL)",
+            &[],
+        )
+        .expect("insert contact links");
+
+        let previous = DbStatSnapshot {
+            contact_links: 2,
+            contacts_list: vec![
+                ContactSummary {
+                    from_agent: "BlueLake".to_string(),
+                    to_agent: "RedStone".to_string(),
+                    from_project_slug: "alpha".to_string(),
+                    to_project_slug: "beta".to_string(),
+                    status: "accepted".to_string(),
+                    reason: "ok".to_string(),
+                    updated_ts: 100,
+                    expires_ts: None,
+                },
+                ContactSummary {
+                    from_agent: "BlueLake".to_string(),
+                    to_agent: "GreenField".to_string(),
+                    from_project_slug: "alpha".to_string(),
+                    to_project_slug: "gamma".to_string(),
+                    status: "pending".to_string(),
+                    reason: "missing project join".to_string(),
+                    updated_ts: 90,
+                    expires_ts: None,
+                },
+            ],
+            timestamp_micros: 50,
+            ..DbStatSnapshot::default()
+        };
+
+        let snapshot = DbStatQueryBatcher::new(&conn).fetch_snapshot(Some(&previous));
+
+        assert_eq!(snapshot.contact_links, 2);
+        assert_eq!(snapshot.contacts_list, previous.contacts_list);
     }
 
     // ── fetch_db_stats with nonexistent DB ───────────────────────────
@@ -3784,7 +4484,7 @@ mod tests {
             ReservationScanMode::FullLegacy
         );
 
-        let bundle = fetch_reservation_snapshot_bundle(&conn, now_micros(), None);
+        let bundle = fetch_reservation_snapshot_bundle(&conn, now_micros(), None, None);
         assert_eq!(bundle.active_count, 1);
         assert_eq!(bundle.snapshots.len(), 1);
         assert_eq!(bundle.snapshots[0].path_pattern, "src/**");
@@ -3839,7 +4539,7 @@ mod tests {
             ReservationScanMode::ActiveFast
         );
 
-        let bundle = fetch_reservation_snapshot_bundle(&conn, now_micros(), None);
+        let bundle = fetch_reservation_snapshot_bundle(&conn, now_micros(), None, None);
         assert_eq!(bundle.active_count, 1);
         assert_eq!(bundle.snapshots.len(), 1);
         assert_eq!(bundle.snapshots[0].path_pattern, "src/**");
@@ -4073,6 +4773,129 @@ mod tests {
     }
 
     #[test]
+    fn fetch_contacts_list_keeps_rows_with_missing_joined_agent_or_project() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE agent_links (
+                id INTEGER PRIMARY KEY,
+                a_agent_id INTEGER NOT NULL,
+                b_agent_id INTEGER NOT NULL,
+                a_project_id INTEGER NOT NULL,
+                b_project_id INTEGER NOT NULL,
+                status TEXT,
+                reason TEXT,
+                updated_ts INTEGER,
+                expires_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create agent_links");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'alpha')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO agent_links
+                (id, a_agent_id, b_agent_id, a_project_id, b_project_id, status, reason, updated_ts, expires_ts)
+             VALUES
+                (1, 1, 99, 1, 77, 'pending', 'missing joins', 100, NULL)",
+            &[],
+        )
+        .expect("insert contact link");
+
+        let contacts = fetch_contacts_list(&conn);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts[0],
+            ContactSummary {
+                from_agent: "BlueLake".to_string(),
+                to_agent: "[unknown-agent-99]".to_string(),
+                from_project_slug: "alpha".to_string(),
+                to_project_slug: "[unknown-project-77]".to_string(),
+                status: "pending".to_string(),
+                reason: "missing joins".to_string(),
+                updated_ts: 100,
+                expires_ts: None,
+            }
+        );
+    }
+
+    #[test]
+    fn fetch_contacts_list_keeps_rows_with_missing_status_text() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE agent_links (
+                id INTEGER PRIMARY KEY,
+                a_agent_id INTEGER NOT NULL,
+                b_agent_id INTEGER NOT NULL,
+                a_project_id INTEGER NOT NULL,
+                b_project_id INTEGER NOT NULL,
+                status TEXT,
+                reason TEXT,
+                updated_ts INTEGER,
+                expires_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create agent_links");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug) VALUES (1, 'alpha'), (2, 'beta')",
+            &[],
+        )
+        .expect("insert projects");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name) VALUES (1, 'BlueLake'), (2, 'RedStone')",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO agent_links
+                (id, a_agent_id, b_agent_id, a_project_id, b_project_id, status, reason, updated_ts, expires_ts)
+             VALUES
+                (1, 1, 2, 1, 2, NULL, 'status missing', 100, NULL)",
+            &[],
+        )
+        .expect("insert contact link");
+
+        let contacts = fetch_contacts_list(&conn);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].status, "[unknown-status]");
+        assert_eq!(contacts[0].reason, "status missing");
+    }
+
+    #[test]
     fn fetch_reservation_snapshots_returns_empty_for_no_table() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_reservations_no_table.db");
@@ -4106,13 +4929,115 @@ mod tests {
         )
         .expect("insert reservation");
 
-        let bundle = fetch_reservation_snapshot_bundle(&conn, 100, None);
+        let bundle = fetch_reservation_snapshot_bundle(&conn, 100, None, None);
         assert_eq!(bundle.active_count, 1);
         assert_eq!(bundle.active_counts_by_project.get(&99), Some(&1));
         assert_eq!(bundle.snapshots.len(), 1);
         assert_eq!(bundle.snapshots[0].project_slug, "[unknown-project]");
         assert_eq!(bundle.snapshots[0].agent_name, "[unknown-agent]");
         assert_eq!(bundle.snapshots[0].path_pattern, "src/**");
+    }
+
+    #[test]
+    fn reservation_snapshot_bundle_fast_keeps_rows_with_missing_path_pattern() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                \"exclusive\" INTEGER,
+                created_ts INTEGER,
+                expires_ts INTEGER,
+                released_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'alpha')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations (
+                id, project_id, agent_id, path_pattern, \"exclusive\", created_ts, expires_ts, released_ts
+            ) VALUES (1, 1, 1, NULL, 1, 10, 1000000, NULL)",
+            &[],
+        )
+        .expect("insert reservation");
+
+        let bundle = fetch_reservation_snapshot_bundle(&conn, 100, None, None);
+        assert_eq!(bundle.active_count, 1);
+        assert_eq!(bundle.snapshots.len(), 1);
+        assert_eq!(bundle.snapshots[0].path_pattern, "[missing-path-pattern-1]");
+    }
+
+    #[test]
+    fn reservation_snapshot_bundle_legacy_keeps_rows_with_missing_path_pattern() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                agent_id INTEGER,
+                path_pattern TEXT,
+                \"exclusive\" INTEGER,
+                created_ts INTEGER,
+                expires_ts TEXT,
+                released_ts TEXT
+            )",
+            &[],
+        )
+        .expect("create reservations");
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync("INSERT INTO projects (id, slug) VALUES (1, 'alpha')", &[])
+            .expect("insert project");
+        conn.execute_sync("INSERT INTO agents (id, name) VALUES (1, 'BlueLake')", &[])
+            .expect("insert agent");
+        conn.execute_sync(
+            "INSERT INTO file_reservations (
+                id, project_id, agent_id, path_pattern, \"exclusive\", created_ts, expires_ts, released_ts
+            ) VALUES (1, 1, 1, NULL, 1, 10, '1000000', NULL)",
+            &[],
+        )
+        .expect("insert reservation");
+
+        let bundle = fetch_reservation_snapshot_bundle(&conn, 100, None, None);
+        assert_eq!(bundle.active_count, 1);
+        assert_eq!(bundle.snapshots.len(), 1);
+        assert_eq!(bundle.snapshots[0].path_pattern, "[missing-path-pattern-1]");
     }
 
     #[test]
@@ -4194,6 +5119,32 @@ mod tests {
     }
 
     #[test]
+    fn fetch_agents_list_keeps_rows_with_missing_name_or_program() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_agents_missing_text_fields.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts) VALUES
+             (7, NULL, NULL, 200),
+             (8, 'NamedAgent', 'codex', 100)",
+            &[],
+        )
+        .expect("insert");
+
+        let agents = fetch_agents_list(&conn);
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name, "[unknown-agent-7]");
+        assert_eq!(agents[0].program, "");
+        assert_eq!(agents[1].name, "NamedAgent");
+    }
+
+    #[test]
     fn fetch_projects_list_includes_aggregate_counts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test_projects_aggregates.db");
@@ -4247,6 +5198,40 @@ mod tests {
         assert_eq!(projects[0].agent_count, 2);
         assert_eq!(projects[0].message_count, 3);
         assert_eq!(projects[0].reservation_count, 1);
+    }
+
+    #[test]
+    fn fetch_projects_list_keeps_rows_with_missing_slug_or_human_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_projects_missing_text_fields.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (5, NULL, NULL, 100)",
+            &[],
+        )
+        .expect("insert project");
+
+        let projects = fetch_projects_list(&conn);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, 5);
+        assert_eq!(projects[0].slug, "[unknown-project-5]");
+        assert_eq!(projects[0].human_key, "[missing-human-key-5]");
     }
 
     #[test]
@@ -4503,7 +5488,7 @@ mod tests {
         // Without LIMIT, the list would grow unbounded with agent count.
         let last_active_sort = timestamp_sort_expr("last_active_ts");
         let sql = format!(
-            "SELECT name, program, last_active_ts FROM agents \
+            "SELECT id, name, program, last_active_ts FROM agents \
              ORDER BY {last_active_sort} DESC, id DESC LIMIT {MAX_AGENTS}"
         );
         assert!(

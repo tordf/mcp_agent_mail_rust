@@ -1883,8 +1883,381 @@ pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result
     open_sync_db_connection_with_busy_timeout(path, INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS)
 }
 
+pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Option<DbConn> {
+    let sqlite_path = resolve_server_database_url_sqlite_path(database_url)?;
+    if !sqlite_path.exists() {
+        return None;
+    }
+    open_interactive_sync_db_connection(sqlite_path.to_string_lossy().as_ref()).ok()
+}
+
 pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
     open_sync_db_connection_with_busy_timeout(path, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveDbDriftSummary {
+    archive_projects: u64,
+    archive_agents: u64,
+    archive_messages: u64,
+    archive_max_id: i64,
+    db_projects: u64,
+    db_agents: u64,
+    db_messages: u64,
+    db_max_id: i64,
+    missing_archive_projects: Vec<String>,
+}
+
+impl ArchiveDbDriftSummary {
+    fn readiness_error(&self) -> String {
+        let missing_project_suffix = if self.missing_archive_projects.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", missing archive project(s) in db: {}",
+                self.missing_archive_projects.join(", ")
+            )
+        };
+        format!(
+            "archive inventory is ahead of the sqlite index (archive projects={}, agents={}, messages={}, latest_id={}, db projects={}, agents={}, messages={}, max_id={}{})",
+            self.archive_projects,
+            self.archive_agents,
+            self.archive_messages,
+            self.archive_max_id,
+            self.db_projects,
+            self.db_agents,
+            self.db_messages,
+            self.db_max_id,
+            missing_project_suffix
+        )
+    }
+}
+
+fn archive_inventory_has_state(storage_root: &Path) -> bool {
+    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+    archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
+}
+
+fn inspect_archive_db_drift(
+    storage_root: &Path,
+    conn: &DbConn,
+) -> Result<Option<ArchiveDbDriftSummary>, String> {
+    let projects_root = storage_root.join("projects");
+    let projects_root_is_dir = std::fs::symlink_metadata(&projects_root)
+        .is_ok_and(|metadata| metadata.file_type().is_dir());
+    if !storage_root.is_dir() || !projects_root_is_dir {
+        return Ok(None);
+    }
+
+    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
+        return Ok(None);
+    }
+
+    let rows = conn
+        .query_sync(
+            "SELECT \
+                (SELECT COUNT(*) FROM projects) AS project_count, \
+                (SELECT COUNT(*) FROM agents) AS agent_count, \
+                (SELECT COUNT(*) FROM messages) AS message_count, \
+                COALESCE((SELECT MAX(id) FROM messages), 0) AS max_id",
+            &[],
+        )
+        .map_err(|e| format!("failed to inspect sqlite inventory during drift check: {e}"))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| "sqlite inventory query returned no rows during drift check".to_string())?;
+    let db_project_count = row
+        .get_named::<i64>("project_count")
+        .ok()
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0);
+    let db_agent_count = row
+        .get_named::<i64>("agent_count")
+        .ok()
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0);
+    let db_message_count = row
+        .get_named::<i64>("message_count")
+        .ok()
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0);
+    let db_max_id = row.get_named::<i64>("max_id").unwrap_or(0);
+    let archive_max_id = archive.latest_message_id.unwrap_or(0);
+    let db_project_identities =
+        mcp_agent_mail_db::collect_db_project_identities(conn).map_err(|e| {
+            format!("failed to inspect sqlite project identities during drift check: {e}")
+        })?;
+    let missing_archive_projects =
+        mcp_agent_mail_db::archive_missing_project_identities(&archive, &db_project_identities);
+
+    if u64::try_from(archive.projects).unwrap_or(u64::MAX) > db_project_count
+        || u64::try_from(archive.agents).unwrap_or(u64::MAX) > db_agent_count
+        || u64::try_from(archive.unique_message_ids).unwrap_or(u64::MAX) > db_message_count
+        || archive_max_id > db_max_id
+        || !missing_archive_projects.is_empty()
+    {
+        return Ok(Some(ArchiveDbDriftSummary {
+            archive_projects: u64::try_from(archive.projects).unwrap_or(u64::MAX),
+            archive_agents: u64::try_from(archive.agents).unwrap_or(u64::MAX),
+            archive_messages: u64::try_from(archive.unique_message_ids).unwrap_or(u64::MAX),
+            archive_max_id,
+            db_projects: db_project_count,
+            db_agents: db_agent_count,
+            db_messages: db_message_count,
+            db_max_id,
+            missing_archive_projects,
+        }));
+    }
+
+    Ok(None)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservabilitySyncDbKind {
+    LiveSqlite,
+    ArchiveSnapshot,
+}
+
+pub(crate) struct SnapshotDirGuard {
+    path: PathBuf,
+}
+
+impl SnapshotDirGuard {
+    fn new(prefix: &str) -> std::io::Result<Self> {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for attempt in 0..32_u32 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = base.join(format!("{prefix}{pid}-{nonce}-{attempt}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "failed to allocate unique snapshot dir under {}",
+                base.display()
+            ),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SnapshotDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+pub(crate) struct ObservabilitySyncDb {
+    conn: DbConn,
+    sqlite_path: String,
+    #[cfg(test)]
+    kind: ObservabilitySyncDbKind,
+    _snapshot_dir: Option<SnapshotDirGuard>,
+}
+
+impl ObservabilitySyncDb {
+    fn live(conn: DbConn, sqlite_path: String) -> Self {
+        Self {
+            conn,
+            sqlite_path,
+            #[cfg(test)]
+            kind: ObservabilitySyncDbKind::LiveSqlite,
+            _snapshot_dir: None,
+        }
+    }
+
+    fn archive_snapshot(
+        storage_root: &Path,
+        salvage_db_path: Option<&Path>,
+        context: &str,
+    ) -> Result<Self, String> {
+        let snapshot_dir = SnapshotDirGuard::new("server-observability-mailbox-")
+            .map_err(|error| format!("failed to allocate observability snapshot dir: {error}"))?;
+        let sqlite_path = snapshot_dir.path().join("mailbox.sqlite3");
+        let reconstruct = salvage_db_path.map_or_else(
+            || mcp_agent_mail_db::reconstruct_from_archive(&sqlite_path, storage_root),
+            |salvage_db_path| {
+                mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
+                    &sqlite_path,
+                    storage_root,
+                    Some(salvage_db_path),
+                )
+            },
+        );
+        if let Err(error) = reconstruct {
+            tracing::warn!(
+                operation = context,
+                storage_root = %storage_root.display(),
+                salvage = ?salvage_db_path.map(|path| path.display().to_string()),
+                error = %error,
+                "failed to build archive-backed observability snapshot"
+            );
+            return Err(format!(
+                "failed to build archive-backed observability snapshot: {error}"
+            ));
+        }
+        let sqlite_path_str = sqlite_path.to_string_lossy().into_owned();
+        let conn = open_best_effort_sync_db_connection(&sqlite_path_str).map_err(|error| {
+            format!(
+                "failed to open archive-backed observability snapshot {}: {error}",
+                sqlite_path.display()
+            )
+        })?;
+        Ok(Self {
+            conn,
+            sqlite_path: sqlite_path_str,
+            #[cfg(test)]
+            kind: ObservabilitySyncDbKind::ArchiveSnapshot,
+            _snapshot_dir: Some(snapshot_dir),
+        })
+    }
+
+    pub(crate) fn conn(&self) -> &DbConn {
+        &self.conn
+    }
+
+    pub(crate) fn into_parts(self) -> (DbConn, String, Option<SnapshotDirGuard>) {
+        (self.conn, self.sqlite_path, self._snapshot_dir)
+    }
+
+    #[cfg(test)]
+    fn uses_archive_snapshot(&self) -> bool {
+        matches!(self.kind, ObservabilitySyncDbKind::ArchiveSnapshot)
+    }
+}
+
+pub(crate) struct ObservabilityDbPool {
+    pool: mcp_agent_mail_db::DbPool,
+    _snapshot_dir: Option<SnapshotDirGuard>,
+}
+
+impl ObservabilityDbPool {
+    pub(crate) fn pool(&self) -> &mcp_agent_mail_db::DbPool {
+        &self.pool
+    }
+}
+
+pub(crate) fn open_observability_db_pool(
+    database_url: &str,
+    storage_root: &Path,
+    context: &str,
+) -> Result<ObservabilityDbPool, String> {
+    let observed = open_observability_sync_db_connection(database_url, storage_root, context)?
+        .ok_or_else(|| "database connection unavailable".to_string())?;
+    let (_conn, sqlite_path, snapshot_dir) = observed.into_parts();
+    let cfg = DbPoolConfig {
+        database_url: format!("sqlite:///{}", sqlite_path),
+        storage_root: Some(storage_root.to_path_buf()),
+        ..Default::default()
+    };
+    let pool = mcp_agent_mail_db::create_pool(&cfg)
+        .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
+    Ok(ObservabilityDbPool {
+        pool,
+        _snapshot_dir: snapshot_dir,
+    })
+}
+
+pub(crate) fn open_observability_sync_db_connection(
+    database_url: &str,
+    storage_root: &Path,
+    context: &str,
+) -> Result<Option<ObservabilitySyncDb>, String> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return Ok(None);
+    }
+
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let sqlite_path = resolve_server_sync_sqlite_path(
+        &cfg.sqlite_path()
+            .map_err(|error| format!("invalid sqlite database URL: {error}"))?,
+    );
+    if sqlite_path == ":memory:" {
+        return Ok(None);
+    }
+
+    let resolved_path = PathBuf::from(&sqlite_path);
+    let archive_has_state = archive_inventory_has_state(storage_root);
+
+    match open_best_effort_sync_db_connection(&sqlite_path) {
+        Ok(conn) => match inspect_archive_db_drift(storage_root, &conn) {
+            Ok(Some(drift)) => {
+                tracing::warn!(
+                    operation = context,
+                    source = %resolved_path.display(),
+                    storage_root = %storage_root.display(),
+                    drift = drift.readiness_error(),
+                    "using archive-backed observability snapshot because the live sqlite index lags the Git archive"
+                );
+                drop(conn);
+                ObservabilitySyncDb::archive_snapshot(
+                    storage_root,
+                    resolved_path.exists().then_some(resolved_path.as_path()),
+                    context,
+                )
+                .map(Some)
+            }
+            Ok(None) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
+            Err(error) if archive_has_state => {
+                tracing::warn!(
+                    operation = context,
+                    source = %resolved_path.display(),
+                    storage_root = %storage_root.display(),
+                    error = %error,
+                    "using archive-backed observability snapshot because the live sqlite inventory probe failed"
+                );
+                drop(conn);
+                ObservabilitySyncDb::archive_snapshot(
+                    storage_root,
+                    resolved_path.exists().then_some(resolved_path.as_path()),
+                    context,
+                )
+                .map(Some)
+            }
+            Err(_) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
+        },
+        Err(error) if archive_has_state => {
+            tracing::warn!(
+                operation = context,
+                source = %resolved_path.display(),
+                storage_root = %storage_root.display(),
+                error = %error,
+                "using archive-backed observability snapshot because the live sqlite source could not be opened"
+            );
+            ObservabilitySyncDb::archive_snapshot(
+                storage_root,
+                resolved_path.exists().then_some(resolved_path.as_path()),
+                context,
+            )
+            .map(Some)
+        }
+        Err(error) => {
+            if resolved_path.exists() {
+                Err(format!(
+                    "failed to open live sqlite source {}: {error}",
+                    resolved_path.display()
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 fn tui_readiness_warmup_failure_message(error: &str) -> String {
@@ -3351,7 +3724,14 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// TTL for cached project/message counts returned by the readiness endpoint.
 const HEALTH_COUNT_CACHE_TTL: Duration = Duration::from_secs(30);
 
-type HealthCountCacheValue = (Instant, Option<(u64, u64)>);
+#[derive(Debug, Clone)]
+struct HealthCountCacheEntry {
+    database_url: String,
+    storage_root: PathBuf,
+    counts: Option<(u64, u64)>,
+}
+
+type HealthCountCacheValue = (Instant, Option<HealthCountCacheEntry>);
 
 /// Cached `(last_refresh, project_count, message_count)`.  Both counts are
 /// `Option` so we can distinguish "never fetched" from "fetch failed".
@@ -3364,6 +3744,25 @@ static HEALTH_COUNT_CACHE: std::sync::LazyLock<Mutex<HealthCountCacheValue>> =
         // CLOCK_MONOTONIC starts from zero.)
         Mutex::new((Instant::now(), None))
     });
+
+/// TTL for cached semantic readiness validation.
+///
+/// This covers the more expensive archive-vs-index parity check used by
+/// `/health/readiness`, while still failing closed quickly when the mailbox
+/// enters a bad state.
+const READINESS_SEMANTIC_CACHE_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+struct ReadinessSemanticCacheEntry {
+    database_url: String,
+    storage_root: PathBuf,
+    result: Result<(), String>,
+}
+
+type ReadinessSemanticCacheValue = (Instant, Option<ReadinessSemanticCacheEntry>);
+
+static READINESS_SEMANTIC_CACHE: std::sync::LazyLock<Mutex<ReadinessSemanticCacheValue>> =
+    std::sync::LazyLock::new(|| Mutex::new((Instant::now(), None)));
 
 // ---------------------------------------------------------------------------
 // Dispatch admission control (Fix: bound concurrent spawn_blocking threads)
@@ -5750,7 +6149,8 @@ impl StartupDashboard {
         let handle = std::thread::Builder::new()
             .name("mcp-agent-mail-dashboard".to_string())
             .spawn(move || {
-                let mut db_conn = dashboard_open_connection(&this.database_url);
+                let mut db_conn =
+                    dashboard_open_connection(&this.database_url, Path::new(&this.storage_root));
                 while !this.stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(1200));
                     if this.stop.load(Ordering::Relaxed) {
@@ -6408,11 +6808,18 @@ impl StartupDashboard {
     }
 
     fn refresh_db_stats(&self) {
-        *lock_mutex(&self.db_stats) = fetch_dashboard_db_stats(&self.database_url);
+        *lock_mutex(&self.db_stats) =
+            fetch_dashboard_db_stats(&self.database_url, Path::new(&self.storage_root));
     }
 
-    fn refresh_db_stats_cached(&self, conn: &mut Option<DbConn>) {
-        *lock_mutex(&self.db_stats) = fetch_dashboard_db_stats_cached(&self.database_url, conn);
+    fn refresh_db_stats_cached(&self, conn: &mut Option<ObservabilitySyncDb>) {
+        let previous = { lock_mutex(&self.db_stats).clone() };
+        *lock_mutex(&self.db_stats) = fetch_dashboard_db_stats_cached(
+            &self.database_url,
+            Path::new(&self.storage_root),
+            conn,
+            &previous,
+        );
     }
 
     fn snapshot(&self) -> DashboardSnapshot {
@@ -7141,46 +7548,65 @@ fn colorize_json_line(line: &str, key_color: &str, num_color: &str, ansi_off: &s
     out
 }
 
-fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
-    let Some(conn) = dashboard_open_connection(database_url) else {
+fn fetch_dashboard_db_stats(database_url: &str, storage_root: &Path) -> DashboardDbStats {
+    let Some(conn) = dashboard_open_connection(database_url, storage_root) else {
         return DashboardDbStats::default();
     };
-    let conn = mcp_agent_mail_db::guard_db_conn(conn, "dashboard stats snapshot connection");
-    fetch_dashboard_db_stats_from_conn(&conn)
+    fetch_dashboard_db_stats_from_conn(conn.conn())
 }
 
-fn dashboard_open_connection(database_url: &str) -> Option<DbConn> {
-    let cfg = DbPoolConfig {
-        database_url: database_url.to_string(),
-        ..Default::default()
-    };
-    let path = cfg.sqlite_path().ok()?;
-    // The operator dashboard is observability-only. It must not trigger archive-aware
-    // recovery against the live runtime database just to render counts.
-    if path == ":memory:" {
-        DbConn::open_memory().ok()
+fn dashboard_open_connection(
+    database_url: &str,
+    storage_root: &Path,
+) -> Option<ObservabilitySyncDb> {
+    // The operator dashboard is observability-only. It must not mutate the
+    // live mailbox just to render counts, but it should still prefer a
+    // canonical archive-backed snapshot when the live sqlite index is stale.
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        Some(ObservabilitySyncDb::live(
+            DbConn::open_memory().ok()?,
+            ":memory:".to_string(),
+        ))
     } else {
-        open_best_effort_sync_db_connection(&path).ok()
+        match open_observability_sync_db_connection(
+            database_url,
+            storage_root,
+            "dashboard stats snapshot",
+        ) {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    database_url,
+                    storage_root = %storage_root.display(),
+                    "dashboard stats snapshot unavailable"
+                );
+                None
+            }
+        }
     }
 }
 
 fn fetch_dashboard_db_stats_cached(
     database_url: &str,
-    conn_state: &mut Option<DbConn>,
+    storage_root: &Path,
+    conn_state: &mut Option<ObservabilitySyncDb>,
+    previous: &DashboardDbStats,
 ) -> DashboardDbStats {
     if let Some(conn) = conn_state.as_ref() {
-        if conn.query_sync("SELECT 1 AS c", &[]).is_ok() {
-            return fetch_dashboard_db_stats_from_conn(conn);
+        if conn.conn().query_sync("SELECT 1 AS c", &[]).is_ok() {
+            return fetch_dashboard_db_stats_from_conn(conn.conn());
         }
         if let Some(old_conn) = conn_state.take() {
-            mcp_agent_mail_db::close_db_conn(old_conn, "dashboard cached connection");
+            let (conn, _sqlite_path, _snapshot_dir) = old_conn.into_parts();
+            mcp_agent_mail_db::close_db_conn(conn, "dashboard cached connection");
         }
     }
 
-    *conn_state = dashboard_open_connection(database_url);
+    *conn_state = dashboard_open_connection(database_url, storage_root);
     conn_state.as_ref().map_or_else(
-        DashboardDbStats::default,
-        fetch_dashboard_db_stats_from_conn,
+        || previous.clone(),
+        |conn| fetch_dashboard_db_stats_from_conn(conn.conn()),
     )
 }
 
@@ -7188,19 +7614,43 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     let now_micros = mcp_agent_mail_db::timestamps::now_micros();
     let agents_list = conn
         .query_sync(
-            "SELECT name, program, last_active_ts FROM agents \
+            "SELECT id, name, program, last_active_ts FROM agents \
              ORDER BY last_active_ts DESC LIMIT 10",
             &[],
         )
         .ok()
         .map(|rows| {
             rows.into_iter()
-                .filter_map(|row| {
-                    Some(AgentSummary {
-                        name: row.get_named::<String>("name").ok()?,
-                        program: row.get_named::<String>("program").ok()?,
-                        last_active_ts: row.get_named::<i64>("last_active_ts").ok()?,
-                    })
+                .map(|row| {
+                    let agent_id = row
+                        .get_named::<i64>("id")
+                        .ok()
+                        .or_else(|| row.get_as::<i64>(0).ok())
+                        .unwrap_or(0);
+                    let name = row
+                        .get_named::<String>("name")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| {
+                            if agent_id > 0 {
+                                format!("[unknown-agent-{agent_id}]")
+                            } else {
+                                "[unknown-agent]".to_string()
+                            }
+                        });
+                    let program = row
+                        .get_named::<String>("program")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "[unknown-program]".to_string());
+
+                    AgentSummary {
+                        name,
+                        program,
+                        last_active_ts: crate::tui_poller::parse_raw_ts(&row, "last_active_ts"),
+                    }
                 })
                 .collect()
         })
@@ -7698,7 +8148,11 @@ impl HttpState {
                 let mut body = serde_json::json!({"status":"ready"});
                 // Enrich readiness response with database identity so
                 // operators can verify the correct DB file is active.
-                enrich_readiness_response(&self.config.database_url, &mut body);
+                enrich_readiness_response(
+                    &self.config.database_url,
+                    self.config.storage_root.as_path(),
+                    &mut body,
+                );
                 return Some(self.health_json_response(req, 200, &body));
             }
             "/.well-known/oauth-authorization-server"
@@ -10042,15 +10496,125 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
 }
 
 fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
-    readiness_check_with_integrity(config, false)
+    let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
+    let sqlite_path = if is_memory {
+        None
+    } else {
+        resolve_server_database_url_sqlite_path(&config.database_url)
+    };
+    let _sqlite_activity_lock = if let Some(sqlite_path) = sqlite_path.as_ref() {
+        acquire_mailbox_activity_lock_for_sqlite_path(sqlite_path, MailboxActivityLockMode::Shared)
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+
+    let conn = if is_memory {
+        DbConn::open_memory().map_err(|e| e.to_string())?
+    } else {
+        let sqlite_path = sqlite_path
+            .as_ref()
+            .ok_or_else(|| "cannot resolve sqlite path for readiness check".to_string())?;
+        if !sqlite_path.exists() {
+            return Err(format!(
+                "SQLite database is missing at {}; quick readiness refuses to initialize the mailbox",
+                sqlite_path.display()
+            ));
+        }
+        open_best_effort_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
+            .map_err(|e| e.to_string())?
+    };
+
+    if let Err(e) = conn.query_sync("SELECT 1", &[]) {
+        let error = e.to_string();
+        if mcp_agent_mail_db::is_corruption_error_message(&error) {
+            return Err(format!(
+                "SQLite corruption detected during readiness check; automatic server-side recovery is disabled: {error}"
+            ));
+        }
+        return Err(error);
+    }
+
+    if is_memory {
+        return Ok(());
+    }
+
+    readiness_check_cached_semantic_status(config, &conn)
+}
+
+fn readiness_check_cached_semantic_status(
+    config: &mcp_agent_mail_core::Config,
+    conn: &DbConn,
+) -> Result<(), String> {
+    {
+        let guard = lock_mutex(&READINESS_SEMANTIC_CACHE);
+        let (last_refresh, cached) = &*guard;
+        if let Some(entry) = cached.as_ref()
+            && last_refresh.elapsed() < READINESS_SEMANTIC_CACHE_TTL
+            && entry.database_url == config.database_url
+            && entry.storage_root == config.storage_root
+        {
+            return entry.result.clone();
+        }
+    }
+
+    let result = readiness_check_semantic_status(config, conn);
+    *lock_mutex(&READINESS_SEMANTIC_CACHE) = (
+        Instant::now(),
+        Some(ReadinessSemanticCacheEntry {
+            database_url: config.database_url.clone(),
+            storage_root: config.storage_root.clone(),
+            result: result.clone(),
+        }),
+    );
+    result
+}
+
+fn readiness_check_semantic_status(
+    config: &mcp_agent_mail_core::Config,
+    conn: &DbConn,
+) -> Result<(), String> {
+    let rows = conn
+        .query_sync(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            &[],
+        )
+        .map_err(|e| format!("failed to inspect sqlite schema during readiness check: {e}"))?;
+    let present = rows
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .collect::<std::collections::BTreeSet<_>>();
+    let missing_tables = [
+        "projects",
+        "agents",
+        "messages",
+        "message_recipients",
+        "threads",
+    ]
+    .into_iter()
+    .filter(|name| !present.contains(*name))
+    .collect::<Vec<_>>();
+    if !missing_tables.is_empty() {
+        return Err(format!(
+            "sqlite schema missing required readiness tables: {}",
+            missing_tables.join(", ")
+        ));
+    }
+
+    if let Some(drift) = inspect_archive_db_drift(&config.storage_root, conn)? {
+        return Err(drift.readiness_error());
+    }
+
+    Ok(())
 }
 
 /// Emit a prominent startup log line showing which database file is active.
 ///
 /// This makes it trivially easy for operators to verify the correct DB when
-/// tailing logs after a restart or deployment.  Also warns when the database
-/// is empty (zero messages) while the archive/storage root contains data,
-/// which typically means the DB was recreated without restoring from archive.
+/// tailing logs after a restart or deployment. It also emits a best-effort
+/// warning when the canonical archive inventory is ahead of the SQLite index,
+/// which usually means the DB was recreated or left stale without a matching
+/// archive restore/reconcile.
 fn log_active_database(config: &mcp_agent_mail_core::Config) {
     let db_display: std::borrow::Cow<'_, str> =
         match resolve_server_database_url_sqlite_path(&config.database_url) {
@@ -10070,25 +10634,24 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
         "Active database"
     );
 
-    // Best-effort warning: DB is empty but archive root has data.
-    if let Some(conn) = dashboard_open_connection(&config.database_url) {
-        let msg_count = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages");
-        if msg_count == 0 {
-            let archive_has_data = config.storage_root.is_dir()
-                && std::fs::read_dir(&config.storage_root)
-                    .ok()
-                    .map_or(false, |mut entries| {
-                        entries.any(|e| e.ok().map_or(false, |e| e.path().is_dir()))
-                    });
-            if archive_has_data {
-                tracing::warn!(
-                    database = %db_display,
-                    storage_root = %config.storage_root.display(),
-                    "Database contains zero messages but the storage root has data — \
-                     the DB may have been recreated without restoring from archive"
-                );
-            }
-        }
+    // Best-effort warning: archive inventory is ahead of the live SQLite index.
+    if let Some(observed) =
+        dashboard_open_connection(&config.database_url, config.storage_root.as_path())
+        && let Ok(Some(drift)) = inspect_archive_db_drift(&config.storage_root, observed.conn())
+    {
+        tracing::warn!(
+            database = %db_display,
+            storage_root = %config.storage_root.display(),
+            archive_projects = drift.archive_projects,
+            archive_agents = drift.archive_agents,
+            archive_messages = drift.archive_messages,
+            db_projects = drift.db_projects,
+            db_agents = drift.db_agents,
+            db_messages = drift.db_messages,
+            missing_archive_projects = ?drift.missing_archive_projects,
+            "Canonical archive inventory is ahead of the SQLite index — \
+             the DB may have been recreated or left stale without archive restore/reconcile"
+        );
     }
 }
 
@@ -10099,7 +10662,11 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
 /// and `version`.  Count queries are best-effort — if they fail the
 /// corresponding fields are set to `null` rather than degrading the overall
 /// readiness signal.
-fn enrich_readiness_response(database_url: &str, body: &mut serde_json::Value) {
+fn enrich_readiness_response(
+    database_url: &str,
+    storage_root: &Path,
+    body: &mut serde_json::Value,
+) {
     // Version — always available at compile time.
     body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
 
@@ -10122,20 +10689,37 @@ fn enrich_readiness_response(database_url: &str, body: &mut serde_json::Value) {
     // see reasonably fresh numbers while load-balancer probes stay fast.
     let cached_counts = {
         let guard = lock_mutex(&HEALTH_COUNT_CACHE);
-        let (last_refresh, cached) = &*guard;
-        if cached.is_some() && last_refresh.elapsed() < HEALTH_COUNT_CACHE_TTL {
-            *cached
+        let (last_refresh, cached_entry) = &*guard;
+        let cached_for_mailbox = cached_entry
+            .as_ref()
+            .filter(|entry| {
+                entry.database_url == database_url && entry.storage_root.as_path() == storage_root
+            })
+            .cloned();
+        if let Some(entry) = cached_for_mailbox.as_ref()
+            && last_refresh.elapsed() < HEALTH_COUNT_CACHE_TTL
+        {
+            entry.counts
         } else {
             // Cache is stale — release the lock before doing I/O, then
             // re-acquire to write the refreshed value.
             drop(guard);
-            let fresh = dashboard_open_connection(database_url).map(|conn| {
-                let projects = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM projects");
-                let messages = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages");
+            let fresh = dashboard_open_connection(database_url, storage_root).map(|db| {
+                let projects = dashboard_count(db.conn(), "SELECT COUNT(*) AS c FROM projects");
+                let messages = dashboard_count(db.conn(), "SELECT COUNT(*) AS c FROM messages");
                 (projects, messages)
             });
-            *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), fresh);
-            fresh
+            let counts =
+                fresh.or_else(|| cached_for_mailbox.as_ref().and_then(|entry| entry.counts));
+            *lock_mutex(&HEALTH_COUNT_CACHE) = (
+                Instant::now(),
+                Some(HealthCountCacheEntry {
+                    database_url: database_url.to_string(),
+                    storage_root: storage_root.to_path_buf(),
+                    counts,
+                }),
+            );
+            counts
         }
     };
     if let Some((projects, messages)) = cached_counts {
@@ -10203,6 +10787,7 @@ fn readiness_check_with_integrity(
     // a large auto-sized pool here causes avoidable startup churn on big hosts.
     let db_config = DbPoolConfig {
         database_url: config.database_url.clone(),
+        storage_root: Some(config.storage_root.clone()),
         min_connections: 1,
         max_connections: 1,
         acquire_timeout_ms: pool_timeout_ms,
@@ -11080,6 +11665,7 @@ mod tests {
     static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
     static TUI_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TOOL_DISPATCH_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     /// Regression test: Budget deadline must be relative to `wall_now()`, not absolute.
@@ -11283,6 +11869,242 @@ mod tests {
             error.contains("mailbox activity lock is busy") || error.contains("temporarily busy"),
             "busy readiness error should mention mailbox contention on the resolved absolute candidate: {error}"
         );
+    }
+
+    #[test]
+    fn readiness_check_quick_does_not_initialize_missing_sqlite() {
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = temp.path().join("missing-readiness.sqlite3");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = false;
+
+        let error =
+            readiness_check_quick(&config).expect_err("quick readiness should not initialize db");
+        assert!(
+            error.contains("quick readiness refuses to initialize the mailbox"),
+            "missing-db readiness error should explain the non-mutating refusal: {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "quick readiness must not create a missing sqlite file"
+        );
+    }
+
+    #[test]
+    fn readiness_check_quick_reports_archive_drift_as_not_ready() {
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("stale-readiness.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root.clone();
+        config.integrity_check_on_startup = false;
+
+        let error = readiness_check_quick(&config)
+            .expect_err("archive-ahead mailbox must not report quick readiness");
+        assert!(
+            error.contains("archive inventory is ahead of the sqlite index"),
+            "readiness drift error should mention archive-vs-db mismatch: {error}"
+        );
+    }
+
+    #[test]
+    fn readiness_check_quick_reports_archive_agent_drift_without_messages() {
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("stale-agent-readiness.sqlite3");
+        let agent_dir = storage_root
+            .join("projects")
+            .join("ahead-project")
+            .join("agents")
+            .join("Alice");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = false;
+
+        let error = readiness_check_quick(&config)
+            .expect_err("archive agent inventory ahead of sqlite must fail readiness");
+        assert!(
+            error.contains("archive inventory is ahead of the sqlite index"),
+            "agent-only archive drift should fail readiness: {error}"
+        );
+    }
+
+    #[test]
+    fn readiness_check_quick_reports_project_identity_drift_with_equal_counts() {
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("stale-project-identity-readiness.sqlite3");
+        let project_dir = storage_root.join("projects").join("archive-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"archive-project","human_key":"/archive-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("wrong-project".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("/wrong-project".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+            ],
+        )
+        .expect("insert wrong project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Alice".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("coder".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(String::new()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("auto".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert agent");
+        drop(conn);
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = false;
+
+        let error = readiness_check_quick(&config)
+            .expect_err("project identity drift should fail readiness even when counts match");
+        assert!(
+            error.contains("missing archive project(s) in db: archive-project (/archive-project)"),
+            "readiness should surface missing archive project identity: {error}"
+        );
+    }
+
+    #[test]
+    fn health_readiness_returns_503_when_archive_is_ahead_of_db() {
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("stale-health.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = false;
+
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 503);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["detail"], "service unavailable");
     }
 
     #[test]
@@ -11892,6 +12714,19 @@ mod tests {
             ],
             || f(project_key),
         )
+    }
+
+    fn with_serialized_health_count_cache<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _lock = HEALTH_COUNT_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
+        let result = f();
+        *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
+        result
     }
 
     fn make_request(method: Http1Method, uri: &str, headers: &[(&str, &str)]) -> Http1Request {
@@ -18306,6 +19141,114 @@ mod tests {
     }
 
     #[test]
+    fn health_readiness_count_cache_is_keyed_by_database_url() {
+        with_serialized_health_count_cache(|| {
+            *lock_mutex(&HEALTH_COUNT_CACHE) = (
+                Instant::now(),
+                Some(HealthCountCacheEntry {
+                    database_url: "sqlite:///tmp/other.sqlite3".to_string(),
+                    storage_root: PathBuf::from("/tmp/other-storage"),
+                    counts: Some((7, 9)),
+                }),
+            );
+
+            let current_storage = PathBuf::from("/tmp/current-storage");
+            let mut body = serde_json::json!({});
+            enrich_readiness_response("sqlite:///:memory:", current_storage.as_path(), &mut body);
+
+            assert_eq!(body["project_count"], serde_json::json!(0));
+            assert_eq!(body["message_count"], serde_json::json!(0));
+
+            let guard = lock_mutex(&HEALTH_COUNT_CACHE);
+            let (_, entry) = &*guard;
+            let entry = entry.as_ref().expect("health count cache entry");
+            assert_eq!(entry.database_url, "sqlite:///:memory:");
+            assert_eq!(entry.storage_root, current_storage);
+            assert_eq!(entry.counts, Some((0, 0)));
+        });
+    }
+
+    #[test]
+    fn health_readiness_count_cache_reuses_stale_counts_when_refresh_fails() {
+        with_serialized_health_count_cache(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage_root = dir.path().join("storage");
+            let db_path = dir.path().join("health-count-stale.sqlite3");
+            let project_dir = storage_root.join("projects").join("ahead-project");
+            let agent_dir = project_dir.join("agents").join("Alice");
+            let messages_dir = project_dir.join("messages").join("2026").join("03");
+            std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+            std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+            std::fs::write(
+                project_dir.join("project.json"),
+                r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+            )
+            .expect("write project metadata");
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+            )
+            .expect("write agent profile");
+            std::fs::write(
+                messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+                r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+            )
+            .expect("write canonical message");
+
+            let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("init schema");
+            drop(conn);
+
+            let database_url = format!("sqlite:///{}", db_path.display());
+            let expected_counts = Some((11, 13));
+            *lock_mutex(&HEALTH_COUNT_CACHE) = (
+                Instant::now(),
+                Some(HealthCountCacheEntry {
+                    database_url: database_url.clone(),
+                    storage_root: storage_root.clone(),
+                    counts: expected_counts,
+                }),
+            );
+
+            let tmpdir_file = dir.path().join("tmpdir-file");
+            std::fs::write(&tmpdir_file, "not a directory").expect("write tmpdir file");
+            let tmpdir = tmpdir_file
+                .to_str()
+                .expect("tmpdir override utf-8")
+                .to_string();
+
+            let mut body = serde_json::json!({});
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("TMPDIR", tmpdir.as_str())],
+                || enrich_readiness_response(&database_url, &storage_root, &mut body),
+            );
+
+            assert_eq!(body["project_count"], serde_json::json!(11));
+            assert_eq!(body["message_count"], serde_json::json!(13));
+
+            let guard = lock_mutex(&HEALTH_COUNT_CACHE);
+            let (_, entry) = &*guard;
+            let entry = entry.as_ref().expect("health count cache entry");
+            assert_eq!(entry.database_url, database_url);
+            assert_eq!(entry.storage_root, storage_root);
+            assert_eq!(entry.counts, expected_counts);
+        });
+    }
+
+    #[test]
     fn health_root_alias_returns_ready_json() {
         let config = mcp_agent_mail_core::Config {
             database_url: "sqlite:///:memory:".to_string(),
@@ -19166,6 +20109,38 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_db_stats_preserves_degraded_agent_rows_with_placeholders() {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("dashboard-degraded-agents.sqlite3");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, program TEXT, last_active_ts DATETIME)",
+        )
+        .expect("create agents");
+
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                Value::BigInt(7),
+                Value::Text(String::new()),
+                Value::Text(String::new()),
+                Value::Null,
+            ],
+        )
+        .expect("insert degraded agent");
+
+        let stats = fetch_dashboard_db_stats_from_conn(&conn);
+        assert_eq!(stats.agents_list.len(), 1);
+        assert_eq!(stats.agents_list[0].name, "[unknown-agent-7]");
+        assert_eq!(stats.agents_list[0].program, "[unknown-program]");
+        assert_eq!(stats.agents_list[0].last_active_ts, 0);
+    }
+
+    #[test]
     fn open_server_sync_db_connection_uses_server_busy_timeout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("server-busy-timeout.db");
@@ -19211,9 +20186,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("dashboard-busy-timeout.db");
         let database_url = format!("sqlite:///{}", db_path.display());
-        let conn = dashboard_open_connection(&database_url).expect("open");
+        let conn = dashboard_open_connection(&database_url, dir.path()).expect("open");
 
         let configured = conn
+            .conn()
             .query_sync("PRAGMA busy_timeout", &[])
             .expect("pragma query")
             .into_iter()
@@ -19248,8 +20224,10 @@ mod tests {
         );
 
         let database_url = format!("sqlite://{}", relative_path.display());
-        let conn = dashboard_open_connection(&database_url).expect("open dashboard fallback db");
+        let conn = dashboard_open_connection(&database_url, dir.path())
+            .expect("open dashboard fallback db");
         let rows = conn
+            .conn()
             .query_sync(
                 "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'marker'",
                 &[],
@@ -19261,6 +20239,222 @@ mod tests {
         assert!(
             !relative_path.exists(),
             "dashboard fallback should not create a stray relative sqlite file"
+        );
+    }
+
+    #[test]
+    fn dashboard_open_connection_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("dashboard-stale.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let observed =
+            dashboard_open_connection(&database_url, &storage_root).expect("open observed db");
+        assert!(
+            observed.uses_archive_snapshot(),
+            "dashboard should switch to an archive-backed snapshot when the live db lags"
+        );
+        let rows = observed
+            .conn()
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("query snapshot messages");
+        assert_eq!(rows[0].get_named::<i64>("c").unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn open_observability_sync_db_connection_reports_archive_snapshot_setup_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("observability-stale.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let tmpdir_file = dir.path().join("tmpdir-file");
+        std::fs::write(&tmpdir_file, "not a directory").expect("write tmpdir file");
+        let tmpdir = tmpdir_file
+            .to_str()
+            .expect("tmpdir override utf-8")
+            .to_string();
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let err = match mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", tmpdir.as_str())],
+            || {
+                open_observability_sync_db_connection(
+                    &database_url,
+                    &storage_root,
+                    "observability snapshot failure test",
+                )
+            },
+        ) {
+            Ok(_) => panic!("snapshot setup failure should be surfaced"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("failed to allocate observability snapshot dir"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn fetch_dashboard_db_stats_cached_reuses_previous_stats_when_refresh_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("dashboard-stale.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let tmpdir_file = dir.path().join("tmpdir-file");
+        std::fs::write(&tmpdir_file, "not a directory").expect("write tmpdir file");
+        let tmpdir = tmpdir_file
+            .to_str()
+            .expect("tmpdir override utf-8")
+            .to_string();
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let previous = DashboardDbStats {
+            projects: 11,
+            agents: 7,
+            messages: 13,
+            file_reservations: 5,
+            contact_links: 3,
+            ack_pending: 2,
+            agents_list: vec![AgentSummary {
+                name: "BlueLake".to_string(),
+                program: "coder".to_string(),
+                last_active_ts: 123,
+            }],
+        };
+        let mut conn_state = None;
+        let stats = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", tmpdir.as_str())],
+            || {
+                fetch_dashboard_db_stats_cached(
+                    &database_url,
+                    &storage_root,
+                    &mut conn_state,
+                    &previous,
+                )
+            },
+        );
+
+        assert_eq!(stats.projects, previous.projects);
+        assert_eq!(stats.agents, previous.agents);
+        assert_eq!(stats.messages, previous.messages);
+        assert_eq!(stats.file_reservations, previous.file_reservations);
+        assert_eq!(stats.contact_links, previous.contact_links);
+        assert_eq!(stats.ack_pending, previous.ack_pending);
+        assert_eq!(stats.agents_list.len(), previous.agents_list.len());
+        assert!(
+            conn_state.is_none(),
+            "failed refresh should not cache a bad connection"
         );
     }
 

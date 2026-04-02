@@ -28,8 +28,7 @@ use ftui_runtime::program::Cmd;
 use ftui_widgets::tree::TreeGuides;
 
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::sqlmodel_core::Value;
+use mcp_agent_mail_db::sqlmodel::{Row, Value};
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 use serde::Deserialize;
 
@@ -529,6 +528,8 @@ pub struct ThreadExplorerScreen {
     focus: Focus,
     /// Lazy-opened DB connection.
     db_conn: Option<DbConn>,
+    /// Holds the temp snapshot directory alive when this screen binds to an archive snapshot.
+    _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
     /// Whether we attempted to open the DB connection.
     db_conn_attempted: bool,
     /// True when DB context could not be bound; used for explicit degraded empty-state copy.
@@ -541,6 +542,8 @@ pub struct ThreadExplorerScreen {
     list_dirty: bool,
     /// Search/filter text (empty = show all).
     filter_text: String,
+    /// Filter text that produced the last successfully loaded DB-backed list.
+    last_loaded_filter_text: String,
     /// Whether we're in filter input mode.
     filter_editing: bool,
     /// Active view lens (cycles with Tab).
@@ -610,12 +613,14 @@ impl ThreadExplorerScreen {
             last_detail_max_scroll: std::cell::Cell::new(0),
             focus: Focus::ThreadList,
             db_conn: None,
+            _db_snapshot_dir: None,
             db_conn_attempted: false,
             db_context_unavailable: false,
             last_refresh: None,
             loaded_thread_id: String::new(),
             list_dirty: true,
             filter_text: String::new(),
+            last_loaded_filter_text: String::new(),
             filter_editing: false,
             view_lens: ViewLens::Activity,
             sort_mode: SortMode::LastActivity,
@@ -709,25 +714,40 @@ impl ThreadExplorerScreen {
             return;
         }
         self.db_conn_attempted = true;
-        let db_url = &state.config_snapshot().raw_database_url;
-        let cfg = DbPoolConfig {
-            database_url: db_url.clone(),
-            ..Default::default()
-        };
-        if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
+        let cfg = state.config_snapshot();
+        match crate::open_observability_sync_db_connection(
+            &cfg.raw_database_url,
+            std::path::Path::new(&cfg.storage_root),
+            "threads screen",
+        ) {
+            Ok(Some(db)) => {
+                let (conn, _, snapshot_dir) = db.into_parts();
+                self.db_conn = Some(conn);
+                self._db_snapshot_dir = snapshot_dir;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "threads screen db bind failed");
+            }
         }
         self.db_context_unavailable = self.db_conn.is_none();
+    }
+
+    fn can_preserve_previous_threads_on_db_unavailable(&self) -> bool {
+        !self.threads.is_empty() && self.last_loaded_filter_text == self.filter_text
     }
 
     /// Fetch thread list from DB.
     fn refresh_thread_list(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let selected_thread_id = self.threads.get(self.cursor).map(|t| t.thread_id.clone());
+        let preserve_previous = self.can_preserve_previous_threads_on_db_unavailable();
         let Some(conn) = &self.db_conn else {
-            self.threads.clear();
-            self.cursor = 0;
-            self.clear_detail_state(Some(state));
+            if !preserve_previous {
+                self.threads.clear();
+                self.cursor = 0;
+                self.clear_detail_state(Some(state));
+            }
             self.sync_focused_event();
             self.list_dirty = false;
             self.last_refresh = Some(Instant::now());
@@ -736,13 +756,16 @@ impl ThreadExplorerScreen {
             self.emit_thread_list_db_unavailable_diagnostic(
                 state,
                 "database connection unavailable",
+                preserve_previous,
             );
             return;
         };
         self.db_context_unavailable = false;
+        let cfg = state.config_snapshot();
         let text_match_thread_ids = resolve_text_filter_thread_ids(
             &self.filter_text,
-            &state.config_snapshot().raw_database_url,
+            &cfg.raw_database_url,
+            &cfg.storage_root,
         );
         let text_match_count = text_match_thread_ids.as_ref().map_or(0, HashSet::len);
         let global_thread_count = fetch_total_thread_count(conn);
@@ -755,6 +778,7 @@ impl ThreadExplorerScreen {
         self.apply_sort();
         self.last_refresh = Some(Instant::now());
         self.list_dirty = false;
+        self.last_loaded_filter_text.clone_from(&self.filter_text);
 
         // Preserve selection by thread id so resorting does not silently jump to
         // a different thread when activity changes reorder the list.
@@ -780,9 +804,16 @@ impl ThreadExplorerScreen {
         self.emit_thread_list_diagnostic(state, global_thread_count, text_match_count);
     }
 
-    fn emit_thread_list_db_unavailable_diagnostic(&mut self, state: &TuiSharedState, reason: &str) {
+    fn emit_thread_list_db_unavailable_diagnostic(
+        &mut self,
+        state: &TuiSharedState,
+        reason: &str,
+        preserved_stale: bool,
+    ) {
         let reason = sanitize_diagnostic_value(reason);
-        let signature = format!("filter=db_context_unavailable;reason={reason}");
+        let signature = format!(
+            "filter=db_context_unavailable;reason={reason};preserved_stale={preserved_stale}"
+        );
         if self
             .last_list_diagnostic_signature
             .as_ref()
@@ -791,6 +822,12 @@ impl ThreadExplorerScreen {
             return;
         }
         self.last_list_diagnostic_signature = Some(signature.clone());
+        let rendered_count = if preserved_stale {
+            self.threads.len()
+        } else {
+            0
+        };
+        let rendered_count = u64::try_from(rendered_count).unwrap_or(u64::MAX);
 
         let cfg = state.config_snapshot();
         let transport_mode = cfg.transport_mode().to_string();
@@ -799,7 +836,7 @@ impl ThreadExplorerScreen {
             scope: "thread_list.db_unavailable".to_string(),
             query_params: signature,
             raw_count: 0,
-            rendered_count: 0,
+            rendered_count,
             dropped_count: 0,
             timestamp_micros: chrono::Utc::now().timestamp_micros(),
             db_url: cfg.database_url,
@@ -2405,13 +2442,21 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
                 last_sender: last_meta
                     .and_then(|meta| sender_name_map.get(&meta.sender_id))
                     .cloned()
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| {
+                        last_meta
+                            .map(|meta| unknown_agent_label(meta.sender_id))
+                            .unwrap_or_default()
+                    }),
                 last_timestamp_micros: row.last_timestamp_micros,
                 last_timestamp_iso: micros_to_iso(row.last_timestamp_micros),
                 project_slug: last_meta
                     .and_then(|meta| project_slug_map.get(&meta.project_id))
                     .cloned()
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| {
+                        last_meta
+                            .map(|meta| unknown_project_label(meta.project_id))
+                            .unwrap_or_default()
+                    }),
                 has_escalation: row.has_escalation,
                 velocity_msg_per_hr: velocity,
                 participant_names,
@@ -2488,13 +2533,14 @@ fn participant_names_by_thread(
                     continue;
                 };
                 let names = participants.entry(thread_id).or_default();
-                if let Some(sender_name) = row
-                    .get_named::<i64>("sender_id")
-                    .ok()
-                    .and_then(|sender_id| sender_name_map.get(&sender_id).cloned())
-                    && !sender_name.is_empty()
-                {
-                    names.insert(sender_name);
+                if let Some(sender_id) = row.get_named::<i64>("sender_id").ok() {
+                    let sender_name = sender_name_map
+                        .get(&sender_id)
+                        .cloned()
+                        .unwrap_or_else(|| unknown_agent_label(sender_id));
+                    if !sender_name.is_empty() {
+                        names.insert(sender_name);
+                    }
                 }
                 let recipients_json = row
                     .get_named::<String>("recipients_json")
@@ -2519,10 +2565,12 @@ fn participant_names_for_sender_ids(
 ) -> String {
     let mut names = BTreeSet::new();
     for sender_id in sender_ids {
-        if let Some(name) = sender_name_map.get(sender_id)
-            && !name.is_empty()
-        {
-            names.insert(name.clone());
+        let name = sender_name_map
+            .get(sender_id)
+            .cloned()
+            .unwrap_or_else(|| unknown_agent_label(*sender_id));
+        if !name.is_empty() {
+            names.insert(name);
         }
     }
     names.into_iter().collect::<Vec<_>>().join(", ")
@@ -2545,19 +2593,26 @@ fn agent_names_by_id(conn: &DbConn, agent_ids: &[i64]) -> HashMap<i64, String> {
 
     let placeholders = vec!["?"; dedup.len()].join(", ");
     let sql = format!("SELECT id, name FROM agents WHERE id IN ({placeholders})");
-    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
-    conn.query_sync(&sql, &params)
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let id = row.get_named::<i64>("id").ok()?;
-                    let name = row.get_named::<String>("name").ok()?;
-                    Some((id, name))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let params: Vec<Value> = dedup.iter().copied().map(Value::BigInt).collect();
+    let mut names = HashMap::new();
+    if let Ok(rows) = conn.query_sync(&sql, &params) {
+        for row in rows {
+            let Ok(id) = row.get_named::<i64>("id") else {
+                continue;
+            };
+            let name = row
+                .get_named::<String>("name")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| unknown_agent_label(id));
+            names.insert(id, name);
+        }
+    }
+    for id in dedup {
+        names.entry(id).or_insert_with(|| unknown_agent_label(id));
+    }
+    names
 }
 
 fn project_slugs_by_id(conn: &DbConn, project_ids: &[i64]) -> HashMap<i64, String> {
@@ -2577,19 +2632,34 @@ fn project_slugs_by_id(conn: &DbConn, project_ids: &[i64]) -> HashMap<i64, Strin
 
     let placeholders = vec!["?"; dedup.len()].join(", ");
     let sql = format!("SELECT id, slug FROM projects WHERE id IN ({placeholders})");
-    let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
-    conn.query_sync(&sql, &params)
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let id = row.get_named::<i64>("id").ok()?;
-                    let slug = row.get_named::<String>("slug").ok()?;
-                    Some((id, slug))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let params: Vec<Value> = dedup.iter().copied().map(Value::BigInt).collect();
+    let mut slugs = HashMap::new();
+    if let Ok(rows) = conn.query_sync(&sql, &params) {
+        for row in rows {
+            let Ok(id) = row.get_named::<i64>("id") else {
+                continue;
+            };
+            let slug = row
+                .get_named::<String>("slug")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| unknown_project_label(id));
+            slugs.insert(id, slug);
+        }
+    }
+    for id in dedup {
+        slugs.entry(id).or_insert_with(|| unknown_project_label(id));
+    }
+    slugs
+}
+
+fn unknown_agent_label(agent_id: i64) -> String {
+    format!("[unknown-agent-{agent_id}]")
+}
+
+fn unknown_project_label(project_id: i64) -> String {
+    format!("[unknown-project-{project_id}]")
 }
 
 fn recipient_names_from_json(raw: &str) -> BTreeSet<String> {
@@ -2631,17 +2701,21 @@ fn assert_thread_list_cardinality(
     }
 }
 
-fn resolve_text_filter_thread_ids(filter: &str, database_url: &str) -> Option<HashSet<String>> {
+fn resolve_text_filter_thread_ids(
+    filter: &str,
+    database_url: &str,
+    storage_root: &str,
+) -> Option<HashSet<String>> {
     let trimmed = filter.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let pool_cfg = DbPoolConfig {
-        database_url: database_url.to_string(),
-        ..Default::default()
-    };
-    let pool = match mcp_agent_mail_db::create_pool(&pool_cfg) {
+    let observed_pool = match crate::open_observability_db_pool(
+        database_url,
+        std::path::Path::new(storage_root),
+        "thread filter search",
+    ) {
         Ok(pool) => pool,
         Err(err) => {
             tracing::warn!("thread filter search pool init failed: {err}");
@@ -2666,7 +2740,8 @@ fn resolve_text_filter_thread_ids(filter: &str, database_url: &str) -> Option<Ha
     };
 
     let outcome = runtime.block_on(async {
-        mcp_agent_mail_db::search_service::execute_search_simple(&cx, &pool, &query).await
+        mcp_agent_mail_db::search_service::execute_search_simple(&cx, observed_pool.pool(), &query)
+            .await
     });
 
     match outcome {
@@ -2716,51 +2791,47 @@ fn fetch_thread_messages_paginated(
     // For "load older", we use offset to skip the most recent ones.
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.importance, m.created_ts, \
-         a_sender.name AS sender_name, \
-         COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+         m.sender_id AS raw_sender_id, a_sender.name AS sender_name \
          FROM messages m \
-         JOIN agents a_sender ON a_sender.id = m.sender_id \
-         LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-         LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
+         LEFT JOIN agents a_sender ON a_sender.id = m.sender_id \
          WHERE m.thread_id = ? \
-         GROUP BY m.id \
          ORDER BY m.created_ts DESC \
          LIMIT {limit} OFFSET {offset}"
     );
 
-    let mut messages: Vec<ThreadMessage> = conn
+    let rows = conn
         .query_sync(&sql, &[Value::Text(thread_id.to_string())])
         .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let created_ts = row.get_named::<i64>("created_ts").ok()?;
-                    Some(ThreadMessage {
-                        id: row.get_named::<i64>("id").ok()?,
-                        reply_to_id: None,
-                        from_agent: row
-                            .get_named::<String>("sender_name")
-                            .ok()
-                            .unwrap_or_default(),
-                        to_agents: row
-                            .get_named::<String>("to_agents")
-                            .ok()
-                            .unwrap_or_default(),
-                        subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
-                        body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
-                        timestamp_iso: micros_to_iso(created_ts),
-                        timestamp_micros: created_ts,
-                        importance: row
-                            .get_named::<String>("importance")
-                            .ok()
-                            .unwrap_or_else(|| "normal".to_string()),
-                        is_unread: false,
-                        ack_required: false,
-                    })
-                })
-                .collect()
-        })
         .unwrap_or_default();
+    let message_ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|row| row.get_named::<i64>("id").ok())
+        .collect();
+    let recipient_map = thread_recipient_names_by_message(conn, &message_ids);
+
+    let mut messages: Vec<ThreadMessage> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let created_ts = row.get_named::<i64>("created_ts").ok()?;
+            let message_id = row.get_named::<i64>("id").ok()?;
+            Some(ThreadMessage {
+                id: message_id,
+                reply_to_id: None,
+                from_agent: read_thread_agent_label(&row, "sender_name", "raw_sender_id"),
+                to_agents: recipient_map.get(&message_id).cloned().unwrap_or_default(),
+                subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
+                timestamp_iso: micros_to_iso(created_ts),
+                timestamp_micros: created_ts,
+                importance: row
+                    .get_named::<String>("importance")
+                    .ok()
+                    .unwrap_or_else(|| "normal".to_string()),
+                is_unread: false,
+                ack_required: false,
+            })
+        })
+        .collect();
 
     // Reverse to get chronological order (oldest first)
     messages.reverse();
@@ -2772,6 +2843,56 @@ fn fetch_thread_messages_paginated(
 fn fetch_thread_messages(conn: &DbConn, thread_id: &str, limit: usize) -> Vec<ThreadMessage> {
     let (messages, _) = fetch_thread_messages_paginated(conn, thread_id, limit, 0);
     messages
+}
+
+fn thread_recipient_names_by_message(conn: &DbConn, message_ids: &[i64]) -> HashMap<i64, String> {
+    if message_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = vec!["?"; message_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT mr.message_id, mr.agent_id AS raw_agent_id, a.name AS agent_name \
+         FROM message_recipients mr \
+         LEFT JOIN agents a ON a.id = mr.agent_id \
+         WHERE mr.message_id IN ({placeholders}) \
+         ORDER BY mr.message_id ASC, mr.agent_id ASC"
+    );
+    let params: Vec<Value> = message_ids.iter().copied().map(Value::BigInt).collect();
+
+    let Ok(rows) = conn.query_sync(&sql, &params) else {
+        return HashMap::new();
+    };
+
+    let mut grouped: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in rows {
+        let Ok(message_id) = row.get_named::<i64>("message_id") else {
+            continue;
+        };
+        let agent_name = read_thread_agent_label(&row, "agent_name", "raw_agent_id");
+        let names = grouped.entry(message_id).or_default();
+        if !names.iter().any(|existing| existing == &agent_name) {
+            names.push(agent_name);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(message_id, names)| (message_id, names.join(", ")))
+        .collect()
+}
+
+fn read_thread_non_empty_text(row: &Row, value_column: &str) -> Option<String> {
+    row.get_named::<String>(value_column)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_thread_agent_label(row: &Row, value_column: &str, id_column: &str) -> String {
+    let agent_id = row.get_named::<i64>(id_column).unwrap_or(0);
+    read_thread_non_empty_text(row, value_column)
+        .unwrap_or_else(|| format!("[unknown-agent-{agent_id}]"))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -4118,6 +4239,49 @@ mod tests {
     use super::*;
     use ftui_harness::buffer_to_text;
 
+    fn write_archive_message(
+        storage_root: &std::path::Path,
+        thread_id: &str,
+        subject: &str,
+        body: &str,
+    ) {
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let message_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&message_dir).expect("create message dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-04-01T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            message_dir.join("2026-04-01T12-00-00Z__thread__1.md"),
+            format!(
+                r#"---json
+{{
+  "id": 1,
+  "thread_id": "{thread_id}",
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "{subject}",
+  "importance": "normal",
+  "created_ts": "2026-04-01T12:00:00Z"
+}}
+---
+
+{body}
+"#
+            ),
+        )
+        .expect("write canonical message");
+    }
+
     fn mouse_event(kind: MouseEventKind, x: u16, y: u16) -> Event {
         Event::Mouse(ftui::MouseEvent {
             kind,
@@ -4210,8 +4374,11 @@ mod tests {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = ThreadExplorerScreen::new();
 
-        screen
-            .emit_thread_list_db_unavailable_diagnostic(&state, "database connection unavailable");
+        screen.emit_thread_list_db_unavailable_diagnostic(
+            &state,
+            "database connection unavailable",
+            false,
+        );
         let diagnostics = state.screen_diagnostics_since(0);
         assert_eq!(diagnostics.len(), 1);
         let (_, diag) = diagnostics
@@ -4224,15 +4391,81 @@ mod tests {
             diag.query_params
                 .contains("reason=database connection unavailable")
         );
+        assert!(diag.query_params.contains("preserved_stale=false"));
         assert_eq!(diag.raw_count, 0);
         assert_eq!(diag.rendered_count, 0);
     }
 
     #[test]
-    fn refresh_thread_list_without_db_clears_focused_event() {
+    fn resolve_text_filter_thread_ids_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("threads-stale.sqlite3");
+        write_archive_message(
+            &storage_root,
+            "thread-archive-only",
+            "Archive-only thread",
+            "archive-only token",
+        );
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let thread_ids = resolve_text_filter_thread_ids(
+            "archive-only",
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        )
+        .expect("thread filter ids");
+        assert!(
+            thread_ids.contains("thread-archive-only"),
+            "thread filter should search the archive-backed snapshot when the live db is stale"
+        );
+    }
+
+    #[test]
+    fn refresh_thread_list_without_db_preserves_previous_threads_for_same_filter() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = ThreadExplorerScreen::new();
         screen.threads.push(make_thread("th-1", 3, 2));
+        screen.detail_messages.push(make_message(1));
+        screen.loaded_thread_id = "th-1".to_string();
+        screen.total_thread_messages = 1;
+        screen.loaded_message_count = 1;
+        screen.last_loaded_filter_text = screen.filter_text.clone();
+        screen.sync_focused_event();
+        assert!(screen.focused_event().is_some());
+
+        screen.db_conn_attempted = true;
+        screen.refresh_thread_list(&state);
+
+        assert_eq!(screen.threads.len(), 1);
+        assert_eq!(screen.threads[0].thread_id, "th-1");
+        assert_eq!(screen.detail_messages.len(), 1);
+        assert_eq!(screen.loaded_thread_id, "th-1");
+        assert!(screen.focused_event().is_some());
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("threads db unavailable diagnostic");
+        assert!(diag.query_params.contains("preserved_stale=true"));
+        assert_eq!(diag.rendered_count, 1);
+    }
+
+    #[test]
+    fn refresh_thread_list_without_db_clears_state_when_filter_changed() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("th-1", 3, 2));
+        screen.detail_messages.push(make_message(1));
+        screen.loaded_thread_id = "th-1".to_string();
+        screen.total_thread_messages = 1;
+        screen.loaded_message_count = 1;
+        screen.last_loaded_filter_text = String::new();
+        screen.filter_text = "urgent".to_string();
         screen.sync_focused_event();
         assert!(screen.focused_event().is_some());
 
@@ -4240,7 +4473,14 @@ mod tests {
         screen.refresh_thread_list(&state);
 
         assert!(screen.threads.is_empty());
+        assert!(screen.detail_messages.is_empty());
         assert!(screen.focused_event().is_none());
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, diag) = diagnostics
+            .last()
+            .expect("threads db unavailable diagnostic");
+        assert!(diag.query_params.contains("preserved_stale=false"));
+        assert_eq!(diag.rendered_count, 0);
     }
 
     #[test]
@@ -5382,6 +5622,20 @@ mod tests {
     }
 
     #[test]
+    fn paginated_fetch_keeps_rows_with_missing_sender_and_recipient_joins() {
+        let conn = make_thread_messages_db("thread-orphaned", 1);
+        conn.execute_raw("DELETE FROM agents WHERE id IN (1, 2)")
+            .expect("delete joined agents");
+
+        let (messages, offset) = fetch_thread_messages_paginated(&conn, "thread-orphaned", 20, 0);
+
+        assert_eq!(offset, 0);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from_agent, "[unknown-agent-1]");
+        assert_eq!(messages[0].to_agents, "[unknown-agent-2]");
+    }
+
+    #[test]
     fn thread_tree_builder_nests_reply_chains_and_sorts_children() {
         let mut root = make_message(10);
         root.subject = "root".to_string();
@@ -5540,6 +5794,24 @@ mod tests {
         let threads = fetch_threads(&conn, "Send", None, 10);
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].thread_id, "thread-by-sender");
+    }
+
+    #[test]
+    fn fetch_threads_preserves_unknown_sender_and_project_labels() {
+        let conn = make_thread_messages_db("thread-unknown-labels", 2);
+        conn.execute_raw("DELETE FROM agents")
+            .expect("remove joined agents");
+        conn.execute_raw("DELETE FROM projects")
+            .expect("remove joined projects");
+
+        let threads = fetch_threads(&conn, "", None, 10);
+        assert_eq!(threads.len(), 1);
+
+        let thread = &threads[0];
+        assert_eq!(thread.last_sender, "[unknown-agent-1]");
+        assert_eq!(thread.project_slug, "[unknown-project-1]");
+        assert!(thread.participant_names.contains("Receiver"));
+        assert!(thread.participant_names.contains("[unknown-agent-1]"));
     }
 
     fn make_thread(id: &str, msg_count: usize, participant_count: usize) -> ThreadSummary {
