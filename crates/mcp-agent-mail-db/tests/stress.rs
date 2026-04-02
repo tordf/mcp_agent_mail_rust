@@ -39,6 +39,7 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
     let db_path = dir.path().join(format!("stress_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 20,
         min_connections: 4,
         acquire_timeout_ms: 60_000,
@@ -100,6 +101,7 @@ fn stress_concurrent_pool_warmup_has_no_sqlite_busy() {
         .join(format!("pool_warmup_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 64,
         min_connections: 0,
         acquire_timeout_ms: 60_000,
@@ -978,6 +980,7 @@ fn stress_pool_exhaustion_recovery() {
         .join(format!("pool_exhaust_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 3,
         min_connections: 1,
         acquire_timeout_ms: 30_000,
@@ -1069,6 +1072,7 @@ fn stress_1000_agent_concurrent_workload() {
     let db_path = dir.path().join(format!("stress_1k_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 100,
         min_connections: 10,
         acquire_timeout_ms: 120_000,
@@ -1293,6 +1297,7 @@ fn stress_burst_200_concurrent_acquire_release() {
     let db_path = dir.path().join(format!("burst200_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 50,
         min_connections: 10,
         acquire_timeout_ms: 30_000,
@@ -1383,6 +1388,7 @@ fn stress_pool_acquire_latency_budget() {
         .join(format!("latency_budget_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 50,
         min_connections: 10,
         acquire_timeout_ms: 30_000,

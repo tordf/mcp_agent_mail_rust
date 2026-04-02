@@ -211,6 +211,7 @@ fn sustained_100_rps_load_test() {
     let db_path_str = db_path.display().to_string();
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{db_path_str}"),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 100,
         min_connections: 25,
         acquire_timeout_ms: 15_000,
@@ -874,6 +875,7 @@ fn multi_project_soak_replay() {
     let db_path_str = db_path.display().to_string();
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{db_path_str}"),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 100,
         min_connections: 25,
         acquire_timeout_ms: 15_000,

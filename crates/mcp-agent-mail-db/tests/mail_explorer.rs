@@ -38,6 +38,7 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
     let db_path = dir.path().join("mail_explorer_test.db");
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 10,
         min_connections: 2,
         acquire_timeout_ms: 30_000,

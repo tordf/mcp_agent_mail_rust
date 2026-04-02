@@ -58,6 +58,7 @@ fn make_pool_with_connections(max: usize, min: usize) -> (DbPool, tempfile::Temp
         .join(format!("load_concurrency_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: max,
         min_connections: min,
         acquire_timeout_ms: 60_000,

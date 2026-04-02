@@ -44,6 +44,7 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
     let db_path = dir.path().join(format!("lr_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 4,
         min_connections: 1,
         acquire_timeout_ms: 30_000,

@@ -46,6 +46,7 @@ fn make_pool(min: usize, max: usize) -> (DbPool, tempfile::TempDir) {
         .join(format!("pool_exhaust_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         min_connections: min,
         max_connections: max,
         acquire_timeout_ms: 30_000,
@@ -495,6 +496,7 @@ fn pool_integrity_check_on_fresh_db() {
 fn pool_memory_minimal_config() {
     let config = DbPoolConfig {
         database_url: "sqlite:///:memory:".to_string(),
+        storage_root: None,
         min_connections: 1,
         max_connections: 1,
         acquire_timeout_ms: 5_000,
