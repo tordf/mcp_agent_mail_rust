@@ -132,6 +132,7 @@ fn make_pool(tmp: &TempDir) -> DbPool {
     let db_path = tmp.path().join(format!("stress_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 20,
         min_connections: 4,
         acquire_timeout_ms: 60_000,
@@ -149,6 +150,7 @@ fn make_large_pool(tmp: &TempDir) -> DbPool {
         .join(format!("stress_large_{}.db", unique_suffix()));
     let config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 50,
         min_connections: 10,
         acquire_timeout_ms: 120_000,
@@ -1055,6 +1057,7 @@ fn stress_pool_exhaustion_with_archive_writes() {
         .join(format!("stress_exhaust_{}.db", unique_suffix()));
     let pool_config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 15, // Deliberately small to trigger contention
         min_connections: 3,
         acquire_timeout_ms: 30_000,
@@ -1888,6 +1891,7 @@ fn stress_150_agent_message_storm() {
         .join(format!("stress_150_{}.db", unique_suffix()));
     let pool_config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 100,
         min_connections: 25,
         acquire_timeout_ms: 120_000,
@@ -2141,6 +2145,7 @@ fn stress_100_agent_full_lifecycle() {
         .join(format!("stress_lifecycle_{}.db", unique_suffix()));
     let pool_config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 100,
         min_connections: 25,
         acquire_timeout_ms: 120_000,
@@ -2538,6 +2543,7 @@ fn stress_multi_project_120_agents() {
         .join(format!("stress_multi120_{}.db", unique_suffix()));
     let pool_config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 80,
         min_connections: 20,
         acquire_timeout_ms: 120_000,
@@ -2777,6 +2783,7 @@ fn stress_200_agent_pool_exhaustion_torture() {
     // Deliberately constrained: 25 max for 200 threads = 8x oversubscription
     let pool_config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 25,
         min_connections: 5,
         acquire_timeout_ms: 120_000,
@@ -3056,6 +3063,7 @@ fn stress_sustained_100_agents_60s() {
         .join(format!("stress_endurance_{}.db", unique_suffix()));
     let pool_config = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(db_path.parent().unwrap().join("storage")),
         max_connections: 100,
         min_connections: 25,
         acquire_timeout_ms: 120_000,

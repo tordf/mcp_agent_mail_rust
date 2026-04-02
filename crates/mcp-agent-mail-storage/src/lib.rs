@@ -7661,6 +7661,7 @@ mod tests {
         let db_path = tmp.path().join("message_pipeline.db");
         let pool_config = DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(config.storage_root.clone()),
             max_connections: 8,
             min_connections: 2,
             acquire_timeout_ms: 60_000,
@@ -7808,6 +7809,7 @@ mod tests {
         let db_path = tmp.path().join("reservation_pipeline.db");
         let pool_config = DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(config.storage_root.clone()),
             max_connections: 8,
             min_connections: 2,
             acquire_timeout_ms: 60_000,
