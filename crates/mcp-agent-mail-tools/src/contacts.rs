@@ -16,7 +16,8 @@ use crate::messaging::{
     enqueue_agent_semantic_index, enqueue_message_semantic_index, try_write_message_archive,
 };
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
+    db_outcome_to_mcp_result, get_db_pool, get_read_db_pool, legacy_tool_error, resolve_agent,
+    resolve_project,
 };
 
 /// Contact link state (tool-facing).
@@ -521,7 +522,7 @@ pub async fn list_contacts(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_db_pool()?;
+    let pool = get_read_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 

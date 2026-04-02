@@ -12,7 +12,9 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 use crate::llm;
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_read_db_pool, legacy_tool_error, resolve_project,
+};
 
 const MAX_SUMMARIZE_THREAD_IDS: usize = 128;
 
@@ -754,7 +756,7 @@ pub async fn search_messages(
         &[("date_to", date_to), ("before", before), ("until", until)],
     )?;
 
-    let pool = get_db_pool()?;
+    let pool = get_read_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -992,7 +994,7 @@ pub async fn summarize_thread(
         )
     })?;
 
-    let pool = get_db_pool()?;
+    let pool = get_read_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 

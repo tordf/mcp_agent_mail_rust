@@ -10,15 +10,15 @@
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::micros_to_iso;
+use mcp_agent_mail_db::{DbConn, guard_db_conn, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error,
-    resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
+    legacy_tool_error, resolve_project,
 };
 
 fn redact_database_url(url: &str) -> String {
@@ -32,6 +32,266 @@ fn redact_database_url(url: &str) -> String {
 
 const fn us_to_ms_ceil(us: u64) -> u64 {
     us.saturating_add(999).saturating_div(1000)
+}
+
+const HEALTH_CHECK_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 5_000;
+const HEALTH_CHECK_REQUIRED_TABLES: &[&str] = &[
+    "projects",
+    "agents",
+    "messages",
+    "message_recipients",
+    "threads",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticReadinessResponse {
+    pub status: String,
+    pub detail: String,
+}
+
+fn resolve_health_check_sqlite_path(database_url: &str) -> Result<Option<PathBuf>, String> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return Ok(None);
+    }
+
+    let Some(sqlite_path) =
+        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
+    else {
+        return Err(format!(
+            "cannot resolve sqlite path from DATABASE_URL {database_url}"
+        ));
+    };
+    let raw = sqlite_path.to_string_lossy().into_owned();
+    let normalized = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(&raw);
+    if normalized != raw {
+        return Ok(Some(PathBuf::from(normalized)));
+    }
+
+    let relative_path = Path::new(&raw);
+    if relative_path.is_absolute() || raw.starts_with("./") || raw.starts_with("../") {
+        return Ok(Some(PathBuf::from(raw)));
+    }
+
+    if !relative_path.exists() {
+        let absolute_candidate = Path::new("/").join(relative_path);
+        if absolute_candidate.exists() {
+            return Ok(Some(absolute_candidate));
+        }
+    }
+
+    Ok(Some(PathBuf::from(raw)))
+}
+
+fn open_health_check_sync_db_connection(path: &Path) -> Result<DbConn, String> {
+    let display = path.display().to_string();
+    let conn = DbConn::open_file(&display)
+        .map_err(|err| format!("open sqlite file {display} for health_check: {err}"))?;
+    conn.execute_raw(&format!(
+        "PRAGMA busy_timeout = {HEALTH_CHECK_SYNC_DB_BUSY_TIMEOUT_MS};"
+    ))
+    .map_err(|err| {
+        format!(
+            "configure sqlite busy_timeout={HEALTH_CHECK_SYNC_DB_BUSY_TIMEOUT_MS} on {display}: {err}"
+        )
+    })?;
+    Ok(conn)
+}
+
+fn semantic_readiness_response(
+    status: &str,
+    detail: impl Into<String>,
+) -> SemanticReadinessResponse {
+    SemanticReadinessResponse {
+        status: status.to_string(),
+        detail: detail.into(),
+    }
+}
+
+fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse {
+    let sqlite_path = match resolve_health_check_sqlite_path(&config.database_url) {
+        Ok(path) => path,
+        Err(error) => return semantic_readiness_response("fail", error),
+    };
+
+    let Some(sqlite_path) = sqlite_path else {
+        return semantic_readiness_response(
+            "ok",
+            "Skipped semantic readiness archive parity for in-memory database",
+        );
+    };
+
+    if !sqlite_path.exists() {
+        return semantic_readiness_response(
+            "fail",
+            format!(
+                "SQLite database is missing at {}; health_check refuses to initialize the mailbox",
+                sqlite_path.display()
+            ),
+        );
+    }
+
+    let conn = match open_health_check_sync_db_connection(&sqlite_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            let status = if mcp_agent_mail_db::is_lock_error(&error) {
+                "warn"
+            } else {
+                "fail"
+            };
+            return semantic_readiness_response(status, error);
+        }
+    };
+    let conn = guard_db_conn(conn, "identity::health_check semantic probe");
+
+    if let Err(error) = conn.query_sync("SELECT 1", &[]) {
+        let error = error.to_string();
+        let status = if mcp_agent_mail_db::is_lock_error(&error) {
+            "warn"
+        } else {
+            "fail"
+        };
+        return semantic_readiness_response(
+            status,
+            format!("sqlite connectivity probe failed during health_check: {error}"),
+        );
+    }
+
+    let rows = match conn.query_sync(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return semantic_readiness_response(
+                "fail",
+                format!("failed to inspect sqlite schema during health_check: {error}"),
+            );
+        }
+    };
+    let present = rows
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .collect::<std::collections::BTreeSet<_>>();
+    let missing_tables = HEALTH_CHECK_REQUIRED_TABLES
+        .iter()
+        .copied()
+        .filter(|name| !present.contains(*name))
+        .collect::<Vec<_>>();
+    if !missing_tables.is_empty() {
+        return semantic_readiness_response(
+            "fail",
+            format!(
+                "sqlite schema missing required health_check tables: {}",
+                missing_tables.join(", ")
+            ),
+        );
+    }
+
+    let archive = mcp_agent_mail_db::scan_archive_message_inventory(&config.storage_root);
+    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
+        return semantic_readiness_response(
+            "ok",
+            format!(
+                "No canonical archive content found under {}",
+                config.storage_root.join("projects").display()
+            ),
+        );
+    }
+
+    let rows = match conn.query_sync(
+        "SELECT \
+            (SELECT COUNT(*) FROM projects) AS project_count, \
+            (SELECT COUNT(*) FROM agents) AS agent_count, \
+            (SELECT COUNT(*) FROM messages) AS message_count, \
+            COALESCE((SELECT MAX(id) FROM messages), 0) AS max_id",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return semantic_readiness_response(
+                "fail",
+                format!("failed to inspect sqlite inventory during health_check: {error}"),
+            );
+        }
+    };
+    let Some(row) = rows.first() else {
+        return semantic_readiness_response(
+            "fail",
+            "sqlite inventory query returned no rows during health_check",
+        );
+    };
+    let db_project_count = row
+        .get_named::<i64>("project_count")
+        .ok()
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0);
+    let db_agent_count = row
+        .get_named::<i64>("agent_count")
+        .ok()
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0);
+    let db_message_count = row
+        .get_named::<i64>("message_count")
+        .ok()
+        .and_then(|count| u64::try_from(count).ok())
+        .unwrap_or(0);
+    let db_max_id = row.get_named::<i64>("max_id").unwrap_or(0);
+    let archive_max_id = archive.latest_message_id.unwrap_or(0);
+    let db_project_identities = match mcp_agent_mail_db::collect_db_project_identities(&conn) {
+        Ok(identities) => identities,
+        Err(error) => {
+            return semantic_readiness_response(
+                "fail",
+                format!("failed to inspect sqlite project identities during health_check: {error}"),
+            );
+        }
+    };
+    let missing_archive_projects =
+        mcp_agent_mail_db::archive_missing_project_identities(&archive, &db_project_identities);
+
+    if u64::try_from(archive.projects).unwrap_or(u64::MAX) > db_project_count
+        || u64::try_from(archive.agents).unwrap_or(u64::MAX) > db_agent_count
+        || u64::try_from(archive.unique_message_ids).unwrap_or(u64::MAX) > db_message_count
+        || archive_max_id > db_max_id
+        || !missing_archive_projects.is_empty()
+    {
+        let missing_project_suffix = if missing_archive_projects.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", missing archive project(s) in db: {}",
+                missing_archive_projects.join(", ")
+            )
+        };
+        return semantic_readiness_response(
+            "fail",
+            format!(
+                "archive inventory is ahead of the sqlite index (archive projects={}, agents={}, messages={}, latest_id={}, db projects={}, agents={}, messages={}, max_id={}{})",
+                archive.projects,
+                archive.agents,
+                archive.unique_message_ids,
+                archive_max_id,
+                db_project_count,
+                db_agent_count,
+                db_message_count,
+                db_max_id,
+                missing_project_suffix
+            ),
+        );
+    }
+
+    semantic_readiness_response(
+        "ok",
+        format!(
+            "Archive and sqlite inventory are aligned enough for health_check: archive projects={}, agents={}, messages={}, db projects={}, agents={}, messages={}",
+            archive.projects,
+            archive.agents,
+            archive.unique_message_ids,
+            db_project_count,
+            db_agent_count,
+            db_message_count
+        ),
+    )
 }
 
 /// Try to write an agent profile to the git archive. Failures are logged
@@ -125,6 +385,7 @@ pub struct HealthCheckResponse {
     pub http_host: String,
     pub http_port: u16,
     pub database_url: String,
+    pub semantic_readiness: SemanticReadinessResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -296,8 +557,24 @@ pub struct CommitInfo {
 #[allow(clippy::too_many_lines)]
 pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let config = &Config::get();
-    let pool = get_db_pool()?;
-    pool.sample_pool_stats_now();
+    let mut semantic_readiness = health_check_semantic_readiness(config);
+    let pool = if semantic_readiness.status == "fail" {
+        None
+    } else {
+        match get_db_pool() {
+            Ok(pool) => {
+                pool.sample_pool_stats_now();
+                Some(pool)
+            }
+            Err(error) => {
+                semantic_readiness = semantic_readiness_response(
+                    "fail",
+                    format!("database pool bootstrap failed during health_check: {error}"),
+                );
+                None
+            }
+        }
+    };
     // Ensure background workers are running so health_check reports stable
     // queue capacity/soft-cap values even before the first write/commit.
     mcp_agent_mail_storage::wbq_start();
@@ -322,13 +599,18 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let (health_level, _changed) = mcp_agent_mail_core::refresh_health_level();
 
     let response = HealthCheckResponse {
-        status: "ok".to_string(),
+        status: if semantic_readiness.status == "fail" {
+            "error".to_string()
+        } else {
+            "ok".to_string()
+        },
         health_level: health_level.to_string(),
         environment: config.app_environment.to_string(),
         http_host: config.http_host.clone(),
         http_port: config.http_port,
         database_url: redact_database_url(&config.database_url),
-        pool_utilization: Some(PoolUtilizationResponse {
+        semantic_readiness,
+        pool_utilization: pool.as_ref().map(|_| PoolUtilizationResponse {
             active: metrics.db.pool_active_connections,
             idle: metrics.db.pool_idle_connections,
             total: metrics.db.pool_total_connections,
@@ -994,7 +1276,7 @@ pub async fn whois(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_db_pool()?;
+    let pool = get_read_db_pool()?;
 
     let include_commits = include_recent_commits.unwrap_or(true);
     let limit_raw = commit_limit.unwrap_or(5);
@@ -1124,7 +1406,7 @@ pub async fn resolve_pane_identity(
 
     let mut project_keys = vec![project_key.clone()];
     if !Path::new(&project_key).is_absolute()
-        && let Ok(pool) = get_db_pool()
+        && let Ok(pool) = get_read_db_pool()
         && let Ok(project) = resolve_project(ctx, &pool, &project_key).await
         && project.human_key != project_key
     {
@@ -1208,7 +1490,7 @@ pub fn cleanup_pane_identities(
     description = "List all registered agents in a project.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, contact_policy."
 )]
 pub async fn list_agents(ctx: &McpContext, project_key: String) -> McpResult<String> {
-    let pool = get_db_pool()?;
+    let pool = get_read_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -1238,7 +1520,14 @@ pub async fn list_agents(ctx: &McpContext, project_key: String) -> McpResult<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::Cx;
+    use asupersync::runtime::RuntimeBuilder;
+    use fastmcp::McpContext;
+    use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    static HEALTH_CHECK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     // ── redact_database_url ──
 
@@ -1328,6 +1617,10 @@ mod tests {
             http_host: "0.0.0.0".into(),
             http_port: 8765,
             database_url: "sqlite:///data/test.db".into(),
+            semantic_readiness: SemanticReadinessResponse {
+                status: "ok".into(),
+                detail: "aligned".into(),
+            },
             pool_utilization: None,
             queues: None,
             disk: None,
@@ -1338,6 +1631,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["status"], "ok");
+        assert_eq!(json["semantic_readiness"]["status"], "ok");
         assert_eq!(json["http_port"], 8765);
     }
 
@@ -1687,6 +1981,10 @@ mod tests {
             http_host: "localhost".into(),
             http_port: 8765,
             database_url: "sqlite:///:memory:".into(),
+            semantic_readiness: SemanticReadinessResponse {
+                status: "ok".into(),
+                detail: "memory".into(),
+            },
             pool_utilization: None,
             queues: None,
             disk: None,
@@ -1701,6 +1999,238 @@ mod tests {
         assert!(!json_str.contains("integrity"));
         assert!(!json_str.contains("semantic_indexing"));
         assert!(!json_str.contains("two_tier_indexing"));
+    }
+
+    #[test]
+    fn health_check_reports_error_when_archive_is_ahead_of_sqlite_index() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("stale-health-check.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-04-01T12-00-00Z__hello__7.md"),
+            r#"---json
+{
+  "id": 7,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Hello",
+  "importance": "normal",
+  "created_ts": "2026-04-01T12:00:00Z"
+}
+---
+
+body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health_check should serialize");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse health_check json");
+                assert_eq!(value["status"], "error");
+                assert_eq!(value["semantic_readiness"]["status"], "fail");
+                assert!(
+                    value["semantic_readiness"]["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("archive inventory is ahead")),
+                    "health_check should surface archive/db drift details: {value}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn health_check_reports_error_when_project_identity_differs_with_equal_counts() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp
+            .path()
+            .join("stale-project-identity-health-check.sqlite3");
+        let project_dir = storage_root.join("projects").join("archive-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"archive-project","human_key":"/archive-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("wrong-project".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("/wrong-project".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+            ],
+        )
+        .expect("insert wrong project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Alice".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("coder".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(String::new()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("auto".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert agent");
+        drop(conn);
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health_check should serialize");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse health_check json");
+                assert_eq!(value["status"], "error");
+                assert_eq!(value["semantic_readiness"]["status"], "fail");
+                assert!(
+                    value["semantic_readiness"]["detail"]
+                        .as_str()
+                        .is_some_and(|detail| {
+                            detail.contains(
+                                "missing archive project(s) in db: archive-project (/archive-project)"
+                            )
+                        }),
+                    "health_check should surface missing archive project identity: {value}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn health_check_does_not_initialize_missing_sqlite() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = temp.path().join("missing-health-check.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health_check should serialize");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse health_check json");
+                assert_eq!(value["status"], "error");
+                assert_eq!(value["semantic_readiness"]["status"], "fail");
+                assert!(
+                    value["semantic_readiness"]["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("refuses to initialize")),
+                    "missing sqlite detail should explain non-mutating refusal: {value}"
+                );
+            },
+        );
+
+        assert!(
+            !db_path.exists(),
+            "health_check must not create a missing sqlite file"
+        );
+    }
+
+    #[test]
+    fn list_agents_uses_archive_snapshot_when_live_db_is_stale() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("stale-list-agents.sqlite3");
+        let project_dir = storage_root.join("projects").join("archive-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"archive-project","human_key":"/archive-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-04-01T12:00:00Z","last_active_ts":"2026-04-01T12:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let response = list_agents(&ctx, "/archive-project".to_string())
+                        .await
+                        .expect("list_agents should succeed");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&response).expect("parse list_agents json");
+                    let agents = value.as_array().expect("agents array");
+                    assert_eq!(agents.len(), 1);
+                    assert_eq!(agents[0]["name"], "Alice");
+                });
+            },
+        );
     }
 
     #[test]

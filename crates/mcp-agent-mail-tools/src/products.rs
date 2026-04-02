@@ -17,8 +17,8 @@ use crate::llm;
 use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, SingleThreadResponse};
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent,
-    resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
+    legacy_tool_error, resolve_agent, resolve_project,
 };
 
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -409,7 +409,7 @@ pub async fn search_messages_product(
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_read_db_pool()?;
     let max_results = parse_product_search_limit(limit);
 
     // Parse optional ranking mode
@@ -537,7 +537,7 @@ pub async fn fetch_inbox_product(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_read_db_pool()?;
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {
@@ -662,7 +662,7 @@ pub async fn summarize_thread_product(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_read_db_pool()?;
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {
@@ -768,6 +768,10 @@ pub async fn summarize_thread_product(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::Cx;
+    use asupersync::runtime::RuntimeBuilder;
+    use fastmcp::McpContext;
+    use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
 
     // -----------------------------------------------------------------------
     // collapse_whitespace
@@ -1198,6 +1202,116 @@ mod tests {
         assert_eq!(
             parse_product_thread_limit(Some(7)).expect("positive limit should pass"),
             7
+        );
+    }
+
+    #[test]
+    fn fetch_inbox_product_uses_archive_snapshot_when_live_db_is_stale() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("stale-product-inbox.sqlite3");
+        let project_dir = storage_root
+            .join("projects")
+            .join("archive-product-project");
+        let alice_dir = project_dir.join("agents").join("Alice");
+        let bob_dir = project_dir.join("agents").join("Bob");
+        let messages_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&alice_dir).expect("create alice dir");
+        std::fs::create_dir_all(&bob_dir).expect("create bob dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"archive-product-project","human_key":"/archive-product-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            alice_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-04-01T12:00:00Z","last_active_ts":"2026-04-01T12:00:00Z"}"#,
+        )
+        .expect("write alice profile");
+        std::fs::write(
+            bob_dir.join("profile.json"),
+            r#"{"name":"Bob","program":"coder","model":"test","inception_ts":"2026-04-01T12:00:00Z","last_active_ts":"2026-04-01T12:00:00Z"}"#,
+        )
+        .expect("write bob profile");
+        std::fs::write(
+            messages_dir.join("2026-04-01T12-00-00Z__archive__9.md"),
+            r#"---json
+{
+  "id": 9,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Archive inbox",
+  "importance": "high",
+  "created_ts": "2026-04-01T12:00:00Z"
+}
+---
+
+archive body
+"#,
+        )
+        .expect("write archive message");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'archive-product-project', '/archive-product-project', 1)",
+            &[],
+        )
+        .expect("insert live project");
+        conn.execute_sync(
+            "INSERT INTO products (id, product_uid, name, created_at) VALUES (7, 'prod-stale', 'Product Stale', 2)",
+            &[],
+        )
+        .expect("insert product");
+        conn.execute_sync(
+            "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (7, 1, 3)",
+            &[],
+        )
+        .expect("insert product link");
+        drop(conn);
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let response = fetch_inbox_product(
+                        &ctx,
+                        "prod-stale".to_string(),
+                        "Bob".to_string(),
+                        Some(10),
+                        Some(false),
+                        Some(true),
+                        None,
+                    )
+                    .await
+                    .expect("fetch_inbox_product should succeed");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&response).expect("parse inbox json");
+                    let messages = value.as_array().expect("messages array");
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(messages[0]["subject"], "Archive inbox");
+                    assert_eq!(messages[0]["from"], "Alice");
+                    assert!(
+                        messages[0]["body_md"]
+                            .as_str()
+                            .is_some_and(|body| body.contains("archive body")),
+                        "expected archive body in fetched message: {value}"
+                    );
+                });
+            },
         );
     }
 

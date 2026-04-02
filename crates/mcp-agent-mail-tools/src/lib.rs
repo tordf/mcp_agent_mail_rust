@@ -55,8 +55,13 @@ pub use search::*;
 pub mod tool_util {
     use fastmcp::McpErrorCode;
     use fastmcp::prelude::*;
-    use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, get_or_create_pool};
+    use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, create_pool, get_or_create_pool};
     use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn legacy_error_payload(
         error_type: &str,
@@ -295,6 +300,274 @@ pub mod tool_util {
     pub fn get_db_pool() -> McpResult<DbPool> {
         let cfg = DbPoolConfig::from_env();
         get_or_create_pool(&cfg).map_err(|e| McpError::internal_error(e.to_string()))
+    }
+
+    fn read_pool_setup_error_to_mcp_error(message: String) -> McpError {
+        let db_error = if mcp_agent_mail_db::is_lock_error(&message) {
+            DbError::ResourceBusy(message)
+        } else {
+            DbError::Sqlite(message)
+        };
+        db_error_to_mcp_error(db_error)
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct ReadReconcileInventory {
+        projects: usize,
+        agents: usize,
+        messages: usize,
+        max_message_id: i64,
+        project_identities: BTreeSet<mcp_agent_mail_db::MailboxProjectIdentity>,
+    }
+
+    fn query_read_db_inventory(
+        conn: &mcp_agent_mail_db::DbConn,
+    ) -> Result<ReadReconcileInventory, String> {
+        let tables = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('projects','agents','messages')",
+                &[],
+            )
+            .map_err(|err| err.to_string())?;
+        let present: BTreeSet<String> = tables
+            .iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect();
+
+        let projects = if present.contains("projects") {
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS project_count FROM projects", &[])
+                .map_err(|err| err.to_string())?;
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("project_count").ok())
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let agents = if present.contains("agents") {
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS agent_count FROM agents", &[])
+                .map_err(|err| err.to_string())?;
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("agent_count").ok())
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let (messages, max_message_id) = if present.contains("messages") {
+            let rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS message_count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                    &[],
+                )
+                .map_err(|err| err.to_string())?;
+            let Some(row) = rows.first() else {
+                return Err("no rows returned from read message inventory query".to_string());
+            };
+            (
+                row.get_named::<i64>("message_count")
+                    .ok()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .unwrap_or(0),
+                row.get_named::<i64>("max_id").unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
+        let project_identities = if present.contains("projects") {
+            mcp_agent_mail_db::collect_db_project_identities(conn).map_err(|err| err.to_string())?
+        } else {
+            BTreeSet::new()
+        };
+
+        Ok(ReadReconcileInventory {
+            projects,
+            agents,
+            messages,
+            max_message_id,
+            project_identities,
+        })
+    }
+
+    fn read_archive_inventory_has_state(storage_root: &Path) -> bool {
+        let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+        archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
+    }
+
+    fn read_archive_is_ahead(
+        storage_root: &Path,
+        conn: &mcp_agent_mail_db::DbConn,
+    ) -> Result<bool, String> {
+        let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+        if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
+            return Ok(false);
+        }
+
+        let db_inventory = query_read_db_inventory(conn)?;
+        let archive_message_count = archive.unique_message_ids;
+        let archive_max_id = archive.latest_message_id.unwrap_or(0);
+        let missing_archive_projects = mcp_agent_mail_db::archive_missing_project_identities(
+            &archive,
+            &db_inventory.project_identities,
+        );
+
+        Ok(archive.projects > db_inventory.projects
+            || archive.agents > db_inventory.agents
+            || archive_message_count > db_inventory.messages
+            || archive_max_id > db_inventory.max_message_id
+            || !missing_archive_projects.is_empty())
+    }
+
+    static READ_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    pub struct ToolReadPool {
+        pool: mcp_agent_mail_db::DbPool,
+        _snapshot_dir: Option<ReadSnapshotDirGuard>,
+    }
+
+    impl ToolReadPool {
+        const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
+            Self {
+                pool,
+                _snapshot_dir: None,
+            }
+        }
+    }
+
+    impl std::ops::Deref for ToolReadPool {
+        type Target = mcp_agent_mail_db::DbPool;
+
+        fn deref(&self) -> &Self::Target {
+            &self.pool
+        }
+    }
+
+    struct ReadSnapshotDirGuard {
+        path: PathBuf,
+    }
+
+    impl ReadSnapshotDirGuard {
+        fn new(prefix: &str) -> std::io::Result<Self> {
+            let base = std::env::temp_dir();
+            let pid = std::process::id();
+            for _ in 0..32 {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let counter = READ_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let path = base.join(format!("{prefix}{pid}_{nanos}_{counter}"));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self { path }),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "failed to allocate unique read snapshot directory",
+            ))
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ReadSnapshotDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn open_read_db_pool() -> Result<Option<ToolReadPool>, String> {
+        let config = Config::from_env();
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+            return Ok(None);
+        }
+
+        let cfg = DbPoolConfig {
+            database_url: config.database_url.clone(),
+            ..Default::default()
+        };
+        let sqlite_path = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
+            &cfg.sqlite_path().map_err(|err| err.to_string())?,
+        );
+        if sqlite_path == ":memory:" {
+            return Ok(None);
+        }
+
+        let resolved_path = PathBuf::from(&sqlite_path);
+        let archive_has_state = read_archive_inventory_has_state(&config.storage_root);
+
+        let use_archive_snapshot = match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
+            Ok(conn) => {
+                let archive_ahead = read_archive_is_ahead(&config.storage_root, &conn);
+                drop(conn);
+                match archive_ahead {
+                    Ok(true) => true,
+                    Err(error) if archive_has_state => {
+                        tracing::warn!(
+                            source = %resolved_path.display(),
+                            storage_root = %config.storage_root.display(),
+                            error = %error,
+                            "using archive-backed tool snapshot because the live sqlite inventory probe failed"
+                        );
+                        true
+                    }
+                    Ok(false) | Err(_) => false,
+                }
+            }
+            Err(error) if archive_has_state => {
+                tracing::warn!(
+                    source = %resolved_path.display(),
+                    storage_root = %config.storage_root.display(),
+                    error = %error,
+                    "using archive-backed tool snapshot because the live sqlite source could not be opened"
+                );
+                true
+            }
+            Err(_) => false,
+        };
+
+        if !use_archive_snapshot {
+            return Ok(None);
+        }
+
+        let snapshot_dir = ReadSnapshotDirGuard::new("agent-mail-tool-snapshot-")
+            .map_err(|err| err.to_string())?;
+        let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
+        if resolved_path.exists() {
+            mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
+                &snapshot_db,
+                &config.storage_root,
+                Some(resolved_path.as_path()),
+            )
+            .map_err(|err| err.to_string())?;
+        } else {
+            mcp_agent_mail_db::reconstruct_from_archive(&snapshot_db, &config.storage_root)
+                .map_err(|err| err.to_string())?;
+        }
+        let pool = create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", snapshot_db.display()),
+            storage_root: Some(config.storage_root),
+            ..Default::default()
+        })
+        .map_err(|err| err.to_string())?;
+        Ok(Some(ToolReadPool {
+            pool,
+            _snapshot_dir: Some(snapshot_dir),
+        }))
+    }
+
+    pub fn get_read_db_pool() -> McpResult<ToolReadPool> {
+        match open_read_db_pool() {
+            Ok(Some(pool)) => Ok(pool),
+            Ok(None) => get_db_pool().map(ToolReadPool::live),
+            Err(error) => Err(read_pool_setup_error_to_mcp_error(error)),
+        }
     }
 
     /// Placeholder patterns that indicate unconfigured hooks/settings.

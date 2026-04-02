@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
@@ -85,6 +86,269 @@ fn resource_sync_db_error_to_mcp_error(message: String) -> McpError {
         DbError::Sqlite(message)
     };
     db_error_to_mcp_error(db_error)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResourceReconcileInventory {
+    projects: usize,
+    agents: usize,
+    messages: usize,
+    max_message_id: i64,
+    project_identities: std::collections::BTreeSet<mcp_agent_mail_db::MailboxProjectIdentity>,
+}
+
+fn query_resource_db_inventory(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> Result<ResourceReconcileInventory, String> {
+    let present = conn
+        .query_sync(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            &[],
+        )
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let query_count = |sql: &str, alias: &str| -> Result<usize, String> {
+        let rows = conn.query_sync(sql, &[]).map_err(|err| err.to_string())?;
+        let Some(row) = rows.first() else {
+            return Err(format!(
+                "no rows returned from resource inventory query for {alias}"
+            ));
+        };
+        Ok(row
+            .get_named::<i64>(alias)
+            .ok()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0))
+    };
+
+    let projects = if present.contains("projects") {
+        query_count(
+            "SELECT COUNT(*) AS project_count FROM projects",
+            "project_count",
+        )?
+    } else {
+        0
+    };
+    let agents = if present.contains("agents") {
+        query_count("SELECT COUNT(*) AS agent_count FROM agents", "agent_count")?
+    } else {
+        0
+    };
+    let (messages, max_message_id) = if present.contains("messages") {
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS message_count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .map_err(|err| err.to_string())?;
+        let Some(row) = rows.first() else {
+            return Err("no rows returned from resource message inventory query".to_string());
+        };
+        (
+            row.get_named::<i64>("message_count")
+                .ok()
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0),
+            row.get_named::<i64>("max_id").unwrap_or(0),
+        )
+    } else {
+        (0, 0)
+    };
+    let project_identities = if present.contains("projects") {
+        mcp_agent_mail_db::collect_db_project_identities(conn).map_err(|err| err.to_string())?
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
+    Ok(ResourceReconcileInventory {
+        projects,
+        agents,
+        messages,
+        max_message_id,
+        project_identities,
+    })
+}
+
+fn resource_archive_inventory_has_state(storage_root: &Path) -> bool {
+    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+    archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
+}
+
+fn resource_archive_is_ahead(
+    storage_root: &Path,
+    conn: &mcp_agent_mail_db::DbConn,
+) -> Result<bool, String> {
+    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
+        return Ok(false);
+    }
+
+    let db_inventory = query_resource_db_inventory(conn)?;
+    let archive_message_count = archive.unique_message_ids;
+    let archive_max_id = archive.latest_message_id.unwrap_or(0);
+    let missing_archive_projects = mcp_agent_mail_db::archive_missing_project_identities(
+        &archive,
+        &db_inventory.project_identities,
+    );
+
+    Ok(archive.projects > db_inventory.projects
+        || archive.agents > db_inventory.agents
+        || archive_message_count > db_inventory.messages
+        || archive_max_id > db_inventory.max_message_id
+        || !missing_archive_projects.is_empty())
+}
+
+static RESOURCE_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct ResourceSnapshotDirGuard {
+    path: PathBuf,
+}
+
+impl ResourceSnapshotDirGuard {
+    fn new(prefix: &str) -> std::io::Result<Self> {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for _ in 0..32 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let counter = RESOURCE_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("{prefix}{pid}_{nanos}_{counter}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to allocate unique resource snapshot directory",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ResourceSnapshotDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+struct ResourceReadPool {
+    pool: mcp_agent_mail_db::DbPool,
+    _snapshot_dir: Option<ResourceSnapshotDirGuard>,
+}
+
+impl ResourceReadPool {
+    const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
+        Self {
+            pool,
+            _snapshot_dir: None,
+        }
+    }
+}
+
+impl std::ops::Deref for ResourceReadPool {
+    type Target = mcp_agent_mail_db::DbPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
+    let config = Config::from_env();
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return Ok(None);
+    }
+
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: config.database_url.clone(),
+        ..Default::default()
+    };
+    let sqlite_path = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
+        &cfg.sqlite_path().map_err(|err| err.to_string())?,
+    );
+    if sqlite_path == ":memory:" {
+        return Ok(None);
+    }
+
+    let resolved_path = PathBuf::from(&sqlite_path);
+    let archive_has_state = resource_archive_inventory_has_state(&config.storage_root);
+
+    let use_archive_snapshot = match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
+        Ok(conn) => {
+            let archive_ahead = resource_archive_is_ahead(&config.storage_root, &conn);
+            drop(conn);
+            match archive_ahead {
+                Ok(true) => true,
+                Err(error) if archive_has_state => {
+                    tracing::warn!(
+                        source = %resolved_path.display(),
+                        storage_root = %config.storage_root.display(),
+                        error = %error,
+                        "using archive-backed resource snapshot because the live sqlite inventory probe failed"
+                    );
+                    true
+                }
+                Ok(false) | Err(_) => false,
+            }
+        }
+        Err(error) if archive_has_state => {
+            tracing::warn!(
+                source = %resolved_path.display(),
+                storage_root = %config.storage_root.display(),
+                error = %error,
+                "using archive-backed resource snapshot because the live sqlite source could not be opened"
+            );
+            true
+        }
+        Err(_) => false,
+    };
+
+    if !use_archive_snapshot {
+        return Ok(None);
+    }
+
+    let snapshot_dir = ResourceSnapshotDirGuard::new("agent-mail-resource-snapshot-")
+        .map_err(|err| err.to_string())?;
+    let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
+    if resolved_path.exists() {
+        mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
+            &snapshot_db,
+            &config.storage_root,
+            Some(resolved_path.as_path()),
+        )
+        .map_err(|err| err.to_string())?;
+    } else {
+        mcp_agent_mail_db::reconstruct_from_archive(&snapshot_db, &config.storage_root)
+            .map_err(|err| err.to_string())?;
+    }
+    let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+        database_url: format!("sqlite:///{}", snapshot_db.display()),
+        storage_root: Some(config.storage_root),
+        ..Default::default()
+    })
+    .map_err(|err| err.to_string())?;
+    Ok(Some(ResourceReadPool {
+        pool,
+        _snapshot_dir: Some(snapshot_dir),
+    }))
+}
+
+fn get_resource_db_pool() -> McpResult<ResourceReadPool> {
+    match open_resource_read_pool() {
+        Ok(Some(pool)) => Ok(pool),
+        Ok(None) => get_db_pool().map(ResourceReadPool::live),
+        Err(error) => Err(resource_sync_db_error_to_mcp_error(error)),
+    }
 }
 
 async fn acquire_resource_conn(
@@ -430,7 +694,7 @@ pub struct AgentsListResponse {
 )]
 pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<String> {
     let (project_key, _query) = split_param_and_query(&project_key);
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
@@ -1746,7 +2010,7 @@ fn apply_projects_list_query_options(
     description = "List all projects known to the server in creation order.\n\nWhen to use\n-----------\n- Discover available projects when a user provides only an agent name.\n- Build UIs that let operators switch context between projects.\n\nReturns\n-------\nlist[dict]\n    Each: { id, slug, human_key, created_at }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r2\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://projects\"}}\n```"
 )]
 pub async fn projects_list(ctx: &McpContext) -> McpResult<String> {
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
     let rows =
         db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
 
@@ -1774,7 +2038,7 @@ pub async fn projects_list_query(ctx: &McpContext, query: String) -> McpResult<S
     let params = parse_query(&query);
     let query_opts = parse_projects_list_query_options(&params)?;
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
     let rows =
         db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
 
@@ -1824,7 +2088,7 @@ pub struct ProjectDetailResponse {
 )]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug, _query) = split_param_and_query(&slug);
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     // Find project by slug
     let projects =
@@ -1927,7 +2191,7 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
     }
 
     let (key, _query) = split_param_and_query(&key);
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
     let product = get_product_by_key(ctx.cx(), &pool, key.trim())
         .await?
         .ok_or_else(|| {
@@ -2005,7 +2269,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -2113,7 +2377,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     // Find project by slug
     let projects =
@@ -2258,7 +2522,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -2845,7 +3109,7 @@ fn mailbox_full_messages(
     description = "List recent messages in an agent's mailbox with commit metadata fields. When archive commit data is unavailable, the `commit.summary` explicitly says so.\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [{ id, subject, from, created_ts, importance, ack_required, kind, commit: {hexsha, summary} | null }] }"
 )]
 pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
     let request = resolve_mailbox_resource_request(ctx, &pool, &agent).await?;
     let (inbox_rows, outbox_messages) = load_mailbox_messages(ctx, &pool, &request).await?;
     let messages = mailbox_simple_messages(
@@ -2872,7 +3136,7 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     description = "List recent messages in an agent's mailbox with commit metadata fields, including explicit unavailable markers when no archive commit data is resolved."
 )]
 pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<String> {
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
     let request = resolve_mailbox_resource_request(ctx, &pool, &agent).await?;
     let (inbox_rows, outbox_messages) = load_mailbox_messages(ctx, &pool, &request).await?;
     let messages = mailbox_full_messages(
@@ -2943,7 +3207,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3028,7 +3292,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     // Find project by slug or human_key
     let projects =
@@ -3109,7 +3373,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     // Find project
     let projects =
@@ -3222,7 +3486,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     // Find project
     let projects =
@@ -3321,7 +3585,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     // Find project
     let projects =
@@ -3835,7 +4099,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     let (slug_str, query) = split_param_and_query(&slug);
     let active_only = query.get("active_only").is_none_or(|v| parse_bool_param(v));
 
-    let pool = get_db_pool()?;
+    let pool = get_resource_db_pool()?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &slug_str).await?;
 
@@ -4163,6 +4427,7 @@ mod resource_shape_tests {
     use asupersync::{Cx, Outcome};
     use mcp_agent_mail_db::{DbPool, MessageRow, ProjectRow, queries};
     use serde_json::Value;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4215,6 +4480,56 @@ mod resource_shape_tests {
             .build()
             .expect("build runtime");
         rt.block_on(f(cx))
+    }
+
+    fn write_archive_ahead_fixture() -> (PathBuf, PathBuf) {
+        let config = Config::from_env();
+        let storage_root = config.storage_root;
+        let db_path = PathBuf::from(
+            mcp_agent_mail_db::DbPoolConfig::from_env()
+                .sqlite_path()
+                .expect("resource fixture sqlite path"),
+        );
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create resource agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create resource messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write resource project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write resource agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write resource canonical message");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open resource live db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init resource live db schema");
+        drop(conn);
+
+        (storage_root, db_path)
     }
 
     async fn ensure_project(cx: &Cx, pool: &DbPool, human_key: &str) -> ProjectRow {
@@ -5865,6 +6180,53 @@ mod resource_shape_tests {
                 schemas["schemas"].is_array(),
                 schemas_query["schemas"].is_array()
             );
+        });
+    }
+
+    #[test]
+    fn resources_use_archive_snapshot_when_live_db_is_stale() {
+        with_serialized_resources(|| {
+            run_async(|cx: Cx| async move {
+                let ctx = McpContext::new(cx.clone(), 1);
+                let (_storage_root, db_path) = write_archive_ahead_fixture();
+
+                let projects = parse_json(&projects_list(&ctx).await.expect("projects list"));
+                let projects_array = projects.as_array().expect("projects array");
+                assert_eq!(projects_array.len(), 1, "expected archive-backed project");
+                assert_eq!(projects_array[0]["slug"], "ahead-project");
+                assert_eq!(projects_array[0]["human_key"], "/ahead-project");
+
+                let agents = parse_json(
+                    &agents_list(&ctx, "/ahead-project".to_string())
+                        .await
+                        .expect("agents list"),
+                );
+                assert_eq!(agents["project"]["slug"], "ahead-project");
+                assert_eq!(agents["agents"].as_array().map_or(0, Vec::len), 1);
+                assert_eq!(agents["agents"][0]["name"], "Alice");
+
+                let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("reopen resource live db");
+                let rows = conn
+                    .query_sync(
+                        "SELECT COUNT(*) AS project_count, \
+                         (SELECT COUNT(*) FROM agents) AS agent_count \
+                         FROM projects",
+                        &[],
+                    )
+                    .expect("query resource live db counts");
+                let row = rows.first().expect("resource live db count row");
+                assert_eq!(
+                    row.get_named::<i64>("project_count")
+                        .expect("resource project count"),
+                    0
+                );
+                assert_eq!(
+                    row.get_named::<i64>("agent_count")
+                        .expect("resource agent count"),
+                    0
+                );
+            });
         });
     }
 
