@@ -113,7 +113,9 @@ pub use pool::{
 };
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use reconstruct::{
-    ArchiveMessageInventory, ReconstructStats, reconstruct_from_archive,
+    ArchiveMessageInventory, MailboxProjectIdentity, ReconstructStats,
+    archive_missing_project_identities, collect_db_project_identities,
+    mailbox_project_identity_matches_db, reconstruct_from_archive,
     reconstruct_from_archive_with_salvage, scan_archive_message_inventory,
 };
 pub use retry::{

@@ -15,7 +15,7 @@ use mcp_agent_mail_core::{
 };
 use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -81,6 +81,13 @@ pub fn auto_pool_size() -> (usize, usize) {
 pub struct DbPoolConfig {
     /// Database URL (`sqlite:///path/to/db.sqlite3`)
     pub database_url: String,
+    /// Storage root used for archive-backed reconcile/recovery.
+    ///
+    /// When unset, callers fall back to the current process configuration.
+    /// Set this explicitly whenever the caller already has an authoritative
+    /// storage-root snapshot; otherwise pool init can reconcile against the
+    /// wrong archive and pool caching can alias unrelated mailboxes.
+    pub storage_root: Option<PathBuf>,
     /// Minimum connections to keep open
     pub min_connections: usize,
     /// Maximum connections
@@ -103,6 +110,7 @@ impl Default for DbPoolConfig {
     fn default() -> Self {
         Self {
             database_url: "sqlite:///./storage.sqlite3".to_string(),
+            storage_root: None,
             min_connections: DEFAULT_POOL_SIZE,
             max_connections: DEFAULT_POOL_SIZE + DEFAULT_MAX_OVERFLOW,
             acquire_timeout_ms: DEFAULT_POOL_TIMEOUT_MS,
@@ -166,6 +174,7 @@ impl DbPoolConfig {
 
         Self {
             database_url,
+            storage_root: Some(mcp_agent_mail_core::Config::from_env().storage_root),
             min_connections: min_conn,
             max_connections: max_conn,
             acquire_timeout_ms: pool_timeout,
@@ -196,6 +205,13 @@ impl DbPoolConfig {
         };
 
         Ok(path.to_string_lossy().into_owned())
+    }
+
+    #[must_use]
+    pub fn resolved_storage_root(&self) -> PathBuf {
+        self.storage_root
+            .clone()
+            .unwrap_or_else(|| mcp_agent_mail_core::Config::from_env().storage_root)
     }
 }
 
@@ -294,6 +310,7 @@ impl DbPoolStatsSampler {
 pub struct DbPool {
     pool: Arc<Pool<DbConn>>,
     sqlite_path: String,
+    storage_root: PathBuf,
     init_sql: Arc<String>,
     run_migrations: bool,
     stats_sampler: Arc<DbPoolStatsSampler>,
@@ -302,6 +319,7 @@ pub struct DbPool {
 impl DbPool {
     fn from_shared_pool(config: &DbPoolConfig, pool: Arc<Pool<DbConn>>) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
+        let storage_root = config.resolved_storage_root();
         let init_sql = Arc::new(schema::build_conn_pragmas(
             config.max_connections,
             config.cache_budget_kb,
@@ -311,6 +329,7 @@ impl DbPool {
         Ok(Self {
             pool,
             sqlite_path,
+            storage_root,
             init_sql,
             run_migrations: config.run_migrations,
             stats_sampler,
@@ -320,6 +339,7 @@ impl DbPool {
     /// Create a new pool (does not open connections until first acquire).
     pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
+        let storage_root = config.resolved_storage_root();
         let init_sql = Arc::new(schema::build_conn_pragmas(
             config.max_connections,
             config.cache_budget_kb,
@@ -337,6 +357,7 @@ impl DbPool {
         Ok(Self {
             pool: Arc::new(Pool::new(pool_config)),
             sqlite_path,
+            storage_root,
             init_sql,
             run_migrations: config.run_migrations,
             stats_sampler,
@@ -365,6 +386,7 @@ impl DbPool {
     #[allow(clippy::too_many_lines)]
     pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
         let sqlite_path = self.sqlite_path.clone();
+        let storage_root = self.storage_root.clone();
         let init_sql = self.init_sql.clone();
         let run_migrations = self.run_migrations;
         let cx2 = cx.clone();
@@ -374,6 +396,7 @@ impl DbPool {
             .pool
             .acquire(cx, || {
                 let sqlite_path = sqlite_path.clone();
+                let storage_root = storage_root.clone();
                 let init_sql = init_sql.clone();
                 let cx2 = cx2.clone();
                 async move {
@@ -389,7 +412,7 @@ impl DbPool {
                     // Run one-time DB initialization (schema + migrations) via a separate
                     // connection to ensure atomic setup before pool connections open.
                     if sqlite_path != ":memory:" {
-                        let init_gate = sqlite_init_gate(&sqlite_path);
+                        let init_gate = sqlite_init_gate(&sqlite_path, &storage_root);
                         let run_migrations = run_migrations;
 
                         let gate_out = init_gate
@@ -401,6 +424,7 @@ impl DbPool {
                                         &cx2,
                                         &sqlite_path,
                                         run_migrations,
+                                        &storage_root,
                                     )
                                     .await
                                     {
@@ -1159,8 +1183,10 @@ fn pool_cache_key(config: &DbPoolConfig) -> String {
             normalize_sqlite_identity_path(&resolved)
         },
     );
+    let storage_root_identity =
+        normalize_sqlite_identity_path(&config.resolved_storage_root().to_string_lossy());
     format!(
-        "{identity}|min={}|max={}|acquire_ms={}|lifetime_ms={}",
+        "{identity}|storage_root={storage_root_identity}|min={}|max={}|acquire_ms={}|lifetime_ms={}",
         config.min_connections,
         config.max_connections,
         config.acquire_timeout_ms,
@@ -1168,8 +1194,12 @@ fn pool_cache_key(config: &DbPoolConfig) -> String {
     )
 }
 
-fn sqlite_init_gate(sqlite_path: &str) -> Arc<OnceCell<()>> {
-    let gate_key = normalize_sqlite_identity_path(sqlite_path);
+fn sqlite_init_gate(sqlite_path: &str, storage_root: &Path) -> Arc<OnceCell<()>> {
+    let gate_key = format!(
+        "{}|storage_root={}",
+        normalize_sqlite_identity_path(sqlite_path),
+        normalize_sqlite_identity_path(&storage_root.to_string_lossy())
+    );
     let gates = SQLITE_INIT_GATES
         .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
 
@@ -1508,38 +1538,89 @@ fn sqlite_absolute_fallback_path(path: &str, open_error: &str) -> Option<String>
     Some(absolute_candidate.to_string_lossy().into_owned())
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReconcileInventory {
+    projects: usize,
+    agents: usize,
+    messages: usize,
+    max_message_id: i64,
+    project_identities: BTreeSet<crate::reconstruct::MailboxProjectIdentity>,
+}
+
 #[allow(clippy::result_large_err)]
-fn query_database_message_inventory_for_reconcile(
+fn query_database_inventory_for_reconcile(
     primary_path: &Path,
-) -> Result<(usize, i64), SqlError> {
+) -> Result<ReconcileInventory, SqlError> {
     let conn = open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref())?;
-    let has_messages = !conn
+    let present = conn
         .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
             &[],
         )?
-        .is_empty();
-    if !has_messages {
-        return Ok((0, 0));
-    }
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .collect::<std::collections::BTreeSet<_>>();
 
-    let rows = conn.query_sync(
-        "SELECT COUNT(*) AS message_count, COALESCE(MAX(id), 0) AS max_id FROM messages",
-        &[],
-    )?;
-    let Some(row) = rows.first() else {
-        return Err(SqlError::Custom(
-            "no rows returned from sqlite message inventory query".to_string(),
-        ));
+    let query_count = |sql: &str, alias: &str| -> Result<usize, SqlError> {
+        let rows = conn.query_sync(sql, &[])?;
+        let Some(row) = rows.first() else {
+            return Err(SqlError::Custom(format!(
+                "no rows returned from sqlite reconcile inventory query for {alias}"
+            )));
+        };
+        Ok(row
+            .get_named::<i64>(alias)
+            .ok()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0))
     };
 
-    let message_count = row
-        .get_named::<i64>("message_count")
-        .ok()
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or(0);
-    let max_id = row.get_named::<i64>("max_id").unwrap_or(0);
-    Ok((message_count, max_id))
+    let projects = if present.contains("projects") {
+        query_count(
+            "SELECT COUNT(*) AS project_count FROM projects",
+            "project_count",
+        )?
+    } else {
+        0
+    };
+    let agents = if present.contains("agents") {
+        query_count("SELECT COUNT(*) AS agent_count FROM agents", "agent_count")?
+    } else {
+        0
+    };
+    let (messages, max_message_id) = if present.contains("messages") {
+        let rows = conn.query_sync(
+            "SELECT COUNT(*) AS message_count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+            &[],
+        )?;
+        let Some(row) = rows.first() else {
+            return Err(SqlError::Custom(
+                "no rows returned from sqlite message inventory query".to_string(),
+            ));
+        };
+        (
+            row.get_named::<i64>("message_count")
+                .ok()
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0),
+            row.get_named::<i64>("max_id").unwrap_or(0),
+        )
+    } else {
+        (0, 0)
+    };
+    let project_identities = if present.contains("projects") {
+        crate::reconstruct::collect_db_project_identities(&conn)?
+    } else {
+        BTreeSet::new()
+    };
+
+    Ok(ReconcileInventory {
+        projects,
+        agents,
+        messages,
+        max_message_id,
+        project_identities,
+    })
 }
 
 fn archive_has_real_projects(storage_root: &Path) -> bool {
@@ -1585,14 +1666,26 @@ fn reconcile_archive_state_before_init(
     }
 
     let archive = crate::reconstruct::scan_archive_message_inventory(storage_root);
-    if archive.unique_message_ids == 0 {
+    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
         return Ok(false);
     }
 
-    let (db_message_count, db_max_id) =
-        query_database_message_inventory_for_reconcile(primary_path)?;
+    let db_inventory = query_database_inventory_for_reconcile(primary_path)?;
     let archive_max_id = archive.latest_message_id.unwrap_or(0);
-    let archive_ahead = archive.unique_message_ids > db_message_count || archive_max_id > db_max_id;
+    let missing_archive_projects = crate::reconstruct::archive_missing_project_identities(
+        &archive,
+        &db_inventory.project_identities,
+    );
+    let archive_projects_ahead = archive.projects > db_inventory.projects;
+    let archive_agents_ahead = archive.agents > db_inventory.agents;
+    let archive_messages_ahead = archive.unique_message_ids > db_inventory.messages;
+    let archive_latest_id_ahead = archive_max_id > db_inventory.max_message_id;
+    let archive_identity_ahead = !missing_archive_projects.is_empty();
+    let archive_ahead = archive_projects_ahead
+        || archive_agents_ahead
+        || archive_messages_ahead
+        || archive_latest_id_ahead
+        || archive_identity_ahead;
     if !archive_ahead {
         return Ok(false);
     }
@@ -1601,12 +1694,17 @@ fn reconcile_archive_state_before_init(
     tracing::warn!(
         path = %primary_path.display(),
         storage_root = %storage_root.display(),
-        db_message_count,
-        db_max_id,
+        db_project_count = db_inventory.projects,
+        db_agent_count = db_inventory.agents,
+        db_message_count = db_inventory.messages,
+        db_max_id = db_inventory.max_message_id,
+        archive_project_count = archive.projects,
+        archive_agent_count = archive.agents,
         archive_message_count = archive.unique_message_ids,
         archive_max_id,
+        missing_archive_projects = ?missing_archive_projects,
         %stats,
-        "reconciled sqlite database from archive before initialization because archive inventory was ahead"
+        "reconciled sqlite database from archive before initialization because archive inventory or project identity state was ahead"
     );
     Ok(true)
 }
@@ -1762,16 +1860,16 @@ async fn initialize_sqlite_file_once(
     cx: &Cx,
     sqlite_path: &str,
     run_migrations: bool,
+    storage_root: &Path,
 ) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
     // Reconcile archive-backed state before first init so every entrypoint,
     // not just the server startup probe, preserves durable message IDs when a
     // DB is missing or stale relative to the archive.
-    if sqlite_path != ":memory:" {
-        let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
-        if let Err(err) = reconcile_archive_state_before_init(path, &storage_root) {
-            return Outcome::Err(err);
-        }
+    if sqlite_path != ":memory:"
+        && let Err(err) = reconcile_archive_state_before_init(path, storage_root)
+    {
+        return Outcome::Err(err);
     }
 
     match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
@@ -3090,6 +3188,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
     }
     if had_primary && sqlite_file_is_healthy(primary_path)? {
+        let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
         return Ok(());
     }
     if had_primary {
@@ -3097,7 +3196,10 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     }
     if had_primary {
         match try_repair_index_only_corruption(primary_path) {
-            Ok(true) => return Ok(()),
+            Ok(true) => {
+                let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
+                return Ok(());
+            }
             Ok(false) => {}
             Err(e) => tracing::warn!(
                 path = %primary_path.display(),
@@ -3111,6 +3213,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     if let Some(backup_path) = find_healthy_backup(primary_path) {
         restore_from_backup(primary_path, &backup_path)?;
         if sqlite_file_is_healthy(primary_path)? {
+            let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
             return Ok(());
         }
         tracing::warn!(
@@ -3162,7 +3265,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
 
     match reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp) {
         Ok(stats) => {
-            if had_primary && stats.agents == 0 && stats.messages == 0 {
+            if had_primary && stats.projects == 0 && stats.agents == 0 && stats.messages == 0 {
                 if let Some(quarantined) = quarantine_reconstructed_candidate(
                     primary_path,
                     &timestamp,
@@ -4426,6 +4529,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_or_create_pool_keeps_distinct_storage_roots_isolated_for_same_sqlite_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.sqlite3");
+        let storage_a = dir.path().join("storage-a");
+        let storage_b = dir.path().join("storage-b");
+        std::fs::create_dir_all(&storage_a).unwrap();
+        std::fs::create_dir_all(&storage_b).unwrap();
+
+        let cfg_a = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_a),
+            ..Default::default()
+        };
+        let cfg_b = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_b),
+            ..Default::default()
+        };
+
+        let pool_a = get_or_create_pool(&cfg_a).expect("pool a");
+        let pool_b = get_or_create_pool(&cfg_b).expect("pool b");
+
+        assert!(
+            !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
+            "pool cache must not alias the same sqlite file across distinct storage roots"
+        );
+    }
+
     /// Verify `DbPool::sqlite_path()` accessor matches config.
     #[test]
     fn pool_sqlite_path_accessor() {
@@ -4544,6 +4676,68 @@ mod tests {
         assert!(
             Arc::ptr_eq(&pool1.pool, &pool2.pool),
             "create_pool should delegate to get_or_create_pool"
+        );
+    }
+
+    #[test]
+    fn pool_acquire_uses_explicit_storage_root_for_archive_reconcile() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("explicit-storage-root.sqlite3");
+        let configured_storage_root = dir.path().join("configured-storage");
+        let wrong_storage_root = dir.path().join("wrong-storage");
+
+        let proj_dir = configured_storage_root
+            .join("projects")
+            .join("archive-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"archive-project","human_key":"/archive-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&wrong_storage_root).unwrap();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", wrong_storage_root.to_str().unwrap())],
+            || {
+                let config = DbPoolConfig {
+                    database_url: format!("sqlite:///{}", db_path.display()),
+                    storage_root: Some(configured_storage_root.clone()),
+                    ..Default::default()
+                };
+                let pool = DbPool::new(&config).unwrap();
+                let rt = RuntimeBuilder::current_thread().build().unwrap();
+                let cx = Cx::for_testing();
+                rt.block_on(async {
+                    let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+                });
+
+                let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+                let rows = conn
+                    .query_sync(
+                        "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                        &[],
+                    )
+                    .unwrap();
+                let row = rows.first().unwrap();
+                assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 1);
+                assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 1);
+            },
         );
     }
 
@@ -5327,6 +5521,113 @@ mod tests {
     }
 
     #[test]
+    fn archive_recovery_reconciles_healthy_db_when_archive_is_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+
+        crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
+            .expect("seed initial reconstructed db");
+
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-05-00Z__second__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
+        )
+        .unwrap();
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("archive-aware recovery should reconcile healthy-but-stale dbs");
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .unwrap();
+        let row = rows.first().unwrap();
+        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
+        assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn archive_recovery_reconciles_restored_backup_when_archive_is_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+
+        crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
+            .expect("seed db for backup");
+        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
+        std::fs::copy(&primary, &backup).unwrap();
+
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-05-00Z__second__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
+        )
+        .unwrap();
+        std::fs::write(&primary, b"corrupted-data").unwrap();
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("archive-aware recovery should reconcile stale backups after restore");
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .unwrap();
+        let row = rows.first().unwrap();
+        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
+        assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
+    }
+
+    #[test]
     fn reconcile_archive_state_before_init_reconstructs_missing_db() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -5421,6 +5722,219 @@ mod tests {
         let row = rows.first().unwrap();
         assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
         assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn reconcile_archive_state_before_init_rebuilds_healthy_db_when_archive_agents_are_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+            "archive-ahead agent/project state should be reconciled before init"
+        );
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let project_rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+            .unwrap();
+        let agent_rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM agents", &[])
+            .unwrap();
+        assert_eq!(project_rows[0].get_named::<i64>("count").unwrap_or(0), 1);
+        assert_eq!(agent_rows[0].get_named::<i64>("count").unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn reconcile_archive_state_before_init_rebuilds_when_project_identity_differs_with_equal_counts()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("archive-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"archive-project","human_key":"/archive-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("wrong-project".to_string()),
+                Value::Text("/wrong-project".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("Alice".to_string()),
+                Value::Text("coder".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+            "archive project identity drift should be reconciled even when counts match"
+        );
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync("SELECT slug, human_key FROM projects", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("slug").unwrap_or_default(),
+            "archive-project"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("human_key").unwrap_or_default(),
+            "/archive-project"
+        );
+    }
+
+    #[test]
+    fn reconcile_archive_state_before_init_rebuilds_when_human_key_differs_with_equal_slug_and_counts()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("shared-slug");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"shared-slug","human_key":"/archive-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("shared-slug".to_string()),
+                Value::Text("/wrong-project".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("Alice".to_string()),
+                Value::Text("coder".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+            "archive human_key drift should be reconciled even when slug and counts match"
+        );
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync("SELECT slug, human_key FROM projects", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("slug").unwrap_or_default(),
+            "shared-slug"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("human_key").unwrap_or_default(),
+            "/archive-project"
+        );
+    }
+
+    #[test]
+    fn archive_recovery_accepts_project_only_reconstruction_as_durable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("project-only");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"project-only","human_key":"/project-only"}"#,
+        )
+        .unwrap();
+        std::fs::write(&primary, b"corrupted-data").unwrap();
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("project-only archive state should survive fail-closed recovery");
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT slug, human_key FROM projects WHERE slug = 'project-only'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[cfg(unix)]

@@ -11069,8 +11069,7 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) =
-            setup_test_pool("reservation_no_conflict_disjoint_simple_globs.db");
+        let (cx, pool, _dir) = setup_test_pool("reservation_no_conflict_disjoint_simple_globs.db");
 
         rt.block_on(async {
             let base = now_micros();
