@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_tui_full_traversal.sh — E2E wrapper for deterministic full-screen
+# test_tui_full_traversal.sh -- E2E wrapper for deterministic full-screen
 # traversal repro harness (br-legjy.1.1).
 #
 # Canonical entrypoint:
@@ -9,9 +9,7 @@
 
 set -euo pipefail
 
+WRAPPER_SUITE="tui_full_traversal"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Safety: default to keeping temp dirs so shared harness cleanup doesn't run `rm -rf`.
-: "${AM_E2E_KEEP_TMP:=1}"
-
-bash "${SCRIPT_DIR}/../../scripts/e2e_tui_full_traversal.sh"
+source "${SCRIPT_DIR}/test_helpers.sh"
+wrapper_exec "${SCRIPT_DIR}/../../scripts/e2e_tui_full_traversal.sh"

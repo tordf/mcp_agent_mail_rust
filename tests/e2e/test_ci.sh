@@ -3,5 +3,9 @@
 #
 # Delegates to scripts/e2e_ci.sh following the standard E2E pattern.
 
+set -euo pipefail
+
+WRAPPER_SUITE="ci"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "${SCRIPT_DIR}/../../scripts/e2e_ci.sh" "$@"
+source "${SCRIPT_DIR}/test_helpers.sh"
+wrapper_exec "${SCRIPT_DIR}/../../scripts/e2e_ci.sh" "$@"

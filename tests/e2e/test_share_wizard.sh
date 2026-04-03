@@ -3,5 +3,7 @@
 
 set -euo pipefail
 
+WRAPPER_SUITE="share_wizard"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bash "${SCRIPT_DIR}/../../scripts/e2e_share_wizard.sh"
+source "${SCRIPT_DIR}/test_helpers.sh"
+wrapper_exec "${SCRIPT_DIR}/../../scripts/e2e_share_wizard.sh"

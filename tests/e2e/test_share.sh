@@ -6,5 +6,7 @@
 
 set -euo pipefail
 
+WRAPPER_SUITE="share"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bash "${SCRIPT_DIR}/../../scripts/e2e_share.sh"
+source "${SCRIPT_DIR}/test_helpers.sh"
+wrapper_exec "${SCRIPT_DIR}/../../scripts/e2e_share.sh"

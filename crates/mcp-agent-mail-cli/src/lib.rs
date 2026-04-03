@@ -27934,8 +27934,13 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
             ],
             || {
-                handle_doctor_archive_normalize(false, true, false)
-                    .expect("archive normalization should succeed");
+                handle_doctor_archive_normalize(
+                    false,
+                    true,
+                    false,
+                    NormalizeApplyMode::Quarantine,
+                )
+                .expect("archive normalization should succeed");
             },
         );
 
@@ -27993,14 +27998,158 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
             ],
             || {
-                handle_doctor_archive_normalize(false, true, false)
-                    .expect("archive normalization should succeed");
+                handle_doctor_archive_normalize(
+                    false,
+                    true,
+                    false,
+                    NormalizeApplyMode::Quarantine,
+                )
+                .expect("archive normalization should succeed");
             },
         );
 
         assert!(
             !project_dir.join("project.json").exists(),
             "normalization should not invent a synthetic human_key when metadata is missing"
+        );
+    }
+
+    #[test]
+    fn doctor_archive_normalize_annotate_mode_writes_sidecar_and_preserves_original() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("archive-normalize-annotate.sqlite3");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/data/projects/demo-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .unwrap();
+        let duplicate = canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md");
+        std::fs::write(
+            &duplicate,
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .unwrap();
+
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let database_url = format!("sqlite:///{}", db_path.display());
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", database_url.as_str()),
+            ],
+            || {
+                handle_doctor_archive_normalize(
+                    false,
+                    true,
+                    false,
+                    NormalizeApplyMode::Annotate,
+                )
+                .expect("archive normalization in annotate mode should succeed");
+            },
+        );
+
+        // The original duplicate file must still exist (never deleted, never moved).
+        assert!(
+            duplicate.exists(),
+            "annotate mode must leave the original file in place"
+        );
+
+        // A normalization sidecar must exist next to the duplicate.
+        let sidecar = normalization_annotation_sidecar_path(&duplicate);
+        assert!(
+            sidecar.exists(),
+            "annotate mode must write a .normalization.json sidecar"
+        );
+
+        // Sidecar contents should be valid JSON with expected fields.
+        let sidecar_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(sidecar_json["normalization_annotation"], true);
+        assert_eq!(
+            sidecar_json["kind"], "duplicate_canonical_message",
+            "sidecar should record the anomaly kind"
+        );
+        assert!(
+            sidecar_json["annotated_at"].is_string(),
+            "sidecar should record a timestamp"
+        );
+
+        // No quarantine directory should be created in annotate mode.
+        let quarantine_root = storage_root.join("doctor").join("archive-quarantine");
+        assert!(
+            !quarantine_root.exists(),
+            "annotate mode must not create a quarantine directory"
+        );
+    }
+
+    #[test]
+    fn doctor_archive_normalize_annotate_mode_dry_run_does_not_write_sidecar() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("archive-normalize-annotate-dry.sqlite3");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/data/projects/demo-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .unwrap();
+        let duplicate = canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md");
+        std::fs::write(
+            &duplicate,
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .unwrap();
+
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let database_url = format!("sqlite:///{}", db_path.display());
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", database_url.as_str()),
+            ],
+            || {
+                handle_doctor_archive_normalize(
+                    true, // dry_run = true
+                    true,
+                    false,
+                    NormalizeApplyMode::Annotate,
+                )
+                .expect("dry-run annotate mode should succeed");
+            },
+        );
+
+        // Original file should still exist.
+        assert!(duplicate.exists(), "dry-run must not move the file");
+
+        // Sidecar must NOT exist in dry-run mode.
+        let sidecar = normalization_annotation_sidecar_path(&duplicate);
+        assert!(
+            !sidecar.exists(),
+            "dry-run mode must not write a sidecar annotation"
         );
     }
 

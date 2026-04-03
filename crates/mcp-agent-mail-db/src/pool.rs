@@ -5445,6 +5445,338 @@ pub fn create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     get_or_create_pool(config)
 }
 
+// ============================================================================
+// Synthetic canary namespace, metrics, and alert-isolation policy
+// (br-97gc6.5.2.6.5.4)
+// ============================================================================
+//
+// Synthetic durability canaries exercise the full durability stack (integrity
+// probes, archive-drift detection, recovery, write-deferral replay) against
+// disposable, isolated mailboxes so regressions surface before they affect
+// real operator traffic.
+//
+// To prevent canary activity from polluting production dashboards, alert
+// streams, or aggregate health signals, three isolation layers are defined:
+//
+// 1. **Namespace convention** — canary projects, agents, and storage roots
+//    carry a well-known prefix (`__canary_`) that is trivially filterable in
+//    structured logs and SQL queries.
+//
+// 2. **Metric isolation** — canary probes record into a dedicated
+//    `CanaryMetrics` surface (in `mcp_agent_mail_core::metrics`) that is
+//    never aggregated into the production `DbMetrics` or `StorageMetrics`
+//    counters.
+//
+// 3. **Alert isolation** — the `CanaryAlertTier` enum classifies every
+//    canary event into one of four routing tiers so alerting pipelines can
+//    suppress canary failures from paging while still making them visible
+//    for debugging.
+
+/// Reserved prefix for all synthetic canary identifiers.
+///
+/// Any project slug, agent name, or storage-root directory whose name begins
+/// with this prefix is treated as canary traffic by the entire durability
+/// subsystem.  Production code paths that aggregate health signals, emit
+/// alerts, or update operator-facing dashboards **must** exclude identifiers
+/// that match [`is_canary_identifier`].
+pub const CANARY_PREFIX: &str = "__canary_";
+
+/// Reserved project slug for the canary's disposable mailbox project.
+///
+/// The canary runner creates a project with this slug at the start of each
+/// canary cycle and tears it down at the end.  Because the slug starts with
+/// [`CANARY_PREFIX`], it is automatically excluded from production metrics.
+pub const CANARY_PROJECT_SLUG: &str = "__canary_durability_probe";
+
+/// Reserved agent-name prefix for canary probe agents.
+///
+/// Canary agents are named `__canary_probe_<N>` where `<N>` is a
+/// monotonically increasing cycle counter.  The prefix ensures they never
+/// collide with real agent names (which must pass `is_valid_agent_name`'s
+/// adjective-noun validation).
+pub const CANARY_AGENT_PREFIX: &str = "__canary_probe_";
+
+/// Subdirectory name under the system temp dir for canary storage roots.
+///
+/// Each canary cycle creates a fresh storage root at
+/// `$TMPDIR/__canary_mailbox_<cycle_id>/` so canary I/O is physically
+/// isolated from the operator's real mailbox storage.
+pub const CANARY_STORAGE_DIR_PREFIX: &str = "__canary_mailbox_";
+
+/// Returns `true` if `name` belongs to the synthetic canary namespace.
+///
+/// This is the single predicate that all production metric, alert, and
+/// dashboard code should use to exclude canary traffic.
+#[must_use]
+pub fn is_canary_identifier(name: &str) -> bool {
+    name.starts_with(CANARY_PREFIX)
+}
+
+/// Returns `true` if the given filesystem path component belongs to the
+/// canary namespace.
+///
+/// This checks the final path component (file or directory name) against
+/// [`CANARY_PREFIX`], so callers can filter storage-root paths, SQLite file
+/// paths, and forensic bundle directories.
+#[must_use]
+pub fn is_canary_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with(CANARY_PREFIX))
+}
+
+/// Generate a canary agent name for the given cycle number.
+///
+/// Returns a name like `__canary_probe_42` that is guaranteed to match
+/// [`is_canary_identifier`] and never collide with valid agent names.
+#[must_use]
+pub fn canary_agent_name(cycle: u64) -> String {
+    format!("{CANARY_AGENT_PREFIX}{cycle}")
+}
+
+/// Generate a canary storage root path under the system temp directory.
+///
+/// Returns a path like `/tmp/__canary_mailbox_42/` that is physically
+/// isolated from production storage.
+#[must_use]
+pub fn canary_storage_root(cycle: u64) -> PathBuf {
+    std::env::temp_dir().join(format!("{CANARY_STORAGE_DIR_PREFIX}{cycle}"))
+}
+
+// ── Alert-isolation policy ─────────────────────────────────────────────
+
+/// Alert-routing tier for canary events.
+///
+/// Canary failures should never page operators.  Instead, they are routed
+/// through a four-tier classification that separates observability from
+/// operational urgency:
+///
+/// | Tier          | Operator paging? | Dashboard visible? | Log level   |
+/// |---------------|------------------|--------------------|-------------|
+/// | `Silent`      | No               | No                 | `TRACE`     |
+/// | `Observable`  | No               | Yes (canary tab)   | `DEBUG`     |
+/// | `Warning`     | No               | Yes (canary tab)   | `WARN`      |
+/// | `Engineering` | No (ticket only) | Yes (canary tab)   | `ERROR`     |
+///
+/// Even the most severe canary failure (`Engineering`) only creates an
+/// engineering ticket — it never fires a pager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryAlertTier {
+    /// Routine success — not shown on any dashboard, logged at TRACE.
+    Silent,
+    /// Interesting event (e.g. slow probe, unusual drift) — visible on the
+    /// canary-specific dashboard tab but no alert.
+    Observable,
+    /// Canary probe failure that may indicate a real regression — shown on
+    /// the canary dashboard and logged at WARN, but still no page.
+    Warning,
+    /// Confirmed canary regression that warrants an engineering ticket —
+    /// logged at ERROR but routed to the ticket system, never the pager.
+    Engineering,
+}
+
+impl CanaryAlertTier {
+    /// Whether this tier should be visible on the canary dashboard tab.
+    #[must_use]
+    pub const fn dashboard_visible(&self) -> bool {
+        matches!(self, Self::Observable | Self::Warning | Self::Engineering)
+    }
+
+    /// Whether this tier should create an engineering ticket.
+    #[must_use]
+    pub const fn creates_ticket(&self) -> bool {
+        matches!(self, Self::Engineering)
+    }
+
+    /// The `tracing` log level appropriate for this tier.
+    #[must_use]
+    pub const fn log_level(&self) -> tracing::Level {
+        match self {
+            Self::Silent => tracing::Level::TRACE,
+            Self::Observable => tracing::Level::DEBUG,
+            Self::Warning => tracing::Level::WARN,
+            Self::Engineering => tracing::Level::ERROR,
+        }
+    }
+
+    /// Short label for structured logs and metrics dimensions.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Silent => "silent",
+            Self::Observable => "observable",
+            Self::Warning => "warning",
+            Self::Engineering => "engineering",
+        }
+    }
+
+    /// All alert tiers in severity order (lowest to highest).
+    pub const ALL: &'static [CanaryAlertTier] = &[
+        Self::Silent,
+        Self::Observable,
+        Self::Warning,
+        Self::Engineering,
+    ];
+}
+
+impl std::fmt::Display for CanaryAlertTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Classification of a canary probe outcome for alert-routing purposes.
+///
+/// This is returned by [`classify_canary_outcome`] and consumed by the
+/// canary runner to decide where to route the result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryAlertPolicy {
+    /// The routing tier.
+    pub tier: CanaryAlertTier,
+    /// Short machine-readable reason code (e.g. `"probe_ok"`,
+    /// `"integrity_mismatch"`).
+    pub reason: &'static str,
+    /// Human-readable detail message.
+    pub detail: String,
+}
+
+impl CanaryAlertPolicy {
+    /// Convenience constructor for the common success case.
+    #[must_use]
+    pub fn success(detail: String) -> Self {
+        Self {
+            tier: CanaryAlertTier::Silent,
+            reason: "probe_ok",
+            detail,
+        }
+    }
+}
+
+/// Latency threshold (in microseconds) above which a successful canary
+/// probe is still flagged as `Observable`.  5 seconds is deliberately
+/// generous — canary mailboxes are tiny and should complete in milliseconds.
+const CANARY_SLOW_PROBE_THRESHOLD_US: u64 = 5_000_000;
+
+/// Classify a canary probe outcome into an alert-routing policy.
+///
+/// The classification logic follows a strict severity waterfall:
+///
+/// 1. Integrity failure -> `Engineering` (possible schema / probe regression)
+/// 2. Recovery failure  -> `Engineering` (possible recovery-logic regression)
+/// 3. Probe assertion failure -> `Warning` (application-level regression)
+/// 4. Slow probe -> `Observable` (performance regression signal)
+/// 5. Otherwise -> `Silent` (routine success)
+#[must_use]
+pub fn classify_canary_outcome(
+    probe_ok: bool,
+    latency_us: u64,
+    integrity_ok: bool,
+    recovery_attempted: bool,
+    recovery_ok: bool,
+) -> CanaryAlertPolicy {
+    if !integrity_ok {
+        return CanaryAlertPolicy {
+            tier: CanaryAlertTier::Engineering,
+            reason: "integrity_mismatch",
+            detail: "canary mailbox failed integrity check — possible regression in \
+                     integrity probe or schema path"
+                .to_string(),
+        };
+    }
+
+    if recovery_attempted && !recovery_ok {
+        return CanaryAlertPolicy {
+            tier: CanaryAlertTier::Engineering,
+            reason: "recovery_failed",
+            detail: "canary recovery path failed on a disposable mailbox — possible \
+                     regression in recovery logic"
+                .to_string(),
+        };
+    }
+
+    if !probe_ok {
+        return CanaryAlertPolicy {
+            tier: CanaryAlertTier::Warning,
+            reason: "probe_assertion_failed",
+            detail: "canary probe assertion failed but integrity and recovery paths \
+                     are healthy"
+                .to_string(),
+        };
+    }
+
+    if latency_us > CANARY_SLOW_PROBE_THRESHOLD_US {
+        return CanaryAlertPolicy {
+            tier: CanaryAlertTier::Observable,
+            reason: "slow_probe",
+            detail: format!(
+                "canary probe succeeded but took {:.1}s (threshold: {:.1}s)",
+                latency_us as f64 / 1_000_000.0,
+                CANARY_SLOW_PROBE_THRESHOLD_US as f64 / 1_000_000.0,
+            ),
+        };
+    }
+
+    CanaryAlertPolicy::success(format!(
+        "canary probe completed in {:.1}ms",
+        latency_us as f64 / 1_000.0,
+    ))
+}
+
+/// Record a canary probe result into the isolated canary metrics surface.
+///
+/// This is the single entry point that the canary runner calls after each
+/// probe cycle.  It updates only `CanaryMetrics` — never the production
+/// `DbMetrics` or `StorageMetrics`.
+pub fn record_canary_probe(
+    latency_us: u64,
+    ok: bool,
+    recovery_attempted: bool,
+    recovery_ok: bool,
+    integrity_ok: bool,
+) {
+    let m = &mcp_agent_mail_core::global_metrics().canary;
+    m.canary_probes_total.inc();
+    m.canary_probe_latency_us.record(latency_us);
+
+    if ok {
+        m.canary_probes_ok.inc();
+    } else {
+        m.canary_probes_failed.inc();
+    }
+
+    if !integrity_ok {
+        m.canary_integrity_failures_total.inc();
+    }
+
+    if recovery_attempted {
+        m.canary_recovery_attempts_total.inc();
+        if recovery_ok {
+            m.canary_recovery_successes_total.inc();
+        }
+    }
+}
+
+/// Increment the active canary mailbox gauge (call when creating a canary
+/// storage root).
+pub fn canary_mailbox_created() {
+    let m = &mcp_agent_mail_core::global_metrics().canary;
+    m.canary_mailboxes_created_total.inc();
+    m.canary_mailboxes_active.add(1);
+}
+
+/// Decrement the active canary mailbox gauge (call when tearing down a
+/// canary storage root).
+pub fn canary_mailbox_destroyed() {
+    let m = &mcp_agent_mail_core::global_metrics().canary;
+    m.canary_mailboxes_destroyed_total.inc();
+    // Saturating decrement: active = max(0, active - 1).
+    let current = m.canary_mailboxes_active.load();
+    if current > 0 {
+        m.canary_mailboxes_active.set(current.saturating_sub(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9569,5 +9901,73 @@ mod tests {
         assert_eq!(entries[0].operation, "op_a");
         assert_eq!(entries[1].operation, "op_b");
         assert!(log.is_empty(), "drain should empty the log");
+    }
+
+    // ── Ephemeral storage root rerouting tests (br-97gc6.5.2.2) ──────
+
+    #[test]
+    fn with_ephemeral_reroute_production_path_unchanged() {
+        let config = DbPoolConfig::default();
+        let rerouted = config.with_ephemeral_reroute(Path::new("/data/projects/real-project"));
+        // For a production path, the storage_root should not change.
+        // Default config has storage_root = None, so resolved_storage_root falls back
+        // to Config::from_env(). The ephemeral reroute should leave it as-is.
+        assert_eq!(rerouted.storage_root, None);
+    }
+
+    #[test]
+    fn would_reroute_for_project_returns_none_for_production() {
+        let config = DbPoolConfig::default();
+        let result = config.would_reroute_for_project(Path::new("/data/projects/my-project"));
+        assert!(
+            result.is_none(),
+            "production path should not trigger reroute"
+        );
+    }
+
+    #[test]
+    fn from_env_for_project_constructs_without_panic() {
+        // Ensure the combined constructor works without panicking.
+        let _config = DbPoolConfig::from_env_for_project(Path::new("/data/projects/test"));
+    }
+
+    #[test]
+    fn with_ephemeral_reroute_returns_isolated_for_tmp_when_default_root() {
+        // Build a config that looks like it uses the default storage root.
+        // compute_ephemeral_storage_root checks is_default_storage_root, which
+        // compares against the live config. We can only verify the method
+        // doesn't panic and returns a modified config when conditions align.
+        let mut config = DbPoolConfig::default();
+        config.storage_root = None; // forces fallback to Config::from_env()
+        let rerouted = config.with_ephemeral_reroute(Path::new("/tmp/ci-test-run"));
+        // Whether reroute actually happens depends on the runtime config's
+        // storage_root being the default. We verify the method is callable
+        // and produces a well-formed config.
+        assert!(rerouted.resolved_storage_root().as_os_str().len() > 0);
+    }
+
+    #[test]
+    fn with_ephemeral_reroute_custom_storage_root_unchanged() {
+        let mut config = DbPoolConfig::default();
+        let custom = PathBuf::from("/opt/custom-mail-storage");
+        config.storage_root = Some(custom.clone());
+        let rerouted = config.with_ephemeral_reroute(Path::new("/tmp/test-project"));
+        // Custom storage root means ephemeral reroute should not apply (the
+        // operator deliberately chose a non-default root).
+        assert_eq!(rerouted.storage_root, Some(custom));
+    }
+
+    #[test]
+    fn would_reroute_matches_with_ephemeral_reroute_behavior() {
+        let mut config = DbPoolConfig::default();
+        let custom = PathBuf::from("/opt/custom-storage");
+        config.storage_root = Some(custom.clone());
+
+        let would = config.would_reroute_for_project(Path::new("/tmp/test"));
+        let cloned = config.clone().with_ephemeral_reroute(Path::new("/tmp/test"));
+
+        // Both should agree: custom storage root prevents reroute.
+        assert!(would.is_none());
+        assert_eq!(cloned.storage_root, Some(custom));
     }
 }

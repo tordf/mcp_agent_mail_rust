@@ -12,6 +12,7 @@ pub mod agent_detect;
 pub mod atc_adaptation;
 pub mod atc_admissibility;
 pub mod atc_assumptions;
+pub mod atc_composition;
 pub mod atc_attribution;
 pub mod atc_baseline;
 pub mod atc_contamination;
@@ -96,8 +97,10 @@ pub use config::{
 pub use diagnostics::{
     ArchiveScanDedupeRule, ArchiveScanDiagnostic, ArchiveScanScope, ArchiveScanSeverityBucket,
     ArchiveScanSummary, ArchiveScanSummaryBucket, ArchiveScanSummaryFinding, ArtifactPointer,
-    ArtifactStatus, DiagnosticFindingCounts, DiagnosticPayload, DiagnosticPayloadSchema,
-    DiagnosticReport, HealthInfo, Recommendation, SystemInfo, init_process_start,
+    ArtifactStatus, CappedWarning, DEFAULT_WARNING_CAP_PER_CATEGORY, DiagnosticFindingCounts,
+    DiagnosticPayload, DiagnosticPayloadSchema, DiagnosticReport, HealthInfo, Recommendation,
+    SystemInfo, WarningCategoryOverflow, WarningFloodGate, WarningFloodSummary,
+    init_process_start,
 };
 pub use ephemeral::{
     EphemeralClass, EphemeralMode, EphemeralSignals, EphemeralTier, classify_ephemeral,

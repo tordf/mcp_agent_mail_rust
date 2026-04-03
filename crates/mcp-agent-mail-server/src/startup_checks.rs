@@ -1271,11 +1271,19 @@ impl StartupReport {
     }
 }
 
+/// Threshold (seconds) beyond which a held recovery lock is considered stalled
+/// for the purpose of startup error context.
+const STARTUP_RECOVERY_STALL_THRESHOLD_SECS: u64 = 300; // 5 minutes
+
 /// Build the recovery-context section appended to startup errors.
 ///
-/// Inspects the recovery lock, ownership, and durability state to surface:
-/// - Active recovery mode
+/// Inspects the recovery lock, ownership, durability state, admission
+/// controller, and deferred-write backlog to surface:
+/// - Active recovery mode and phase
 /// - Current lock owner / competing PIDs
+/// - Elapsed time since recovery started
+/// - Stall detection and reason
+/// - Deferred-write backlog summary
 /// - Next recommended action
 /// - Most recent forensic bundle path (if any)
 fn format_recovery_context() -> Option<String> {
@@ -1315,6 +1323,19 @@ fn format_recovery_context() -> Option<String> {
     out.push_str("\n  Recovery context:\n");
     let _ = writeln!(out, "    Mode:   {durability}");
 
+    // Phase descriptor.
+    let phase = if recovery_lock.active {
+        "lock_held"
+    } else if recovery_lock.exists {
+        "lock_stale"
+    } else {
+        match durability {
+            DurabilityState::Corrupt => "corrupt_no_lock",
+            _ => "degraded_no_lock",
+        }
+    };
+    let _ = writeln!(out, "    Phase:  {phase}");
+
     let owner_desc = match ownership.disposition {
         MailboxOwnershipDisposition::Unowned => "none".to_string(),
         MailboxOwnershipDisposition::ActiveOtherOwner => {
@@ -1352,20 +1373,116 @@ fn format_recovery_context() -> Option<String> {
         let _ = writeln!(out, "    Lock:   recovery lock held by {lock_holder}");
     }
 
-    let next_action = match durability {
-        DurabilityState::Healthy => "No action required",
-        DurabilityState::DegradedReadOnly => {
-            if recovery_lock.active {
-                "Wait for recovery to complete, or inspect the recovery lock holder"
-            } else {
-                "Run `am doctor repair` to attempt automatic recovery"
+    // ── Elapsed time since recovery lock created ─────────────────────────
+    let lock_path = PathBuf::from(&recovery_lock.lock_path);
+    let elapsed_secs = if lock_path.exists() {
+        std::fs::metadata(&lock_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mtime| {
+                std::time::SystemTime::now()
+                    .duration_since(mtime)
+                    .ok()
+                    .map(|d| d.as_secs())
+            })
+    } else {
+        None
+    };
+    if let Some(age) = elapsed_secs {
+        let _ = writeln!(out, "    Elapsed: {}", format_recovery_elapsed(age));
+    }
+
+    // ── Stall detection ──────────────────────────────────────────────────
+    let adm = mcp_agent_mail_db::recovery_admission().status();
+    let dw_status = mcp_agent_mail_db::deferred_write_queue().status();
+    let mut stall_reasons: Vec<&str> = Vec::new();
+
+    if recovery_lock.active {
+        if let Some(age) = elapsed_secs {
+            if age >= STARTUP_RECOVERY_STALL_THRESHOLD_SECS {
+                stall_reasons.push("lock held beyond stall threshold");
             }
         }
-        DurabilityState::Recovering => {
-            "Recovery in progress; wait for completion or investigate stall"
+    }
+    if adm.suppressed {
+        stall_reasons.push("admission suppressed after repeated failures");
+    }
+    if matches!(
+        dw_status.pressure,
+        mcp_agent_mail_db::BacklogPressure::HardStop
+    ) {
+        stall_reasons.push("deferred-write queue at hard-stop");
+    }
+    if recovery_lock.exists && !recovery_lock.active && durability != DurabilityState::Healthy {
+        stall_reasons.push("stale recovery lock from dead process");
+    }
+
+    if !stall_reasons.is_empty() {
+        let _ = writeln!(out, "    Stall:  YES ({})", stall_reasons.join("; "));
+    } else if recovery_lock.active {
+        let _ = writeln!(out, "    Stall:  no (still within budget)");
+    }
+
+    // ── Deferred-write backlog ───────────────────────────────────────────
+    if dw_status.active || dw_status.sealed || dw_status.queued > 0 {
+        let pressure_label = match dw_status.pressure {
+            mcp_agent_mail_db::BacklogPressure::Normal => "normal",
+            mcp_agent_mail_db::BacklogPressure::Elevated => "elevated",
+            mcp_agent_mail_db::BacklogPressure::Critical => "critical",
+            mcp_agent_mail_db::BacklogPressure::HardStop => "hard_stop",
+        };
+        let _ = writeln!(
+            out,
+            "    Backlog: {}/{} writes queued, oldest {}s, pressure={pressure_label}",
+            dw_status.queued, dw_status.capacity, dw_status.oldest_age_secs,
+        );
+    }
+
+    // ── Admission controller ─────────────────────────────────────────────
+    if adm.consecutive_failures > 0 || adm.suppressed {
+        let _ = writeln!(
+            out,
+            "    Admission: {} consecutive failures, {} attempts in window{}",
+            adm.consecutive_failures,
+            adm.attempts_in_window,
+            if adm.suppressed { ", SUPPRESSED" } else { "" },
+        );
+    }
+
+    // ── Next action (enriched with stall context) ────────────────────────
+    let stalled = !stall_reasons.is_empty();
+    let next_action = if stalled {
+        match durability {
+            DurabilityState::Recovering | DurabilityState::DegradedReadOnly => {
+                if recovery_lock.exists && !recovery_lock.active {
+                    "Recovery lock is stale (process exited); run `am doctor repair` to restart"
+                } else if adm.suppressed {
+                    "Recovery suppressed after repeated failures; run `am doctor repair --force` to override"
+                } else {
+                    "Recovery appears stalled; investigate lock holder or run `am doctor repair --force`"
+                }
+            }
+            DurabilityState::Corrupt => {
+                "Run `am doctor repair --force` or restore from archive backup"
+            }
+            DurabilityState::Healthy => "No action required",
         }
-        DurabilityState::Corrupt => {
-            "Run `am doctor repair --force` or restore from archive backup"
+    } else {
+        match durability {
+            DurabilityState::Healthy => "No action required",
+            DurabilityState::DegradedReadOnly => {
+                if recovery_lock.active {
+                    "Recovery in progress; still within budget, no action needed yet"
+                } else {
+                    "Run `am doctor repair` to attempt automatic recovery"
+                }
+            }
+            DurabilityState::Recovering => {
+                "Recovery in progress; wait for completion or investigate stall"
+            }
+            DurabilityState::Corrupt => {
+                "Run `am doctor repair --force` or restore from archive backup"
+            }
         }
     };
     let _ = writeln!(out, "    Action: {next_action}");
@@ -1387,6 +1504,25 @@ fn format_recovery_context() -> Option<String> {
     }
 
     Some(out)
+}
+
+/// Format elapsed recovery time as a compact human-readable string.
+fn format_recovery_elapsed(total_secs: u64) -> String {
+    if total_secs < 60 {
+        format!("{total_secs}s")
+    } else if total_secs < 3600 {
+        let m = total_secs / 60;
+        let s = total_secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
+    } else {
+        let h = total_secs / 3600;
+        let m = (total_secs % 3600) / 60;
+        format!("{h}h {m}m")
+    }
 }
 
 /// Scan a forensics root for the most recently modified bundle directory.

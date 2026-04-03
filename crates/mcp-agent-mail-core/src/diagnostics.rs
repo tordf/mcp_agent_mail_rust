@@ -773,6 +773,256 @@ impl DiagnosticPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Warning flood gate — cap terminal noise while preserving full detail
+// ---------------------------------------------------------------------------
+
+/// Default per-category cap for terminal-visible warnings.
+pub const DEFAULT_WARNING_CAP_PER_CATEGORY: usize = 3;
+
+/// A single warning entry captured by the flood gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CappedWarning {
+    /// Stable category key for dedupe (e.g. `"reconstruct_parse_error"`,
+    /// `"duplicate_canonical_message"`, `"sanitized_thread_id"`).
+    pub category: String,
+    /// Full warning message (always preserved in artifacts).
+    pub message: String,
+}
+
+/// Per-category overflow statistics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WarningCategoryOverflow {
+    /// Stable category key.
+    pub category: String,
+    /// Number of warnings that were captured in this category.
+    pub total: usize,
+    /// Number that fit within the cap (shown to the operator).
+    pub shown: usize,
+    /// Number suppressed from terminal output.
+    pub suppressed: usize,
+}
+
+/// Summary of warnings after flood-gate processing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WarningFloodSummary {
+    /// Total warnings across all categories.
+    pub total_warnings: usize,
+    /// Total warnings shown to the operator.
+    pub total_shown: usize,
+    /// Total warnings suppressed.
+    pub total_suppressed: usize,
+    /// Number of distinct categories with at least one warning.
+    pub category_count: usize,
+    /// Number of categories that had overflow.
+    pub overflow_category_count: usize,
+    /// Per-category overflow detail.
+    pub overflows: Vec<WarningCategoryOverflow>,
+    /// One-line summary sentence for terminal output. `None` if nothing was suppressed.
+    pub suppression_notice: Option<String>,
+}
+
+/// Caps terminal warning floods while preserving the complete warning list
+/// for machine-readable artifact output.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let mut gate = WarningFloodGate::new(3);
+/// for warning in warnings {
+///     gate.push("parse_error", &warning);
+/// }
+/// // Terminal output: gate.terminal_warnings() (capped)
+/// // Artifact detail: gate.all_warnings() (complete)
+/// // Summary: gate.summary()
+/// ```
+#[derive(Debug, Clone)]
+pub struct WarningFloodGate {
+    cap_per_category: usize,
+    /// All warnings in insertion order (never capped).
+    all_warnings: Vec<CappedWarning>,
+    /// Per-category count of warnings seen.
+    category_counts: std::collections::BTreeMap<String, usize>,
+}
+
+impl WarningFloodGate {
+    /// Create a new flood gate with the given per-category cap.
+    #[must_use]
+    pub fn new(cap_per_category: usize) -> Self {
+        Self {
+            cap_per_category: cap_per_category.max(1),
+            all_warnings: Vec::new(),
+            category_counts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Create a flood gate with the default cap.
+    #[must_use]
+    pub fn default_cap() -> Self {
+        Self::new(DEFAULT_WARNING_CAP_PER_CATEGORY)
+    }
+
+    /// Record a warning. Always preserved in the full list; only shown on
+    /// terminal if the per-category cap hasn't been reached.
+    ///
+    /// Returns `true` if this warning is within the cap (should be shown),
+    /// `false` if it was suppressed from terminal output.
+    pub fn push(&mut self, category: &str, message: impl Into<String>) -> bool {
+        let message = message.into();
+        self.all_warnings.push(CappedWarning {
+            category: category.to_string(),
+            message,
+        });
+        let count = self
+            .category_counts
+            .entry(category.to_string())
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        *count <= self.cap_per_category
+    }
+
+    /// Record a warning from an existing `String`, returning the within-cap status.
+    pub fn push_owned(&mut self, category: String, message: String) -> bool {
+        self.all_warnings.push(CappedWarning {
+            category: category.clone(),
+            message,
+        });
+        let count = self.category_counts.entry(category).or_insert(0);
+        *count = count.saturating_add(1);
+        *count <= self.cap_per_category
+    }
+
+    /// Total number of warnings across all categories.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.all_warnings.len()
+    }
+
+    /// Whether any warnings were suppressed from terminal output.
+    #[must_use]
+    pub fn has_suppressed(&self) -> bool {
+        self.category_counts
+            .values()
+            .any(|&count| count > self.cap_per_category)
+    }
+
+    /// Complete list of all warnings (for artifact/JSON output).
+    #[must_use]
+    pub fn all_warnings(&self) -> &[CappedWarning] {
+        &self.all_warnings
+    }
+
+    /// Warnings that fit within the per-category cap (for terminal output).
+    #[must_use]
+    pub fn terminal_warnings(&self) -> Vec<&CappedWarning> {
+        let mut per_category_seen: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        self.all_warnings
+            .iter()
+            .filter(|warning| {
+                let seen = per_category_seen
+                    .entry(&warning.category)
+                    .or_insert(0);
+                *seen += 1;
+                *seen <= self.cap_per_category
+            })
+            .collect()
+    }
+
+    /// Extract just the terminal-visible warning messages (convenience).
+    #[must_use]
+    pub fn terminal_messages(&self) -> Vec<&str> {
+        self.terminal_warnings()
+            .into_iter()
+            .map(|w| w.message.as_str())
+            .collect()
+    }
+
+    /// Extract all warning messages (convenience for artifact output).
+    #[must_use]
+    pub fn all_messages(&self) -> Vec<&str> {
+        self.all_warnings.iter().map(|w| w.message.as_str()).collect()
+    }
+
+    /// Build a summary of flood-gate state.
+    #[must_use]
+    pub fn summary(&self) -> WarningFloodSummary {
+        let total_warnings = self.all_warnings.len();
+        let mut total_shown = 0usize;
+        let mut overflows = Vec::new();
+        for (category, &count) in &self.category_counts {
+            let shown = count.min(self.cap_per_category);
+            let suppressed = count.saturating_sub(self.cap_per_category);
+            total_shown = total_shown.saturating_add(shown);
+            if suppressed > 0 {
+                overflows.push(WarningCategoryOverflow {
+                    category: category.clone(),
+                    total: count,
+                    shown,
+                    suppressed,
+                });
+            }
+        }
+        let total_suppressed = total_warnings.saturating_sub(total_shown);
+        let overflow_category_count = overflows.len();
+
+        let suppression_notice = if total_suppressed > 0 {
+            let category_detail: Vec<String> = overflows
+                .iter()
+                .map(|o| format!("{}: {} suppressed", o.category, o.suppressed))
+                .collect();
+            Some(format!(
+                "{total_suppressed} warning(s) suppressed from terminal output \
+                 across {overflow_category_count} category/categories; \
+                 full detail in artifacts. [{detail}]",
+                detail = category_detail.join("; ")
+            ))
+        } else {
+            None
+        };
+
+        WarningFloodSummary {
+            total_warnings,
+            total_shown,
+            total_suppressed,
+            category_count: self.category_counts.len(),
+            overflow_category_count,
+            overflows,
+            suppression_notice,
+        }
+    }
+
+    /// Consume the gate and return all warnings as owned strings (for
+    /// compatibility with existing `Vec<String>` warning fields).
+    #[must_use]
+    pub fn into_all_messages(self) -> Vec<String> {
+        self.all_warnings
+            .into_iter()
+            .map(|w| w.message)
+            .collect()
+    }
+
+    /// Consume the gate and return only terminal-visible warnings as owned
+    /// strings.
+    #[must_use]
+    pub fn into_terminal_messages(self) -> Vec<String> {
+        let cap = self.cap_per_category;
+        let mut per_category_seen: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        self.all_warnings
+            .into_iter()
+            .filter(|warning| {
+                let seen = per_category_seen
+                    .entry(warning.category.clone())
+                    .or_insert(0);
+                *seen += 1;
+                *seen <= cap
+            })
+            .map(|w| w.message)
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Static system info
 // ---------------------------------------------------------------------------
 
