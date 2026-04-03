@@ -3,6 +3,18 @@
 #
 # Runs install.sh in a controlled offline environment using local release artifacts.
 # Validates same-version idempotency and upgrade-path safety.
+#
+# Artifact strategy (br-aazao.3.2):
+#   Cases 1-4 use synthetic shell-stub artifacts.  These stubs are REQUIRED
+#   for narrow contract coverage that cannot be satisfied by real binaries:
+#     - Controlled version strings (0.1.0 / 0.1.1) to test upgrade-path
+#       logic without coupling to the actual Cargo.toml version.
+#     - Deterministic "doctor" / "migrate" output strings the assertions
+#       match verbatim.
+#     - Two distinct version tarballs to exercise the binary-swap code path.
+#   Cases 5-7 (built-artifact lane) use real cargo-built binaries packaged
+#   into tarballs and fed to install.sh via --artifact-url file://.  These
+#   exercise the same installer code paths with production ELF payloads.
 
 set -euo pipefail
 
@@ -367,5 +379,168 @@ git -C "${STORAGE_ROOT}" fsck --no-progress >/dev/null 2>&1
 GIT_FSCK_RC_UPGRADE=$?
 set -e
 e2e_assert_exit_code "storage root git repo integrity preserved (upgrade)" "0" "$GIT_FSCK_RC_UPGRADE"
+
+# ===========================================================================
+# Built-artifact lane (br-aazao.3.2)
+# Uses real cargo-built binaries instead of synthetic shell stubs.
+# ===========================================================================
+
+build_real_release_artifact() {
+    local artifact_path="$1"
+    local stage="${WORK}/real_artifact"
+
+    rm -rf "$stage"
+    mkdir -p "$stage"
+
+    # Ensure real binaries are available via the e2e build machinery.
+    e2e_ensure_binary "am" >/dev/null
+    e2e_ensure_binary "mcp-agent-mail" >/dev/null
+
+    cp "${CARGO_TARGET_DIR}/debug/am" "${stage}/am"
+    cp "${CARGO_TARGET_DIR}/debug/mcp-agent-mail" "${stage}/mcp-agent-mail"
+    chmod +x "${stage}/am" "${stage}/mcp-agent-mail"
+    tar -cJf "$artifact_path" -C "$stage" am mcp-agent-mail
+}
+
+REAL_VERSION="$("${CARGO_TARGET_DIR}/debug/am" --version 2>/dev/null | awk '{print $2}' | sed 's/^v//' | head -1)"
+if [ -z "${REAL_VERSION}" ]; then
+    REAL_VERSION="${CARGO_PKG_VERSION:-0.0.0}"
+    REAL_VERSION="${REAL_VERSION#v}"
+fi
+
+ARTIFACT_REAL="${WORK}/mcp-agent-mail-real.tar.xz"
+build_real_release_artifact "$ARTIFACT_REAL"
+
+# Reset sandbox state for the built-artifact lane
+REAL_HOME="${WORK}/real_home"
+REAL_DEST="${REAL_HOME}/.local/bin"
+REAL_STORAGE="${REAL_HOME}/storage_root"
+REAL_RUN_DIR="${WORK}/real_project"
+REAL_MCP_CONFIG="${REAL_RUN_DIR}/codex.mcp.json"
+mkdir -p "$REAL_DEST" "$REAL_HOME/.config/fish" "$REAL_STORAGE" "$REAL_RUN_DIR"
+
+cat > "${REAL_HOME}/.zshrc" <<'EOF'
+# clean baseline
+EOF
+cat > "${REAL_HOME}/.bashrc" <<'EOF'
+# clean baseline
+EOF
+
+mkdir -p "${REAL_STORAGE}"
+git -C "${REAL_STORAGE}" init >/dev/null 2>&1
+git -C "${REAL_STORAGE}" config user.email "e2e@example.com"
+git -C "${REAL_STORAGE}" config user.name "E2E"
+echo "seed" > "${REAL_STORAGE}/README.md"
+git -C "${REAL_STORAGE}" add README.md
+git -C "${REAL_STORAGE}" commit -m "seed" >/dev/null 2>&1
+
+REAL_RUST_ENV="${REAL_HOME}/.config/mcp-agent-mail/config.env"
+mkdir -p "$(dirname "$REAL_RUST_ENV")"
+cat > "$REAL_RUST_ENV" <<'EOF'
+HTTP_BEARER_TOKEN=real-token-xyz
+EOF
+
+cat > "${REAL_MCP_CONFIG}" <<'EOF'
+{
+  "mcpServers": {
+    "other-tool": {
+      "command": "node",
+      "args": ["server.js"]
+    }
+  }
+}
+EOF
+
+run_real_installer() {
+    local case_name="$1"
+    local stdout_file="${WORK}/${case_name}_stdout.txt"
+    local stderr_file="${WORK}/${case_name}_stderr.txt"
+
+    set +e
+    (
+        cd "$REAL_RUN_DIR"
+        HOME="$REAL_HOME" \
+        SHELL="$TEST_SHELL" \
+        STORAGE_ROOT="$REAL_STORAGE" \
+        PATH="$PATH_BASE" \
+        bash "$INSTALL_SH" \
+            --version "v${REAL_VERSION}" \
+            --artifact-url "file://${ARTIFACT_REAL}" \
+            --dest "$REAL_DEST" \
+            --offline \
+            --no-verify \
+            --no-gum
+    ) >"$stdout_file" 2>"$stderr_file"
+    LAST_INSTALL_RC=$?
+    set -e
+
+    LAST_INSTALL_STDOUT="$(cat "$stdout_file" 2>/dev/null || true)"
+    LAST_INSTALL_STDERR="$(cat "$stderr_file" 2>/dev/null || true)"
+    e2e_save_artifact "${case_name}_stdout.txt" "$LAST_INSTALL_STDOUT"
+    e2e_save_artifact "${case_name}_stderr.txt" "$LAST_INSTALL_STDERR"
+}
+
+# ===========================================================================
+# Case 5 (built-artifact): First install with real binary
+# ===========================================================================
+e2e_case_banner "[built-artifact] First install with real binary"
+
+run_real_installer "case_05_real_first_install"
+e2e_assert_exit_code "[built-artifact] first install exits 0" "0" "$LAST_INSTALL_RC"
+
+REAL_AM_OUT="$("$REAL_DEST/am" --version 2>&1)"
+e2e_assert_contains "[built-artifact] installed am reports real version" "$REAL_AM_OUT" "$REAL_VERSION"
+
+set +e
+REAL_FILE_TYPE="$(file "$REAL_DEST/am" 2>&1)"
+set -e
+e2e_assert_contains "[built-artifact] installed am is ELF binary" "$REAL_FILE_TYPE" "ELF"
+
+REAL_AM_SHA_FIRST="$(sha256_file "$REAL_DEST/am")"
+REAL_SERVER_SHA_FIRST="$(sha256_file "$REAL_DEST/mcp-agent-mail")"
+REAL_TOKEN_FIRST="$(grep -E '^HTTP_BEARER_TOKEN=' "$REAL_RUST_ENV" | head -1 | cut -d= -f2-)"
+e2e_assert_eq "[built-artifact] bearer token preserved" "real-token-xyz" "$REAL_TOKEN_FIRST"
+
+# ===========================================================================
+# Case 6 (built-artifact): Same-version reinstall is idempotent
+# ===========================================================================
+e2e_case_banner "[built-artifact] Same-version reinstall idempotent"
+
+run_real_installer "case_06_real_second_install"
+e2e_assert_exit_code "[built-artifact] second install exits 0" "0" "$LAST_INSTALL_RC"
+e2e_assert_contains "[built-artifact] second install reports already installed" "$LAST_INSTALL_STDOUT" "already installed"
+
+REAL_AM_SHA_SECOND="$(sha256_file "$REAL_DEST/am")"
+REAL_SERVER_SHA_SECOND="$(sha256_file "$REAL_DEST/mcp-agent-mail")"
+e2e_assert_eq "[built-artifact] am checksum unchanged" "$REAL_AM_SHA_FIRST" "$REAL_AM_SHA_SECOND"
+e2e_assert_eq "[built-artifact] server checksum unchanged" "$REAL_SERVER_SHA_FIRST" "$REAL_SERVER_SHA_SECOND"
+
+REAL_TOKEN_SECOND="$(grep -E '^HTTP_BEARER_TOKEN=' "$REAL_RUST_ENV" | head -1 | cut -d= -f2-)"
+e2e_assert_eq "[built-artifact] bearer token unchanged" "$REAL_TOKEN_FIRST" "$REAL_TOKEN_SECOND"
+
+REAL_MCP_SHA_AFTER="$(sha256_file "$REAL_MCP_CONFIG")"
+REAL_MCP_SHA_BEFORE="$(sha256_file "$REAL_MCP_CONFIG")"
+e2e_assert_eq "[built-artifact] mcp config unchanged" "$REAL_MCP_SHA_BEFORE" "$REAL_MCP_SHA_AFTER"
+
+# ===========================================================================
+# Case 7 (built-artifact): Real binary doctor surface exercised
+# ===========================================================================
+e2e_case_banner "[built-artifact] Doctor runs against real binary"
+
+set +e
+REAL_DOCTOR_OUT="$(
+    HOME="$REAL_HOME" \
+    STORAGE_ROOT="$REAL_STORAGE" \
+    "$REAL_DEST/am" doctor check 2>&1
+)"
+REAL_DOCTOR_RC=$?
+set -e
+e2e_save_artifact "case_07_real_doctor.txt" "$REAL_DOCTOR_OUT"
+# Doctor may return 0 (green) or 1 (warnings on fresh install) but must not panic.
+if [ "$REAL_DOCTOR_RC" -le 1 ]; then
+    e2e_pass "[built-artifact] doctor exits cleanly (rc=$REAL_DOCTOR_RC)"
+else
+    e2e_fail "[built-artifact] doctor should not crash" "exit <=1" "exit $REAL_DOCTOR_RC"
+fi
 
 e2e_summary

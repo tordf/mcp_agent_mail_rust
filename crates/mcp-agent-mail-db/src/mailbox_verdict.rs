@@ -1215,6 +1215,282 @@ fn probe_schema_populated(db_path: &Path, archive_count: usize) -> ProbeResult {
 }
 
 // ============================================================================
+// Durability verification artifact (br-97gc6.5.2.6.6)
+// ============================================================================
+
+/// Fault class that a durability test scenario exercises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityFaultClass {
+    /// DB file is missing or zero-length while archive is non-empty.
+    EmptyDb,
+    /// DB file fails `PRAGMA integrity_check` or has wrong schema.
+    MalformedDb,
+    /// DB file is locked by another process / busy timeout.
+    BusyLock,
+    /// The server binary or recovery binary is missing from PATH.
+    DeletedBinary,
+    /// Archive message count diverges from DB message count.
+    ArchiveDrift,
+    /// Recovery process was killed mid-operation (crash injection).
+    AbruptTermination,
+    /// Concurrent readers during background rebuild.
+    DegradedConcurrentRead,
+    /// WAL/SHM sidecars are inconsistent or orphaned.
+    StaleSidecars,
+    /// No fault injected (baseline/happy-path control).
+    None,
+}
+
+impl DurabilityFaultClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyDb => "empty_db",
+            Self::MalformedDb => "malformed_db",
+            Self::BusyLock => "busy_lock",
+            Self::DeletedBinary => "deleted_binary",
+            Self::ArchiveDrift => "archive_drift",
+            Self::AbruptTermination => "abrupt_termination",
+            Self::DegradedConcurrentRead => "degraded_concurrent_read",
+            Self::StaleSidecars => "stale_sidecars",
+            Self::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for DurabilityFaultClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Outcome of a durability test scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityTestOutcome {
+    /// Test passed: the system detected and handled the fault correctly.
+    Pass,
+    /// Test failed: the system did not handle the fault as expected.
+    Fail,
+    /// Test was skipped (prerequisites not met, e.g. missing binary).
+    Skip,
+    /// Test encountered an unexpected error during setup or teardown.
+    Error,
+}
+
+impl DurabilityTestOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skip => "skip",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for DurabilityTestOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Structured artifact emitted by every durability test scenario.
+///
+/// Consumed by CI gates, the verification matrix, and the residual-risk
+/// register. Every durability test — unit, E2E, or chaos — must emit
+/// exactly one of these per scenario run so downstream tooling can
+/// aggregate pass/fail evidence without parsing log output.
+///
+/// # Fields by audience
+///
+/// **Machine-facing** (for CI gates and aggregation):
+/// `scenario_id`, `fault_class`, `outcome`, `started_at_micros`,
+/// `finished_at_micros`, `durability_state_before`, `durability_state_after`,
+/// `messages_before`, `messages_after`, `data_loss_detected`.
+///
+/// **Operator-facing** (for triage and investigation):
+/// `description`, `failure_reason`, `forensic_bundle_path`, `rerun_hint`,
+/// `probes_before`, `probes_after`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurabilityTestArtifact {
+    // ── scenario identity ────────────────────────────────────────────
+    /// Stable identifier for the test scenario (e.g., `"empty_db_with_archive"`).
+    pub scenario_id: String,
+    /// Human-readable description of what this scenario tests.
+    pub description: String,
+    /// The fault class exercised by this scenario.
+    pub fault_class: DurabilityFaultClass,
+
+    // ── timing ───────────────────────────────────────────────────────
+    /// When the scenario started (microseconds since epoch).
+    pub started_at_micros: i64,
+    /// When the scenario finished (microseconds since epoch).
+    pub finished_at_micros: i64,
+
+    // ── mailbox state transitions ────────────────────────────────────
+    /// Mailbox durability state observed before fault injection.
+    pub durability_state_before: DurabilityState,
+    /// Mailbox durability state observed after fault handling / recovery.
+    pub durability_state_after: DurabilityState,
+    /// Mailbox state (fine-grained) before fault injection.
+    pub mailbox_state_before: MailboxState,
+    /// Mailbox state (fine-grained) after fault handling / recovery.
+    pub mailbox_state_after: MailboxState,
+
+    // ── ownership evidence ───────────────────────────────────────────
+    /// Ownership disposition before fault injection.
+    pub owner_disposition_before: Option<MailboxOwnershipDisposition>,
+    /// Ownership disposition after fault handling.
+    pub owner_disposition_after: Option<MailboxOwnershipDisposition>,
+
+    // ── archive / DB facts ───────────────────────────────────────────
+    /// Archive message count before fault injection.
+    pub archive_messages_before: Option<usize>,
+    /// Archive message count after fault handling.
+    pub archive_messages_after: Option<usize>,
+    /// DB message count before fault injection.
+    pub db_messages_before: Option<usize>,
+    /// DB message count after fault handling.
+    pub db_messages_after: Option<usize>,
+    /// Archive drift state after recovery.
+    pub archive_drift_after: Option<MailboxArchiveDriftState>,
+
+    // ── data integrity assertions ────────────────────────────────────
+    /// Whether any data loss was detected (messages lost, not recoverable).
+    pub data_loss_detected: bool,
+    /// Number of messages that were lost (0 if none).
+    pub messages_lost: usize,
+
+    // ── outcome ──────────────────────────────────────────────────────
+    /// Test outcome.
+    pub outcome: DurabilityTestOutcome,
+    /// If outcome is `Fail` or `Error`, the reason.
+    pub failure_reason: Option<String>,
+
+    // ── forensic / recovery artifacts ────────────────────────────────
+    /// Path to the forensic bundle captured during this scenario, if any.
+    pub forensic_bundle_path: Option<PathBuf>,
+    /// Probe results before fault injection (for detailed triage).
+    pub probes_before: Vec<ProbeResult>,
+    /// Probe results after fault handling (for detailed triage).
+    pub probes_after: Vec<ProbeResult>,
+
+    // ── rerun hints ──────────────────────────────────────────────────
+    /// Shell command to reproduce this scenario in isolation.
+    pub rerun_hint: Option<String>,
+}
+
+impl DurabilityTestArtifact {
+    /// Create a new artifact with the scenario identity and fault class.
+    /// Timing fields are initialized to now; call [`Self::finish`] when done.
+    #[must_use]
+    pub fn begin(
+        scenario_id: impl Into<String>,
+        description: impl Into<String>,
+        fault_class: DurabilityFaultClass,
+    ) -> Self {
+        let now = mcp_agent_mail_core::timestamps::now_micros();
+        Self {
+            scenario_id: scenario_id.into(),
+            description: description.into(),
+            fault_class,
+            started_at_micros: now,
+            finished_at_micros: 0,
+            durability_state_before: DurabilityState::Healthy,
+            durability_state_after: DurabilityState::Healthy,
+            mailbox_state_before: MailboxState::Healthy,
+            mailbox_state_after: MailboxState::Healthy,
+            owner_disposition_before: None,
+            owner_disposition_after: None,
+            archive_messages_before: None,
+            archive_messages_after: None,
+            db_messages_before: None,
+            db_messages_after: None,
+            archive_drift_after: None,
+            data_loss_detected: false,
+            messages_lost: 0,
+            outcome: DurabilityTestOutcome::Error, // default until finish()
+            failure_reason: None,
+            forensic_bundle_path: None,
+            probes_before: Vec::new(),
+            probes_after: Vec::new(),
+            rerun_hint: None,
+        }
+    }
+
+    /// Record the "before" snapshot from a health verdict.
+    pub fn record_before(&mut self, verdict: &MailboxHealthVerdict) {
+        self.mailbox_state_before = verdict.state;
+        self.durability_state_before = DurabilityState::from_mailbox_state(verdict.state);
+        self.owner_disposition_before = Some(verdict.ownership.disposition);
+        self.probes_before = verdict.probes.clone();
+    }
+
+    /// Record the "after" snapshot from a health verdict.
+    pub fn record_after(&mut self, verdict: &MailboxHealthVerdict) {
+        self.mailbox_state_after = verdict.state;
+        self.durability_state_after = DurabilityState::from_mailbox_state(verdict.state);
+        self.owner_disposition_after = Some(verdict.ownership.disposition);
+        self.archive_drift_after = Some(verdict.archive_drift.state);
+        self.probes_after = verdict.probes.clone();
+    }
+
+    /// Mark the artifact as finished with a pass/fail outcome.
+    pub fn finish(&mut self, outcome: DurabilityTestOutcome) {
+        self.finished_at_micros = mcp_agent_mail_core::timestamps::now_micros();
+        self.outcome = outcome;
+    }
+
+    /// Mark as failed with a reason.
+    pub fn fail(&mut self, reason: impl Into<String>) {
+        self.finish(DurabilityTestOutcome::Fail);
+        self.failure_reason = Some(reason.into());
+    }
+
+    /// Duration of the scenario in microseconds.
+    #[must_use]
+    pub fn duration_micros(&self) -> i64 {
+        self.finished_at_micros.saturating_sub(self.started_at_micros)
+    }
+
+    /// Whether the after-state is at least as good as the before-state
+    /// (no regression).
+    #[must_use]
+    pub fn no_state_regression(&self) -> bool {
+        self.durability_state_after.severity() <= self.durability_state_before.severity()
+    }
+
+    /// Serialize to JSON for artifact logging.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| format!("{self:?}"))
+    }
+
+    /// Serialize to a single compact JSON line for JSONL artifact logs.
+    #[must_use]
+    pub fn to_json_line(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| format!("{self:?}"))
+    }
+}
+
+impl std::fmt::Display for DurabilityTestArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}] {} ({}) → {} in {}ms",
+            self.outcome,
+            self.scenario_id,
+            self.fault_class,
+            self.durability_state_after,
+            self.duration_micros() / 1000,
+        )
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

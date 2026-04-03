@@ -35389,7 +35389,7 @@ COMMIT;\n";
             .find("Primary issue: [FAIL]")
             .expect("primary summary");
         let archive_pos = output
-            .find("Archive hygiene: [WARN]")
+            .find("Archive hygiene (cosmetic): [WARN]")
             .expect("archive hygiene summary");
         let check_pos = output
             .find("[FAIL] archive_db_parity")

@@ -5122,10 +5122,7 @@ impl AtcEngine {
         let execution_posture = if safe_mode {
             ExecutionPosture::SafeMode
         } else if self.eprocess.miscalibrated()
-            || matches!(
-                self.slow_controller.probe_budget_fraction < 0.5,
-                true
-            )
+            || self.slow_controller.probe_budget_fraction < 0.5
         {
             ExecutionPosture::Cautious
         } else {

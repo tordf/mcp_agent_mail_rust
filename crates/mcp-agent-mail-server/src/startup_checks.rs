@@ -1576,6 +1576,12 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
 
     let storage_root = std::path::Path::new(&config.storage_root);
 
+    // Capture live DB family, lock holders, and process inventory *before*
+    // any repair or reconstruct mutates the mailbox state.
+    let _pre_snapshot =
+        mcp_agent_mail_db::capture_pre_recovery_snapshot(&db_path, "startup-integrity")
+            .with_environment(storage_root, &config.database_url);
+
     let result = if storage_root.is_dir() {
         mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(&db_path, storage_root)
     } else {

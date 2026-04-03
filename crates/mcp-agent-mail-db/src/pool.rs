@@ -361,6 +361,532 @@ impl std::fmt::Display for RecoveryApproval {
     }
 }
 
+// ============================================================================
+// Recovery admission control: single-flight, backoff, loop suppression
+// ============================================================================
+
+/// Governs admission of recovery attempts to prevent thundering-herd,
+/// runaway-loop, and retry-storm failure modes.
+///
+/// Three control layers work together:
+///
+/// 1. **Single-flight guard** — An [`AtomicBool`] ensures at most one
+///    recovery attempt runs at any given time. Concurrent callers see
+///    `Ok(false)` immediately rather than queuing.
+///
+/// 2. **Exponential backoff** — After each consecutive failure the
+///    controller enforces an increasing cooldown before the next attempt
+///    is admitted. Backoff resets on success.
+///
+/// 3. **Loop suppression** — If recovery fires more than
+///    [`MAX_ATTEMPTS_IN_WINDOW`] times within [`SUPPRESSION_WINDOW`],
+///    all further attempts are refused until the window expires. This
+///    prevents a broken-disk or missing-backup scenario from burning
+///    CPU in a tight retry loop.
+///
+/// The controller is stored in a global [`OnceLock`] so all callers in
+/// the process share the same admission state. It is fully `Sync` and
+/// lock-free on the fast path (single-flight check + timestamp compare).
+pub struct RecoveryAdmissionController {
+    /// Single-flight guard: `true` when a recovery is in progress.
+    in_progress: std::sync::atomic::AtomicBool,
+
+    /// Mutable state behind a `Mutex` — only held briefly to read/update
+    /// counters and timestamps, never across the actual recovery I/O.
+    state: Mutex<RecoveryAdmissionState>,
+}
+
+/// Interior state protected by the controller's `Mutex`.
+struct RecoveryAdmissionState {
+    /// Number of consecutive failures (reset to 0 on success).
+    consecutive_failures: u32,
+
+    /// Instant of the most recent recovery attempt (success or failure).
+    last_attempt: Option<Instant>,
+
+    /// Ring buffer of attempt timestamps within the current suppression window.
+    window_attempts: std::collections::VecDeque<Instant>,
+
+    /// If `Some`, the controller has entered suppression mode and will not
+    /// admit new attempts until this instant.
+    suppressed_until: Option<Instant>,
+}
+
+/// Configuration constants for the admission controller.
+impl RecoveryAdmissionController {
+    /// Maximum recovery attempts allowed within [`SUPPRESSION_WINDOW`].
+    /// Once exceeded, the controller refuses further attempts until the
+    /// window rotates.
+    pub const MAX_ATTEMPTS_IN_WINDOW: usize = 5;
+
+    /// The sliding window over which [`MAX_ATTEMPTS_IN_WINDOW`] is tracked.
+    pub const SUPPRESSION_WINDOW: Duration = Duration::from_secs(300); // 5 minutes
+
+    /// Base delay for exponential backoff (doubles on each consecutive failure).
+    pub const BACKOFF_BASE: Duration = Duration::from_secs(2);
+
+    /// Maximum backoff delay (cap to avoid unbounded wait).
+    pub const BACKOFF_CAP: Duration = Duration::from_secs(120); // 2 minutes
+
+    /// Create a new controller in the ready (un-suppressed, no backoff) state.
+    pub fn new() -> Self {
+        Self {
+            in_progress: std::sync::atomic::AtomicBool::new(false),
+            state: Mutex::new(RecoveryAdmissionState {
+                consecutive_failures: 0,
+                last_attempt: None,
+                window_attempts: std::collections::VecDeque::new(),
+                suppressed_until: None,
+            }),
+        }
+    }
+
+    /// Attempt to acquire the single-flight guard.
+    ///
+    /// Returns `Some(RecoveryGuard)` if recovery may proceed, or `None` if:
+    /// - Another recovery is already in progress (single-flight).
+    /// - The controller is in backoff cooldown after a recent failure.
+    /// - Loop suppression is active (too many attempts in the window).
+    ///
+    /// When the returned `RecoveryGuard` is dropped, the in-progress flag
+    /// is automatically cleared. Callers **must** call
+    /// [`report_success`](Self::report_success) or
+    /// [`report_failure`](Self::report_failure) before the guard drops so
+    /// the backoff/window state is updated correctly.
+    pub fn try_acquire(&self) -> Option<RecoveryGuard<'_>> {
+        // Fast path: check suppression and backoff without acquiring the Mutex
+        // on every call — but we do need the Mutex to read timestamps safely.
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+
+            // Check loop suppression.
+            if let Some(until) = state.suppressed_until {
+                if now < until {
+                    tracing::warn!(
+                        remaining_secs = (until - now).as_secs(),
+                        "recovery admission suppressed — too many attempts in window"
+                    );
+                    return None;
+                }
+                // Window expired — suppression will be cleared on next state update.
+            }
+
+            // Check exponential backoff.
+            if state.consecutive_failures > 0 {
+                if let Some(last) = state.last_attempt {
+                    let required_delay = Self::backoff_delay(state.consecutive_failures);
+                    let elapsed = now.saturating_duration_since(last);
+                    if elapsed < required_delay {
+                        tracing::info!(
+                            consecutive_failures = state.consecutive_failures,
+                            remaining_secs = (required_delay - elapsed).as_secs(),
+                            "recovery admission deferred — exponential backoff in effect"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // Single-flight CAS.
+        if self
+            .in_progress
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            tracing::warn!("recovery admission refused — another recovery already in progress");
+            return None;
+        }
+
+        Some(RecoveryGuard { controller: self })
+    }
+
+    /// Record a successful recovery. Resets consecutive-failure count and
+    /// clears any active suppression.
+    pub fn report_success(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        state.consecutive_failures = 0;
+        state.last_attempt = Some(now);
+        state.suppressed_until = None;
+        Self::prune_window(&mut state.window_attempts, now);
+        state.window_attempts.push_back(now);
+    }
+
+    /// Record a failed recovery. Increments consecutive-failure count,
+    /// records the attempt in the sliding window, and may activate
+    /// loop suppression if the window threshold is exceeded.
+    pub fn report_failure(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        state.last_attempt = Some(now);
+        Self::prune_window(&mut state.window_attempts, now);
+        state.window_attempts.push_back(now);
+
+        if state.window_attempts.len() >= Self::MAX_ATTEMPTS_IN_WINDOW {
+            let suppress_until = now + Self::SUPPRESSION_WINDOW;
+            state.suppressed_until = Some(suppress_until);
+            tracing::error!(
+                attempts_in_window = state.window_attempts.len(),
+                suppressed_for_secs = Self::SUPPRESSION_WINDOW.as_secs(),
+                "recovery loop detected — suppressing further attempts"
+            );
+        }
+    }
+
+    /// Compute the exponential backoff delay for the given number of
+    /// consecutive failures. Result is clamped to [`BACKOFF_CAP`](Self::BACKOFF_CAP).
+    #[must_use]
+    pub fn backoff_delay(consecutive_failures: u32) -> Duration {
+        if consecutive_failures == 0 {
+            return Duration::ZERO;
+        }
+        // 2^(failures-1) * BASE, capped at BACKOFF_CAP.
+        let exponent = (consecutive_failures - 1).min(30);
+        let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
+        let delay_ms = Self::BACKOFF_BASE
+            .as_millis()
+            .saturating_mul(u128::from(multiplier));
+        let delay = Duration::from_millis(delay_ms.min(u128::from(u64::MAX)) as u64);
+        if delay > Self::BACKOFF_CAP {
+            Self::BACKOFF_CAP
+        } else {
+            delay
+        }
+    }
+
+    /// Return the current admission status for diagnostics.
+    #[must_use]
+    pub fn status(&self) -> RecoveryAdmissionStatus {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        RecoveryAdmissionStatus {
+            in_progress: self.in_progress.load(std::sync::atomic::Ordering::SeqCst),
+            consecutive_failures: state.consecutive_failures,
+            attempts_in_window: state.window_attempts.len(),
+            suppressed: state
+                .suppressed_until
+                .map_or(false, |until| now < until),
+            current_backoff: Self::backoff_delay(state.consecutive_failures),
+        }
+    }
+
+    /// Remove window entries older than [`SUPPRESSION_WINDOW`].
+    fn prune_window(window: &mut std::collections::VecDeque<Instant>, now: Instant) {
+        while let Some(&front) = window.front() {
+            if now.saturating_duration_since(front) > Self::SUPPRESSION_WINDOW {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Reset all admission state. Intended for testing and manual operator override.
+    pub fn reset(&self) {
+        self.in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.consecutive_failures = 0;
+        state.last_attempt = None;
+        state.window_attempts.clear();
+        state.suppressed_until = None;
+    }
+}
+
+/// RAII guard that clears the single-flight flag when dropped.
+pub struct RecoveryGuard<'a> {
+    controller: &'a RecoveryAdmissionController,
+}
+
+impl Drop for RecoveryGuard<'_> {
+    fn drop(&mut self) {
+        self.controller
+            .in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Snapshot of the admission controller state for diagnostics/logging.
+#[derive(Debug, Clone)]
+pub struct RecoveryAdmissionStatus {
+    /// Whether a recovery is currently in progress.
+    pub in_progress: bool,
+    /// Number of consecutive recovery failures.
+    pub consecutive_failures: u32,
+    /// Number of recovery attempts within the current sliding window.
+    pub attempts_in_window: usize,
+    /// Whether loop suppression is currently active.
+    pub suppressed: bool,
+    /// Current backoff delay (zero if no failures).
+    pub current_backoff: Duration,
+}
+
+/// Global singleton recovery admission controller.
+///
+/// Shared by all [`DbPool`] instances in the process.
+static RECOVERY_ADMISSION: OnceLock<RecoveryAdmissionController> = OnceLock::new();
+
+/// Access the global recovery admission controller.
+#[must_use]
+pub fn recovery_admission() -> &'static RecoveryAdmissionController {
+    RECOVERY_ADMISSION.get_or_init(RecoveryAdmissionController::new)
+}
+
+// ============================================================================
+// Bounded write deferral queue (br-97gc6.5.2.1.9)
+// ============================================================================
+
+/// A write operation captured for deferred replay after recovery completes.
+///
+/// Each entry stores the SQL statement, bound parameters, and a monotonic
+/// sequence number so replay preserves original ordering.
+#[derive(Debug, Clone)]
+pub struct DeferredWrite {
+    /// Monotonically increasing sequence number (ordering key).
+    pub seq: u64,
+    /// The SQL statement to replay (INSERT, UPDATE, DELETE).
+    pub sql: String,
+    /// Bound parameters.
+    pub params: Vec<Value>,
+    /// Wall-clock timestamp (microseconds) when the write was deferred.
+    pub deferred_at_us: i64,
+    /// Caller context for diagnostics (e.g. "send_message", "register_agent").
+    pub operation: &'static str,
+}
+
+/// Outcome of attempting to enqueue a write into the deferral queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferralOutcome {
+    /// Write was accepted into the queue and will be replayed after recovery.
+    Queued { position: u64 },
+    /// Queue is full — backpressure applied, caller should fail the write.
+    BackpressureFull { capacity: usize },
+    /// Queue is not active (durability state is not `Recovering`).
+    NotRecovering,
+    /// Queue has been sealed — no new writes accepted (drain in progress).
+    Sealed,
+}
+
+/// Outcome of replaying deferred writes after recovery completes.
+#[derive(Debug, Clone)]
+pub struct ReplayResult {
+    /// Number of writes successfully replayed.
+    pub replayed: usize,
+    /// Number of writes that failed during replay (logged, not retried).
+    pub failed: usize,
+    /// Total writes that were in the queue.
+    pub total: usize,
+}
+
+/// Bounded FIFO queue for writes deferred during `Recovering` state.
+///
+/// **Lifecycle:**
+///
+/// 1. When the durability state transitions to `Recovering`, call [`activate()`]
+///    to accept writes.
+/// 2. While active, callers use [`enqueue()`] to defer writes instead of
+///    hitting the live DB. The queue enforces a hard capacity limit; writes
+///    beyond the limit receive [`DeferralOutcome::BackpressureFull`].
+/// 3. When recovery completes (state → `Healthy`), call [`seal_and_drain()`]
+///    to atomically stop accepting new writes and return all queued entries
+///    in order for replay.
+/// 4. After successful replay, call [`reset()`] to prepare for the next
+///    recovery cycle.
+///
+/// The queue is `Sync` and safe for concurrent producers — interior
+/// synchronization uses a `Mutex` held only for the duration of a push/drain.
+///
+/// [`activate()`]: DeferredWriteQueue::activate
+/// [`enqueue()`]: DeferredWriteQueue::enqueue
+/// [`seal_and_drain()`]: DeferredWriteQueue::seal_and_drain
+/// [`reset()`]: DeferredWriteQueue::reset
+pub struct DeferredWriteQueue {
+    state: Mutex<DeferredWriteQueueInner>,
+}
+
+#[derive(Debug)]
+struct DeferredWriteQueueInner {
+    /// Whether the queue is accepting writes.
+    active: bool,
+    /// Whether the queue has been sealed (drain in progress, no new writes).
+    sealed: bool,
+    /// Monotonic sequence counter.
+    next_seq: u64,
+    /// The actual FIFO buffer.
+    entries: Vec<DeferredWrite>,
+    /// Hard capacity limit (backpressure threshold).
+    capacity: usize,
+}
+
+/// Default capacity: 1024 deferred writes before backpressure kicks in.
+///
+/// This is generous enough for a typical recovery window (seconds to low
+/// minutes) at normal multi-agent write rates (~10-50 writes/sec), while
+/// preventing unbounded memory growth if recovery stalls.
+pub const DEFAULT_DEFERRED_WRITE_CAPACITY: usize = 1024;
+
+impl DeferredWriteQueue {
+    /// Create a new inactive queue with the given capacity.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(DeferredWriteQueueInner {
+                active: false,
+                sealed: false,
+                next_seq: 0,
+                entries: Vec::new(),
+                capacity,
+            }),
+        }
+    }
+
+    /// Create a new inactive queue with [`DEFAULT_DEFERRED_WRITE_CAPACITY`].
+    #[must_use]
+    pub fn with_default_capacity() -> Self {
+        Self::new(DEFAULT_DEFERRED_WRITE_CAPACITY)
+    }
+
+    /// Activate the queue to begin accepting writes.
+    ///
+    /// Call this when the durability state transitions to `Recovering`.
+    /// If already active, this is a no-op.
+    pub fn activate(&self) {
+        let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        inner.active = true;
+        inner.sealed = false;
+    }
+
+    /// Whether the queue is currently active and accepting writes.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        inner.active && !inner.sealed
+    }
+
+    /// Current number of queued writes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        inner.entries.len()
+    }
+
+    /// Whether the queue is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Attempt to enqueue a deferred write.
+    ///
+    /// Returns the outcome indicating whether the write was accepted,
+    /// rejected due to backpressure, or refused because the queue is
+    /// not in the right state.
+    pub fn enqueue(
+        &self,
+        sql: String,
+        params: Vec<Value>,
+        operation: &'static str,
+    ) -> DeferralOutcome {
+        let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+
+        if !inner.active {
+            return DeferralOutcome::NotRecovering;
+        }
+        if inner.sealed {
+            return DeferralOutcome::Sealed;
+        }
+        if inner.entries.len() >= inner.capacity {
+            return DeferralOutcome::BackpressureFull {
+                capacity: inner.capacity,
+            };
+        }
+
+        let seq = inner.next_seq;
+        inner.next_seq = seq.wrapping_add(1);
+        inner.entries.push(DeferredWrite {
+            seq,
+            sql,
+            params,
+            deferred_at_us: crate::now_micros(),
+            operation,
+        });
+
+        DeferralOutcome::Queued { position: seq }
+    }
+
+    /// Seal the queue and drain all entries for replay.
+    ///
+    /// After this call, [`enqueue()`] returns [`DeferralOutcome::Sealed`]
+    /// until [`reset()`] is called. The returned entries are sorted by
+    /// sequence number (insertion order).
+    ///
+    /// [`enqueue()`]: DeferredWriteQueue::enqueue
+    /// [`reset()`]: DeferredWriteQueue::reset
+    pub fn seal_and_drain(&self) -> Vec<DeferredWrite> {
+        let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        inner.sealed = true;
+        inner.active = false;
+        let mut entries = std::mem::take(&mut inner.entries);
+        entries.sort_by_key(|e| e.seq);
+        entries
+    }
+
+    /// Reset the queue to its initial inactive state.
+    ///
+    /// Call after replay completes (or after recovery is abandoned).
+    pub fn reset(&self) {
+        let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        inner.active = false;
+        inner.sealed = false;
+        inner.next_seq = 0;
+        inner.entries.clear();
+    }
+
+    /// Snapshot for diagnostics.
+    #[must_use]
+    pub fn status(&self) -> DeferredWriteQueueStatus {
+        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        DeferredWriteQueueStatus {
+            active: inner.active,
+            sealed: inner.sealed,
+            queued: inner.entries.len(),
+            capacity: inner.capacity,
+            next_seq: inner.next_seq,
+        }
+    }
+}
+
+/// Diagnostic snapshot of the deferred write queue.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeferredWriteQueueStatus {
+    pub active: bool,
+    pub sealed: bool,
+    pub queued: usize,
+    pub capacity: usize,
+    pub next_seq: u64,
+}
+
+/// Global singleton deferred write queue.
+///
+/// Shared by all write paths in the process.
+static DEFERRED_WRITE_QUEUE: OnceLock<DeferredWriteQueue> = OnceLock::new();
+
+/// Access the global deferred write queue.
+#[must_use]
+pub fn deferred_write_queue() -> &'static DeferredWriteQueue {
+    DEFERRED_WRITE_QUEUE.get_or_init(DeferredWriteQueue::with_default_capacity)
+}
+
+// ============================================================================
+
 /// Default pool configuration values — sized for 1000+ concurrent agents.
 ///
 /// ## Sizing rationale
@@ -2057,7 +2583,7 @@ fn ensure_sqlite_parent_dir_exists(path: &str) -> Result<(), SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
-fn open_sqlite_file_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlError> {
+pub(crate) fn open_sqlite_file_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlError> {
     open_sqlite_file_with_lock_retry_impl(
         sqlite_path,
         |path| DbConn::open_file(path),
@@ -2711,6 +3237,11 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
 fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
     let config = mcp_agent_mail_core::Config::from_env();
     let storage_root_path = config.storage_root.as_path();
+
+    // Capture pre-recovery snapshot before any mutation.
+    let _snapshot =
+        crate::forensics::capture_pre_recovery_snapshot(primary_path, "automatic-recovery")
+            .with_environment(storage_root_path, &config.database_url);
     if is_real_directory(storage_root_path) {
         return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
     }

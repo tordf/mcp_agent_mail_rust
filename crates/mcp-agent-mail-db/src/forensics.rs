@@ -10,7 +10,8 @@ use crate::{
         inspect_mailbox_db_inventory, inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state,
     },
     reconstruct::{
-        ArchiveMessageInventory, archive_missing_project_identities, scan_archive_message_inventory,
+        ArchiveMessageInventory, archive_missing_project_identities,
+        compute_archive_drift_report, scan_archive_message_inventory,
     },
 };
 use serde::Serialize;
@@ -36,22 +37,22 @@ pub struct MailboxForensicCapture<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ForensicProcessHolder {
-    pid: u32,
-    roles: Vec<String>,
-    cmdline: Option<String>,
-    exe_path: Option<String>,
-    exe_deleted: bool,
+pub struct ForensicProcessHolder {
+    pub pid: u32,
+    pub roles: Vec<String>,
+    pub cmdline: Option<String>,
+    pub exe_path: Option<String>,
+    pub exe_deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ForensicFileLock {
-    role: String,
-    pid: u32,
-    lock_type: String,
-    access: String,
-    range_start: String,
-    range_end: String,
+pub struct ForensicFileLock {
+    pub role: String,
+    pub pid: u32,
+    pub lock_type: String,
+    pub access: String,
+    pub range_start: String,
+    pub range_end: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -61,6 +62,160 @@ struct FileIdentity {
     ino: u64,
     major: u32,
     minor: u32,
+}
+
+// ============================================================================
+// Pre-recovery snapshot
+// ============================================================================
+
+/// Lightweight snapshot of live DB state captured immediately before recovery.
+///
+/// This is cheaper than a full forensic bundle — it reads only file metadata
+/// and `/proc` state, never opens the SQLite file or walks the archive.
+/// Recovery callers should capture this *before* any mutation, close, or
+/// rename so that the evidence reflects the state that triggered recovery.
+#[derive(Debug, Clone, Serialize)]
+pub struct ForensicPreSnapshot {
+    /// Trigger that caused the snapshot (e.g. "startup-integrity", "runtime-corruption").
+    pub trigger: String,
+    /// Canonical path to the primary DB file.
+    pub db_path: String,
+    /// Database family name (e.g. "storage.sqlite3"), derived from the DB path.
+    pub db_family: String,
+    /// Primary DB file size in bytes, or `None` if missing.
+    pub db_bytes: Option<u64>,
+    /// WAL file size in bytes, or `None` if missing.
+    pub wal_bytes: Option<u64>,
+    /// SHM file size in bytes, or `None` if missing.
+    pub shm_bytes: Option<u64>,
+    /// SQLite page size read from the DB header (bytes 16..18), or `None` on error.
+    pub page_size: Option<u32>,
+    /// Total page count read from the DB header (bytes 28..32), or `None` on error.
+    pub page_count: Option<u32>,
+    /// Processes with open file descriptors on the DB/WAL/SHM files.
+    pub process_holders: Vec<ForensicProcessHolder>,
+    /// File-level locks held on the DB/WAL/SHM files.
+    pub file_locks: Vec<ForensicFileLock>,
+    /// Whether a `.recovery.lock` file exists and is held by a live process.
+    pub recovery_lock_active: bool,
+    /// PID recorded in the recovery lock file, if any.
+    pub recovery_lock_pid: Option<u32>,
+    /// PID of the current process (for cross-reference with holders).
+    pub self_pid: u32,
+    /// Microsecond timestamp when the snapshot was taken.
+    pub captured_at_us: i64,
+    /// Storage root path, if provided via [`with_environment`](Self::with_environment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<String>,
+    /// Redacted `DATABASE_URL`, if provided via [`with_environment`](Self::with_environment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_url_redacted: Option<String>,
+}
+
+impl ForensicPreSnapshot {
+    /// Attach environment/config context to the snapshot.
+    ///
+    /// Call this after [`capture_pre_recovery_snapshot`] when you have access
+    /// to the storage root and database URL.  The URL is automatically redacted
+    /// to strip credentials.
+    #[must_use]
+    pub fn with_environment(mut self, storage_root: &Path, database_url: &str) -> Self {
+        self.storage_root = Some(storage_root.display().to_string());
+        self.database_url_redacted = Some(redact_database_url(database_url));
+        self
+    }
+}
+
+/// Read SQLite page size and page count from the database file header.
+///
+/// The header format is fixed: bytes 16..18 hold the page size as a big-endian
+/// u16 (with 1 meaning 65536), and bytes 28..32 hold the page count as a
+/// big-endian u32.  Returns `(page_size, page_count)` or `None` on any error.
+fn read_sqlite_header_fields(db_path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(db_path).ok()?;
+    let mut header = [0u8; 32];
+    file.read_exact(&mut header).ok()?;
+
+    // Bytes 0..16 are the magic string "SQLite format 3\000".
+    if &header[..16] != b"SQLite format 3\0" {
+        return None;
+    }
+
+    let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size: u32 = if raw_page_size == 1 {
+        65_536
+    } else {
+        u32::from(raw_page_size)
+    };
+    let page_count = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
+    Some((page_size, page_count))
+}
+
+/// Capture a lightweight pre-recovery snapshot of the live DB state.
+///
+/// This reads file metadata and `/proc` state without opening the SQLite
+/// connection, so it is safe to call even when the DB is corrupt or locked.
+#[must_use]
+pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicPreSnapshot {
+    let db_bytes = std::fs::metadata(db_path).ok().map(|m| m.len());
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    let wal_bytes = std::fs::metadata(&wal_path).ok().map(|m| m.len());
+    let shm_bytes = std::fs::metadata(&shm_path).ok().map(|m| m.len());
+    let (page_size, page_count) = read_sqlite_header_fields(db_path)
+        .map(|(ps, pc)| (Some(ps), Some(pc)))
+        .unwrap_or((None, None));
+
+    let family_paths: Vec<(&str, PathBuf)> = vec![
+        ("db", db_path.to_path_buf()),
+        ("wal", wal_path),
+        ("shm", shm_path),
+    ];
+    let process_holders = process_holders_for_paths(&family_paths);
+    let file_locks = file_locks_for_paths(&family_paths);
+
+    // Recovery lock state — derived from the well-known sidecar path.
+    let recovery_lock = inspect_mailbox_recovery_lock(db_path);
+    let recovery_lock_active = recovery_lock.active;
+    let recovery_lock_pid = recovery_lock.pid;
+
+    let snapshot = ForensicPreSnapshot {
+        trigger: trigger.to_string(),
+        db_path: db_path.display().to_string(),
+        db_family: forensic_db_family_name(db_path),
+        db_bytes,
+        wal_bytes,
+        shm_bytes,
+        page_size,
+        page_count,
+        process_holders,
+        file_locks,
+        recovery_lock_active,
+        recovery_lock_pid,
+        self_pid: std::process::id(),
+        captured_at_us: mcp_agent_mail_core::timestamps::now_micros(),
+        storage_root: None,
+        database_url_redacted: None,
+    };
+
+    tracing::info!(
+        db_path = %snapshot.db_path,
+        db_family = %snapshot.db_family,
+        trigger = %snapshot.trigger,
+        db_bytes = ?snapshot.db_bytes,
+        wal_bytes = ?snapshot.wal_bytes,
+        page_size = ?snapshot.page_size,
+        page_count = ?snapshot.page_count,
+        holders = snapshot.process_holders.len(),
+        locks = snapshot.file_locks.len(),
+        recovery_lock_active = snapshot.recovery_lock_active,
+        recovery_lock_pid = ?snapshot.recovery_lock_pid,
+        "captured pre-recovery forensic snapshot"
+    );
+
+    snapshot
 }
 
 fn redact_database_url(url: &str) -> String {
@@ -683,6 +838,7 @@ pub fn capture_mailbox_forensic_bundle(
     let references_dir = bundle_dir.join("references");
     let live_db_state = build_live_db_reference(capture);
     let archive_drift = build_archive_drift_reference(capture);
+    let archive_drift_report = compute_archive_drift_report(capture.storage_root, capture.db_path);
     let environment = build_environment_reference(capture);
 
     let mut reference_artifacts = serde_json::Map::new();
@@ -710,6 +866,29 @@ pub fn capture_mailbox_forensic_bundle(
             &archive_drift,
         )?,
     );
+    match archive_drift_report {
+        Ok(drift_report) => {
+            reference_artifacts.insert(
+                "archive_drift_report".to_string(),
+                add_report_artifact(
+                    &bundle_dir,
+                    &mut files,
+                    &references_dir.join("archive-drift-report.json"),
+                    "report",
+                    "archive_drift_report",
+                    "mcp-agent-mail-archive-drift-report.v1",
+                    &drift_report,
+                )?,
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to compute archive drift report for forensic bundle"
+            );
+        }
+    }
+
     reference_artifacts.insert(
         "environment".to_string(),
         add_report_artifact(
@@ -744,6 +923,7 @@ pub fn capture_mailbox_forensic_bundle(
         "references": {
             "live_db_state": "references/live-db-state.json",
             "archive_drift": "references/archive-drift.json",
+            "archive_drift_report": "references/archive-drift-report.json",
             "environment": "references/environment.json",
         },
     });
@@ -767,6 +947,7 @@ pub fn capture_mailbox_forensic_bundle(
 
     let mut referenced_evidence = BTreeSet::from([
         "archive_drift".to_string(),
+        "archive_drift_report".to_string(),
         "environment_summary".to_string(),
         "live_db_state".to_string(),
     ]);
@@ -825,7 +1006,10 @@ pub fn capture_mailbox_forensic_bundle(
 
 #[cfg(test)]
 mod tests {
-    use super::{MailboxForensicCapture, capture_mailbox_forensic_bundle};
+    use super::{
+        MailboxForensicCapture, capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot,
+        read_sqlite_header_fields,
+    };
 
     #[test]
     fn capture_mailbox_forensic_bundle_records_reference_reports() {
@@ -909,6 +1093,177 @@ mod tests {
                 .join("archive-drift.json")
                 .exists(),
             "archive drift evidence should still be recorded"
+        );
+    }
+
+    // ── ForensicPreSnapshot tests ────────────────────────────────────
+
+    #[test]
+    fn pre_snapshot_captures_existing_db_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.sqlite3");
+        // Write a minimal valid SQLite header (100 bytes).
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        // Page size = 4096 (big-endian u16 at offset 16).
+        header[16] = 0x10;
+        header[17] = 0x00;
+        // Page count = 42 (big-endian u32 at offset 28).
+        header[28] = 0;
+        header[29] = 0;
+        header[30] = 0;
+        header[31] = 42;
+        std::fs::write(&db_path, &header).expect("write db");
+
+        // Create a WAL sidecar.
+        let wal_path = dir.path().join("test.sqlite3-wal");
+        std::fs::write(&wal_path, vec![0u8; 512]).expect("write wal");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "test-trigger");
+
+        assert_eq!(snap.trigger, "test-trigger");
+        assert_eq!(snap.db_family, "test.sqlite3");
+        assert_eq!(snap.db_bytes, Some(100));
+        assert_eq!(snap.wal_bytes, Some(512));
+        assert!(snap.shm_bytes.is_none());
+        assert_eq!(snap.page_size, Some(4096));
+        assert_eq!(snap.page_count, Some(42));
+        assert!(!snap.recovery_lock_active);
+        assert!(snap.recovery_lock_pid.is_none());
+        assert_eq!(snap.self_pid, std::process::id());
+        assert!(snap.captured_at_us > 0);
+        // Environment fields are None until with_environment is called.
+        assert!(snap.storage_root.is_none());
+        assert!(snap.database_url_redacted.is_none());
+    }
+
+    #[test]
+    fn pre_snapshot_handles_missing_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("nonexistent.sqlite3");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "missing-db");
+
+        assert!(snap.db_bytes.is_none());
+        assert!(snap.wal_bytes.is_none());
+        assert!(snap.shm_bytes.is_none());
+        assert!(snap.page_size.is_none());
+        assert!(snap.page_count.is_none());
+    }
+
+    #[test]
+    fn pre_snapshot_handles_non_sqlite_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("not_sqlite.db");
+        std::fs::write(&db_path, b"this is not a sqlite file").expect("write");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "corrupt");
+
+        assert_eq!(snap.db_bytes, Some(25));
+        assert!(snap.page_size.is_none(), "non-sqlite header should yield None");
+        assert!(snap.page_count.is_none());
+    }
+
+    #[test]
+    fn pre_snapshot_serializes_to_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("serial.sqlite3");
+        std::fs::write(&db_path, b"short").expect("write");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "json-test");
+        let json = serde_json::to_value(&snap).expect("serialize");
+
+        assert_eq!(json["trigger"], "json-test");
+        assert_eq!(json["db_family"], "serial.sqlite3");
+        assert!(json["self_pid"].is_number());
+        assert!(json["captured_at_us"].is_number());
+        assert!(json["process_holders"].is_array());
+        assert!(json["file_locks"].is_array());
+        assert_eq!(json["recovery_lock_active"], false);
+        // Optional env fields should be absent when not set.
+        assert!(json.get("storage_root").is_none());
+        assert!(json.get("database_url_redacted").is_none());
+    }
+
+    #[test]
+    fn pre_snapshot_with_environment_attaches_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("env.sqlite3");
+        std::fs::write(&db_path, b"short").expect("write");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "env-test")
+            .with_environment(dir.path(), "sqlite:///secret@host/db.sqlite3");
+
+        assert_eq!(snap.storage_root.as_deref(), Some(dir.path().to_str().unwrap()));
+        assert_eq!(
+            snap.database_url_redacted.as_deref(),
+            Some("sqlite:///secret@host/db.sqlite3")
+        );
+        // Verify JSON includes the environment fields.
+        let json = serde_json::to_value(&snap).expect("serialize");
+        assert!(json["storage_root"].is_string());
+        assert!(json["database_url_redacted"].is_string());
+    }
+
+    #[test]
+    fn pre_snapshot_detects_active_recovery_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("locked.sqlite3");
+        std::fs::write(&db_path, b"data").expect("write db");
+
+        // Write a recovery lock file with our own PID (guaranteed alive).
+        let lock_path = dir.path().join("locked.sqlite3.recovery.lock");
+        std::fs::write(&lock_path, std::process::id().to_string()).expect("write lock");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "lock-test");
+
+        assert!(snap.recovery_lock_active, "should detect live recovery lock");
+        assert_eq!(snap.recovery_lock_pid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn pre_snapshot_detects_stale_recovery_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("stale.sqlite3");
+        std::fs::write(&db_path, b"data").expect("write db");
+
+        // PID 999999999 almost certainly doesn't exist.
+        let lock_path = dir.path().join("stale.sqlite3.recovery.lock");
+        std::fs::write(&lock_path, "999999999").expect("write lock");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "stale-lock");
+
+        assert!(!snap.recovery_lock_active, "stale lock should not be active");
+        assert_eq!(snap.recovery_lock_pid, Some(999_999_999));
+    }
+
+    #[test]
+    fn read_sqlite_header_fields_page_size_1_means_65536() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("big_page.sqlite3");
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        // Page size = 1 means 65536.
+        header[16] = 0x00;
+        header[17] = 0x01;
+        // Page count = 1.
+        header[31] = 1;
+        std::fs::write(&db_path, &header).expect("write");
+
+        let (ps, pc) = read_sqlite_header_fields(&db_path).expect("valid header");
+        assert_eq!(ps, 65_536);
+        assert_eq!(pc, 1);
+    }
+
+    #[test]
+    fn read_sqlite_header_fields_rejects_truncated_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("truncated.sqlite3");
+        std::fs::write(&db_path, b"SQLite format 3\0").expect("write");
+
+        assert!(
+            read_sqlite_header_fields(&db_path).is_none(),
+            "16-byte file should fail (need 32 bytes)"
         );
     }
 }

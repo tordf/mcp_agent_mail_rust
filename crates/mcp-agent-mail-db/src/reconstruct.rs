@@ -21,6 +21,7 @@
 
 use crate::error::{DbError, DbResult};
 use crate::schema;
+use serde::Serialize;
 use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_sqlite::SqliteConnection as SqliteDbConn;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -70,7 +71,7 @@ pub struct ReconstructStats {
     duplicate_canonical_id_set: BTreeSet<i64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct MailboxProjectIdentity {
     pub slug: Option<String>,
     pub human_key: Option<String>,
@@ -308,6 +309,371 @@ pub fn archive_missing_project_identities(
         })
         .map(MailboxProjectIdentity::display_label)
         .collect()
+}
+
+// ============================================================================
+// Archive drift report — per-message-ID evidence for forensic bundles
+// ============================================================================
+
+/// A project identity seen in one source but not the other, or present in both
+/// but with conflicting slug/human_key values.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectIdentityMismatch {
+    /// The identity as seen in the archive (if present).
+    pub archive: Option<MailboxProjectIdentity>,
+    /// The identity as seen in the database (if present).
+    pub db: Option<MailboxProjectIdentity>,
+    /// Human-readable description of the mismatch.
+    pub reason: String,
+}
+
+/// Per-message-ID drift evidence captured before any reconstruct or recovery
+/// mutation, so that callers can reason about exactly which messages the archive
+/// has that the DB does not, and vice versa.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveDriftReport {
+    /// Schema marker for downstream tooling.
+    pub schema: ArchiveDriftReportSchema,
+    /// Microsecond timestamp when the report was generated.
+    pub captured_at_us: i64,
+    /// Total unique message IDs in the archive.
+    pub archive_message_count: usize,
+    /// Total message IDs in the database.
+    pub db_message_count: usize,
+    /// Messages present in both archive and DB.
+    pub shared_message_count: usize,
+    /// Message IDs present in the archive but absent from the DB.
+    pub archive_only_ids: BTreeSet<i64>,
+    /// Message IDs present in the DB but absent from the archive.
+    pub db_only_ids: BTreeSet<i64>,
+    /// Project identity mismatches between archive and DB.
+    pub identity_mismatches: Vec<ProjectIdentityMismatch>,
+    /// Archive inventory counts (for cross-reference with existing drift checks).
+    pub archive_projects: usize,
+    /// DB project count.
+    pub db_projects: usize,
+    /// Archive agent count.
+    pub archive_agents: usize,
+    /// DB agent count.
+    pub db_agents: usize,
+    /// Largest message ID in the archive.
+    pub archive_latest_message_id: Option<i64>,
+    /// Largest message ID in the DB.
+    pub db_max_message_id: i64,
+    /// Warnings or errors encountered while building the report.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveDriftReportSchema {
+    pub name: &'static str,
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl Default for ArchiveDriftReportSchema {
+    fn default() -> Self {
+        Self {
+            name: "mcp-agent-mail-archive-drift-report",
+            major: 1,
+            minor: 0,
+        }
+    }
+}
+
+impl ArchiveDriftReport {
+    /// True when there is any per-ID drift (archive-only or db-only messages).
+    #[must_use]
+    pub fn has_message_drift(&self) -> bool {
+        !self.archive_only_ids.is_empty() || !self.db_only_ids.is_empty()
+    }
+
+    /// True when there are project identity mismatches.
+    #[must_use]
+    pub fn has_identity_drift(&self) -> bool {
+        !self.identity_mismatches.is_empty()
+    }
+
+    /// True when there is any drift at all.
+    #[must_use]
+    pub fn has_any_drift(&self) -> bool {
+        self.has_message_drift() || self.has_identity_drift()
+    }
+}
+
+/// Walk the archive and return the full set of positive message IDs found in
+/// canonical message files (frontmatter `"id"` fields).
+///
+/// This is a heavier variant of [`scan_archive_message_inventory`] that retains
+/// the actual ID set instead of only counting unique entries.
+#[must_use]
+pub fn scan_archive_message_ids(storage_root: &Path) -> (BTreeSet<i64>, usize) {
+    let mut ids = BTreeSet::new();
+    let mut parse_errors: usize = 0;
+    let projects_dir = storage_root.join("projects");
+    if !is_real_directory(&projects_dir) {
+        return (ids, parse_errors);
+    }
+
+    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+        return (ids, parse_errors);
+    };
+
+    for entry in project_entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        collect_project_archive_message_ids(&path.join("messages"), &mut ids, &mut parse_errors);
+    }
+
+    (ids, parse_errors)
+}
+
+fn collect_project_archive_message_ids(
+    messages_dir: &Path,
+    ids: &mut BTreeSet<i64>,
+    parse_errors: &mut usize,
+) {
+    if !is_real_directory(messages_dir) {
+        return;
+    }
+
+    let Ok(year_entries) = std::fs::read_dir(messages_dir) else {
+        return;
+    };
+
+    for year_entry in year_entries.flatten() {
+        let year_path = year_entry.path();
+        let Ok(year_type) = year_entry.file_type() else {
+            continue;
+        };
+        if !year_type.is_dir() || year_type.is_symlink() {
+            continue;
+        }
+        let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if year_name.len() != 4 || !year_name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+
+        let Ok(month_entries) = std::fs::read_dir(&year_path) else {
+            continue;
+        };
+        for month_entry in month_entries.flatten() {
+            let month_path = month_entry.path();
+            let Ok(month_type) = month_entry.file_type() else {
+                continue;
+            };
+            if !month_type.is_dir() || month_type.is_symlink() {
+                continue;
+            }
+            let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if month_name.len() != 2 || !month_name.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+
+            let Ok(file_entries) = std::fs::read_dir(&month_path) else {
+                continue;
+            };
+            for file_entry in file_entries.flatten() {
+                let file_path = file_entry.path();
+                let Ok(file_type) = file_entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file()
+                    || file_type.is_symlink()
+                    || file_path.extension().is_none_or(|ext| ext != "md")
+                {
+                    continue;
+                }
+                match scan_archive_message_id(&file_path) {
+                    Ok(Some(message_id)) => {
+                        ids.insert(message_id);
+                    }
+                    Ok(None) => {}
+                    Err(_) => *parse_errors += 1,
+                }
+            }
+        }
+    }
+}
+
+/// Query the database for all message IDs.
+#[allow(clippy::result_large_err)]
+pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError> {
+    let db_str = db_path.to_string_lossy();
+    let conn = SqliteDbConn::open_file(db_str.as_ref()).map_err(|e| {
+        SqlError::Custom(format!(
+            "collect_db_message_ids: cannot open {}: {e}",
+            db_path.display()
+        ))
+    })?;
+    // Check if messages table exists.
+    let tables = conn.query_sync(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
+        &[],
+    )?;
+    if tables.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let rows = conn.query_sync("SELECT id FROM messages", &[])?;
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        if let Ok(id) = row.get_named::<i64>("id") {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Compare project identities between archive and DB, returning mismatches.
+fn compute_identity_mismatches(
+    archive_identities: &BTreeSet<MailboxProjectIdentity>,
+    db_identities: &BTreeSet<MailboxProjectIdentity>,
+) -> Vec<ProjectIdentityMismatch> {
+    let mut mismatches = Vec::new();
+
+    // Archive identities not matched in DB.
+    for archive_id in archive_identities {
+        if !mailbox_project_identity_matches_db(archive_id, db_identities) {
+            // Check if there's a partial match (token overlap but not exact).
+            let candidates = project_identity_token_candidates(archive_id, db_identities);
+            if candidates.is_empty() {
+                mismatches.push(ProjectIdentityMismatch {
+                    archive: Some(archive_id.clone()),
+                    db: None,
+                    reason: format!(
+                        "Archive project {} has no matching DB identity",
+                        archive_id.display_label()
+                    ),
+                });
+            } else {
+                for candidate in candidates {
+                    mismatches.push(ProjectIdentityMismatch {
+                        archive: Some(archive_id.clone()),
+                        db: Some(candidate.clone()),
+                        reason: format!(
+                            "Archive project {} has ambiguous match with DB project {}",
+                            archive_id.display_label(),
+                            candidate.display_label()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // DB identities not found in archive (reverse check).
+    for db_id in db_identities {
+        let has_archive_match = archive_identities
+            .iter()
+            .any(|archive_id| archive_id.exact_matches(db_id));
+        let has_token_match = !archive_identities.is_empty()
+            && archive_identities.iter().any(|archive_id| {
+                let archive_tokens = project_identity_match_tokens(archive_id);
+                let db_tokens = project_identity_match_tokens(db_id);
+                !archive_tokens.is_disjoint(&db_tokens)
+            });
+        if !has_archive_match && !has_token_match {
+            mismatches.push(ProjectIdentityMismatch {
+                archive: None,
+                db: Some(db_id.clone()),
+                reason: format!(
+                    "DB project {} has no matching archive identity",
+                    db_id.display_label()
+                ),
+            });
+        }
+    }
+
+    mismatches
+}
+
+/// Compute a full archive drift report with per-message-ID evidence.
+///
+/// This captures the state of both the archive and the DB *before* any
+/// reconstruct or recovery mutation, so the report reflects the pre-mutation
+/// evidence that explains why drift exists.
+///
+/// # Errors
+///
+/// Returns an error only if the database cannot be opened or queried.
+/// Archive scan failures are recorded as warnings, not errors.
+pub fn compute_archive_drift_report(
+    storage_root: &Path,
+    db_path: &Path,
+) -> DbResult<ArchiveDriftReport> {
+    let mut warnings = Vec::new();
+    let captured_at_us = crate::now_micros();
+
+    // Scan archive for full message ID set.
+    let (archive_ids, archive_parse_errors) = scan_archive_message_ids(storage_root);
+    if archive_parse_errors > 0 {
+        warnings.push(format!(
+            "{archive_parse_errors} archive message file(s) failed to parse"
+        ));
+    }
+
+    // Scan archive for inventory counts (projects, agents, identities).
+    let archive_inventory = scan_archive_message_inventory(storage_root);
+
+    // Query DB for full message ID set.
+    let db_ids = match collect_db_message_ids(db_path) {
+        Ok(ids) => ids,
+        Err(error) => {
+            warnings.push(format!("Cannot read DB message IDs: {error}"));
+            BTreeSet::new()
+        }
+    };
+
+    // Query DB inventory for project/agent counts and identities.
+    let (db_projects, db_agents, db_max_message_id, db_identities) =
+        match crate::pool::inspect_mailbox_db_inventory(db_path) {
+            Ok(inv) => (
+                inv.projects,
+                inv.agents,
+                inv.max_message_id,
+                inv.project_identities,
+            ),
+            Err(error) => {
+                warnings.push(format!("Cannot read DB inventory: {error}"));
+                (0, 0, 0, BTreeSet::new())
+            }
+        };
+
+    // Compute set differences.
+    let archive_only_ids: BTreeSet<i64> = archive_ids.difference(&db_ids).copied().collect();
+    let db_only_ids: BTreeSet<i64> = db_ids.difference(&archive_ids).copied().collect();
+    let shared_message_count = archive_ids.intersection(&db_ids).count();
+
+    // Compute identity mismatches.
+    let identity_mismatches =
+        compute_identity_mismatches(&archive_inventory.project_identities, &db_identities);
+
+    Ok(ArchiveDriftReport {
+        schema: ArchiveDriftReportSchema::default(),
+        captured_at_us,
+        archive_message_count: archive_ids.len(),
+        db_message_count: db_ids.len(),
+        shared_message_count,
+        archive_only_ids,
+        db_only_ids,
+        identity_mismatches,
+        archive_projects: archive_inventory.projects,
+        db_projects,
+        archive_agents: archive_inventory.agents,
+        db_agents,
+        archive_latest_message_id: archive_inventory.latest_message_id,
+        db_max_message_id,
+        warnings,
+    })
 }
 
 #[allow(clippy::result_large_err)]

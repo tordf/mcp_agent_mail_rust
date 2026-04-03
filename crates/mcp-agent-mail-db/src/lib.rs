@@ -98,7 +98,10 @@ pub mod tracking;
 pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
 pub use error::{DbError, DbResult, is_corruption_error, is_lock_error, is_pool_exhausted_error};
-pub use forensics::{MailboxForensicCapture, capture_mailbox_forensic_bundle};
+pub use forensics::{
+    ForensicFileLock, ForensicPreSnapshot, ForensicProcessHolder, MailboxForensicCapture,
+    capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot,
+};
 pub use integrity::{
     CheckKind, IntegrityCheckResult, IntegrityMetrics, MailboxIntegrityStatus,
     MailboxIntegrityVerdict, attempt_vacuum_recovery, full_check, incremental_check,
@@ -119,7 +122,9 @@ pub use migrate::{
 pub use models::*;
 pub use pool::{
     DbPool, DbPoolConfig, MailboxDbInventory, MailboxRecoveryLockState, MailboxSidecarState,
-    RecoveryAction, RecoveryApproval, ResolvedMailboxSqlitePath, auto_pool_size, create_pool,
+    DeferralOutcome, DeferredWriteQueue, DeferredWriteQueueStatus, RecoveryAction,
+    RecoveryApproval, ResolvedMailboxSqlitePath, auto_pool_size, create_pool,
+    deferred_write_queue,
     ensure_sqlite_file_healthy, ensure_sqlite_file_healthy_with_archive, get_or_create_pool,
     inspect_mailbox_db_inventory, inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state,
     is_corruption_error_message, is_sqlite_recovery_error_message,
@@ -128,10 +133,12 @@ pub use pool::{
 };
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use reconstruct::{
-    ArchiveMessageInventory, MailboxProjectIdentity, ReconstructStats,
-    archive_missing_project_identities, collect_db_project_identities,
-    mailbox_project_identity_matches_db, reconstruct_from_archive,
-    reconstruct_from_archive_with_salvage, scan_archive_message_inventory,
+    ArchiveDriftReport, ArchiveDriftReportSchema, ArchiveMessageInventory,
+    MailboxProjectIdentity, ProjectIdentityMismatch, ReconstructStats,
+    archive_missing_project_identities, collect_db_message_ids, collect_db_project_identities,
+    compute_archive_drift_report, mailbox_project_identity_matches_db,
+    reconstruct_from_archive, reconstruct_from_archive_with_salvage,
+    scan_archive_message_ids, scan_archive_message_inventory,
 };
 pub use retry::{
     CIRCUIT_BREAKER, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL, CircuitBreaker,

@@ -740,6 +740,630 @@ pub const ALL_ANOMALY_TAGS: &[&str] = &[
 ];
 
 // ============================================================================
+// Archive anomaly scanner
+// ============================================================================
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
+
+/// Required frontmatter fields for a complete message.
+const REQUIRED_FRONTMATTER_FIELDS: &[&str] = &["from", "to", "subject", "created_at"];
+
+/// Slug prefixes that suggest an ephemeral/test project.
+const SUSPICIOUS_SLUG_PREFIXES: &[&str] = &["tmp-", "tmp_", "test-", "test_", "dev-", "dev_"];
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Extract the JSON frontmatter text from a `---json\n...\n---` block.
+fn extract_json_frontmatter(content: &str) -> Option<&str> {
+    let start = content.find("---json")?;
+    let after_start = &content[start..];
+    let json_start = if after_start.starts_with("---json\r\n") {
+        start + "---json\r\n".len()
+    } else if after_start.starts_with("---json\n") {
+        start + "---json\n".len()
+    } else {
+        return None;
+    };
+
+    let mut search_from = json_start;
+    while let Some(relative) = content[search_from..].find("---") {
+        let marker_start = search_from + relative;
+        if marker_start == 0 || !content[..marker_start].ends_with('\n') {
+            search_from = marker_start + 3;
+            continue;
+        }
+
+        let after_marker = marker_start + 3;
+        if after_marker == content.len()
+            || content[after_marker..].starts_with("\r\n")
+            || content[after_marker..].starts_with('\n')
+        {
+            return Some(&content[json_start..marker_start]);
+        }
+
+        search_from = marker_start + 3;
+    }
+
+    None
+}
+
+/// Check whether a slug looks ephemeral or test-oriented.
+fn suspicious_project_reason(slug: &str, human_key: Option<&str>) -> Option<String> {
+    let lower = slug.to_ascii_lowercase();
+    for prefix in SUSPICIOUS_SLUG_PREFIXES {
+        if lower.starts_with(prefix) {
+            return Some(format!(
+                "project slug '{slug}' has ephemeral/test prefix '{prefix}'"
+            ));
+        }
+    }
+
+    if let Some(hk) = human_key {
+        if mcp_agent_mail_core::ephemeral::path_has_ephemeral_root(Path::new(hk)) {
+            return Some(format!(
+                "human_key '{hk}' resolves into a temporary filesystem root"
+            ));
+        }
+    }
+
+    None
+}
+
+/// Scan the archive at `storage_root` for anomalies and return a structured report.
+///
+/// This function walks `{storage_root}/projects/` and inspects:
+///
+/// - **Project metadata**: missing or malformed `project.json`, suspicious/ephemeral slugs
+/// - **Agent profiles**: orphaned agents (parent project unrecognized), missing or
+///   malformed `profile.json`
+/// - **Message files**: duplicate canonical IDs, missing/unparseable JSON frontmatter,
+///   invalid message IDs, incomplete required fields
+/// - **Archive structure**: invalid year/month directory names, non-`.md` files in
+///   message directories, unexpected symlinks
+///
+/// The scanner never modifies the archive. It only reads files and reports findings.
+#[must_use]
+pub fn scan_archive_anomalies(storage_root: &Path) -> ArchiveAnomalyReport {
+    let mut report = ArchiveAnomalyReport::new();
+    let projects_dir = storage_root.join("projects");
+
+    if !is_real_directory(&projects_dir) {
+        return report;
+    }
+
+    // Check for symlink at the projects/ level itself.
+    if is_symlink(&projects_dir) {
+        report.record(ArchiveAnomalyKind::UnexpectedSymlink {
+            path: projects_dir.clone(),
+            target: std::fs::read_link(&projects_dir).ok(),
+        });
+        return report;
+    }
+
+    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+        return report;
+    };
+
+    // Collect and sort project directories for deterministic output.
+    let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
+    for entry in project_entries.flatten() {
+        let path = entry.path();
+
+        // Check for symlinks at the project level.
+        if is_symlink(&path) {
+            report.record(ArchiveAnomalyKind::UnexpectedSymlink {
+                path: path.clone(),
+                target: std::fs::read_link(&path).ok(),
+            });
+            continue;
+        }
+
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(slug) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+            continue;
+        };
+        project_dirs.push((slug, path));
+    }
+    project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Track all canonical message IDs across all projects for global dedup.
+    // Maps message_id -> (first_path, [duplicate_paths]).
+    let mut global_message_ids: BTreeMap<i64, (PathBuf, Vec<PathBuf>)> = BTreeMap::new();
+
+    // Collect recognized project slugs for orphan detection.
+    let recognized_slugs: BTreeSet<String> =
+        project_dirs.iter().map(|(slug, _)| slug.clone()).collect();
+
+    for (slug, project_path) in &project_dirs {
+        // -- Project metadata checks --
+        scan_project_metadata(&mut report, project_path, slug);
+
+        // -- Agent profile checks --
+        scan_project_agents(&mut report, project_path, slug, &recognized_slugs);
+
+        // -- Message file checks (also populates global_message_ids) --
+        scan_project_messages(&mut report, project_path, &mut global_message_ids);
+    }
+
+    // Emit duplicate canonical ID anomalies from the global map.
+    for (message_id, (keep_path, duplicate_paths)) in &global_message_ids {
+        if !duplicate_paths.is_empty() {
+            report.record(ArchiveAnomalyKind::DuplicateCanonicalId {
+                message_id: *message_id,
+                keep_path: keep_path.clone(),
+                duplicate_paths: duplicate_paths.clone(),
+            });
+        }
+    }
+
+    report
+}
+
+/// Check a single project directory for metadata anomalies.
+fn scan_project_metadata(report: &mut ArchiveAnomalyReport, project_path: &Path, slug: &str) {
+    let project_json_path = project_path.join("project.json");
+
+    if !is_real_file(&project_json_path) {
+        // Missing project.json.
+        report.record(ArchiveAnomalyKind::MissingProjectMetadata {
+            project_dir: project_path.to_path_buf(),
+            fallback_slug: slug.to_string(),
+        });
+
+        // Check for suspicious slug even without metadata.
+        if let Some(reason) = suspicious_project_reason(slug, None) {
+            report.record(ArchiveAnomalyKind::SuspiciousEphemeralProject {
+                project_dir: project_path.to_path_buf(),
+                slug: slug.to_string(),
+                human_key: None,
+                reason,
+            });
+        }
+        return;
+    }
+
+    // project.json exists — try to parse it.
+    let content = match std::fs::read_to_string(&project_json_path) {
+        Ok(c) => c,
+        Err(e) => {
+            report.record(ArchiveAnomalyKind::InvalidProjectMetadata {
+                path: project_json_path,
+                slug: slug.to_string(),
+                canonical_human_key: None,
+                detail: format!("cannot read file: {e}"),
+            });
+            return;
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            report.record(ArchiveAnomalyKind::InvalidProjectMetadata {
+                path: project_json_path,
+                slug: slug.to_string(),
+                canonical_human_key: None,
+                detail: format!("malformed JSON: {e}"),
+            });
+            return;
+        }
+    };
+
+    // Check required fields.
+    let json_slug = parsed
+        .get("slug")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let human_key = parsed
+        .get("human_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    if json_slug.is_none() && human_key.is_none() {
+        report.record(ArchiveAnomalyKind::InvalidProjectMetadata {
+            path: project_json_path,
+            slug: slug.to_string(),
+            canonical_human_key: None,
+            detail: "project.json has neither 'slug' nor 'human_key' field".to_string(),
+        });
+    }
+
+    // Check for suspicious project.
+    if let Some(reason) = suspicious_project_reason(slug, human_key.as_deref()) {
+        report.record(ArchiveAnomalyKind::SuspiciousEphemeralProject {
+            project_dir: project_path.to_path_buf(),
+            slug: slug.to_string(),
+            human_key,
+            reason,
+        });
+    }
+}
+
+/// Check agent profile directories under a project.
+fn scan_project_agents(
+    report: &mut ArchiveAnomalyReport,
+    project_path: &Path,
+    _project_slug: &str,
+    _recognized_slugs: &BTreeSet<String>,
+) {
+    let agents_dir = project_path.join("agents");
+    if !is_real_directory(&agents_dir) {
+        return;
+    }
+
+    if is_symlink(&agents_dir) {
+        report.record(ArchiveAnomalyKind::UnexpectedSymlink {
+            path: agents_dir.clone(),
+            target: std::fs::read_link(&agents_dir).ok(),
+        });
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return;
+    };
+
+    let mut agent_dirs: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if is_symlink(&path) {
+            report.record(ArchiveAnomalyKind::UnexpectedSymlink {
+                path: path.clone(),
+                target: std::fs::read_link(&path).ok(),
+            });
+            continue;
+        }
+
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(agent_name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+            continue;
+        };
+        agent_dirs.push((agent_name, path));
+    }
+    agent_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (agent_name, agent_path) in &agent_dirs {
+        let profile_path = agent_path.join("profile.json");
+
+        if !is_real_file(&profile_path) {
+            // Agent directory exists but no profile.json.
+            report.record(ArchiveAnomalyKind::MalformedAgentProfile {
+                profile_path: profile_path.clone(),
+                agent_name: agent_name.clone(),
+                detail: "profile.json is missing".to_string(),
+            });
+            continue;
+        }
+
+        // Try to read and parse the profile.
+        let content = match std::fs::read_to_string(&profile_path) {
+            Ok(c) => c,
+            Err(e) => {
+                report.record(ArchiveAnomalyKind::MalformedAgentProfile {
+                    profile_path: profile_path.clone(),
+                    agent_name: agent_name.clone(),
+                    detail: format!("cannot read file: {e}"),
+                });
+                continue;
+            }
+        };
+
+        if let Err(e) = serde_json::from_str::<serde_json::Value>(&content) {
+            report.record(ArchiveAnomalyKind::MalformedAgentProfile {
+                profile_path: profile_path.clone(),
+                agent_name: agent_name.clone(),
+                detail: format!("malformed JSON: {e}"),
+            });
+        }
+    }
+}
+
+/// Scan message files under a project, checking for frontmatter anomalies and
+/// populating the global duplicate-ID map.
+fn scan_project_messages(
+    report: &mut ArchiveAnomalyReport,
+    project_path: &Path,
+    global_message_ids: &mut BTreeMap<i64, (PathBuf, Vec<PathBuf>)>,
+) {
+    let messages_dir = project_path.join("messages");
+    if !is_real_directory(&messages_dir) {
+        return;
+    }
+
+    if is_symlink(&messages_dir) {
+        report.record(ArchiveAnomalyKind::UnexpectedSymlink {
+            path: messages_dir.clone(),
+            target: std::fs::read_link(&messages_dir).ok(),
+        });
+        return;
+    }
+
+    let Ok(year_entries) = std::fs::read_dir(&messages_dir) else {
+        return;
+    };
+
+    for year_entry in year_entries.flatten() {
+        let year_path = year_entry.path();
+
+        if is_symlink(&year_path) {
+            report.record(ArchiveAnomalyKind::UnexpectedSymlink {
+                path: year_path.clone(),
+                target: std::fs::read_link(&year_path).ok(),
+            });
+            continue;
+        }
+
+        let Ok(year_type) = year_entry.file_type() else {
+            continue;
+        };
+        if !year_type.is_dir() {
+            continue;
+        }
+
+        let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        // Validate year directory name: must be exactly 4 ASCII digits.
+        if year_name.len() != 4 || !year_name.bytes().all(|b| b.is_ascii_digit()) {
+            report.record(ArchiveAnomalyKind::InvalidDateDirectory {
+                path: year_path.clone(),
+                level: DateDirectoryLevel::Year,
+                name: year_name.to_string(),
+            });
+            continue;
+        }
+
+        let Ok(month_entries) = std::fs::read_dir(&year_path) else {
+            continue;
+        };
+
+        for month_entry in month_entries.flatten() {
+            let month_path = month_entry.path();
+
+            if is_symlink(&month_path) {
+                report.record(ArchiveAnomalyKind::UnexpectedSymlink {
+                    path: month_path.clone(),
+                    target: std::fs::read_link(&month_path).ok(),
+                });
+                continue;
+            }
+
+            let Ok(month_type) = month_entry.file_type() else {
+                continue;
+            };
+            if !month_type.is_dir() {
+                continue;
+            }
+
+            let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            // Validate month directory name: must be exactly 2 ASCII digits.
+            if month_name.len() != 2 || !month_name.bytes().all(|b| b.is_ascii_digit()) {
+                report.record(ArchiveAnomalyKind::InvalidDateDirectory {
+                    path: month_path.clone(),
+                    level: DateDirectoryLevel::Month,
+                    name: month_name.to_string(),
+                });
+                continue;
+            }
+
+            let Ok(file_entries) = std::fs::read_dir(&month_path) else {
+                continue;
+            };
+
+            for file_entry in file_entries.flatten() {
+                let file_path = file_entry.path();
+
+                if is_symlink(&file_path) {
+                    report.record(ArchiveAnomalyKind::UnexpectedSymlink {
+                        path: file_path.clone(),
+                        target: std::fs::read_link(&file_path).ok(),
+                    });
+                    continue;
+                }
+
+                let Ok(file_type) = file_entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                // Check for non-.md files.
+                if file_path.extension().is_none_or(|ext| ext != "md") {
+                    report.record(ArchiveAnomalyKind::UnexpectedFileInMessageDir {
+                        path: file_path.clone(),
+                    });
+                    continue;
+                }
+
+                // Parse and validate frontmatter.
+                scan_message_file(report, &file_path, global_message_ids);
+            }
+        }
+    }
+}
+
+/// Scan a single `.md` message file for frontmatter anomalies.
+fn scan_message_file(
+    report: &mut ArchiveAnomalyReport,
+    file_path: &Path,
+    global_message_ids: &mut BTreeMap<i64, (PathBuf, Vec<PathBuf>)>,
+) {
+    let content = match std::fs::read_to_string(file_path) {
+        Ok(c) => c,
+        Err(_) => {
+            // Unreadable file — treat as missing frontmatter.
+            report.record(ArchiveAnomalyKind::MissingFrontmatter {
+                path: file_path.to_path_buf(),
+            });
+            return;
+        }
+    };
+
+    let Some(frontmatter_text) = extract_json_frontmatter(&content) else {
+        report.record(ArchiveAnomalyKind::MissingFrontmatter {
+            path: file_path.to_path_buf(),
+        });
+        return;
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(frontmatter_text) {
+        Ok(v) => v,
+        Err(e) => {
+            report.record(ArchiveAnomalyKind::UnparseableFrontmatter {
+                path: file_path.to_path_buf(),
+                parse_error: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    // Validate message ID.
+    let message_id = match parsed.get("id") {
+        None => {
+            report.record(ArchiveAnomalyKind::InvalidMessageId {
+                path: file_path.to_path_buf(),
+                detail: "missing 'id' field".to_string(),
+            });
+            return;
+        }
+        Some(id_value) => match id_value.as_i64() {
+            None => {
+                report.record(ArchiveAnomalyKind::InvalidMessageId {
+                    path: file_path.to_path_buf(),
+                    detail: format!("'id' is not a valid integer: {id_value}"),
+                });
+                return;
+            }
+            Some(id) if id <= 0 => {
+                report.record(ArchiveAnomalyKind::InvalidMessageId {
+                    path: file_path.to_path_buf(),
+                    detail: format!("'id' is not positive: {id}"),
+                });
+                return;
+            }
+            Some(id) => id,
+        },
+    };
+
+    // Track duplicate canonical message IDs.
+    global_message_ids
+        .entry(message_id)
+        .and_modify(|(_keep, dupes)| {
+            dupes.push(file_path.to_path_buf());
+        })
+        .or_insert_with(|| (file_path.to_path_buf(), Vec::new()));
+
+    // Check required frontmatter fields.
+    let missing_fields: Vec<String> = REQUIRED_FRONTMATTER_FIELDS
+        .iter()
+        .filter(|&&field| {
+            let value = parsed.get(field);
+            match value {
+                None => true,
+                Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+                Some(serde_json::Value::Array(arr)) => arr.is_empty(),
+                _ => false,
+            }
+        })
+        .map(|&field| field.to_string())
+        .collect();
+
+    if !missing_fields.is_empty() {
+        report.record(ArchiveAnomalyKind::IncompleteFrontmatter {
+            path: file_path.to_path_buf(),
+            missing_fields,
+        });
+    }
+}
+
+/// Scan the archive for anomalies, also comparing against a database for
+/// identity mismatches and count drift.
+///
+/// This extends [`scan_archive_anomalies`] with DB-side cross-checks:
+/// - Projects in the archive but not in the DB (or vice versa)
+/// - Message count drift between archive and DB
+///
+/// Requires a path to the database file. If the DB cannot be opened or
+/// queried, the DB-side checks are skipped silently and the archive-only
+/// anomalies are still returned.
+#[must_use]
+pub fn scan_archive_anomalies_with_db(
+    storage_root: &Path,
+    db_path: &Path,
+) -> ArchiveAnomalyReport {
+    let mut report = scan_archive_anomalies(storage_root);
+
+    // Gather archive inventory for comparison.
+    let archive_inventory = crate::reconstruct::scan_archive_message_inventory(storage_root);
+
+    // Try to get DB inventory for cross-checks.
+    let db_inventory = match crate::pool::inspect_mailbox_db_inventory(db_path) {
+        Ok(inv) => Some(inv),
+        Err(_) => None,
+    };
+
+    if let Some(ref inv) = db_inventory {
+        // Check for archive/DB project identity mismatches.
+        let missing =
+            crate::reconstruct::archive_missing_project_identities(&archive_inventory, &inv.project_identities);
+        for label in missing {
+            report.record(ArchiveAnomalyKind::ArchiveDbProjectMismatch {
+                archive_slug: label.clone(),
+                archive_human_key: None,
+                detail: "archive project has no matching DB identity".to_string(),
+            });
+        }
+
+        // Check for message count drift.
+        let archive_count = archive_inventory.unique_message_ids;
+        let db_count_result = crate::reconstruct::collect_db_message_ids(db_path);
+        if let Ok(db_ids) = db_count_result {
+            let db_count = db_ids.len();
+            let drift = archive_count.abs_diff(db_count);
+            if drift > 0 {
+                report.record(ArchiveAnomalyKind::ArchiveDbCountDrift {
+                    archive_count,
+                    db_count,
+                    drift,
+                });
+            }
+        }
+    }
+
+    // Sort by severity for consistent output.
+    report.sort_by_severity();
+    report
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

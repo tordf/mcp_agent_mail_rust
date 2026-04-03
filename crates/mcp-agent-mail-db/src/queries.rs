@@ -12554,11 +12554,6 @@ mod tests {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
 
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("probe_busy_retry.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
