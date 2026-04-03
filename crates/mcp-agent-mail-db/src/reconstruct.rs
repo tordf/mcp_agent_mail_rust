@@ -5222,4 +5222,312 @@ archive body
         );
         assert_eq!(bob.get_named::<String>("contact_policy").unwrap(), "open");
     }
+
+    // ========================================================================
+    // Archive drift report tests
+    // ========================================================================
+
+    fn write_archive_message(storage_root: &Path, slug: &str, id: i64) {
+        let messages_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("messages")
+            .join("2026")
+            .join("03");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        let filename = format!("2026-03-01T00-00-00Z__test__{id}.md");
+        std::fs::write(
+            messages_dir.join(filename),
+            format!(
+                "---json\n{{\"id\": {id}, \"from\": \"Alice\", \"to\": [\"Bob\"], \"subject\": \"msg {id}\", \"importance\": \"normal\", \"created_ts\": 1709251200000000}}\n---\n\nBody {id}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn setup_db_with_messages(db_path: &Path, ids: &[i64]) {
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                human_key TEXT,
+                created_at INTEGER
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE IF NOT EXISTS agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT,
+                model TEXT,
+                task_description TEXT,
+                inception_ts INTEGER,
+                last_active_ts INTEGER,
+                attachments_policy TEXT,
+                contact_policy TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                thread_id TEXT,
+                subject TEXT,
+                body_md TEXT,
+                importance TEXT,
+                ack_required INTEGER DEFAULT 0,
+                created_ts INTEGER,
+                recipients_json TEXT,
+                attachments TEXT DEFAULT '[]'
+            )",
+        )
+        .unwrap();
+        conn.query_sync(
+            "INSERT OR IGNORE INTO projects (id, slug, human_key, created_at) VALUES (1, 'test-project', '/test/project', 100)",
+            &[],
+        )
+        .unwrap();
+        conn.query_sync(
+            "INSERT OR IGNORE INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (1, 1, 'Alice', 'test', 'test', '', 100, 100, 'auto', 'auto')",
+            &[],
+        )
+        .unwrap();
+        for &id in ids {
+            conn.query_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, recipients_json) \
+                 VALUES (?, 1, 1, 'test', 'body', 'normal', 100, '{}')",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn scan_archive_message_ids_finds_all_positive_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        write_archive_message(&storage_root, "proj-a", 10);
+        write_archive_message(&storage_root, "proj-a", 20);
+        write_archive_message(&storage_root, "proj-b", 30);
+
+        let (ids, errors) = scan_archive_message_ids(&storage_root);
+        assert_eq!(errors, 0);
+        assert_eq!(ids, BTreeSet::from([10, 20, 30]));
+    }
+
+    #[test]
+    fn scan_archive_message_ids_empty_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ids, errors) = scan_archive_message_ids(tmp.path());
+        assert_eq!(errors, 0);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn collect_db_message_ids_returns_all_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        setup_db_with_messages(&db_path, &[5, 15, 25]);
+        let ids = collect_db_message_ids(&db_path).unwrap();
+        assert_eq!(ids, BTreeSet::from([5, 15, 25]));
+    }
+
+    #[test]
+    fn collect_db_message_ids_missing_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("empty.db");
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_raw("CREATE TABLE dummy (id INTEGER)").unwrap();
+        drop(conn);
+        let ids = collect_db_message_ids(&db_path).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn drift_report_aligned_when_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("aligned.db");
+
+        write_archive_message(&storage_root, "test-project", 1);
+        write_archive_message(&storage_root, "test-project", 2);
+        write_archive_message(&storage_root, "test-project", 3);
+        // Write project.json so identity matches.
+        std::fs::write(
+            storage_root
+                .join("projects")
+                .join("test-project")
+                .join("project.json"),
+            r#"{"slug": "test-project", "human_key": "/test/project"}"#,
+        )
+        .unwrap();
+        setup_db_with_messages(&db_path, &[1, 2, 3]);
+
+        let report = compute_archive_drift_report(&storage_root, &db_path).unwrap();
+        assert_eq!(report.archive_message_count, 3);
+        assert_eq!(report.db_message_count, 3);
+        assert_eq!(report.shared_message_count, 3);
+        assert!(report.archive_only_ids.is_empty());
+        assert!(report.db_only_ids.is_empty());
+        assert!(!report.has_message_drift());
+    }
+
+    #[test]
+    fn drift_report_archive_ahead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("archive_ahead.db");
+
+        write_archive_message(&storage_root, "test-project", 1);
+        write_archive_message(&storage_root, "test-project", 2);
+        write_archive_message(&storage_root, "test-project", 3);
+        std::fs::write(
+            storage_root
+                .join("projects")
+                .join("test-project")
+                .join("project.json"),
+            r#"{"slug": "test-project", "human_key": "/test/project"}"#,
+        )
+        .unwrap();
+        // DB only has message 1.
+        setup_db_with_messages(&db_path, &[1]);
+
+        let report = compute_archive_drift_report(&storage_root, &db_path).unwrap();
+        assert_eq!(report.archive_message_count, 3);
+        assert_eq!(report.db_message_count, 1);
+        assert_eq!(report.shared_message_count, 1);
+        assert_eq!(report.archive_only_ids, BTreeSet::from([2, 3]));
+        assert!(report.db_only_ids.is_empty());
+        assert!(report.has_message_drift());
+        assert!(report.has_any_drift());
+    }
+
+    #[test]
+    fn drift_report_db_ahead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("db_ahead.db");
+
+        write_archive_message(&storage_root, "test-project", 1);
+        std::fs::write(
+            storage_root
+                .join("projects")
+                .join("test-project")
+                .join("project.json"),
+            r#"{"slug": "test-project", "human_key": "/test/project"}"#,
+        )
+        .unwrap();
+        // DB has messages 1, 2, 3.
+        setup_db_with_messages(&db_path, &[1, 2, 3]);
+
+        let report = compute_archive_drift_report(&storage_root, &db_path).unwrap();
+        assert_eq!(report.archive_message_count, 1);
+        assert_eq!(report.db_message_count, 3);
+        assert_eq!(report.shared_message_count, 1);
+        assert!(report.archive_only_ids.is_empty());
+        assert_eq!(report.db_only_ids, BTreeSet::from([2, 3]));
+        assert!(report.has_message_drift());
+    }
+
+    #[test]
+    fn drift_report_bidirectional_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("bidir.db");
+
+        // Archive has 1, 2, 5.
+        write_archive_message(&storage_root, "test-project", 1);
+        write_archive_message(&storage_root, "test-project", 2);
+        write_archive_message(&storage_root, "test-project", 5);
+        std::fs::write(
+            storage_root
+                .join("projects")
+                .join("test-project")
+                .join("project.json"),
+            r#"{"slug": "test-project", "human_key": "/test/project"}"#,
+        )
+        .unwrap();
+        // DB has 1, 3, 4.
+        setup_db_with_messages(&db_path, &[1, 3, 4]);
+
+        let report = compute_archive_drift_report(&storage_root, &db_path).unwrap();
+        assert_eq!(report.shared_message_count, 1); // only id=1
+        assert_eq!(report.archive_only_ids, BTreeSet::from([2, 5]));
+        assert_eq!(report.db_only_ids, BTreeSet::from([3, 4]));
+        assert!(report.has_message_drift());
+    }
+
+    #[test]
+    fn drift_report_identity_mismatch_archive_project_missing_from_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("identity_mismatch.db");
+
+        // Archive has two projects.
+        write_archive_message(&storage_root, "proj-a", 1);
+        write_archive_message(&storage_root, "proj-b", 2);
+        // DB only has proj-a.
+        setup_db_with_messages(&db_path, &[1]);
+
+        let report = compute_archive_drift_report(&storage_root, &db_path).unwrap();
+        // proj-b should appear as an identity mismatch.
+        assert!(report.has_identity_drift());
+        assert!(
+            report
+                .identity_mismatches
+                .iter()
+                .any(|m| m.archive.is_some() && m.db.is_none()),
+            "expected archive-only project identity mismatch"
+        );
+    }
+
+    #[test]
+    fn drift_report_serializes_to_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("serialize.db");
+
+        write_archive_message(&storage_root, "test-project", 1);
+        write_archive_message(&storage_root, "test-project", 2);
+        std::fs::write(
+            storage_root
+                .join("projects")
+                .join("test-project")
+                .join("project.json"),
+            r#"{"slug": "test-project", "human_key": "/test/project"}"#,
+        )
+        .unwrap();
+        setup_db_with_messages(&db_path, &[1]);
+
+        let report = compute_archive_drift_report(&storage_root, &db_path).unwrap();
+        let json = serde_json::to_value(&report).expect("should serialize");
+        assert_eq!(
+            json["schema"]["name"],
+            "mcp-agent-mail-archive-drift-report"
+        );
+        assert_eq!(json["schema"]["major"], 1);
+        assert!(json["archive_only_ids"].as_array().unwrap().len() == 1);
+        assert!(json["db_only_ids"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn drift_report_empty_archive_and_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("empty_storage");
+        let db_path = tmp.path().join("empty.db");
+        // Create an empty DB with the messages table.
+        setup_db_with_messages(&db_path, &[]);
+
+        let report = compute_archive_drift_report(&storage_root, &db_path).unwrap();
+        assert_eq!(report.archive_message_count, 0);
+        assert_eq!(report.db_message_count, 0);
+        assert_eq!(report.shared_message_count, 0);
+        assert!(!report.has_any_drift());
+    }
 }

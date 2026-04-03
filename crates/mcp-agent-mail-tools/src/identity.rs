@@ -21,6 +21,153 @@ use crate::tool_util::{
     legacy_tool_error, resolve_project,
 };
 
+/// Build recovery status for the health_check response.
+///
+/// Returns `Some(RecoveryStatusResponse)` when the mailbox is not fully healthy,
+/// so operators immediately see the current mode, owner, next action, and bundle path.
+/// Returns `None` when the mailbox is healthy (no recovery context to surface).
+fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
+    use mcp_agent_mail_db::mailbox_verdict::{
+        DurabilityState, VerdictOptions, compute_mailbox_verdict,
+    };
+    use mcp_agent_mail_db::pool::{
+        MailboxOwnershipDisposition, inspect_mailbox_ownership, inspect_mailbox_recovery_lock,
+        resolve_mailbox_sqlite_path,
+    };
+
+    let resolved = resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+    let db_path = PathBuf::from(&resolved.canonical_path);
+    let storage_root = &config.storage_root;
+
+    // Lightweight recovery-lock + ownership probes (no full verdict).
+    let recovery_lock = inspect_mailbox_recovery_lock(&db_path);
+    let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
+
+    // Compute the full verdict to get the durability state.
+    let verdict = compute_mailbox_verdict(
+        &config.database_url,
+        storage_root.as_path(),
+        &VerdictOptions {
+            skip_integrity_check: true, // integrity is already probed elsewhere
+            ..VerdictOptions::default()
+        },
+    );
+    let durability = DurabilityState::from_mailbox_state(verdict.state);
+
+    if durability == DurabilityState::Healthy && !recovery_lock.active {
+        return None;
+    }
+
+    let mode = durability.to_string();
+
+    let owner = match ownership.disposition {
+        MailboxOwnershipDisposition::Unowned => "none".to_string(),
+        MailboxOwnershipDisposition::ActiveOtherOwner => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (active)", proc.pid)
+            } else {
+                "active (unknown pid)".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::StaleLiveProcess => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (stale)", proc.pid)
+            } else {
+                "stale (unknown pid)".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::DeletedExecutable => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (deleted executable)", proc.pid)
+            } else {
+                "deleted executable".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::SplitBrain => format!(
+            "split-brain ({} competing pids)",
+            ownership.competing_pids.len()
+        ),
+    };
+
+    let next_action = match durability {
+        DurabilityState::Healthy => "No action required".to_string(),
+        DurabilityState::DegradedReadOnly => {
+            if recovery_lock.active {
+                "Recovery in progress; wait for completion or check recovery lock holder".to_string()
+            } else {
+                "Run `am doctor repair` to attempt automatic recovery".to_string()
+            }
+        }
+        DurabilityState::Recovering => {
+            if let Some(pid) = recovery_lock.pid {
+                format!("Recovery active (pid {pid}); wait for completion or investigate stall")
+            } else {
+                "Recovery lock held but PID unknown; check for stale lock files".to_string()
+            }
+        }
+        DurabilityState::Corrupt => {
+            "Run `am doctor repair --force` or restore from archive backup".to_string()
+        }
+    };
+
+    // Locate latest forensic bundle if one exists.
+    let bundle_path = find_latest_forensic_bundle(storage_root.as_path(), &db_path);
+
+    Some(RecoveryStatusResponse {
+        mode,
+        owner,
+        next_action,
+        bundle_path,
+        recovery_lock_active: recovery_lock.active,
+        recovery_lock_pid: recovery_lock.pid,
+    })
+}
+
+/// Find the most recently created forensic bundle directory.
+fn find_latest_forensic_bundle(storage_root: &std::path::Path, db_path: &std::path::Path) -> Option<String> {
+    let forensics_dir = if storage_root.is_dir() {
+        storage_root.join("doctor").join("forensics")
+    } else {
+        db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("doctor")
+            .join("forensics")
+    };
+    if !forensics_dir.is_dir() {
+        return None;
+    }
+    // Walk one level: forensics/<db_family>/<bundle_name>/
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let Ok(families) = std::fs::read_dir(&forensics_dir) else {
+        return None;
+    };
+    for family_entry in families.flatten() {
+        let family_path = family_entry.path();
+        if !family_path.is_dir() {
+            continue;
+        }
+        let Ok(bundles) = std::fs::read_dir(&family_path) else {
+            continue;
+        };
+        for bundle_entry in bundles.flatten() {
+            let bundle_path = bundle_entry.path();
+            if !bundle_path.is_dir() {
+                continue;
+            }
+            let mtime = bundle_entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if latest.as_ref().is_none_or(|(prev, _)| mtime > *prev) {
+                latest = Some((mtime, bundle_path));
+            }
+        }
+    }
+    latest.map(|(_, path)| path.display().to_string())
+}
+
 fn redact_database_url(url: &str) -> String {
     if let Some((scheme, rest)) = url.split_once("://")
         && let Some((_creds, host)) = rest.rsplit_once('@')
@@ -378,6 +525,27 @@ pub struct HealthCheckResponse {
     pub semantic_indexing: Option<mcp_agent_mail_db::search_service::SemanticIndexingHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub two_tier_indexing: Option<mcp_agent_mail_db::search_service::TwoTierIndexingHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryStatusResponse>,
+}
+
+/// Active recovery state surfaced in health_check when the mailbox is degraded or recovering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryStatusResponse {
+    /// Current durability mode: "healthy", "degraded_read_only", "recovering", or "corrupt".
+    pub mode: String,
+    /// Mailbox ownership disposition: who holds the lock.
+    pub owner: String,
+    /// Next recommended operator action.
+    pub next_action: String,
+    /// Path to the most recent forensic bundle, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<String>,
+    /// Whether a recovery lock is currently held.
+    pub recovery_lock_active: bool,
+    /// PID of the process holding the recovery lock, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_lock_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -704,6 +872,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         },
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
         two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),
+        recovery: build_recovery_status(config),
     };
 
     serde_json::to_string(&response)

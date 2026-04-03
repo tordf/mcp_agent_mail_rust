@@ -1222,6 +1222,10 @@ impl StartupReport {
     }
 
     /// Format a human-readable error block for terminal output.
+    ///
+    /// When the primary issue is database/integrity/storage related, appends
+    /// a recovery context block showing the active recovery mode, lock owner,
+    /// next recommended action, and forensic bundle path.
     #[must_use]
     pub fn format_errors(&self) -> String {
         use fmt::Write;
@@ -1252,8 +1256,167 @@ impl StartupReport {
                 let _ = writeln!(out, "     Next action: {}", fail.fix);
             }
         }
+
+        // Append recovery context when the failure is durability-related.
+        if matches!(
+            primary.name,
+            "database" | "db-lock" | "integrity" | "storage"
+        ) {
+            if let Some(ctx) = format_recovery_context() {
+                let _ = write!(out, "{ctx}");
+            }
+        }
+
         out
     }
+}
+
+/// Build the recovery-context section appended to startup errors.
+///
+/// Inspects the recovery lock, ownership, and durability state to surface:
+/// - Active recovery mode
+/// - Current lock owner / competing PIDs
+/// - Next recommended action
+/// - Most recent forensic bundle path (if any)
+fn format_recovery_context() -> Option<String> {
+    use fmt::Write;
+    use mcp_agent_mail_db::mailbox_verdict::{
+        DurabilityState, VerdictOptions, compute_mailbox_verdict,
+    };
+    use mcp_agent_mail_db::pool::{
+        MailboxOwnershipDisposition, inspect_mailbox_ownership, inspect_mailbox_recovery_lock,
+        resolve_mailbox_sqlite_path,
+    };
+
+    let config = mcp_agent_mail_core::Config::get();
+    let resolved = resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+    let db_path = PathBuf::from(&resolved.canonical_path);
+    let storage_root = &config.storage_root;
+
+    let recovery_lock = inspect_mailbox_recovery_lock(&db_path);
+    let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
+
+    let verdict = compute_mailbox_verdict(
+        &config.database_url,
+        storage_root.as_path(),
+        &VerdictOptions {
+            skip_integrity_check: true,
+            ..VerdictOptions::default()
+        },
+    );
+    let durability = DurabilityState::from_mailbox_state(verdict.state);
+
+    // Only emit context when something is wrong.
+    if durability == DurabilityState::Healthy && !recovery_lock.active {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str("\n  Recovery context:\n");
+    let _ = writeln!(out, "    Mode:   {durability}");
+
+    let owner_desc = match ownership.disposition {
+        MailboxOwnershipDisposition::Unowned => "none".to_string(),
+        MailboxOwnershipDisposition::ActiveOtherOwner => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (active)", proc.pid)
+            } else {
+                "active (unknown pid)".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::StaleLiveProcess => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (stale)", proc.pid)
+            } else {
+                "stale (unknown pid)".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::DeletedExecutable => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (deleted executable)", proc.pid)
+            } else {
+                "deleted executable".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::SplitBrain => format!(
+            "split-brain ({} competing pids)",
+            ownership.competing_pids.len()
+        ),
+    };
+    let _ = writeln!(out, "    Owner:  {owner_desc}");
+
+    if recovery_lock.active {
+        let lock_holder = recovery_lock
+            .pid
+            .map_or("unknown".to_string(), |pid| format!("pid {pid}"));
+        let _ = writeln!(out, "    Lock:   recovery lock held by {lock_holder}");
+    }
+
+    let next_action = match durability {
+        DurabilityState::Healthy => "No action required",
+        DurabilityState::DegradedReadOnly => {
+            if recovery_lock.active {
+                "Wait for recovery to complete, or inspect the recovery lock holder"
+            } else {
+                "Run `am doctor repair` to attempt automatic recovery"
+            }
+        }
+        DurabilityState::Recovering => {
+            "Recovery in progress; wait for completion or investigate stall"
+        }
+        DurabilityState::Corrupt => {
+            "Run `am doctor repair --force` or restore from archive backup"
+        }
+    };
+    let _ = writeln!(out, "    Action: {next_action}");
+
+    // Find latest forensic bundle.
+    let forensics_dir = if storage_root.is_dir() {
+        storage_root.join("doctor").join("forensics")
+    } else {
+        db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("doctor")
+            .join("forensics")
+    };
+    if forensics_dir.is_dir() {
+        if let Some(bundle) = find_latest_bundle_in(&forensics_dir) {
+            let _ = writeln!(out, "    Bundle: {}", bundle.display());
+        }
+    }
+
+    Some(out)
+}
+
+/// Scan a forensics root for the most recently modified bundle directory.
+fn find_latest_bundle_in(forensics_dir: &std::path::Path) -> Option<PathBuf> {
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let families = std::fs::read_dir(forensics_dir).ok()?;
+    for family_entry in families.flatten() {
+        let family_path = family_entry.path();
+        if !family_path.is_dir() {
+            continue;
+        }
+        let Ok(bundles) = std::fs::read_dir(&family_path) else {
+            continue;
+        };
+        for bundle_entry in bundles.flatten() {
+            let bundle_path = bundle_entry.path();
+            if !bundle_path.is_dir() {
+                continue;
+            }
+            let mtime = bundle_entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if latest.as_ref().is_none_or(|(prev, _)| mtime > *prev) {
+                latest = Some((mtime, bundle_path));
+            }
+        }
+    }
+    latest.map(|(_, path)| path)
 }
 
 // ──────────────────────────────────────────────────────────────────────

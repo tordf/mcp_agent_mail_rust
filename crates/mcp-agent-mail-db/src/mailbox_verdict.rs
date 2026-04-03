@@ -2067,4 +2067,290 @@ mod tests {
             assert!(exits >= 1, "{state} must have at least one exit transition");
         }
     }
+
+    // ── Exhaustive DurabilityState transition matrix tests ──────────
+
+    const ALL_DURABILITY_STATES: [DurabilityState; 4] = [
+        DurabilityState::Healthy,
+        DurabilityState::DegradedReadOnly,
+        DurabilityState::Recovering,
+        DurabilityState::Corrupt,
+    ];
+
+    #[test]
+    fn durability_exhaustive_4x4_transition_matrix() {
+        // Classify every (from, to) pair in the 4×4 matrix.
+        // Valid non-self transitions that MUST succeed:
+        let valid_pairs: &[(DurabilityState, DurabilityState)] = &[
+            (DurabilityState::Healthy, DurabilityState::DegradedReadOnly),
+            (DurabilityState::Healthy, DurabilityState::Corrupt),
+            (DurabilityState::DegradedReadOnly, DurabilityState::Healthy),
+            (DurabilityState::DegradedReadOnly, DurabilityState::Recovering),
+            (DurabilityState::DegradedReadOnly, DurabilityState::Corrupt),
+            (DurabilityState::Recovering, DurabilityState::Healthy),
+            (DurabilityState::Recovering, DurabilityState::DegradedReadOnly),
+            (DurabilityState::Recovering, DurabilityState::Corrupt),
+            (DurabilityState::Corrupt, DurabilityState::Recovering),
+        ];
+
+        // Invalid non-self transitions that MUST fail:
+        let invalid_pairs: &[(DurabilityState, DurabilityState)] = &[
+            (DurabilityState::Healthy, DurabilityState::Recovering),
+            (DurabilityState::Corrupt, DurabilityState::Healthy),
+            (DurabilityState::Corrupt, DurabilityState::DegradedReadOnly),
+        ];
+
+        // Self-transitions (idempotent):
+        for &state in &ALL_DURABILITY_STATES {
+            let trigger = validate_durability_transition(state, state)
+                .unwrap_or_else(|e| panic!("{state}->{state} should be idempotent: {e}"));
+            assert_eq!(trigger, "idempotent", "{state}->{state}");
+        }
+
+        for &(from, to) in valid_pairs {
+            let trigger = validate_durability_transition(from, to)
+                .unwrap_or_else(|e| panic!("{from}->{to} should be valid: {e}"));
+            assert_ne!(trigger, "idempotent", "{from}->{to} is not a self-transition");
+        }
+
+        for &(from, to) in invalid_pairs {
+            validate_durability_transition(from, to)
+                .expect_err(&format!("{from}->{to} should be invalid"));
+        }
+
+        // Verify we covered all 16 cells: 4 self + 9 valid + 3 invalid = 16
+        assert_eq!(
+            4 + valid_pairs.len() + invalid_pairs.len(),
+            16,
+            "must cover all 4×4 = 16 cells"
+        );
+    }
+
+    #[test]
+    fn durability_no_duplicate_transitions() {
+        for (i, a) in DURABILITY_TRANSITIONS.iter().enumerate() {
+            for (j, b) in DURABILITY_TRANSITIONS.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        !(a.from == b.from && a.to == b.to),
+                        "duplicate transition: {}->{} at indices {i} and {j}",
+                        a.from, a.to
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn durability_every_transition_has_nonempty_trigger() {
+        for t in DURABILITY_TRANSITIONS {
+            assert!(
+                !t.trigger.is_empty(),
+                "transition {}->{} has empty trigger",
+                t.from, t.to
+            );
+        }
+    }
+
+    #[test]
+    fn durability_severity_is_strictly_monotonic() {
+        // All 4 states must have distinct severity values (no ties).
+        let mut severities: Vec<u8> = ALL_DURABILITY_STATES.iter().map(|s| s.severity()).collect();
+        severities.sort_unstable();
+        severities.dedup();
+        assert_eq!(
+            severities.len(),
+            4,
+            "all 4 states must have distinct severity"
+        );
+    }
+
+    #[test]
+    fn durability_from_mailbox_state_never_loses_severity() {
+        // Collapsing 7→4 states must be severity-monotone:
+        // if mailbox_a.severity > mailbox_b.severity, then
+        // durability(mailbox_a).severity >= durability(mailbox_b).severity.
+        let all_mailbox = [
+            MailboxState::Healthy,
+            MailboxState::Stale,
+            MailboxState::Suspect,
+            MailboxState::DegradedReadOnly,
+            MailboxState::Recovering,
+            MailboxState::Broken,
+            MailboxState::Escalate,
+        ];
+        for &a in &all_mailbox {
+            for &b in &all_mailbox {
+                if a.severity() > b.severity() {
+                    let da = DurabilityState::from_mailbox_state(a);
+                    let db = DurabilityState::from_mailbox_state(b);
+                    assert!(
+                        da.severity() >= db.severity(),
+                        "severity monotonicity violated: {a}(sev={}) -> {da}(sev={}), \
+                         {b}(sev={}) -> {db}(sev={})",
+                        a.severity(), da.severity(), b.severity(), db.severity()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn durability_corrupt_requires_recovering_to_reach_healthy() {
+        // Corrupt has no direct path to Healthy — must go through Recovering.
+        // Verify: the only exit from Corrupt is to Recovering.
+        let corrupt_exits: Vec<DurabilityState> = DURABILITY_TRANSITIONS
+            .iter()
+            .filter(|t| t.from == DurabilityState::Corrupt)
+            .map(|t| t.to)
+            .collect();
+        assert_eq!(corrupt_exits, vec![DurabilityState::Recovering]);
+
+        // Also verify Corrupt→Healthy is explicitly rejected.
+        validate_durability_transition(DurabilityState::Corrupt, DurabilityState::Healthy)
+            .expect_err("Corrupt→Healthy must be invalid");
+
+        // And Corrupt→DegradedReadOnly is rejected.
+        validate_durability_transition(DurabilityState::Corrupt, DurabilityState::DegradedReadOnly)
+            .expect_err("Corrupt→DegradedReadOnly must be invalid");
+    }
+
+    #[test]
+    fn durability_combined_health_and_verdict_max_severity() {
+        use mcp_agent_mail_core::HealthLevel;
+
+        // When both a MailboxState verdict and a HealthLevel floor are available,
+        // max_severity should produce the most severe of the two.
+        let combos: &[(MailboxState, HealthLevel, DurabilityState)] = &[
+            // Healthy verdict + Green health → Healthy
+            (MailboxState::Healthy, HealthLevel::Green, DurabilityState::Healthy),
+            // Healthy verdict + Red health → DegradedReadOnly (floor wins)
+            (MailboxState::Healthy, HealthLevel::Red, DurabilityState::DegradedReadOnly),
+            // Broken verdict + Green health → Corrupt (verdict wins)
+            (MailboxState::Broken, HealthLevel::Green, DurabilityState::Corrupt),
+            // Stale verdict + Red health → DegradedReadOnly (both agree)
+            (MailboxState::Stale, HealthLevel::Red, DurabilityState::DegradedReadOnly),
+            // Recovering verdict + Yellow health → Recovering (verdict wins)
+            (MailboxState::Recovering, HealthLevel::Yellow, DurabilityState::Recovering),
+            // Escalate verdict + Red health → Corrupt (verdict wins, Corrupt > DegradedReadOnly)
+            (MailboxState::Escalate, HealthLevel::Red, DurabilityState::Corrupt),
+        ];
+
+        for &(verdict, health, expected) in combos {
+            let from_verdict = DurabilityState::from_mailbox_state(verdict);
+            let from_health = DurabilityState::floor_from_health_level(health);
+            let combined = from_verdict.max_severity(from_health);
+            assert_eq!(
+                combined, expected,
+                "verdict={verdict}, health={health:?}: expected {expected}, got {combined}"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_recovery_start_matches_transitions_to_recovering() {
+        // States that allow recovery_start should be exactly those that have
+        // a transition edge to Recovering in DURABILITY_TRANSITIONS.
+        let states_with_recovering_exit: std::collections::HashSet<DurabilityState> =
+            DURABILITY_TRANSITIONS
+                .iter()
+                .filter(|t| t.to == DurabilityState::Recovering)
+                .map(|t| t.from)
+                .collect();
+
+        for &state in &ALL_DURABILITY_STATES {
+            let allows = state.allows_recovery_start();
+            let has_edge = states_with_recovering_exit.contains(&state);
+            assert_eq!(
+                allows, has_edge,
+                "{state}: allows_recovery_start()={allows} but has_edge_to_Recovering={has_edge}"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_every_state_reachable_from_healthy() {
+        // BFS from Healthy should reach all 4 states (the graph is connected).
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(DurabilityState::Healthy);
+        visited.insert(DurabilityState::Healthy);
+
+        while let Some(current) = queue.pop_front() {
+            for t in DURABILITY_TRANSITIONS {
+                if t.from == current && !visited.contains(&t.to) {
+                    visited.insert(t.to);
+                    queue.push_back(t.to);
+                }
+            }
+        }
+        assert_eq!(
+            visited.len(),
+            4,
+            "all states must be reachable from Healthy; unreachable: {:?}",
+            ALL_DURABILITY_STATES
+                .iter()
+                .filter(|s| !visited.contains(s))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn durability_healthy_reachable_from_every_state() {
+        // Every state can eventually return to Healthy (BFS in reverse).
+        for &start in &ALL_DURABILITY_STATES {
+            let mut visited = std::collections::HashSet::new();
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(start);
+            visited.insert(start);
+
+            while let Some(current) = queue.pop_front() {
+                for t in DURABILITY_TRANSITIONS {
+                    if t.from == current && !visited.contains(&t.to) {
+                        visited.insert(t.to);
+                        queue.push_back(t.to);
+                    }
+                }
+            }
+            assert!(
+                visited.contains(&DurabilityState::Healthy),
+                "Healthy must be reachable from {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_as_str_matches_display() {
+        for &state in &ALL_DURABILITY_STATES {
+            assert_eq!(
+                state.as_str(),
+                &state.to_string(),
+                "{state:?}: as_str() and Display must agree"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_max_severity_is_commutative() {
+        for &a in &ALL_DURABILITY_STATES {
+            for &b in &ALL_DURABILITY_STATES {
+                assert_eq!(
+                    a.max_severity(b),
+                    b.max_severity(a),
+                    "max_severity must be commutative: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn durability_max_severity_is_idempotent() {
+        for &a in &ALL_DURABILITY_STATES {
+            assert_eq!(
+                a.max_severity(a),
+                a,
+                "max_severity with self must be identity: {a}"
+            );
+        }
+    }
 }

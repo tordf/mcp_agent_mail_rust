@@ -8514,4 +8514,144 @@ mod tests {
             assert_eq!(*approval, parsed, "serde roundtrip failed for {approval:?}");
         }
     }
+
+    // ── DeferredWriteQueue tests ──────────────────────────────────────
+
+    #[test]
+    fn deferred_write_queue_inactive_rejects_writes() {
+        let q = DeferredWriteQueue::new(10);
+        let out = q.enqueue("INSERT INTO x VALUES(?)".into(), vec![Value::BigInt(1)], "test");
+        assert_eq!(out, DeferralOutcome::NotRecovering);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn deferred_write_queue_active_accepts_writes() {
+        let q = DeferredWriteQueue::new(10);
+        q.activate();
+        assert!(q.is_active());
+
+        let out = q.enqueue("INSERT INTO x VALUES(?)".into(), vec![Value::BigInt(1)], "test_op");
+        assert!(matches!(out, DeferralOutcome::Queued { position: 0 }));
+        assert_eq!(q.len(), 1);
+
+        let out = q.enqueue("UPDATE x SET y=?".into(), vec![Value::BigInt(2)], "test_op");
+        assert!(matches!(out, DeferralOutcome::Queued { position: 1 }));
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn deferred_write_queue_backpressure_at_capacity() {
+        let q = DeferredWriteQueue::new(2);
+        q.activate();
+
+        q.enqueue("sql1".into(), vec![], "op1");
+        q.enqueue("sql2".into(), vec![], "op2");
+        let out = q.enqueue("sql3".into(), vec![], "op3");
+        assert_eq!(out, DeferralOutcome::BackpressureFull { capacity: 2 });
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn deferred_write_queue_seal_and_drain_returns_ordered_entries() {
+        let q = DeferredWriteQueue::new(10);
+        q.activate();
+
+        q.enqueue("sql_a".into(), vec![], "op_a");
+        q.enqueue("sql_b".into(), vec![], "op_b");
+        q.enqueue("sql_c".into(), vec![], "op_c");
+
+        let entries = q.seal_and_drain();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sql, "sql_a");
+        assert_eq!(entries[1].sql, "sql_b");
+        assert_eq!(entries[2].sql, "sql_c");
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[1].seq, 1);
+        assert_eq!(entries[2].seq, 2);
+
+        // After seal, enqueue returns Sealed
+        let out = q.enqueue("sql_d".into(), vec![], "op_d");
+        assert_eq!(out, DeferralOutcome::Sealed);
+        assert!(!q.is_active());
+    }
+
+    #[test]
+    fn deferred_write_queue_reset_allows_reuse() {
+        let q = DeferredWriteQueue::new(10);
+        q.activate();
+        q.enqueue("sql1".into(), vec![], "op");
+        q.seal_and_drain();
+
+        // After reset, queue is inactive
+        q.reset();
+        assert!(!q.is_active());
+        assert!(q.is_empty());
+
+        // Can re-activate for next recovery cycle
+        q.activate();
+        let out = q.enqueue("sql_new".into(), vec![], "op_new");
+        assert!(matches!(out, DeferralOutcome::Queued { position: 0 }));
+    }
+
+    #[test]
+    fn deferred_write_queue_status_reflects_state() {
+        let q = DeferredWriteQueue::new(5);
+        let s = q.status();
+        assert!(!s.active);
+        assert!(!s.sealed);
+        assert_eq!(s.queued, 0);
+        assert_eq!(s.capacity, 5);
+
+        q.activate();
+        q.enqueue("sql".into(), vec![], "op");
+        let s = q.status();
+        assert!(s.active);
+        assert!(!s.sealed);
+        assert_eq!(s.queued, 1);
+        assert_eq!(s.next_seq, 1);
+    }
+
+    #[test]
+    fn deferred_write_queue_entries_have_timestamps_and_operation() {
+        let q = DeferredWriteQueue::new(10);
+        q.activate();
+        q.enqueue("INSERT INTO t VALUES(?)".into(), vec![Value::BigInt(42)], "send_message");
+        let entries = q.seal_and_drain();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].operation, "send_message");
+        assert!(entries[0].deferred_at_us > 0);
+        assert_eq!(entries[0].params.len(), 1);
+    }
+
+    #[test]
+    fn deferred_write_queue_concurrent_producers() {
+        use std::sync::Arc;
+
+        let q = Arc::new(DeferredWriteQueue::new(1000));
+        q.activate();
+
+        let mut handles = vec![];
+        for i in 0..10 {
+            let q = Arc::clone(&q);
+            handles.push(std::thread::spawn(move || {
+                for j in 0..50 {
+                    let sql = format!("INSERT INTO t VALUES({i}, {j})");
+                    q.enqueue(sql, vec![], "concurrent_op");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        assert_eq!(q.len(), 500);
+        let entries = q.seal_and_drain();
+        assert_eq!(entries.len(), 500);
+        // Sequences are monotonically assigned (no duplicates)
+        let mut seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 500);
+    }
 }

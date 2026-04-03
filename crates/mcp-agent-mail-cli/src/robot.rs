@@ -704,6 +704,22 @@ pub struct StatusData {
     pub top_threads: Vec<ThreadSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<AnomalyCard>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryStatus>,
+}
+
+/// Recovery state surfaced in `robot status` when the mailbox is degraded or recovering.
+#[derive(Debug, Serialize)]
+pub struct RecoveryStatus {
+    /// Current durability mode: "healthy", "degraded_read_only", "recovering", or "corrupt".
+    pub mode: String,
+    /// Mailbox ownership disposition.
+    pub owner: String,
+    /// Next recommended operator action.
+    pub next_action: String,
+    /// Path to the most recent forensic bundle, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<String>,
 }
 
 /// File reservation entry for status/reservation display.
@@ -2095,6 +2111,145 @@ const ACK_SLA_VIOLATION_THRESHOLD_US: i64 = 60 * 60 * 1_000_000;
 
 // ── Status command implementation ───────────────────────────────────────────
 
+fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
+    use mcp_agent_mail_db::mailbox_verdict::{DurabilityState, VerdictOptions, compute_mailbox_verdict};
+    use mcp_agent_mail_db::pool::{
+        MailboxOwnershipDisposition, inspect_mailbox_ownership,
+        inspect_mailbox_recovery_lock, resolve_mailbox_sqlite_path,
+    };
+
+    let config = mcp_agent_mail_core::Config::get();
+    let resolved = resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+    let db_path = std::path::PathBuf::from(&resolved.canonical_path);
+    let storage_root = config.storage_root.as_path();
+
+    let recovery_lock = inspect_mailbox_recovery_lock(&db_path);
+    let ownership = inspect_mailbox_ownership(&db_path, storage_root);
+
+    let verdict = compute_mailbox_verdict(
+        &config.database_url,
+        storage_root,
+        &VerdictOptions {
+            skip_integrity_check: true,
+            ..VerdictOptions::default()
+        },
+    );
+    let durability = DurabilityState::from_mailbox_state(verdict.state);
+
+    if durability == DurabilityState::Healthy && !recovery_lock.active {
+        return None;
+    }
+
+    let mode = durability.to_string();
+
+    let owner = match ownership.disposition {
+        MailboxOwnershipDisposition::Unowned => "none".to_string(),
+        MailboxOwnershipDisposition::ActiveOtherOwner => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (active)", proc.pid)
+            } else {
+                "active (unknown pid)".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::StaleLiveProcess => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (stale)", proc.pid)
+            } else {
+                "stale (unknown pid)".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::DeletedExecutable => {
+            if let Some(proc) = ownership.processes.first() {
+                format!("pid {} (deleted executable)", proc.pid)
+            } else {
+                "deleted executable".to_string()
+            }
+        }
+        MailboxOwnershipDisposition::SplitBrain => format!(
+            "split-brain ({} competing pids)",
+            ownership.competing_pids.len()
+        ),
+    };
+
+    let next_action = match durability {
+        DurabilityState::Healthy => "No action required".to_string(),
+        DurabilityState::DegradedReadOnly => {
+            if recovery_lock.active {
+                "Recovery in progress; wait for completion or check recovery lock holder".to_string()
+            } else {
+                "Run `am doctor repair` to attempt automatic recovery".to_string()
+            }
+        }
+        DurabilityState::Recovering => {
+            if let Some(pid) = recovery_lock.pid {
+                format!("Recovery active (pid {pid}); wait for completion or investigate stall")
+            } else {
+                "Recovery lock held but PID unknown; check for stale lock files".to_string()
+            }
+        }
+        DurabilityState::Corrupt => {
+            "Run `am doctor repair --force` or restore from archive backup".to_string()
+        }
+    };
+
+    // Locate latest forensic bundle.
+    let bundle_path = find_latest_forensic_bundle_for_robot(storage_root, &db_path);
+
+    Some(RecoveryStatus {
+        mode,
+        owner,
+        next_action,
+        bundle_path,
+    })
+}
+
+/// Find the most recently created forensic bundle directory (CLI helper).
+fn find_latest_forensic_bundle_for_robot(
+    storage_root: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Option<String> {
+    let forensics_dir = if storage_root.is_dir() {
+        storage_root.join("doctor").join("forensics")
+    } else {
+        db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("doctor")
+            .join("forensics")
+    };
+    if !forensics_dir.is_dir() {
+        return None;
+    }
+    let mut latest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let Ok(families) = std::fs::read_dir(&forensics_dir) else {
+        return None;
+    };
+    for family_entry in families.flatten() {
+        let family_path = family_entry.path();
+        if !family_path.is_dir() {
+            continue;
+        }
+        let Ok(bundles) = std::fs::read_dir(&family_path) else {
+            continue;
+        };
+        for bundle_entry in bundles.flatten() {
+            let bundle_path = bundle_entry.path();
+            if !bundle_path.is_dir() {
+                continue;
+            }
+            let mtime = bundle_entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if latest.as_ref().is_none_or(|(prev, _)| mtime > *prev) {
+                latest = Some((mtime, bundle_path));
+            }
+        }
+    }
+    latest.map(|(_, path)| path.display().to_string())
+}
+
 fn build_status(
     conn: &DbConn,
     project_id: i64,
@@ -2332,14 +2487,31 @@ fn build_status(
         ));
     }
 
-    let health = if anomalies.iter().any(|a| a.severity == "error") {
-        "error"
+    let recovery = build_recovery_status_for_robot();
+
+    // Escalate health to "recovering" or "error" if durability is degraded.
+    let health = if recovery.is_some() {
+        let mode = recovery.as_ref().map(|r| r.mode.as_str()).unwrap_or("healthy");
+        match mode {
+            "recovering" => "recovering".to_string(),
+            "corrupt" => "error".to_string(),
+            "degraded_read_only" => "degraded".to_string(),
+            _ => if anomalies.iter().any(|a| a.severity == "error") {
+                "error"
+            } else if anomalies.is_empty() {
+                "ok"
+            } else {
+                "degraded"
+            }
+            .to_string(),
+        }
+    } else if anomalies.iter().any(|a| a.severity == "error") {
+        "error".to_string()
     } else if anomalies.is_empty() {
-        "ok"
+        "ok".to_string()
     } else {
-        "degraded"
-    }
-    .to_string();
+        "degraded".to_string()
+    };
 
     let data = StatusData {
         health,
@@ -2354,6 +2526,7 @@ fn build_status(
         my_reservations,
         top_threads,
         anomalies,
+        recovery,
     };
 
     Ok((data, actions))
@@ -8949,6 +9122,7 @@ mod tests {
             my_reservations: vec![],
             top_threads: vec![],
             anomalies: vec![],
+            recovery: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"health\":\"ok\""));
@@ -8978,6 +9152,7 @@ mod tests {
                 rationale: "Pending acknowledgements".into(),
                 remediation: "am mail ack".into(),
             }],
+            recovery: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, data).with_alert(
             "warn",
@@ -9163,6 +9338,7 @@ mod tests {
             my_reservations: vec![],
             top_threads: vec![],
             anomalies: anomalies.clone(),
+            recovery: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, status).with_alert(
             "info",
