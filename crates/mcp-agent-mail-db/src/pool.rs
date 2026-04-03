@@ -9970,4 +9970,169 @@ mod tests {
         assert!(would.is_none());
         assert_eq!(cloned.storage_root, Some(custom));
     }
+
+    // ── Canary namespace tests (br-97gc6.5.2.6.5.4) ───────────────────
+
+    #[test]
+    fn canary_prefix_constants_are_consistent() {
+        assert!(CANARY_PROJECT_SLUG.starts_with(CANARY_PREFIX));
+        assert!(CANARY_AGENT_PREFIX.starts_with(CANARY_PREFIX));
+        assert!(CANARY_STORAGE_DIR_PREFIX.starts_with(CANARY_PREFIX));
+    }
+
+    #[test]
+    fn is_canary_identifier_accepts_canary_names() {
+        assert!(is_canary_identifier(CANARY_PROJECT_SLUG));
+        assert!(is_canary_identifier("__canary_probe_42"));
+        assert!(is_canary_identifier("__canary_anything_else"));
+    }
+
+    #[test]
+    fn is_canary_identifier_rejects_production_names() {
+        assert!(!is_canary_identifier("my_real_project"));
+        assert!(!is_canary_identifier("SilentBadger"));
+        assert!(!is_canary_identifier(""));
+        assert!(!is_canary_identifier("_canary_missing_second_underscore"));
+    }
+
+    #[test]
+    fn canary_agent_name_is_in_namespace() {
+        let name = canary_agent_name(7);
+        assert_eq!(name, "__canary_probe_7");
+        assert!(is_canary_identifier(&name));
+    }
+
+    #[test]
+    fn canary_storage_root_is_in_namespace() {
+        let root = canary_storage_root(42);
+        assert!(is_canary_path(&root));
+        let dir_name = root.file_name().unwrap().to_str().unwrap();
+        assert!(dir_name.starts_with(CANARY_STORAGE_DIR_PREFIX));
+    }
+
+    #[test]
+    fn is_canary_path_accepts_canary_dirs() {
+        assert!(is_canary_path(Path::new("/tmp/__canary_mailbox_1")));
+        assert!(is_canary_path(Path::new("/var/data/__canary_probe_99")));
+    }
+
+    #[test]
+    fn is_canary_path_rejects_production_dirs() {
+        assert!(!is_canary_path(Path::new("/tmp/real_project")));
+        assert!(!is_canary_path(Path::new("/home/user/.mcp_agent_mail")));
+    }
+
+    #[test]
+    fn canary_alert_tier_properties() {
+        // Silent: not visible, no ticket
+        assert!(!CanaryAlertTier::Silent.dashboard_visible());
+        assert!(!CanaryAlertTier::Silent.creates_ticket());
+
+        // Observable: visible, no ticket
+        assert!(CanaryAlertTier::Observable.dashboard_visible());
+        assert!(!CanaryAlertTier::Observable.creates_ticket());
+
+        // Warning: visible, no ticket
+        assert!(CanaryAlertTier::Warning.dashboard_visible());
+        assert!(!CanaryAlertTier::Warning.creates_ticket());
+
+        // Engineering: visible AND creates ticket (but never pages)
+        assert!(CanaryAlertTier::Engineering.dashboard_visible());
+        assert!(CanaryAlertTier::Engineering.creates_ticket());
+    }
+
+    #[test]
+    fn canary_alert_tier_all_is_exhaustive() {
+        assert_eq!(CanaryAlertTier::ALL.len(), 4);
+        assert_eq!(CanaryAlertTier::ALL[0], CanaryAlertTier::Silent);
+        assert_eq!(CanaryAlertTier::ALL[3], CanaryAlertTier::Engineering);
+    }
+
+    #[test]
+    fn classify_canary_outcome_success() {
+        let policy = classify_canary_outcome(true, 1_000, true, false, false);
+        assert_eq!(policy.tier, CanaryAlertTier::Silent);
+        assert_eq!(policy.reason, "probe_ok");
+    }
+
+    #[test]
+    fn classify_canary_outcome_slow_probe() {
+        let policy = classify_canary_outcome(true, 6_000_000, true, false, false);
+        assert_eq!(policy.tier, CanaryAlertTier::Observable);
+        assert_eq!(policy.reason, "slow_probe");
+    }
+
+    #[test]
+    fn classify_canary_outcome_probe_failed() {
+        let policy = classify_canary_outcome(false, 1_000, true, false, false);
+        assert_eq!(policy.tier, CanaryAlertTier::Warning);
+        assert_eq!(policy.reason, "probe_assertion_failed");
+    }
+
+    #[test]
+    fn classify_canary_outcome_integrity_failure() {
+        let policy = classify_canary_outcome(true, 1_000, false, false, false);
+        assert_eq!(policy.tier, CanaryAlertTier::Engineering);
+        assert_eq!(policy.reason, "integrity_mismatch");
+    }
+
+    #[test]
+    fn classify_canary_outcome_recovery_failure() {
+        let policy = classify_canary_outcome(true, 1_000, true, true, false);
+        assert_eq!(policy.tier, CanaryAlertTier::Engineering);
+        assert_eq!(policy.reason, "recovery_failed");
+    }
+
+    #[test]
+    fn classify_canary_outcome_integrity_trumps_recovery() {
+        // Integrity failure is more severe than recovery failure.
+        let policy = classify_canary_outcome(false, 1_000, false, true, false);
+        assert_eq!(policy.tier, CanaryAlertTier::Engineering);
+        assert_eq!(policy.reason, "integrity_mismatch");
+    }
+
+    #[test]
+    fn record_canary_probe_updates_metrics() {
+        record_canary_probe(500, true, false, false, true);
+        let snap = mcp_agent_mail_core::global_metrics().canary.snapshot();
+        assert!(snap.canary_probes_total > 0);
+        assert!(snap.canary_probes_ok > 0);
+    }
+
+    #[test]
+    fn canary_mailbox_lifecycle_updates_gauge() {
+        let before = mcp_agent_mail_core::global_metrics()
+            .canary
+            .canary_mailboxes_created_total
+            .load();
+        canary_mailbox_created();
+        let after = mcp_agent_mail_core::global_metrics()
+            .canary
+            .canary_mailboxes_created_total
+            .load();
+        assert!(after > before);
+
+        canary_mailbox_destroyed();
+        let destroyed = mcp_agent_mail_core::global_metrics()
+            .canary
+            .canary_mailboxes_destroyed_total
+            .load();
+        assert!(destroyed > 0);
+    }
+
+    #[test]
+    fn canary_alert_policy_success_constructor() {
+        let p = CanaryAlertPolicy::success("test detail".to_string());
+        assert_eq!(p.tier, CanaryAlertTier::Silent);
+        assert_eq!(p.reason, "probe_ok");
+        assert_eq!(p.detail, "test detail");
+    }
+
+    #[test]
+    fn canary_alert_tier_display_labels() {
+        assert_eq!(CanaryAlertTier::Silent.to_string(), "silent");
+        assert_eq!(CanaryAlertTier::Observable.to_string(), "observable");
+        assert_eq!(CanaryAlertTier::Warning.to_string(), "warning");
+        assert_eq!(CanaryAlertTier::Engineering.to_string(), "engineering");
+    }
 }

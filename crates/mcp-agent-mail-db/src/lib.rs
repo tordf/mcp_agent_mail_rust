@@ -126,6 +126,11 @@ pub use pool::{
     MutatingSurface, OverloadPolicy, RecoveryAction, RecoveryAdmissionStatus, RecoveryApproval,
     ReplayCompensationLog, ReplayCompensationRecord, ReplayResult,
     ResolvedMailboxSqlitePath, WriteRouteDisposition,
+    // Canary namespace, metrics, and alert-isolation policy (br-97gc6.5.2.6.5.4)
+    CanaryAlertPolicy, CanaryAlertTier,
+    CANARY_AGENT_PREFIX, CANARY_PREFIX, CANARY_PROJECT_SLUG, CANARY_STORAGE_DIR_PREFIX,
+    canary_agent_name, canary_mailbox_created, canary_mailbox_destroyed, canary_storage_root,
+    classify_canary_outcome, is_canary_identifier, is_canary_path, record_canary_probe,
     auto_pool_size, create_pool, deferred_write_queue, evaluate_write_route,
     ensure_sqlite_file_healthy, ensure_sqlite_file_healthy_with_archive, get_or_create_pool,
     inspect_mailbox_db_inventory, inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state,

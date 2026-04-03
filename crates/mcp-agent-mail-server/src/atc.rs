@@ -3999,14 +3999,14 @@ struct PrevSnapshotState {
 }
 
 #[derive(Debug, Default)]
-struct LivenessEvaluation {
+pub(crate) struct LivenessEvaluation {
     due_agents: usize,
     actions: Vec<(String, LivenessAction)>,
     decision_metadata: HashMap<String, LivenessDecisionMetadata>,
 }
 
 #[derive(Debug, Clone)]
-struct LivenessDecisionMetadata {
+pub(crate) struct LivenessDecisionMetadata {
     decision_id: u64,
 }
 
@@ -4188,6 +4188,30 @@ impl AtcEngine {
             .and_then(|entry| entry.project_key.clone())
     }
 
+    /// Get the alive-state posterior probability for an agent.
+    #[must_use]
+    pub fn agent_alive_posterior(&self, name: &str) -> Option<f64> {
+        self.agents.get(name).map(|entry| {
+            entry
+                .core
+                .posterior()
+                .iter()
+                .find(|(s, _)| *s == LivenessState::Alive)
+                .map_or(0.0, |(_, p)| *p)
+        })
+    }
+
+    /// Mutable access to the e-process monitor (for replay harness).
+    pub(crate) fn eprocess_mut(&mut self) -> &mut EProcessMonitor {
+        &mut self.eprocess
+    }
+
+    /// Mutable access to the CUSUM detector (for replay harness).
+    pub(crate) fn cusum_mut(&mut self) -> &mut CusumDetector {
+        &mut self.cusum
+    }
+
+
     fn conflict_edge_ttl_micros(&self) -> i64 {
         self.config
             .advisory_cooldown_micros
@@ -4239,7 +4263,7 @@ impl AtcEngine {
         }
     }
 
-    fn note_reservation_granted(
+    pub(crate) fn note_reservation_granted(
         &mut self,
         agent: &str,
         paths: &[String],
@@ -4264,7 +4288,7 @@ impl AtcEngine {
         }
     }
 
-    fn note_reservation_released(
+    pub(crate) fn note_reservation_released(
         &mut self,
         agent: &str,
         paths: &[String],
@@ -4285,7 +4309,7 @@ impl AtcEngine {
         }
     }
 
-    fn note_reservation_conflicts(
+    pub(crate) fn note_reservation_conflicts(
         &mut self,
         requester: &str,
         project: &str,
@@ -4864,7 +4888,7 @@ impl AtcEngine {
     /// Returns the number of due agents that were inspected together with any
     /// `(agent_name, recommended_action)` pairs that require intervention.
     #[must_use]
-    fn evaluate_liveness(&mut self, now_micros: i64) -> LivenessEvaluation {
+    pub(crate) fn evaluate_liveness(&mut self, now_micros: i64) -> LivenessEvaluation {
         let fallback_reason = self.current_release_guard_reason();
         let fallback_active = fallback_reason.is_some();
         let incumbent_policy = self.incumbent_policy.clone();
@@ -9538,14 +9562,67 @@ pub struct AgentStateSnapshot {
     pub intervention_count: u64,
 }
 
+// ── Shared test helpers (accessible from sibling crate modules) ─────
+
+/// Shared lock for tests that mutate global ATC state.
+#[cfg(test)]
+pub(crate) static GLOBAL_ATC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reset all global ATC state for a fresh test run.
+#[cfg(test)]
+pub(crate) fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Config) {
+    let atc_config = AtcEngine::config_from_env(config);
+    let fresh_engine = AtcEngine::new(atc_config);
+
+    let engine_lock = ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new_for_testing()));
+    *engine_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh_engine;
+
+    let population_lock =
+        ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
+    *population_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = HierarchicalAgentModel::new();
+
+    let conformal_lock =
+        ATC_CONFORMAL.get_or_init(|| Mutex::new(AtcConformalSet::new(200, 0.90)));
+    *conformal_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = AtcConformalSet::new(200, 0.90);
+
+    let thresholds_lock = ATC_THRESHOLDS.get_or_init(|| Mutex::new(HashMap::new()));
+    thresholds_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+
+    let survival_lock = ATC_SURVIVAL.get_or_init(|| Mutex::new(HashMap::new()));
+    survival_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+
+    let tuner_lock = ATC_LIVENESS_TUNER
+        .get_or_init(|| Mutex::new(LossMatrixTuner::from_core(&default_liveness_core(), 10)));
+    *tuner_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        LossMatrixTuner::from_core(&default_liveness_core(), 10);
+}
+
 // ── Tests for alien-artifact enhancements ───────────────────────────
 
 #[cfg(test)]
 mod alien_enhancement_tests {
     use super::*;
-    static GLOBAL_ATC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Config) {
+    // Use the crate-level shared lock and reset function.
+    #[allow(unused_imports)]
+    use super::{GLOBAL_ATC_TEST_LOCK, reset_global_atc_state_for_test};
+
+    #[allow(dead_code)]
+    fn reset_global_atc_state_for_test_local(config: &mcp_agent_mail_core::Config) {
         let atc_config = AtcEngine::config_from_env(config);
         let fresh_engine = AtcEngine::new(atc_config);
 

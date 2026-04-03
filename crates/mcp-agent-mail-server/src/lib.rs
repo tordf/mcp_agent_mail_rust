@@ -71,6 +71,7 @@ pub const COMPAT_MCP_ALIASES: &[&str] = &["/api", "/mcp"];
 
 mod ack_ttl;
 pub mod atc;
+pub mod atc_replay;
 mod cleanup;
 pub mod console;
 mod disk_monitor;

@@ -775,6 +775,7 @@ mod tests {
                 tui_spin_watchdog_last_trip_us: 0,
             },
             search: SearchMetricsSnapshot::default(),
+            canary: CanaryMetricsSnapshot::default(),
         };
 
         let signals = HealthSignals::from_snapshot(&snap, 1_000_000_000);

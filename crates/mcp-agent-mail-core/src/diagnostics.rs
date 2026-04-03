@@ -2073,4 +2073,149 @@ mod tests {
         assert_eq!(DiagnosticPayload::SCHEMA_MAJOR, 1);
         assert_eq!(DiagnosticPayload::SCHEMA_MINOR, 0);
     }
+
+    // -- WarningFloodGate tests --
+
+    #[test]
+    fn flood_gate_empty_has_no_warnings() {
+        let gate = WarningFloodGate::default_cap();
+        assert_eq!(gate.total(), 0);
+        assert!(!gate.has_suppressed());
+        assert!(gate.terminal_warnings().is_empty());
+        assert!(gate.all_warnings().is_empty());
+        let summary = gate.summary();
+        assert_eq!(summary.total_warnings, 0);
+        assert_eq!(summary.total_suppressed, 0);
+        assert!(summary.suppression_notice.is_none());
+    }
+
+    #[test]
+    fn flood_gate_within_cap_shows_all() {
+        let mut gate = WarningFloodGate::new(3);
+        assert!(gate.push("parse_error", "file A failed"));
+        assert!(gate.push("parse_error", "file B failed"));
+        assert!(gate.push("parse_error", "file C failed"));
+        assert_eq!(gate.total(), 3);
+        assert!(!gate.has_suppressed());
+        assert_eq!(gate.terminal_warnings().len(), 3);
+        assert_eq!(gate.all_warnings().len(), 3);
+    }
+
+    #[test]
+    fn flood_gate_exceeds_cap_suppresses() {
+        let mut gate = WarningFloodGate::new(2);
+        assert!(gate.push("dup", "dup warning 1"));
+        assert!(gate.push("dup", "dup warning 2"));
+        assert!(!gate.push("dup", "dup warning 3")); // suppressed
+        assert!(!gate.push("dup", "dup warning 4")); // suppressed
+        assert_eq!(gate.total(), 4);
+        assert!(gate.has_suppressed());
+        assert_eq!(gate.terminal_warnings().len(), 2);
+        assert_eq!(gate.all_warnings().len(), 4);
+    }
+
+    #[test]
+    fn flood_gate_multiple_categories_independent_caps() {
+        let mut gate = WarningFloodGate::new(2);
+        gate.push("cat_a", "a1");
+        gate.push("cat_a", "a2");
+        gate.push("cat_a", "a3"); // suppressed
+        gate.push("cat_b", "b1");
+        gate.push("cat_b", "b2");
+        assert_eq!(gate.total(), 5);
+        assert_eq!(gate.terminal_warnings().len(), 4); // 2 from a, 2 from b
+        assert_eq!(gate.all_warnings().len(), 5);
+    }
+
+    #[test]
+    fn flood_gate_summary_reports_overflow() {
+        let mut gate = WarningFloodGate::new(2);
+        for i in 0..10 {
+            gate.push("flood", format!("warning {i}"));
+        }
+        gate.push("clean", "single warning");
+
+        let summary = gate.summary();
+        assert_eq!(summary.total_warnings, 11);
+        assert_eq!(summary.total_shown, 3); // 2 flood + 1 clean
+        assert_eq!(summary.total_suppressed, 8);
+        assert_eq!(summary.category_count, 2);
+        assert_eq!(summary.overflow_category_count, 1);
+        assert_eq!(summary.overflows.len(), 1);
+        assert_eq!(summary.overflows[0].category, "flood");
+        assert_eq!(summary.overflows[0].total, 10);
+        assert_eq!(summary.overflows[0].shown, 2);
+        assert_eq!(summary.overflows[0].suppressed, 8);
+        assert!(summary.suppression_notice.is_some());
+        let notice = summary.suppression_notice.unwrap();
+        assert!(notice.contains("8 warning(s) suppressed"));
+        assert!(notice.contains("flood: 8 suppressed"));
+    }
+
+    #[test]
+    fn flood_gate_no_suppression_notice_when_within_cap() {
+        let mut gate = WarningFloodGate::new(5);
+        gate.push("a", "w1");
+        gate.push("b", "w2");
+        let summary = gate.summary();
+        assert!(summary.suppression_notice.is_none());
+    }
+
+    #[test]
+    fn flood_gate_terminal_messages_convenience() {
+        let mut gate = WarningFloodGate::new(1);
+        gate.push("x", "first");
+        gate.push("x", "second");
+        let msgs = gate.terminal_messages();
+        assert_eq!(msgs, vec!["first"]);
+        let all = gate.all_messages();
+        assert_eq!(all, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn flood_gate_into_terminal_messages() {
+        let mut gate = WarningFloodGate::new(1);
+        gate.push("x", "keep");
+        gate.push("x", "drop");
+        gate.push("y", "keep_y");
+        let msgs = gate.into_terminal_messages();
+        assert_eq!(msgs, vec!["keep", "keep_y"]);
+    }
+
+    #[test]
+    fn flood_gate_into_all_messages() {
+        let mut gate = WarningFloodGate::new(1);
+        gate.push("x", "a");
+        gate.push("x", "b");
+        let msgs = gate.into_all_messages();
+        assert_eq!(msgs, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn flood_gate_push_owned() {
+        let mut gate = WarningFloodGate::new(1);
+        assert!(gate.push_owned("cat".to_string(), "msg1".to_string()));
+        assert!(!gate.push_owned("cat".to_string(), "msg2".to_string()));
+        assert_eq!(gate.total(), 2);
+        assert_eq!(gate.terminal_warnings().len(), 1);
+    }
+
+    #[test]
+    fn flood_gate_summary_serializes() {
+        let mut gate = WarningFloodGate::new(2);
+        for i in 0..5 {
+            gate.push("test", format!("w{i}"));
+        }
+        let summary = gate.summary();
+        let json = serde_json::to_value(&summary).expect("serialize");
+        assert_eq!(json["total_warnings"], 5);
+        assert_eq!(json["total_suppressed"], 3);
+        assert!(json["suppression_notice"].is_string());
+    }
+
+    #[test]
+    fn flood_gate_cap_at_least_one() {
+        let gate = WarningFloodGate::new(0); // should be clamped to 1
+        assert_eq!(gate.cap_per_category, 1);
+    }
 }

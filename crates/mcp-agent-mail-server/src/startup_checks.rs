@@ -3450,4 +3450,27 @@ second body
 
         file.unlock().unwrap();
     }
+
+    // ── Recovery elapsed formatting tests (br-rqv3i.7) ──────────────────
+
+    #[test]
+    fn format_recovery_elapsed_seconds() {
+        assert_eq!(super::format_recovery_elapsed(0), "0s");
+        assert_eq!(super::format_recovery_elapsed(45), "45s");
+        assert_eq!(super::format_recovery_elapsed(59), "59s");
+    }
+
+    #[test]
+    fn format_recovery_elapsed_minutes() {
+        assert_eq!(super::format_recovery_elapsed(60), "1m");
+        assert_eq!(super::format_recovery_elapsed(90), "1m 30s");
+        assert_eq!(super::format_recovery_elapsed(155), "2m 35s");
+    }
+
+    #[test]
+    fn format_recovery_elapsed_hours() {
+        assert_eq!(super::format_recovery_elapsed(3600), "1h 0m");
+        assert_eq!(super::format_recovery_elapsed(4320), "1h 12m");
+        assert_eq!(super::format_recovery_elapsed(7200), "2h 0m");
+    }
 }

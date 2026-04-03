@@ -743,12 +743,12 @@ pub const INTERACTION_RULES: [InteractionRule; 19] = [
         kind: InteractionKind::Gates,
         description: "safe mode disables high-risk action admissibility",
     },
-    // --- CalibrationGuard forces AdaptationEngine reset ---
+    // --- CalibrationGuard vetoes AdaptationEngine promotion ---
     InteractionRule {
         source: ControllerId::CalibrationGuard,
         target: ControllerId::AdaptationEngine,
-        kind: InteractionKind::ForcesReset,
-        description: "safe-mode entry forces rollback to incumbent policy",
+        kind: InteractionKind::Vetoes,
+        description: "safe-mode entry vetoes candidate promotion and triggers rollback to incumbent",
     },
     // --- ConformalRiskBudget gates AdmissibilityGates ---
     InteractionRule {
@@ -785,12 +785,12 @@ pub const INTERACTION_RULES: [InteractionRule; 19] = [
         kind: InteractionKind::Feeds,
         description: "cumulative regret drives policy evaluation decisions",
     },
-    // --- ShrinkageEstimator feeds ConformalRiskBudget ---
+    // --- ShrinkageEstimator modulates ConformalRiskBudget (cross-tick) ---
     InteractionRule {
         source: ControllerId::ShrinkageEstimator,
         target: ControllerId::ConformalRiskBudget,
-        kind: InteractionKind::Feeds,
-        description: "shrunk estimates improve sparse-stratum risk budgets",
+        kind: InteractionKind::Modulates,
+        description: "shrunk estimates improve sparse-stratum risk budgets (applied next tick)",
     },
     // --- SlowController modulates probe budget ---
     InteractionRule {
@@ -841,12 +841,12 @@ pub const INTERACTION_RULES: [InteractionRule; 19] = [
         kind: InteractionKind::Vetoes,
         description: "safe mode blocks policy promotion certification",
     },
-    // --- VoIControl feeds AdmissibilityGates ---
+    // --- VoIControl modulates AdmissibilityGates (cross-tick) ---
     InteractionRule {
         source: ControllerId::VoIControl,
         target: ControllerId::AdmissibilityGates,
-        kind: InteractionKind::Feeds,
-        description: "experiment budget availability gates exploration actions",
+        kind: InteractionKind::Modulates,
+        description: "experiment budget availability modulates exploration admissibility (applied next tick)",
     },
     // --- FairnessGuards feeds PolicyCertificates ---
     InteractionRule {
@@ -1044,15 +1044,22 @@ pub fn validate_composition() -> Vec<CompositionViolation> {
     }
 
     // Check 4: interaction rules respect timescale ordering.
+    //
+    // ForcesReset from a slower controller to a faster controller is
+    // architecturally correct: regime shifts propagate downward to reset
+    // stale state (e.g. RegimeManager resets FairnessGuards history after
+    // a regime change).  The violation is the opposite direction: a fast
+    // controller forcing a reset on a slower controller would be an
+    // authority inversion.
     for rule in &INTERACTION_RULES {
         if rule.kind == InteractionKind::ForcesReset
-            && rule.source.timescale() > rule.target.timescale()
+            && rule.source.timescale() < rule.target.timescale()
         {
             violations.push(CompositionViolation {
                 kind: ViolationKind::TimescaleCrossing,
                 controllers: vec![rule.source, rule.target],
                 description: format!(
-                    "slow controller {} forces reset on faster controller {}",
+                    "fast controller {} forces reset on slower controller {} (authority inversion)",
                     rule.source.as_str(),
                     rule.target.as_str(),
                 ),

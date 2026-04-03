@@ -13172,4 +13172,241 @@ mod tests {
         assert_eq!(json["_alerts"].as_array().unwrap().len(), 2);
         assert_eq!(json["_actions"].as_array().unwrap().len(), 2);
     }
+
+    // ── Recovery progress, elapsed, stall detection tests (br-rqv3i.7) ──
+
+    #[test]
+    fn format_duration_human_seconds() {
+        assert_eq!(super::format_duration_human(0), "0s");
+        assert_eq!(super::format_duration_human(45), "45s");
+        assert_eq!(super::format_duration_human(59), "59s");
+    }
+
+    #[test]
+    fn format_duration_human_minutes() {
+        assert_eq!(super::format_duration_human(60), "1m");
+        assert_eq!(super::format_duration_human(90), "1m 30s");
+        assert_eq!(super::format_duration_human(155), "2m 35s");
+        assert_eq!(super::format_duration_human(3599), "59m 59s");
+    }
+
+    #[test]
+    fn format_duration_human_hours() {
+        assert_eq!(super::format_duration_human(3600), "1h 0m");
+        assert_eq!(super::format_duration_human(4320), "1h 12m");
+        assert_eq!(super::format_duration_human(7200), "2h 0m");
+        assert_eq!(super::format_duration_human(86400), "24h 0m");
+    }
+
+    #[test]
+    fn recovery_status_serialization_with_progress_fields() {
+        let status = RecoveryStatus {
+            mode: "recovering".into(),
+            owner: "pid 12345 (active)".into(),
+            next_action: "Recovery active (pid 12345, 2m 35s); still self-healing".into(),
+            bundle_path: Some("/tmp/forensics/bundle-1".into()),
+            elapsed_secs: Some(155),
+            elapsed_display: Some("2m 35s".into()),
+            phase: "lock_held".into(),
+            stall_detected: false,
+            stall_reason: None,
+            deferred_write_backlog: None,
+            admission: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["mode"], "recovering");
+        assert_eq!(json["phase"], "lock_held");
+        assert_eq!(json["elapsed_secs"], 155);
+        assert_eq!(json["elapsed_display"], "2m 35s");
+        assert_eq!(json["stall_detected"], false);
+        // stall_reason should be absent (skip_serializing_if)
+        assert!(json.get("stall_reason").is_none());
+        // deferred_write_backlog should be absent
+        assert!(json.get("deferred_write_backlog").is_none());
+        // admission should be absent
+        assert!(json.get("admission").is_none());
+    }
+
+    #[test]
+    fn recovery_status_serialization_with_stall_detected() {
+        let status = RecoveryStatus {
+            mode: "recovering".into(),
+            owner: "pid 999 (active)".into(),
+            next_action: "Recovery has been running for 8m 20s without completing; investigate lock holder or run `am doctor repair --force`".into(),
+            bundle_path: None,
+            elapsed_secs: Some(500),
+            elapsed_display: Some("8m 20s".into()),
+            phase: "lock_held".into(),
+            stall_detected: true,
+            stall_reason: Some("recovery lock held beyond stall threshold".into()),
+            deferred_write_backlog: Some(DeferredWriteBacklog {
+                queued: 42,
+                capacity: 1000,
+                oldest_age_secs: 120,
+                estimated_bytes: 8192,
+                pressure: "elevated".into(),
+                shed_count: 3,
+            }),
+            admission: Some(RecoveryAdmissionSnapshot {
+                in_progress: true,
+                consecutive_failures: 2,
+                attempts_in_window: 3,
+                suppressed: false,
+            }),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["stall_detected"], true);
+        assert_eq!(
+            json["stall_reason"],
+            "recovery lock held beyond stall threshold"
+        );
+        // Backlog present
+        assert_eq!(json["deferred_write_backlog"]["queued"], 42);
+        assert_eq!(json["deferred_write_backlog"]["capacity"], 1000);
+        assert_eq!(json["deferred_write_backlog"]["pressure"], "elevated");
+        assert_eq!(json["deferred_write_backlog"]["shed_count"], 3);
+        // Admission present
+        assert_eq!(json["admission"]["in_progress"], true);
+        assert_eq!(json["admission"]["consecutive_failures"], 2);
+        assert_eq!(json["admission"]["suppressed"], false);
+    }
+
+    #[test]
+    fn recovery_status_stale_lock_phase() {
+        let status = RecoveryStatus {
+            mode: "degraded_read_only".into(),
+            owner: "none".into(),
+            next_action: "Recovery lock is stale (process exited); run `am doctor repair` to restart".into(),
+            bundle_path: None,
+            elapsed_secs: Some(600),
+            elapsed_display: Some("10m".into()),
+            phase: "lock_stale".into(),
+            stall_detected: true,
+            stall_reason: Some("stale recovery lock from a dead process".into()),
+            deferred_write_backlog: None,
+            admission: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["phase"], "lock_stale");
+        assert_eq!(json["stall_detected"], true);
+        assert!(json["stall_reason"]
+            .as_str()
+            .unwrap()
+            .contains("stale recovery lock"));
+    }
+
+    #[test]
+    fn recovery_status_corrupt_no_lock_phase() {
+        let status = RecoveryStatus {
+            mode: "corrupt".into(),
+            owner: "none".into(),
+            next_action: "Run `am doctor repair --force` or restore from archive backup".into(),
+            bundle_path: None,
+            elapsed_secs: None,
+            elapsed_display: None,
+            phase: "corrupt_no_lock".into(),
+            stall_detected: false,
+            stall_reason: None,
+            deferred_write_backlog: None,
+            admission: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["phase"], "corrupt_no_lock");
+        // elapsed fields should be absent (skip_serializing_if)
+        assert!(json.get("elapsed_secs").is_none());
+        assert!(json.get("elapsed_display").is_none());
+    }
+
+    #[test]
+    fn recovery_status_admission_suppressed() {
+        let status = RecoveryStatus {
+            mode: "recovering".into(),
+            owner: "none".into(),
+            next_action: "Recovery suppressed after 5 consecutive failures; run `am doctor repair --force` to override".into(),
+            bundle_path: None,
+            elapsed_secs: None,
+            elapsed_display: None,
+            phase: "degraded_no_lock".into(),
+            stall_detected: true,
+            stall_reason: Some("admission controller suppressed after repeated failures".into()),
+            deferred_write_backlog: None,
+            admission: Some(RecoveryAdmissionSnapshot {
+                in_progress: false,
+                consecutive_failures: 5,
+                attempts_in_window: 5,
+                suppressed: true,
+            }),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["admission"]["suppressed"], true);
+        assert_eq!(json["admission"]["consecutive_failures"], 5);
+        assert!(json["stall_reason"]
+            .as_str()
+            .unwrap()
+            .contains("admission controller suppressed"));
+    }
+
+    #[test]
+    fn recovery_status_deferred_write_hard_stop() {
+        let status = RecoveryStatus {
+            mode: "recovering".into(),
+            owner: "pid 42 (active)".into(),
+            next_action: "Recovery appears stalled; investigate lock holder or run `am doctor repair --force`".into(),
+            bundle_path: None,
+            elapsed_secs: Some(60),
+            elapsed_display: Some("1m".into()),
+            phase: "lock_held".into(),
+            stall_detected: true,
+            stall_reason: Some("deferred-write queue at hard-stop".into()),
+            deferred_write_backlog: Some(DeferredWriteBacklog {
+                queued: 1000,
+                capacity: 1000,
+                oldest_age_secs: 400,
+                estimated_bytes: 1_048_576,
+                pressure: "hard_stop".into(),
+                shed_count: 50,
+            }),
+            admission: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["deferred_write_backlog"]["pressure"], "hard_stop");
+        assert_eq!(json["deferred_write_backlog"]["queued"], 1000);
+        assert_eq!(json["deferred_write_backlog"]["shed_count"], 50);
+    }
+
+    #[test]
+    fn status_data_with_recovery_progress_serializes_correctly() {
+        let data = StatusData {
+            health: "recovering".into(),
+            unread: 0,
+            urgent: 0,
+            ack_required: 0,
+            ack_overdue: 0,
+            active_reservations: 0,
+            reservations_expiring_soon: 0,
+            active_agents: 1,
+            recent_messages: 0,
+            my_reservations: vec![],
+            top_threads: vec![],
+            anomalies: vec![],
+            recovery: Some(RecoveryStatus {
+                mode: "recovering".into(),
+                owner: "pid 100 (active)".into(),
+                next_action: "Recovery active (pid 100, 30s); still self-healing".into(),
+                bundle_path: None,
+                elapsed_secs: Some(30),
+                elapsed_display: Some("30s".into()),
+                phase: "lock_held".into(),
+                stall_detected: false,
+                stall_reason: None,
+                deferred_write_backlog: None,
+                admission: None,
+            }),
+        };
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["health"], "recovering");
+        assert_eq!(json["recovery"]["phase"], "lock_held");
+        assert_eq!(json["recovery"]["elapsed_secs"], 30);
+        assert_eq!(json["recovery"]["stall_detected"], false);
+    }
 }

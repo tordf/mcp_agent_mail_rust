@@ -145,9 +145,9 @@ pub use mcp_config::{
 };
 pub use memory::{MemoryPressure, MemorySample};
 pub use metrics::{
-    Counter, DbMetricsSnapshot, GaugeI64, GaugeU64, GlobalMetricsSnapshot, HistogramSnapshot,
-    HttpMetricsSnapshot, Log2Histogram, StorageMetricsSnapshot, ToolsMetricsSnapshot,
-    global_metrics,
+    CanaryMetrics, CanaryMetricsSnapshot, Counter, DbMetricsSnapshot, GaugeI64, GaugeU64,
+    GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot, Log2Histogram,
+    StorageMetricsSnapshot, ToolsMetricsSnapshot, global_metrics,
 };
 pub use models::{
     Agent, AgentLink, ConsistencyMessageRef, ConsistencyReport, FileReservation,

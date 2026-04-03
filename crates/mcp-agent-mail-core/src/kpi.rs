@@ -1627,8 +1627,9 @@ pub fn quick_insight_feed() -> InsightFeed {
 mod tests {
     use super::*;
     use crate::metrics::{
-        DbMetricsSnapshot, GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
-        SearchMetricsSnapshot, StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot,
+        CanaryMetricsSnapshot, DbMetricsSnapshot, GlobalMetricsSnapshot, HistogramSnapshot,
+        HttpMetricsSnapshot, SearchMetricsSnapshot, StorageMetricsSnapshot,
+        SystemMetricsSnapshot, ToolsMetricsSnapshot,
     };
     use std::sync::Mutex;
     use std::thread;
@@ -1752,6 +1753,7 @@ mod tests {
                 tui_spin_watchdog_last_trip_us: 0,
             },
             search: SearchMetricsSnapshot::default(),
+            canary: CanaryMetricsSnapshot::default(),
         }
     }
 
