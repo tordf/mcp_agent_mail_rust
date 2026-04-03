@@ -35,7 +35,11 @@ use chrono::{DateTime, Utc};
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::McpContext;
 
-use mcp_agent_mail_core::{AgentDetectError, AgentDetectOptions, Config, resolve_project_identity};
+use mcp_agent_mail_core::{
+    AgentDetectError, AgentDetectOptions, ArchiveScanDedupeRule, ArchiveScanDiagnostic,
+    ArchiveScanScope, ArchiveScanSeverityBucket, ArchiveScanSummary, ArtifactPointer, Config,
+    DiagnosticPayload, resolve_project_identity,
+};
 use mcp_agent_mail_share as share;
 use serde::{Deserialize, Serialize};
 
@@ -13029,6 +13033,124 @@ impl DoctorArchiveAuditReport {
     }
 }
 
+const DOCTOR_ARCHIVE_SCAN_SUMMARY_SAMPLE_LIMIT: usize = 3;
+
+fn doctor_archive_scan_diagnostics(
+    report: &DoctorArchiveAuditReport,
+) -> Vec<ArchiveScanDiagnostic> {
+    let mut diagnostics = Vec::with_capacity(report.finding_count());
+
+    for finding in &report.missing_project_metadata {
+        diagnostics.push(ArchiveScanDiagnostic {
+            code: "missing_project_metadata".to_string(),
+            severity: ArchiveScanSeverityBucket::Warning,
+            scope: ArchiveScanScope::HygieneDebt,
+            dedupe_rule: ArchiveScanDedupeRule::ProjectDir,
+            dedupe_value: finding.project_dir.clone(),
+            summary: format!("project '{}' is missing project.json", finding.slug),
+            recommendation: Some(
+                "Safe auto remediation can write canonical project metadata when the archive identity is already clear."
+                    .to_string(),
+            ),
+        });
+    }
+
+    for finding in &report.invalid_project_metadata {
+        let can_auto_normalize = finding.canonical_human_key.is_some();
+        diagnostics.push(ArchiveScanDiagnostic {
+            code: "invalid_project_metadata".to_string(),
+            severity: if can_auto_normalize {
+                ArchiveScanSeverityBucket::Warning
+            } else {
+                ArchiveScanSeverityBucket::Critical
+            },
+            scope: if can_auto_normalize {
+                ArchiveScanScope::HygieneDebt
+            } else {
+                ArchiveScanScope::ImmediateAction
+            },
+            dedupe_rule: ArchiveScanDedupeRule::ProjectDir,
+            dedupe_value: finding.project_dir.clone(),
+            summary: if can_auto_normalize {
+                format!("project '{}' metadata needs normalization", finding.slug)
+            } else {
+                format!(
+                    "project '{}' metadata cannot be auto-normalized safely",
+                    finding.slug
+                )
+            },
+            recommendation: Some(if can_auto_normalize {
+                "Run archive normalization in dry-run mode first; this project has a canonical human_key candidate."
+                    .to_string()
+            } else {
+                "Resolve project.json manually before trusting archive reconstruction or promotion."
+                    .to_string()
+            }),
+        });
+    }
+
+    for finding in &report.malformed_message_files {
+        diagnostics.push(ArchiveScanDiagnostic {
+            code: "malformed_canonical_message".to_string(),
+            severity: ArchiveScanSeverityBucket::Critical,
+            scope: ArchiveScanScope::ImmediateAction,
+            dedupe_rule: ArchiveScanDedupeRule::CanonicalPath,
+            dedupe_value: finding.path.clone(),
+            summary: format!(
+                "canonical message file is malformed: {}",
+                truncate_str(&finding.path, 72)
+            ),
+            recommendation: Some(
+                "Inspect the canonical file manually; malformed message content should stay in artifact detail, not terminal floods."
+                    .to_string(),
+            ),
+        });
+    }
+
+    for group in &report.duplicate_canonical_groups {
+        diagnostics.push(ArchiveScanDiagnostic {
+            code: "duplicate_canonical_id".to_string(),
+            severity: ArchiveScanSeverityBucket::Critical,
+            scope: ArchiveScanScope::ImmediateAction,
+            dedupe_rule: ArchiveScanDedupeRule::MessageId,
+            dedupe_value: group.message_id.to_string(),
+            summary: format!(
+                "message id {} has {} duplicate canonical file(s)",
+                group.message_id,
+                group.duplicates.len()
+            ),
+            recommendation: Some(
+                "Review the canonical winner and quarantine duplicate files only after confirmation."
+                    .to_string(),
+            ),
+        });
+    }
+
+    for finding in &report.suspicious_projects {
+        diagnostics.push(ArchiveScanDiagnostic {
+            code: "suspicious_ephemeral_project".to_string(),
+            severity: ArchiveScanSeverityBucket::Info,
+            scope: ArchiveScanScope::HygieneDebt,
+            dedupe_rule: ArchiveScanDedupeRule::ProjectDir,
+            dedupe_value: finding.project_dir.clone(),
+            summary: format!("project '{}' looks ephemeral in the archive", finding.slug),
+            recommendation: Some(
+                "Keep ephemeral or temp roots isolated from the production mailbox archive."
+                    .to_string(),
+            ),
+        });
+    }
+
+    diagnostics
+}
+
+fn doctor_archive_scan_summary(report: &DoctorArchiveAuditReport) -> ArchiveScanSummary {
+    ArchiveScanSummary::build(
+        doctor_archive_scan_diagnostics(report),
+        DOCTOR_ARCHIVE_SCAN_SUMMARY_SAMPLE_LIMIT,
+    )
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct DoctorArchiveNormalizeAction {
     kind: String,
@@ -13104,8 +13226,406 @@ enum DoctorDatabaseFixStrategy {
     Reconstruct(String),
 }
 
+const DOCTOR_SUMMARY_DETAIL_LIMIT: usize = 220;
+const DOCTOR_TABLE_DETAIL_LIMIT: usize = 240;
+const DOCTOR_PRIMARY_CHECK_PRIORITY: &[&str] = &[
+    "db_file_sanity",
+    "database",
+    "pool_init",
+    "storage_root_writable",
+    "archive_db_parity",
+    "foreign_key_integrity",
+    "server_port",
+    "server_process_cpu",
+    "server_http_health",
+    "server_jsonrpc_health",
+];
+const DOCTOR_DATABASE_INCIDENT_CHECKS: &[&str] = &[
+    "db_file_sanity",
+    "database",
+    "pool_init",
+    "archive_db_parity",
+    "foreign_key_integrity",
+    "storage_root_writable",
+];
+const DOCTOR_SERVER_INCIDENT_CHECKS: &[&str] = &[
+    "server_port",
+    "server_process_cpu",
+    "server_http_health",
+    "server_jsonrpc_health",
+];
+
+/// Archive hygiene checks are cosmetic / non-urgent: orphaned files, naming
+/// inconsistencies, metadata drift, stale lock files, disk space.  They never
+/// indicate live data-path corruption or operational outages.
+const DOCTOR_ARCHIVE_HYGIENE_CHECKS: &[&str] = &[
+    "archive_hygiene",
+    "storage_root_git_repo",
+    "storage_root_git_index_lock",
+    "storage_root_disk_space",
+    "storage_root",
+];
+
+/// Returns one of `"live_incident"`, `"archive_hygiene"`, or `"environment"`.
+fn doctor_check_category(check_name: &str) -> &'static str {
+    if DOCTOR_DATABASE_INCIDENT_CHECKS.contains(&check_name)
+        || DOCTOR_SERVER_INCIDENT_CHECKS.contains(&check_name)
+    {
+        "live_incident"
+    } else if DOCTOR_ARCHIVE_HYGIENE_CHECKS.contains(&check_name) {
+        "archive_hygiene"
+    } else {
+        "environment"
+    }
+}
+
+/// Human-readable heading for a doctor check category.
+fn doctor_category_heading(category: &str) -> &'static str {
+    match category {
+        "live_incident" => "Live Operational Checks",
+        "archive_hygiene" => "Archive Hygiene (cosmetic)",
+        "environment" => "Environment & Configuration",
+        _ => "Other",
+    }
+}
+
 fn truncate_doctor_command(raw: &str) -> String {
     truncate_str(&collapse_whitespace(raw.trim()), 160)
+}
+
+fn doctor_check_value_str<'a>(check: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    check.get(field).and_then(|value| value.as_str())
+}
+
+fn doctor_find_check<'a>(
+    checks: &'a [serde_json::Value],
+    check_name: &str,
+) -> Option<&'a serde_json::Value> {
+    checks.iter().find(|check| {
+        doctor_check_value_str(check, "check").is_some_and(|value| value == check_name)
+    })
+}
+
+fn doctor_compact_detail(detail: &str, limit: usize) -> String {
+    truncate_str(&collapse_whitespace(detail.trim()), limit)
+}
+
+fn doctor_check_priority(check_name: &str) -> usize {
+    DOCTOR_PRIMARY_CHECK_PRIORITY
+        .iter()
+        .position(|candidate| *candidate == check_name)
+        .unwrap_or(DOCTOR_PRIMARY_CHECK_PRIORITY.len())
+}
+
+fn doctor_primary_check<'a>(checks: &'a [serde_json::Value]) -> Option<&'a serde_json::Value> {
+    checks
+        .iter()
+        .filter(|check| {
+            matches!(
+                doctor_check_value_str(check, "status"),
+                Some("fail") | Some("warn")
+            )
+        })
+        .min_by_key(|check| {
+            let status_bucket = if doctor_check_value_str(check, "status") == Some("fail") {
+                0
+            } else {
+                1
+            };
+            let check_name = doctor_check_value_str(check, "check").unwrap_or_default();
+            (status_bucket, doctor_check_priority(check_name))
+        })
+}
+
+fn doctor_ordered_checks<'a>(
+    checks: &'a [serde_json::Value],
+    summary: &serde_json::Value,
+) -> Vec<&'a serde_json::Value> {
+    let primary_name = summary
+        .get("primary_issue")
+        .filter(|value| !value.is_null())
+        .and_then(|value| value.get("check"))
+        .and_then(|value| value.as_str());
+
+    let mut ordered: Vec<_> = checks.iter().enumerate().collect();
+    ordered.sort_by_key(|(index, check)| {
+        let check_name = doctor_check_value_str(check, "check").unwrap_or_default();
+        let status = doctor_check_value_str(check, "status").unwrap_or("ok");
+        // Primary category bucket: live incidents first, then archive hygiene, then env.
+        let category_bucket = match doctor_check_category(check_name) {
+            "live_incident" => 0,
+            "archive_hygiene" => 1,
+            _ => 2,
+        };
+        // Within each category, surface the primary issue first, then failures,
+        // then warnings, then passing checks.
+        let status_bucket = if Some(check_name) == primary_name {
+            0
+        } else if status == "fail" {
+            1
+        } else if status == "warn" {
+            2
+        } else {
+            3
+        };
+        (category_bucket, status_bucket, doctor_check_priority(check_name), *index)
+    });
+    ordered.into_iter().map(|(_, check)| check).collect()
+}
+
+fn doctor_database_next_action(strategy: &DoctorDatabaseFixStrategy) -> String {
+    match strategy {
+        DoctorDatabaseFixStrategy::Reconstruct(_) => {
+            "Run `am doctor fix --dry-run` or `am doctor reconstruct --dry-run`.".to_string()
+        }
+        DoctorDatabaseFixStrategy::Repair(_) => {
+            "Run `am doctor fix --dry-run` or `am doctor repair --dry-run`.".to_string()
+        }
+        DoctorDatabaseFixStrategy::None(_) => {
+            "No database repair action is currently recommended.".to_string()
+        }
+    }
+}
+
+fn doctor_server_next_action(diagnostics: &DoctorServerFixDiagnostics) -> Option<String> {
+    if diagnostics.restart_recommended {
+        Some(
+            "Run `am doctor fix --dry-run` or restart the unhealthy Agent Mail listener."
+                .to_string(),
+        )
+    } else if diagnostics.port_check.status != "ok"
+        || diagnostics.http_check.status != "ok"
+        || diagnostics.rpc_check.status != "ok"
+        || diagnostics.process_check.status != "ok"
+    {
+        Some(
+            "Inspect the local listener and MCP endpoint health; restart if probes stay degraded."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn doctor_issue_summary_value(
+    check: &serde_json::Value,
+    class: &str,
+    next_action: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "class": class,
+        "check": doctor_check_value_str(check, "check").unwrap_or_default(),
+        "status": doctor_check_value_str(check, "status").unwrap_or("warn"),
+        "detail": doctor_compact_detail(
+            doctor_check_value_str(check, "detail").unwrap_or_default(),
+            DOCTOR_SUMMARY_DETAIL_LIMIT,
+        ),
+        "next_action": next_action,
+    })
+}
+
+fn build_doctor_check_summary(
+    checks: &[serde_json::Value],
+    database_strategy: Option<&DoctorDatabaseFixStrategy>,
+    server_diagnostics: Option<&DoctorServerFixDiagnostics>,
+) -> serde_json::Value {
+    let fail_count = checks
+        .iter()
+        .filter(|check| doctor_check_value_str(check, "status") == Some("fail"))
+        .count();
+    let warn_count = checks
+        .iter()
+        .filter(|check| doctor_check_value_str(check, "status") == Some("warn"))
+        .count();
+
+    let primary_check = doctor_primary_check(checks);
+
+    let primary_status = primary_check
+        .and_then(|check| doctor_check_value_str(check, "status"))
+        .unwrap_or("ok");
+    let primary_issue = primary_check.map_or(serde_json::Value::Null, |check| {
+        let check_name = doctor_check_value_str(check, "check").unwrap_or_default();
+        if DOCTOR_DATABASE_INCIDENT_CHECKS.contains(&check_name) {
+            doctor_issue_summary_value(
+                check,
+                "live_mailbox_incident",
+                database_strategy.map(doctor_database_next_action),
+            )
+        } else if DOCTOR_SERVER_INCIDENT_CHECKS.contains(&check_name) {
+            doctor_issue_summary_value(
+                check,
+                "server_runtime_incident",
+                server_diagnostics.and_then(doctor_server_next_action),
+            )
+        } else {
+            doctor_issue_summary_value(check, "operator_warning", None)
+        }
+    });
+
+    let archive_hygiene = doctor_find_check(checks, "archive_hygiene")
+        .filter(|check| {
+            doctor_check_value_str(check, "status").is_some_and(|status| status != "ok")
+        })
+        .map(|check| {
+            doctor_issue_summary_value(
+                check,
+                "archive_hygiene_debt",
+                Some("Run `am doctor archive-scan` for details.".to_string()),
+            )
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    let primary_fail_count = if primary_status == "fail" { 1 } else { 0 };
+    let primary_warn_count = if primary_status == "warn" { 1 } else { 0 };
+    let archive_warn_count = if archive_hygiene.is_null() { 0 } else { 1 };
+
+    // Per-category breakdown so consumers can distinguish severity tiers.
+    let live_incident_findings = checks
+        .iter()
+        .filter(|c| {
+            let name = doctor_check_value_str(c, "check").unwrap_or_default();
+            doctor_check_category(name) == "live_incident"
+                && matches!(
+                    doctor_check_value_str(c, "status"),
+                    Some("fail") | Some("warn")
+                )
+        })
+        .count();
+    let archive_hygiene_findings = checks
+        .iter()
+        .filter(|c| {
+            let name = doctor_check_value_str(c, "check").unwrap_or_default();
+            doctor_check_category(name) == "archive_hygiene"
+                && matches!(
+                    doctor_check_value_str(c, "status"),
+                    Some("fail") | Some("warn")
+                )
+        })
+        .count();
+    let environment_findings = checks
+        .iter()
+        .filter(|c| {
+            let name = doctor_check_value_str(c, "check").unwrap_or_default();
+            doctor_check_category(name) == "environment"
+                && matches!(
+                    doctor_check_value_str(c, "status"),
+                    Some("fail") | Some("warn")
+                )
+        })
+        .count();
+
+    serde_json::json!({
+        "overall_status": if fail_count > 0 {
+            "fail"
+        } else if warn_count > 0 {
+            "warn"
+        } else {
+            "ok"
+        },
+        "primary_issue": primary_issue,
+        "archive_hygiene": archive_hygiene,
+        "secondary_fail_count": fail_count.saturating_sub(primary_fail_count),
+        "secondary_warning_count": warn_count
+            .saturating_sub(primary_warn_count)
+            .saturating_sub(archive_warn_count),
+        "category_breakdown": {
+            "live_incident_findings": live_incident_findings,
+            "archive_hygiene_findings": archive_hygiene_findings,
+            "environment_findings": environment_findings,
+        },
+    })
+}
+
+fn emit_doctor_check_summary_table(summary: &serde_json::Value) {
+    let overall_status = summary
+        .get("overall_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("ok");
+    let primary_issue = summary
+        .get("primary_issue")
+        .filter(|value| !value.is_null());
+    let archive_hygiene = summary
+        .get("archive_hygiene")
+        .filter(|value| !value.is_null());
+
+    if let Some(primary_issue) = primary_issue {
+        let primary_status = primary_issue
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("warn");
+        let icon = match primary_status {
+            "ok" => "OK",
+            "warn" => "WARN",
+            _ => "FAIL",
+        };
+        let detail = primary_issue
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        ftui_runtime::ftui_println!("  Primary issue: [{icon}] {detail}");
+        if let Some(next_action) = primary_issue
+            .get("next_action")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            ftui_runtime::ftui_println!("  Next action: {next_action}");
+        }
+    } else {
+        let icon = if overall_status == "ok" { "OK" } else { "WARN" };
+        let detail = if overall_status == "ok" {
+            "No live mailbox incident detected."
+        } else {
+            "No blocking live mailbox incident detected."
+        };
+        ftui_runtime::ftui_println!("  Summary: [{icon}] {detail}");
+    }
+
+    if let Some(archive_hygiene) = archive_hygiene {
+        let detail = archive_hygiene
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        ftui_runtime::ftui_println!("  Archive hygiene (cosmetic): [WARN] {detail}");
+    }
+
+    let secondary_fail_count = summary
+        .get("secondary_fail_count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let secondary_warning_count = summary
+        .get("secondary_warning_count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    if secondary_fail_count > 0 || secondary_warning_count > 0 {
+        ftui_runtime::ftui_println!(
+            "  Secondary findings: {secondary_fail_count} fail, {secondary_warning_count} warn."
+        );
+    }
+
+    // Show per-category breakdown when there are findings in multiple
+    // categories, so the operator can tell live issues from cosmetic debt.
+    if let Some(breakdown) = summary.get("category_breakdown") {
+        let live = breakdown
+            .get("live_incident_findings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let archive = breakdown
+            .get("archive_hygiene_findings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let env = breakdown
+            .get("environment_findings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if live + archive + env > 0 {
+            ftui_runtime::ftui_println!(
+                "  Breakdown: {} live incident(s), {} archive hygiene, {} environment",
+                live,
+                archive,
+                env,
+            );
+        }
+    }
 }
 
 fn summarize_agent_mail_process_samples(samples: &[DoctorProcessSample]) -> String {
@@ -13802,20 +14322,7 @@ fn doctor_archive_project_fallback_slug(project_path: &Path) -> String {
 }
 
 fn doctor_archive_path_has_ephemeral_root(path: &Path) -> bool {
-    let temp_root = std::env::temp_dir();
-    if path.starts_with(&temp_root) {
-        return true;
-    }
-
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    normalized == "/tmp"
-        || normalized.starts_with("/tmp/")
-        || normalized == "/var/tmp"
-        || normalized.starts_with("/var/tmp/")
-        || normalized == "/private/tmp"
-        || normalized.starts_with("/private/tmp/")
-        || normalized == "/var/folders"
-        || normalized.starts_with("/var/folders/")
+    mcp_agent_mail_core::ephemeral::path_has_ephemeral_root(path)
 }
 
 fn doctor_archive_suspicious_project_reason(slug: &str, human_key: Option<&str>) -> Option<String> {
@@ -14639,6 +15146,7 @@ fn handle_doctor_check_with(
 ) -> CliResult<()> {
     let mut checks: Vec<serde_json::Value> = Vec::new();
     let mut db_file_sanity_failed = false;
+    let mut server_diagnostics_for_summary: Option<DoctorServerFixDiagnostics> = None;
     let env_config = Config::from_env();
 
     // Check 1: Database accessible (non-mutating; avoid auto-recovery side effects).
@@ -14974,21 +15482,19 @@ fn handle_doctor_check_with(
     }
 
     if let Some(archive_audit) = archive_audit.as_ref() {
+        let archive_summary = doctor_archive_scan_summary(archive_audit);
         checks.push(serde_json::json!({
             "check": "archive_hygiene",
             "status": if archive_audit.finding_count() > 0 { "warn" } else { "ok" },
             "detail": if archive_audit.finding_count() > 0 {
                 format!(
-                    "Archive hygiene findings: missing project.json={}, invalid project.json={}, duplicate canonical ids={}, malformed canonical messages={}, suspicious temp projects={}. Run `am doctor archive-scan` for details.",
-                    archive_audit.missing_project_metadata.len(),
-                    archive_audit.invalid_project_metadata.len(),
-                    archive_audit.duplicate_canonical_groups.len(),
-                    archive_audit.malformed_message_files.len(),
-                    archive_audit.suspicious_projects.len(),
+                    "{} Run `am doctor archive-scan` for deduped severity buckets and artifact detail.",
+                    archive_summary.headline
                 )
             } else {
                 "No archive hygiene findings detected".to_string()
             },
+            "summary": archive_summary,
         }));
     }
 
@@ -15761,104 +16267,31 @@ fn handle_doctor_check_with(
 
     // Check 4g: Local server runtime health (port, /health, JSON-RPC, CPU).
     {
-        let runtime = collect_doctor_server_runtime_diagnostics(&env_config);
-
-        let (port_status, port_detail) = match &runtime.port_status {
-            mcp_agent_mail_server::startup_checks::PortStatus::Free => (
-                "warn",
-                format!(
-                    "No Agent Mail server is listening on {}:{}",
-                    env_config.http_host, env_config.http_port
-                ),
-            ),
-            mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer => (
-                "ok",
-                format!(
-                    "Agent Mail server detected on {}:{}",
-                    env_config.http_host, env_config.http_port
-                ),
-            ),
-            mcp_agent_mail_server::startup_checks::PortStatus::OtherProcess { description } => (
-                "warn",
-                format!(
-                    "Non-Agent-Mail listener on {}:{} ({description})",
-                    env_config.http_host, env_config.http_port
-                ),
-            ),
-            mcp_agent_mail_server::startup_checks::PortStatus::Error { message, .. } => (
-                "warn",
-                format!(
-                    "Could not determine listener status for {}:{}: {message}",
-                    env_config.http_host, env_config.http_port
-                ),
-            ),
-        };
+        let server_diagnostics = doctor_server_diagnostics(&env_config);
         checks.push(serde_json::json!({
             "check": "server_port",
-            "status": port_status,
-            "detail": port_detail,
+            "status": server_diagnostics.port_check.status,
+            "detail": server_diagnostics.port_check.detail,
         }));
 
         checks.push(serde_json::json!({
             "check": "server_http_health",
-            "status": runtime.http_health.status_for_check(),
-            "detail": runtime.http_health.detail(),
+            "status": server_diagnostics.http_check.status,
+            "detail": server_diagnostics.http_check.detail,
         }));
 
         checks.push(serde_json::json!({
             "check": "server_jsonrpc_health",
-            "status": runtime.jsonrpc_health.status_for_check(),
-            "detail": runtime.jsonrpc_health.detail(),
+            "status": server_diagnostics.rpc_check.status,
+            "detail": server_diagnostics.rpc_check.detail,
         }));
 
-        let high_cpu = runtime.high_cpu_samples();
-        let (process_status, process_detail) = if let Some(error) = &runtime.process_error {
-            (
-                "warn",
-                format!("Unable to sample Agent Mail listener CPU usage: {error}"),
-            )
-        } else if runtime.listener_pids.is_empty() {
-            (
-                "warn",
-                format!(
-                    "No listener PID sample available for {}:{}",
-                    env_config.http_host, env_config.http_port
-                ),
-            )
-        } else if high_cpu.is_empty() {
-            (
-                "ok",
-                format!(
-                    "Listener CPU sample(s): {}",
-                    summarize_agent_mail_process_samples(&runtime.process_samples)
-                ),
-            )
-        } else if runtime.http_health.is_failure() || runtime.jsonrpc_health.is_failure() {
-            (
-                "fail",
-                format!(
-                    "High CPU plus failed health probes detected: {}",
-                    summarize_agent_mail_process_samples(
-                        &high_cpu.into_iter().cloned().collect::<Vec<_>>()
-                    )
-                ),
-            )
-        } else {
-            (
-                "warn",
-                format!(
-                    "High CPU Agent Mail listener detected: {}",
-                    summarize_agent_mail_process_samples(
-                        &high_cpu.into_iter().cloned().collect::<Vec<_>>()
-                    )
-                ),
-            )
-        };
         checks.push(serde_json::json!({
             "check": "server_process_cpu",
-            "status": process_status,
-            "detail": process_detail,
+            "status": server_diagnostics.process_check.status,
+            "detail": server_diagnostics.process_check.detail,
         }));
+        server_diagnostics_for_summary = Some(server_diagnostics);
     }
 
     // Check 4h: Database format and health (br-28mgh.7.4)
@@ -16046,12 +16479,155 @@ fn handle_doctor_check_with(
         }
     }
 
-    // Output
+    // Output — enrich each check with its category before building the payload.
+    for check in &mut checks {
+        if let Some(name) = check.get("check").and_then(|v| v.as_str()).map(String::from) {
+            check.as_object_mut().map(|obj| {
+                obj.insert(
+                    "category".to_string(),
+                    serde_json::Value::String(doctor_check_category(&name).to_string()),
+                )
+            });
+        }
+    }
+
     let all_ok = checks.iter().all(|c| c["status"] != "fail");
+    let fail_count = checks
+        .iter()
+        .filter(|c| c["status"] == "fail")
+        .count();
+    let warn_count = checks
+        .iter()
+        .filter(|c| c["status"] == "warn")
+        .count();
+    let database_fix_strategy = doctor_database_fix_strategy(database_url, storage_root).ok();
+    let summary = build_doctor_check_summary(
+        &checks,
+        database_fix_strategy.as_ref(),
+        server_diagnostics_for_summary.as_ref(),
+    );
     let fmt = output::CliOutputFormat::resolve(format, json);
+
+    // Build artifact pointers for the diagnostic payload.
+    let mut diagnostic_artifacts: Vec<ArtifactPointer> = Vec::new();
+
+    // SQLite database file pointer.
+    {
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: database_url.to_string(),
+            ..Default::default()
+        };
+        match cfg.sqlite_path() {
+            Ok(db_path) if db_path != ":memory:" => {
+                let resolved = resolve_sqlite_path_with_absolute_candidate(&db_path);
+                let p = Path::new(&resolved);
+                if p.exists() {
+                    diagnostic_artifacts.push(
+                        ArtifactPointer::referenced("sqlite_db", &resolved, "SQLite database")
+                            .with_detail(format!("bytes={}", p.metadata().map(|m| m.len()).unwrap_or(0))),
+                    );
+                    // WAL sidecar
+                    let wal_path = format!("{resolved}-wal");
+                    if Path::new(&wal_path).exists() {
+                        diagnostic_artifacts.push(
+                            ArtifactPointer::referenced("wal_sidecar", &wal_path, "WAL sidecar"),
+                        );
+                    }
+                    // SHM sidecar
+                    let shm_path = format!("{resolved}-shm");
+                    if Path::new(&shm_path).exists() {
+                        diagnostic_artifacts.push(
+                            ArtifactPointer::referenced("shm_sidecar", &shm_path, "SHM sidecar"),
+                        );
+                    }
+                } else {
+                    diagnostic_artifacts.push(
+                        ArtifactPointer::missing("sqlite_db", "SQLite database")
+                            .with_detail(format!("expected at {resolved}")),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Storage root (archive) pointer.
+    if storage_root.exists() {
+        diagnostic_artifacts.push(
+            ArtifactPointer::referenced(
+                "archive_root",
+                &storage_root.display().to_string(),
+                "Git mailbox archive root",
+            ),
+        );
+    }
+
+    // Forensic bundles directory pointer.
+    {
+        let forensics_dir = storage_root.join("doctor").join("forensics");
+        if forensics_dir.exists() {
+            diagnostic_artifacts.push(
+                ArtifactPointer::referenced(
+                    "forensic_bundles_dir",
+                    &forensics_dir.display().to_string(),
+                    "Forensic bundles directory",
+                ),
+            );
+        }
+    }
+
+    // Doctor reports directory pointer.
+    {
+        let reports_dir = storage_root.join("doctor").join("reports");
+        if reports_dir.exists() {
+            diagnostic_artifacts.push(
+                ArtifactPointer::referenced(
+                    "doctor_reports_dir",
+                    &reports_dir.display().to_string(),
+                    "Doctor scan reports directory",
+                ),
+            );
+        }
+    }
+
+    // Backups directory pointer.
+    {
+        let backups_dir = storage_root.join("backups");
+        if backups_dir.exists() {
+            diagnostic_artifacts.push(
+                ArtifactPointer::referenced(
+                    "backups_dir",
+                    &backups_dir.display().to_string(),
+                    "Database backups directory",
+                ),
+            );
+        }
+    }
+
+    let overall_status = if !all_ok {
+        "fail"
+    } else if warn_count > 0 {
+        "warn"
+    } else {
+        "ok"
+    };
+    let headline = if all_ok {
+        "All doctor checks passed.".to_string()
+    } else {
+        format!("{fail_count} check(s) failed, {warn_count} warning(s).")
+    };
+    let diagnostic_payload = DiagnosticPayload::from_doctor_check(
+        overall_status,
+        &headline,
+        fail_count,
+        warn_count,
+        diagnostic_artifacts,
+    );
     let payload = serde_json::json!({
         "healthy": all_ok,
+        "summary": summary,
         "checks": checks,
+        "diagnostic_payload": diagnostic_payload,
     });
 
     if matches!(fmt, output::CliOutputFormat::Table) {
@@ -16062,26 +16638,55 @@ fn handle_doctor_check_with(
                 .map(|p| format!(" ({p})"))
                 .unwrap_or_default()
         );
-        for c in payload
+        if let Some(summary) = payload.get("summary") {
+            emit_doctor_check_summary_table(summary);
+        }
+        let ordered_checks = payload
             .get("checks")
             .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-        {
+            .map(|checks| {
+                doctor_ordered_checks(
+                    checks,
+                    payload.get("summary").unwrap_or(&serde_json::Value::Null),
+                )
+            })
+            .unwrap_or_default();
+
+        // Emit checks grouped by category with section headings.
+        let mut last_category: Option<String> = None;
+        for c in ordered_checks {
+            let check_name = c["check"].as_str().unwrap_or("?");
+            let category = c
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| doctor_check_category(check_name));
+            if last_category.as_deref() != Some(category) {
+                if last_category.is_some() {
+                    ftui_runtime::ftui_println!("");
+                }
+                ftui_runtime::ftui_println!("  --- {} ---", doctor_category_heading(category));
+                last_category = Some(category.to_string());
+            }
             let icon = match c["status"].as_str().unwrap_or("") {
                 "ok" => "OK",
                 "warn" => "WARN",
                 _ => "FAIL",
             };
             let detail = if verbose {
-                format!(" - {}", c["detail"].as_str().unwrap_or(""))
+                format!(
+                    " - {}",
+                    doctor_compact_detail(
+                        c["detail"].as_str().unwrap_or(""),
+                        DOCTOR_TABLE_DETAIL_LIMIT,
+                    )
+                )
             } else {
                 String::new()
             };
             ftui_runtime::ftui_println!(
                 "  [{}] {}{}",
                 icon,
-                c["check"].as_str().unwrap_or("?"),
+                check_name,
                 detail
             );
         }
@@ -26856,7 +27461,7 @@ startup_timeout_sec = 42
 
         let bundle_dir = capture_doctor_forensic_bundle(
             "repair",
-            &format!("sqlite:///{}", db_path.display()),
+            "sqlite://user:secret@example.test/tmp/storage.sqlite3",
             &db_path,
             &storage_root,
             Some("integrity failed"),
@@ -26864,10 +27469,93 @@ startup_timeout_sec = 42
         .expect("bundle capture should succeed")
         .expect("bundle should be created");
 
-        assert!(bundle_dir.join("storage.sqlite3").exists());
-        assert!(bundle_dir.join("storage.sqlite3-wal").exists());
-        assert!(bundle_dir.join("storage.sqlite3-shm").exists());
+        assert!(bundle_dir.join("sqlite").join("storage.sqlite3").exists());
+        assert!(
+            bundle_dir
+                .join("sqlite")
+                .join("storage.sqlite3-wal")
+                .exists()
+        );
+        assert!(
+            bundle_dir
+                .join("sqlite")
+                .join("storage.sqlite3-shm")
+                .exists()
+        );
+        assert!(bundle_dir.join("manifest.json").exists());
         assert!(bundle_dir.join("summary.json").exists());
+
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["schema"]["name"],
+            "mcp-agent-mail-doctor-forensics"
+        );
+        assert_eq!(manifest["command"], "repair");
+        assert_eq!(manifest["source"]["db_family"], "storage.sqlite3");
+        assert_eq!(
+            manifest["source"]["database_url"],
+            "sqlite://****@example.test/tmp/storage.sqlite3"
+        );
+        assert_eq!(manifest["artifacts"]["summary"]["path"], "summary.json");
+        assert_eq!(
+            manifest["artifacts"]["sqlite"]["db"]["path"],
+            "sqlite/storage.sqlite3"
+        );
+        assert_eq!(manifest["artifacts"]["sqlite"]["db"]["status"], "captured");
+        assert_eq!(manifest["retention"]["review_after_days"], 14);
+        assert_eq!(
+            manifest["retention"]["delete_after_days"],
+            serde_json::Value::Null
+        );
+        assert_eq!(manifest["redaction"]["sqlite_family"], "raw_local_only");
+
+        let files = manifest["files"].as_array().expect("files array");
+        assert!(
+            files.iter().any(|entry| entry["path"] == "summary.json"),
+            "summary inventory missing: {manifest}"
+        );
+        assert!(
+            files
+                .iter()
+                .any(|entry| entry["path"] == "sqlite/storage.sqlite3"),
+            "sqlite db inventory missing: {manifest}"
+        );
+    }
+
+    #[test]
+    fn capture_doctor_forensic_bundle_marks_missing_shm_as_optional_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let db_path = tmp.path().join("storage.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&db_path, b"sqlite-bytes").unwrap();
+        std::fs::write(&wal_path, b"wal-bytes").unwrap();
+
+        let bundle_dir = capture_doctor_forensic_bundle(
+            "reconstruct",
+            &format!("sqlite:///{}", db_path.display()),
+            &db_path,
+            &storage_root,
+            None,
+        )
+        .expect("bundle capture should succeed")
+        .expect("bundle should be created");
+
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["artifacts"]["sqlite"]["db"]["status"], "captured");
+        assert_eq!(manifest["artifacts"]["sqlite"]["wal"]["status"], "captured");
+        assert_eq!(manifest["artifacts"]["sqlite"]["shm"]["status"], "missing");
+        assert_eq!(
+            manifest["artifacts"]["sqlite"]["shm"]["path"],
+            "sqlite/storage.sqlite3-shm"
+        );
     }
 
     #[test]
@@ -27107,6 +27795,60 @@ startup_timeout_sec = 42
             report.suspicious_projects[0]
                 .reason
                 .contains("looks ephemeral")
+        );
+    }
+
+    #[test]
+    fn doctor_archive_scan_summary_separates_immediate_action_from_hygiene_debt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("tmp-demo-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-02-00Z__broken__8.md"),
+            "not-json-frontmatter\nbody\n",
+        )
+        .unwrap();
+
+        let report = audit_doctor_archive(&storage_root);
+        let summary = doctor_archive_scan_summary(&report);
+
+        assert_eq!(
+            summary.highest_severity,
+            Some(ArchiveScanSeverityBucket::Critical)
+        );
+        assert_eq!(summary.immediate_action_count, 2);
+        assert_eq!(summary.hygiene_debt_count, 2);
+        assert_eq!(
+            summary.sample_limit,
+            DOCTOR_ARCHIVE_SCAN_SUMMARY_SAMPLE_LIMIT
+        );
+        assert_eq!(summary.buckets.len(), 3);
+        assert_eq!(
+            summary.buckets[0].severity,
+            ArchiveScanSeverityBucket::Critical
+        );
+        assert_eq!(
+            summary.buckets[1].severity,
+            ArchiveScanSeverityBucket::Warning
+        );
+        assert_eq!(summary.buckets[2].severity, ArchiveScanSeverityBucket::Info);
+        assert!(
+            summary.headline.contains("Immediate action required"),
+            "headline should surface stop-now work: {}",
+            summary.headline
         );
     }
 
@@ -27795,14 +28537,172 @@ COMMIT;\n";
             serde_json::json!({"check": "storage_root", "status": "warn", "detail": "/tmp"}),
         ];
         let all_ok = checks.iter().all(|c| c["status"] != "fail");
-        let output = serde_json::json!({"healthy": all_ok, "checks": checks});
+        let output = serde_json::json!({
+            "healthy": all_ok,
+            "summary": {
+                "overall_status": "warn",
+                "primary_issue": serde_json::Value::Null,
+                "archive_hygiene": serde_json::Value::Null,
+                "secondary_fail_count": 0,
+                "secondary_warning_count": 1
+            },
+            "checks": checks
+        });
         assert!(output["healthy"].as_bool().unwrap());
+        assert!(output["summary"].is_object());
         assert_eq!(output["checks"].as_array().unwrap().len(), 2);
         for c in output["checks"].as_array().unwrap() {
             assert!(c["check"].is_string());
             assert!(c["status"].is_string());
             assert!(c["detail"].is_string());
         }
+    }
+
+    #[test]
+    fn build_doctor_check_summary_prioritizes_live_incident_over_archive_hygiene() {
+        let checks = vec![
+            serde_json::json!({
+                "check": "archive_db_parity",
+                "status": "fail",
+                "detail": "Archive canonical data is not fully represented in the SQLite DB (messages archive=10 db=0)"
+            }),
+            serde_json::json!({
+                "check": "archive_hygiene",
+                "status": "warn",
+                "detail": "Archive hygiene findings: missing project.json=1, duplicate canonical ids=2. Run `am doctor archive-scan` for details."
+            }),
+            serde_json::json!({
+                "check": "mcp_config",
+                "status": "warn",
+                "detail": "legacy config drift"
+            }),
+        ];
+
+        let summary = build_doctor_check_summary(
+            &checks,
+            Some(&DoctorDatabaseFixStrategy::Reconstruct(
+                "Archive canonical data is not fully represented in the SQLite DB".to_string(),
+            )),
+            None,
+        );
+
+        assert_eq!(summary["overall_status"], "fail");
+        assert_eq!(summary["primary_issue"]["check"], "archive_db_parity");
+        assert_eq!(summary["primary_issue"]["class"], "live_mailbox_incident");
+        assert_eq!(summary["archive_hygiene"]["class"], "archive_hygiene_debt");
+        assert_eq!(summary["secondary_fail_count"], 0);
+        assert_eq!(summary["secondary_warning_count"], 1);
+        let next_action = summary["primary_issue"]["next_action"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            next_action.contains("am doctor reconstruct --dry-run"),
+            "expected reconstruct next action, got: {next_action}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_check_summary_prioritizes_server_port_over_dependent_health_warnings() {
+        let checks = vec![
+            serde_json::json!({
+                "check": "server_http_health",
+                "status": "warn",
+                "detail": "Skipped /health probe because no listener is present"
+            }),
+            serde_json::json!({
+                "check": "server_jsonrpc_health",
+                "status": "warn",
+                "detail": "Skipped JSON-RPC probe because no Agent Mail listener is present"
+            }),
+            serde_json::json!({
+                "check": "server_port",
+                "status": "warn",
+                "detail": "No Agent Mail server is listening on 127.0.0.1:8765"
+            }),
+        ];
+
+        let diagnostics = DoctorServerFixDiagnostics {
+            port_status: mcp_agent_mail_server::startup_checks::PortStatus::Free,
+            port_check: DoctorFixCheck {
+                status: "warn",
+                detail: "No Agent Mail server is listening on 127.0.0.1:8765".to_string(),
+            },
+            http_check: DoctorFixCheck {
+                status: "warn",
+                detail: "Skipped /health probe because no listener is present".to_string(),
+            },
+            rpc_check: DoctorFixCheck {
+                status: "warn",
+                detail: "Skipped JSON-RPC probe because no Agent Mail listener is present"
+                    .to_string(),
+            },
+            process_check: DoctorFixCheck {
+                status: "warn",
+                detail: "No listener PID sample available for 127.0.0.1:8765".to_string(),
+            },
+            restart_recommended: false,
+        };
+
+        let summary = build_doctor_check_summary(&checks, None, Some(&diagnostics));
+
+        assert_eq!(summary["overall_status"], "warn");
+        assert_eq!(summary["primary_issue"]["check"], "server_port");
+        assert_eq!(summary["primary_issue"]["class"], "server_runtime_incident");
+        assert_eq!(summary["secondary_warning_count"], 2);
+    }
+
+    #[test]
+    fn doctor_ordered_checks_puts_primary_issue_before_secondary_server_warnings() {
+        let checks = vec![
+            serde_json::json!({
+                "check": "server_http_health",
+                "status": "warn",
+                "detail": "Skipped /health probe because no listener is present"
+            }),
+            serde_json::json!({
+                "check": "server_jsonrpc_health",
+                "status": "warn",
+                "detail": "Skipped JSON-RPC probe because no Agent Mail listener is present"
+            }),
+            serde_json::json!({
+                "check": "server_port",
+                "status": "warn",
+                "detail": "No Agent Mail server is listening on 127.0.0.1:8765"
+            }),
+            serde_json::json!({
+                "check": "archive_hygiene",
+                "status": "warn",
+                "detail": "Archive hygiene findings present"
+            }),
+            serde_json::json!({
+                "check": "binary_resolution",
+                "status": "ok",
+                "detail": "'am' resolves correctly"
+            }),
+        ];
+
+        let ordered = doctor_ordered_checks(
+            &checks,
+            &serde_json::json!({
+                "primary_issue": { "check": "server_port" },
+                "archive_hygiene": { "check": "archive_hygiene" },
+            }),
+        );
+        let ordered_names: Vec<_> = ordered
+            .iter()
+            .map(|check| doctor_check_value_str(check, "check").unwrap_or_default())
+            .collect();
+
+        assert_eq!(
+            ordered_names,
+            vec![
+                "server_port",
+                "server_http_health",
+                "server_jsonrpc_health",
+                "archive_hygiene",
+                "binary_resolution",
+            ]
+        );
     }
 
     #[test]
@@ -29643,12 +30543,21 @@ COMMIT;\n";
     fn json_doctor_check_schema_stable() {
         let output = serde_json::json!({
             "healthy": true,
+            "summary": {
+                "overall_status": "ok",
+                "primary_issue": serde_json::Value::Null,
+                "archive_hygiene": serde_json::Value::Null,
+                "secondary_fail_count": 0,
+                "secondary_warning_count": 0
+            },
             "checks": [
                 {"check": "database", "status": "ok", "detail": "accessible"},
                 {"check": "storage_root", "status": "ok", "detail": "/tmp/store"}
             ]
         });
         assert!(output["healthy"].is_boolean());
+        assert!(output["summary"].is_object());
+        assert!(output["summary"]["overall_status"].is_string());
         assert!(output["checks"].is_array());
         for check in output["checks"].as_array().unwrap() {
             assert!(check["check"].is_string(), "check field must be string");
@@ -30021,10 +30930,12 @@ COMMIT;\n";
             .expect("archive_hygiene check should be present");
         assert_eq!(hygiene["status"].as_str(), Some("warn"));
         let detail = hygiene["detail"].as_str().unwrap_or_default();
-        assert!(detail.contains("missing project.json=1"));
-        assert!(detail.contains("duplicate canonical ids=1"));
-        assert!(detail.contains("suspicious temp projects=1"));
+        assert!(detail.contains("Immediate action required"));
         assert!(detail.contains("am doctor archive-scan"));
+        let summary = hygiene["summary"].as_object().expect("summary object");
+        assert_eq!(summary["highest_severity"], "critical");
+        assert_eq!(summary["immediate_action_count"], 1);
+        assert_eq!(summary["hygiene_debt_count"], 2);
     }
 
     #[test]
@@ -34382,6 +35293,115 @@ COMMIT;\n";
                 "missing check '{check}' in doctor output"
             );
         }
+    }
+
+    #[test]
+    fn doctor_check_summary_separates_archive_hygiene_from_primary_incident() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("summary.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let project_dir = dir.path().join("projects").join("tmp-summary-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .expect("write canonical message");
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .expect("write duplicate canonical message");
+
+        let parsed = run_doctor_check_json(&db_url, dir.path());
+        let summary = parsed["summary"].as_object().expect("summary object");
+        assert_eq!(
+            summary
+                .get("overall_status")
+                .and_then(|value| value.as_str()),
+            Some("fail")
+        );
+        assert_eq!(
+            summary["primary_issue"]["check"].as_str(),
+            Some("archive_db_parity")
+        );
+        assert_eq!(
+            summary["archive_hygiene"]["check"].as_str(),
+            Some("archive_hygiene")
+        );
+        let next_action = summary["primary_issue"]["next_action"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            next_action.contains("am doctor reconstruct --dry-run"),
+            "expected reconstruct guidance, got: {next_action}"
+        );
+    }
+
+    #[test]
+    fn doctor_check_table_output_leads_with_primary_issue_summary() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("summary_table.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let project_dir = dir.path().join("projects").join("tmp-summary-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .expect("write canonical message");
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .expect("write duplicate canonical message");
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+        let result = handle_doctor_check_with(
+            &db_url,
+            dir.path(),
+            None,
+            false,
+            Some(output::CliOutputFormat::Table),
+            false,
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "doctor check should exit non-zero for parity failure: {result:?}"
+        );
+
+        let primary_pos = output
+            .find("Primary issue: [FAIL]")
+            .expect("primary summary");
+        let archive_pos = output
+            .find("Archive hygiene: [WARN]")
+            .expect("archive hygiene summary");
+        let check_pos = output
+            .find("[FAIL] archive_db_parity")
+            .expect("archive_db_parity check line");
+        assert!(
+            primary_pos < check_pos,
+            "primary summary should appear before raw check lines:\n{output}"
+        );
+        assert!(
+            archive_pos < check_pos,
+            "archive hygiene summary should appear before raw check lines:\n{output}"
+        );
     }
 
     #[test]
@@ -39044,27 +40064,6 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
 // Doctor repair, backups, restore
 // ---------------------------------------------------------------------------
 
-fn doctor_redact_database_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://")
-        && let Some((_creds, host)) = rest.rsplit_once('@')
-    {
-        return format!("{scheme}://****@{host}");
-    }
-    url.to_string()
-}
-
-fn doctor_forensics_root(storage_root: &Path, db_path: &Path) -> PathBuf {
-    if storage_root.exists() {
-        storage_root.join("doctor").join("forensics")
-    } else {
-        db_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("doctor")
-            .join("forensics")
-    }
-}
-
 fn capture_doctor_forensic_bundle(
     command_name: &str,
     database_url: &str,
@@ -39072,59 +40071,16 @@ fn capture_doctor_forensic_bundle(
     storage_root: &Path,
     integrity_detail: Option<&str>,
 ) -> CliResult<Option<PathBuf>> {
-    let source_paths = [
-        ("db", db_path.to_path_buf()),
-        ("wal", sqlite_sidecar_path(db_path, "-wal")),
-        ("shm", sqlite_sidecar_path(db_path, "-shm")),
-    ];
-    if source_paths.iter().all(|(_, path)| !path.exists()) {
-        return Ok(None);
-    }
-
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let bundle_dir =
-        doctor_forensics_root(storage_root, db_path).join(format!("{command_name}-{timestamp}"));
-    std::fs::create_dir_all(&bundle_dir)?;
-
-    let mut artifacts = Vec::new();
-    for (kind, source_path) in source_paths {
-        if !source_path.exists() {
-            continue;
-        }
-        let destination = bundle_dir.join(
-            source_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(kind),
-        );
-        let copy_result = std::fs::copy(&source_path, &destination);
-        let size_bytes = source_path.metadata().ok().map(|meta| meta.len());
-        artifacts.push(serde_json::json!({
-            "kind": kind,
-            "source_path": source_path.display().to_string(),
-            "captured_path": destination.display().to_string(),
-            "size_bytes": size_bytes,
-            "status": if copy_result.is_ok() { "captured" } else { "error" },
-            "error": copy_result.err().map(|err| err.to_string()),
-        }));
-    }
-
-    let summary_path = bundle_dir.join("summary.json");
-    write_doctor_json_report(
-        &summary_path,
-        &serde_json::json!({
-            "command": command_name,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "database_url": doctor_redact_database_url(database_url),
-            "db_path": db_path.display().to_string(),
-            "storage_root": storage_root.display().to_string(),
-            "integrity_detail": integrity_detail,
-            "archive_scan": scan_archive_stats(storage_root),
-            "artifacts": artifacts,
-        }),
-    )?;
-
-    Ok(Some(bundle_dir))
+    mcp_agent_mail_db::capture_mailbox_forensic_bundle(mcp_agent_mail_db::MailboxForensicCapture {
+        command_name,
+        trigger: "doctor",
+        database_url,
+        db_path,
+        storage_root,
+        integrity_detail,
+    })
+    .map(Some)
+    .map_err(|error| CliError::Other(format!("failed to capture forensic bundle: {error}")))
 }
 
 fn handle_doctor_repair(
@@ -40322,6 +41278,7 @@ fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
 
 fn doctor_archive_audit_summary_text(report: &DoctorArchiveAuditReport) -> Vec<String> {
     let inventory = &report.inventory;
+    let summary = doctor_archive_scan_summary(report);
     let mut lines = vec![
         format!("Projects:                 {}", inventory.projects),
         format!("Agents:                   {}", inventory.agents),
@@ -40353,40 +41310,33 @@ fn doctor_archive_audit_summary_text(report: &DoctorArchiveAuditReport) -> Vec<S
         ),
     ];
 
-    if let Some(group) = report.duplicate_canonical_groups.first() {
-        lines.push(format!(
-            "Sample duplicate id {}: keep {} + {} duplicate(s)",
-            group.message_id,
-            truncate_str(&group.keep, 72),
-            group.duplicates.len()
-        ));
-    }
-    if let Some(finding) = report.missing_project_metadata.first() {
-        lines.push(format!(
-            "Sample missing project.json: {}",
-            truncate_str(&finding.project_dir, 72)
-        ));
-    }
-    if let Some(finding) = report.invalid_project_metadata.first() {
-        lines.push(format!(
-            "Sample invalid project.json: {} ({})",
-            truncate_str(&finding.project_json, 72),
-            finding.problem
-        ));
-    }
-    if let Some(finding) = report.malformed_message_files.first() {
-        lines.push(format!(
-            "Sample malformed message: {} ({})",
-            truncate_str(&finding.path, 72),
-            finding.problem
-        ));
-    }
-    if let Some(finding) = report.suspicious_projects.first() {
-        lines.push(format!(
-            "Sample suspicious project: {} ({})",
-            truncate_str(&finding.project_dir, 72),
-            finding.reason
-        ));
+    if report.finding_count() > 0 {
+        lines.push(format!("Headline:                {}", summary.headline));
+        if let Some(next_action) = &summary.next_action {
+            lines.push(format!("Next action:             {next_action}"));
+        }
+        for bucket in &summary.buckets {
+            lines.push(format!(
+                "{}: {} deduped group(s) / {} raw finding(s)",
+                bucket.severity.as_str().to_uppercase(),
+                bucket.deduped_count,
+                bucket.raw_count
+            ));
+            for finding in &bucket.findings {
+                lines.push(format!(
+                    "  [{}] {}",
+                    finding.scope.as_str(),
+                    truncate_str(&finding.summary, 88)
+                ));
+            }
+            if bucket.overflow_count > 0 {
+                lines.push(format!(
+                    "  +{} more {} group(s) preserved in artifact detail",
+                    bucket.overflow_count,
+                    bucket.severity.as_str()
+                ));
+            }
+        }
     }
 
     lines
@@ -40471,15 +41421,118 @@ fn handle_doctor_archive_scan(
     let config = Config::from_env();
     let storage_root = config.storage_root;
     let report = audit_doctor_archive(&storage_root);
+    let summary = doctor_archive_scan_summary(&report);
+
+    // Build artifact pointers for the diagnostic payload.
+    let mut scan_artifacts: Vec<ArtifactPointer> = Vec::new();
+
+    // Archive root pointer.
+    scan_artifacts.push(
+        ArtifactPointer::referenced(
+            "archive_root",
+            &storage_root.display().to_string(),
+            "Git mailbox archive root",
+        ),
+    );
+
+    // Projects directory pointer.
+    {
+        let projects_dir = storage_root.join("projects");
+        if projects_dir.exists() {
+            scan_artifacts.push(
+                ArtifactPointer::referenced(
+                    "archive_projects_dir",
+                    &projects_dir.display().to_string(),
+                    "Archive projects directory",
+                )
+                .with_detail(format!(
+                    "projects={}, agents={}, messages={}",
+                    report.inventory.projects,
+                    report.inventory.agents,
+                    report.inventory.messages,
+                )),
+            );
+        }
+    }
+
+    // Forensic bundles directory pointer.
+    {
+        let forensics_dir = storage_root.join("doctor").join("forensics");
+        if forensics_dir.exists() {
+            scan_artifacts.push(
+                ArtifactPointer::referenced(
+                    "forensic_bundles_dir",
+                    &forensics_dir.display().to_string(),
+                    "Forensic bundles directory",
+                ),
+            );
+        }
+    }
+
+    // Doctor reports directory pointer.
+    {
+        let reports_dir = storage_root.join("doctor").join("reports");
+        if reports_dir.exists() {
+            scan_artifacts.push(
+                ArtifactPointer::referenced(
+                    "doctor_reports_dir",
+                    &reports_dir.display().to_string(),
+                    "Doctor scan reports directory",
+                ),
+            );
+        }
+    }
+
+    // SQLite database pointer (for cross-reference with archive).
+    {
+        let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+        let db_pool_cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: db_cfg.database_url.clone(),
+            ..Default::default()
+        };
+        if let Ok(db_path) = db_pool_cfg.sqlite_path() {
+            if db_path != ":memory:" {
+                let resolved = resolve_sqlite_path_with_absolute_candidate(&db_path);
+                if Path::new(&resolved).exists() {
+                    scan_artifacts.push(
+                        ArtifactPointer::referenced(
+                            "sqlite_db",
+                            &resolved,
+                            "SQLite database (archive cross-reference)",
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // Quarantine directory pointer (if exists from prior normalizations).
+    {
+        let quarantine_dir = storage_root.join("doctor").join("quarantine");
+        if quarantine_dir.exists() {
+            scan_artifacts.push(
+                ArtifactPointer::referenced(
+                    "quarantine_dir",
+                    &quarantine_dir.display().to_string(),
+                    "Quarantined duplicate files directory",
+                ),
+            );
+        }
+    }
+
+    let diagnostic_payload = DiagnosticPayload::from_archive_scan(&summary, scan_artifacts);
+
     let value = serde_json::json!({
         "storage_root": storage_root.display().to_string(),
         "finding_count": report.finding_count(),
+        "summary": summary,
         "inventory": report.inventory,
         "missing_project_metadata": report.missing_project_metadata,
         "invalid_project_metadata": report.invalid_project_metadata,
         "duplicate_canonical_groups": report.duplicate_canonical_groups,
         "malformed_message_files": report.malformed_message_files,
         "suspicious_projects": report.suspicious_projects,
+        "diagnostic_payload": diagnostic_payload,
     });
 
     output::emit_output(&value, fmt, || {

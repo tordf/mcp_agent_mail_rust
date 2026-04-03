@@ -13,6 +13,7 @@ use mcp_agent_mail_core::{
     config::env_value,
     disk::{is_sqlite_memory_database_url, sqlite_file_path_from_database_url},
 };
+use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -28,6 +29,336 @@ struct SampledMessage {
     sender_id: i64,
     subject: String,
     created_ts_iso: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedMailboxSqlitePath {
+    pub configured_path: String,
+    pub canonical_path: String,
+    pub used_absolute_fallback: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxSidecarState {
+    pub wal_exists: bool,
+    pub wal_bytes: Option<u64>,
+    pub shm_exists: bool,
+    pub shm_bytes: Option<u64>,
+    pub live_sidecars: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxRecoveryLockState {
+    pub lock_path: String,
+    pub exists: bool,
+    pub active: bool,
+    pub pid: Option<u32>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxOwnershipDisposition {
+    Unowned,
+    ActiveOtherOwner,
+    StaleLiveProcess,
+    DeletedExecutable,
+    SplitBrain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxOwnershipProcess {
+    pub pid: u32,
+    pub command: Option<String>,
+    pub executable_path: Option<String>,
+    pub executable_deleted: bool,
+    pub holds_storage_root_lock: bool,
+    pub holds_sqlite_lock: bool,
+    pub holds_database_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxOwnershipState {
+    pub disposition: MailboxOwnershipDisposition,
+    pub storage_lock_path: String,
+    pub sqlite_lock_path: String,
+    pub processes: Vec<MailboxOwnershipProcess>,
+    pub competing_pids: Vec<u32>,
+    pub supervised_restart_required: bool,
+    pub detail: String,
+}
+
+impl MailboxOwnershipState {
+    #[must_use]
+    pub const fn blocks_mutation(&self) -> bool {
+        !matches!(self.disposition, MailboxOwnershipDisposition::Unowned)
+    }
+}
+
+// ============================================================================
+// Recovery action classification: silent self-heal vs explicit escalation
+// ============================================================================
+
+/// Classification of a recovery action's approval requirement.
+///
+/// Every recovery action the system can perform falls into one of two
+/// categories:
+///
+/// - **`SilentSelfHeal`**: The action is safe to perform automatically
+///   without operator approval. These actions are idempotent, bounded in
+///   scope, and cannot cause data loss even on a false positive.
+///
+/// - **`ExplicitEscalation`**: The action is destructive or irreversible
+///   enough that it requires explicit operator approval before execution.
+///   The system should log the recommendation, emit a metric, and block
+///   until an operator (or an authorizing policy gate) approves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryApproval {
+    /// Automatic execution is safe — no operator in the loop.
+    SilentSelfHeal,
+    /// Must wait for explicit operator or policy-gate approval.
+    ExplicitEscalation,
+}
+
+/// An enumeration of every discrete recovery action the system can attempt.
+///
+/// Each variant carries its classification ([`RecoveryApproval`]) as a
+/// compile-time constant so call sites can branch on `action.approval()`
+/// without maintaining separate lookup tables.
+///
+/// # Design rationale
+///
+/// The boundary between silent and escalated is drawn by two principles:
+///
+/// 1. **Idempotent + bounded + non-destructive → silent.**
+///    WAL checkpoints, stale-lock cleanup, connection-pool refresh, and
+///    index rebuilds meet all three criteria.
+///
+/// 2. **Irreversible, data-destructive, or authority-changing → escalate.**
+///    Archive reconstruction replaces the live DB, corrupt-DB deletion
+///    discards data, force-unlock overrides contested ownership, and
+///    schema migration changes the storage contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAction {
+    // ── Silent self-heal actions ──────────────────────────────────────
+
+    /// `PRAGMA wal_checkpoint(PASSIVE)` — non-blocking, best-effort.
+    WalCheckpointPassive,
+
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` — may briefly block writers but
+    /// always converges and never mutates user data.
+    WalCheckpointTruncate,
+
+    /// Remove a `.recovery.lock` or `.activity.lock` file whose PID is no
+    /// longer running (stale lock cleanup).
+    StaleLockCleanup,
+
+    /// Remove a zero-byte `-wal` sidecar that prevents clean open.
+    EmptyWalSidecarCleanup,
+
+    /// Drop and re-open pooled connections (e.g. after detecting a stale
+    /// file-descriptor pointing at an unlinked inode).
+    ConnectionPoolRefresh,
+
+    /// `REINDEX` to repair index-only corruption detected by
+    /// `quick_check` / `integrity_check(1)`.
+    IndexRebuild,
+
+    /// Rebuild the `inbox_stats` materialized summary table from
+    /// ground-truth message data. Purely derived; never loses user data.
+    InboxStatsRebuild,
+
+    /// Restore the live database from a healthy `.bak` sibling that was
+    /// proactively created by the system itself. The corrupt file is
+    /// quarantined (renamed), not deleted.
+    RestoreFromProactiveBackup,
+
+    /// Create a `.bak` backup of the database file during idle periods.
+    CreateProactiveBackup,
+
+    // ── Explicit escalation actions ──────────────────────────────────
+
+    /// Reconstruct the SQLite database from the Git-backed mail archive.
+    /// This replaces the live DB file entirely and may lose non-archived
+    /// state (e.g. local draft metadata).
+    ReconstructFromArchive,
+
+    /// Delete (or quarantine-then-replace) a corrupt database file and
+    /// reinitialize from scratch when no backup or archive is available.
+    DeleteCorruptDb,
+
+    /// Override a contested lock held by a live (or ambiguous) process.
+    /// Could cause split-brain if the other process is still writing.
+    ForceUnlockContested,
+
+    /// Run a schema migration that alters table structure, column types,
+    /// or index definitions on the live database.
+    SchemaMigration,
+
+    /// Promote a reconstructed candidate database to the live path after
+    /// archive-based recovery.
+    PromoteReconstructedCandidate,
+
+    /// Reinitialize the database from scratch (blank), discarding all
+    /// existing data because no recovery source is available.
+    ReinitializeBlank,
+}
+
+impl RecoveryAction {
+    /// The approval classification for this action.
+    #[must_use]
+    pub const fn approval(&self) -> RecoveryApproval {
+        match self {
+            // Silent self-heal: idempotent, bounded, non-destructive
+            Self::WalCheckpointPassive
+            | Self::WalCheckpointTruncate
+            | Self::StaleLockCleanup
+            | Self::EmptyWalSidecarCleanup
+            | Self::ConnectionPoolRefresh
+            | Self::IndexRebuild
+            | Self::InboxStatsRebuild
+            | Self::RestoreFromProactiveBackup
+            | Self::CreateProactiveBackup => RecoveryApproval::SilentSelfHeal,
+
+            // Explicit escalation: destructive, irreversible, or authority-changing
+            Self::ReconstructFromArchive
+            | Self::DeleteCorruptDb
+            | Self::ForceUnlockContested
+            | Self::SchemaMigration
+            | Self::PromoteReconstructedCandidate
+            | Self::ReinitializeBlank => RecoveryApproval::ExplicitEscalation,
+        }
+    }
+
+    /// Whether this action can be performed without operator approval.
+    #[must_use]
+    pub const fn is_silent(&self) -> bool {
+        matches!(self.approval(), RecoveryApproval::SilentSelfHeal)
+    }
+
+    /// Whether this action requires explicit operator approval.
+    #[must_use]
+    pub const fn requires_escalation(&self) -> bool {
+        matches!(self.approval(), RecoveryApproval::ExplicitEscalation)
+    }
+
+    /// A short human-readable label for log messages and metrics.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::WalCheckpointPassive => "wal_checkpoint_passive",
+            Self::WalCheckpointTruncate => "wal_checkpoint_truncate",
+            Self::StaleLockCleanup => "stale_lock_cleanup",
+            Self::EmptyWalSidecarCleanup => "empty_wal_sidecar_cleanup",
+            Self::ConnectionPoolRefresh => "connection_pool_refresh",
+            Self::IndexRebuild => "index_rebuild",
+            Self::InboxStatsRebuild => "inbox_stats_rebuild",
+            Self::RestoreFromProactiveBackup => "restore_from_proactive_backup",
+            Self::CreateProactiveBackup => "create_proactive_backup",
+            Self::ReconstructFromArchive => "reconstruct_from_archive",
+            Self::DeleteCorruptDb => "delete_corrupt_db",
+            Self::ForceUnlockContested => "force_unlock_contested",
+            Self::SchemaMigration => "schema_migration",
+            Self::PromoteReconstructedCandidate => "promote_reconstructed_candidate",
+            Self::ReinitializeBlank => "reinitialize_blank",
+        }
+    }
+
+    /// Explanation of why this action has its current classification.
+    #[must_use]
+    pub const fn rationale(&self) -> &'static str {
+        match self {
+            Self::WalCheckpointPassive =>
+                "Non-blocking best-effort; never mutates user data or blocks writers",
+            Self::WalCheckpointTruncate =>
+                "May briefly block writers but always converges; no user data mutation",
+            Self::StaleLockCleanup =>
+                "Only removes locks whose owning PID no longer exists; idempotent",
+            Self::EmptyWalSidecarCleanup =>
+                "Only removes zero-byte WAL files that prevent clean open; idempotent",
+            Self::ConnectionPoolRefresh =>
+                "Closes stale file descriptors and opens fresh connections; no data mutation",
+            Self::IndexRebuild =>
+                "REINDEX rebuilds derived index structures; user data rows are untouched",
+            Self::InboxStatsRebuild =>
+                "Rebuilds a derived materialized view from ground-truth message data",
+            Self::RestoreFromProactiveBackup =>
+                "Quarantines (renames) the corrupt file and copies back the system-created .bak",
+            Self::CreateProactiveBackup =>
+                "Copies the primary database to a .bak sibling; purely additive",
+            Self::ReconstructFromArchive =>
+                "Replaces the live database from Git archive; may lose non-archived local state",
+            Self::DeleteCorruptDb =>
+                "Quarantines and replaces the corrupt database; irreversible data loss if no backup",
+            Self::ForceUnlockContested =>
+                "Overrides locks held by a potentially live process; risk of split-brain writes",
+            Self::SchemaMigration =>
+                "Alters table structure on the live database; irreversible without backup",
+            Self::PromoteReconstructedCandidate =>
+                "Replaces the live database with a reconstructed candidate; loses any non-archived state",
+            Self::ReinitializeBlank =>
+                "Creates an empty database discarding all existing data; total data loss",
+        }
+    }
+
+    /// All recovery actions, in declaration order.
+    pub const ALL: &'static [RecoveryAction] = &[
+        Self::WalCheckpointPassive,
+        Self::WalCheckpointTruncate,
+        Self::StaleLockCleanup,
+        Self::EmptyWalSidecarCleanup,
+        Self::ConnectionPoolRefresh,
+        Self::IndexRebuild,
+        Self::InboxStatsRebuild,
+        Self::RestoreFromProactiveBackup,
+        Self::CreateProactiveBackup,
+        Self::ReconstructFromArchive,
+        Self::DeleteCorruptDb,
+        Self::ForceUnlockContested,
+        Self::SchemaMigration,
+        Self::PromoteReconstructedCandidate,
+        Self::ReinitializeBlank,
+    ];
+
+    /// All silent self-heal actions.
+    pub const SILENT: &'static [RecoveryAction] = &[
+        Self::WalCheckpointPassive,
+        Self::WalCheckpointTruncate,
+        Self::StaleLockCleanup,
+        Self::EmptyWalSidecarCleanup,
+        Self::ConnectionPoolRefresh,
+        Self::IndexRebuild,
+        Self::InboxStatsRebuild,
+        Self::RestoreFromProactiveBackup,
+        Self::CreateProactiveBackup,
+    ];
+
+    /// All actions requiring explicit escalation.
+    pub const ESCALATED: &'static [RecoveryAction] = &[
+        Self::ReconstructFromArchive,
+        Self::DeleteCorruptDb,
+        Self::ForceUnlockContested,
+        Self::SchemaMigration,
+        Self::PromoteReconstructedCandidate,
+        Self::ReinitializeBlank,
+    ];
+}
+
+impl std::fmt::Display for RecoveryAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl std::fmt::Display for RecoveryApproval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SilentSelfHeal => f.write_str("silent_self_heal"),
+            Self::ExplicitEscalation => f.write_str("explicit_escalation"),
+        }
+    }
 }
 
 /// Default pool configuration values — sized for 1000+ concurrent agents.
@@ -1539,18 +1870,16 @@ fn sqlite_absolute_fallback_path(path: &str, open_error: &str) -> Option<String>
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ReconcileInventory {
-    projects: usize,
-    agents: usize,
-    messages: usize,
-    max_message_id: i64,
-    project_identities: BTreeSet<crate::reconstruct::MailboxProjectIdentity>,
+pub struct MailboxDbInventory {
+    pub projects: usize,
+    pub agents: usize,
+    pub messages: usize,
+    pub max_message_id: i64,
+    pub project_identities: BTreeSet<crate::reconstruct::MailboxProjectIdentity>,
 }
 
 #[allow(clippy::result_large_err)]
-fn query_database_inventory_for_reconcile(
-    primary_path: &Path,
-) -> Result<ReconcileInventory, SqlError> {
+pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInventory, SqlError> {
     let conn = open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref())?;
     let present = conn
         .query_sync(
@@ -1614,7 +1943,7 @@ fn query_database_inventory_for_reconcile(
         BTreeSet::new()
     };
 
-    Ok(ReconcileInventory {
+    Ok(MailboxDbInventory {
         projects,
         agents,
         messages,
@@ -1650,6 +1979,8 @@ fn reconcile_archive_state_before_init(
         return Ok(false);
     }
 
+    refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
+
     if !primary_path.exists() {
         let stats = reconstruct_sqlite_file_with_archive_salvage(primary_path, storage_root)?;
         tracing::warn!(
@@ -1670,7 +2001,7 @@ fn reconcile_archive_state_before_init(
         return Ok(false);
     }
 
-    let db_inventory = query_database_inventory_for_reconcile(primary_path)?;
+    let db_inventory = inspect_mailbox_db_inventory(primary_path)?;
     let archive_max_id = archive.latest_message_id.unwrap_or(0);
     let missing_archive_projects = crate::reconstruct::archive_missing_project_identities(
         &archive,
@@ -2216,7 +2547,7 @@ where
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+pub(crate) fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
 }
 
@@ -2384,6 +2715,30 @@ fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
         return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
     }
     ensure_sqlite_file_healthy(primary_path)
+}
+
+#[allow(clippy::result_large_err)]
+fn capture_automatic_recovery_bundle(
+    primary_path: &Path,
+    storage_root: &Path,
+    command_name: &str,
+) -> Result<PathBuf, SqlError> {
+    let database_url = format!("sqlite:///{}", primary_path.display());
+    let bundle_dir = crate::capture_mailbox_forensic_bundle(crate::MailboxForensicCapture {
+        command_name,
+        trigger: "automatic-recovery",
+        database_url: &database_url,
+        db_path: primary_path,
+        storage_root,
+        integrity_detail: None,
+    })?;
+    tracing::warn!(
+        path = %primary_path.display(),
+        command = command_name,
+        bundle = %bundle_dir.display(),
+        "captured mailbox forensic bundle before automatic recovery"
+    );
+    Ok(bundle_dir)
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -2560,6 +2915,519 @@ fn resolve_sqlite_path_with_absolute_fallback(sqlite_path: &str) -> String {
 #[must_use]
 pub fn normalize_sqlite_path_for_pool_key(sqlite_path: &str) -> String {
     resolve_sqlite_path_with_absolute_fallback(sqlite_path)
+}
+
+pub fn resolve_mailbox_sqlite_path(database_url: &str) -> DbResult<ResolvedMailboxSqlitePath> {
+    let config = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let configured_path = config.sqlite_path()?;
+    let canonical_path = normalize_sqlite_path_for_pool_key(&configured_path);
+    Ok(ResolvedMailboxSqlitePath {
+        used_absolute_fallback: canonical_path != configured_path,
+        configured_path,
+        canonical_path,
+    })
+}
+
+#[must_use]
+pub fn inspect_mailbox_sidecar_state(db_path: &Path) -> MailboxSidecarState {
+    if db_path.as_os_str() == ":memory:" {
+        return MailboxSidecarState::default();
+    }
+
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    let wal_meta = std::fs::metadata(&wal_path).ok();
+    let shm_meta = std::fs::metadata(&shm_path).ok();
+
+    MailboxSidecarState {
+        wal_exists: wal_meta.as_ref().is_some_and(|meta| meta.is_file()),
+        wal_bytes: wal_meta.as_ref().map(std::fs::Metadata::len),
+        shm_exists: shm_meta.as_ref().is_some_and(|meta| meta.is_file()),
+        shm_bytes: shm_meta.as_ref().map(std::fs::Metadata::len),
+        live_sidecars: sqlite_file_has_live_sidecars(db_path),
+    }
+}
+
+#[must_use]
+pub fn inspect_mailbox_recovery_lock(db_path: &Path) -> MailboxRecoveryLockState {
+    let lock_path = PathBuf::from(format!("{}.recovery.lock", db_path.display()));
+    if db_path.as_os_str() == ":memory:" {
+        return MailboxRecoveryLockState {
+            lock_path: lock_path.display().to_string(),
+            exists: false,
+            active: false,
+            pid: None,
+            detail: "In-memory database (no recovery lock file)".to_string(),
+        };
+    }
+
+    if !lock_path.exists() {
+        return MailboxRecoveryLockState {
+            lock_path: lock_path.display().to_string(),
+            exists: false,
+            active: false,
+            pid: None,
+            detail: "No recovery lock present".to_string(),
+        };
+    }
+
+    match std::fs::read_to_string(&lock_path) {
+        Ok(content) => match content.trim().parse::<u32>() {
+            Ok(pid) => {
+                let proc_path = PathBuf::from(format!("/proc/{pid}"));
+                if proc_path.exists() {
+                    MailboxRecoveryLockState {
+                        lock_path: lock_path.display().to_string(),
+                        exists: true,
+                        active: true,
+                        pid: Some(pid),
+                        detail: format!("Recovery lock held by PID {pid}"),
+                    }
+                } else {
+                    MailboxRecoveryLockState {
+                        lock_path: lock_path.display().to_string(),
+                        exists: true,
+                        active: false,
+                        pid: Some(pid),
+                        detail: format!("Stale recovery lock from PID {pid} (process not running)"),
+                    }
+                }
+            }
+            Err(_) => MailboxRecoveryLockState {
+                lock_path: lock_path.display().to_string(),
+                exists: true,
+                active: false,
+                pid: None,
+                detail: "Recovery lock file has invalid content".to_string(),
+            },
+        },
+        Err(error) => MailboxRecoveryLockState {
+            lock_path: lock_path.display().to_string(),
+            exists: true,
+            active: false,
+            pid: None,
+            detail: format!("Cannot read recovery lock file: {error}"),
+        },
+    }
+}
+
+fn normalized_mailbox_activity_sqlite_path(db_path: &Path) -> PathBuf {
+    PathBuf::from(normalize_sqlite_path_for_pool_key(
+        db_path.to_string_lossy().as_ref(),
+    ))
+}
+
+fn mailbox_activity_lock_path_for_sqlite(db_path: &Path) -> PathBuf {
+    let sqlite_path = normalized_mailbox_activity_sqlite_path(db_path);
+    PathBuf::from(format!("{}.activity.lock", sqlite_path.display()))
+}
+
+fn mailbox_activity_lock_path_for_storage_root(storage_root: &Path) -> PathBuf {
+    storage_root.join(".mailbox.activity.lock")
+}
+
+#[cfg(target_os = "linux")]
+fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    let target_ino = meta.ino();
+    let target_dev = meta.dev();
+    let target_major = ((target_dev >> 8) & 0xfff) as u32;
+    let target_minor = ((target_dev & 0xff) | ((target_dev >> 12) & 0xfff00)) as u32;
+    let Ok(locks_content) = std::fs::read_to_string("/proc/locks") else {
+        return Vec::new();
+    };
+
+    let mut pids = BTreeSet::new();
+    for line in locks_content.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 || fields[1] != "FLOCK" {
+            continue;
+        }
+        let parts: Vec<&str> = fields[5].split(':').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let Ok(major) = u32::from_str_radix(parts[0], 16) else {
+            continue;
+        };
+        let Ok(minor) = u32::from_str_radix(parts[1], 16) else {
+            continue;
+        };
+        let Ok(ino) = parts[2].parse::<u64>() else {
+            continue;
+        };
+        if ino != target_ino || major != target_major || minor != target_minor {
+            continue;
+        }
+        let Ok(pid) = fields[4].parse::<u32>() else {
+            continue;
+        };
+        pids.insert(pid);
+    }
+    pids.into_iter().collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_holder_pids_via_proc(_path: &Path) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(target_meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    let target_ino = target_meta.ino();
+    let target_dev = target_meta.dev();
+
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+
+    let mut holders = BTreeSet::new();
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let fd_dir = format!("/proc/{pid}/fd");
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd_entry in fds.flatten() {
+            let Ok(link_target) = std::fs::read_link(fd_entry.path()) else {
+                continue;
+            };
+            if let Ok(link_meta) = std::fs::metadata(&link_target)
+                && link_meta.ino() == target_ino
+                && link_meta.dev() == target_dev
+            {
+                holders.insert(pid);
+                break;
+            }
+        }
+    }
+
+    holders.into_iter().collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pids_holding_file_via_proc(_path: &Path) -> Vec<u32> {
+    Vec::new()
+}
+
+fn executable_name_has_agent_mail_signature(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "am" | "am.exe"
+            | "agent-mail"
+            | "agent-mail.exe"
+            | "agent_mail"
+            | "agent_mail.exe"
+            | "mcp-agent-mail"
+            | "mcp_agent_mail"
+            | "mcp-agent-mail.exe"
+            | "mcp_agent_mail.exe"
+            | "mcp-agent-mail-cli"
+            | "mcp_agent_mail_cli"
+            | "mcp-agent-mail-cli.exe"
+            | "mcp_agent_mail_cli.exe"
+    )
+}
+
+fn command_line_has_agent_mail_signature(command: &str) -> bool {
+    let Some(argv0) = command.split_whitespace().next() else {
+        return false;
+    };
+    let basename = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+    executable_name_has_agent_mail_signature(basename)
+}
+
+#[cfg(target_os = "linux")]
+fn pid_command_line(pid: u32) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let segments: Vec<String> = cmdline
+        .split(|&b| b == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).into_owned())
+        .collect();
+    (!segments.is_empty()).then(|| segments.join(" "))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_command_line(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn pid_executable_path(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_executable_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+fn pid_executable_deleted(pid: u32) -> bool {
+    pid_executable_path(pid)
+        .map(|path| path.to_string_lossy().contains(" (deleted)"))
+        .unwrap_or(false)
+}
+
+fn pid_is_agent_mail(pid: u32) -> bool {
+    pid_command_line(pid).is_some_and(|command| command_line_has_agent_mail_signature(&command))
+        || pid_executable_path(pid)
+            .and_then(|exe| {
+                exe.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .is_some_and(|basename| executable_name_has_agent_mail_signature(&basename))
+}
+
+fn add_mailbox_process_surface(
+    processes: &mut HashMap<u32, MailboxOwnershipProcess>,
+    pid: u32,
+    mark: impl Fn(&mut MailboxOwnershipProcess),
+) {
+    let entry = processes
+        .entry(pid)
+        .or_insert_with(|| MailboxOwnershipProcess {
+            pid,
+            command: None,
+            executable_path: None,
+            executable_deleted: false,
+            holds_storage_root_lock: false,
+            holds_sqlite_lock: false,
+            holds_database_file: false,
+        });
+    mark(entry);
+}
+
+fn describe_mailbox_process(process: &MailboxOwnershipProcess) -> String {
+    let mut surfaces = Vec::new();
+    if process.holds_storage_root_lock {
+        surfaces.push("storage_lock");
+    }
+    if process.holds_sqlite_lock {
+        surfaces.push("sqlite_lock");
+    }
+    if process.holds_database_file {
+        surfaces.push("db_file");
+    }
+    let surface_text = if surfaces.is_empty() {
+        "no_live_surface".to_string()
+    } else {
+        surfaces.join(",")
+    };
+    let command = process
+        .command
+        .as_deref()
+        .filter(|command| !command.trim().is_empty())
+        .unwrap_or("<unknown>");
+    let executable = process
+        .executable_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or("<unknown>");
+    let deleted = if process.executable_deleted {
+        " deleted-executable"
+    } else {
+        ""
+    };
+    format!(
+        "PID {} [{}] cmd={command} exe={executable}{deleted}",
+        process.pid, surface_text
+    )
+}
+
+fn classify_mailbox_ownership(
+    processes: &[MailboxOwnershipProcess],
+    current_pid: u32,
+) -> (MailboxOwnershipDisposition, Vec<u32>, bool, String) {
+    let competing: Vec<&MailboxOwnershipProcess> = processes
+        .iter()
+        .filter(|process| process.pid != current_pid)
+        .collect();
+    let competing_pids: Vec<u32> = competing.iter().map(|process| process.pid).collect();
+    let current_deleted = pid_executable_deleted(current_pid);
+
+    if competing.len() > 1 {
+        let detail = format!(
+            "mailbox ownership is split-brain across live Agent Mail processes: {}",
+            competing
+                .iter()
+                .map(|process| describe_mailbox_process(process))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        return (
+            MailboxOwnershipDisposition::SplitBrain,
+            competing_pids,
+            true,
+            detail,
+        );
+    }
+
+    if let Some(process) = competing.first()
+        && process.executable_deleted
+    {
+        return (
+            MailboxOwnershipDisposition::DeletedExecutable,
+            competing_pids,
+            true,
+            format!(
+                "another live Agent Mail mailbox owner is running a deleted executable: {}",
+                describe_mailbox_process(process)
+            ),
+        );
+    }
+
+    if current_deleted {
+        return (
+            MailboxOwnershipDisposition::DeletedExecutable,
+            competing_pids,
+            true,
+            format!(
+                "current Agent Mail process PID {} is running a deleted executable",
+                current_pid
+            ),
+        );
+    }
+
+    if let Some(process) = competing.first() {
+        if !process.holds_storage_root_lock
+            && !process.holds_sqlite_lock
+            && process.holds_database_file
+        {
+            return (
+                MailboxOwnershipDisposition::StaleLiveProcess,
+                competing_pids,
+                true,
+                format!(
+                    "live Agent Mail process still holds the mailbox database without mailbox activity locks: {}",
+                    describe_mailbox_process(process)
+                ),
+            );
+        }
+        return (
+            MailboxOwnershipDisposition::ActiveOtherOwner,
+            competing_pids,
+            false,
+            format!(
+                "another Agent Mail process already owns the mailbox: {}",
+                describe_mailbox_process(process)
+            ),
+        );
+    }
+
+    (
+        MailboxOwnershipDisposition::Unowned,
+        Vec::new(),
+        false,
+        "no competing Agent Mail mailbox owners or live database holders detected".to_string(),
+    )
+}
+
+#[must_use]
+pub fn inspect_mailbox_ownership(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> MailboxOwnershipState {
+    let storage_lock_path = mailbox_activity_lock_path_for_storage_root(storage_root);
+    let sqlite_lock_path = mailbox_activity_lock_path_for_sqlite(primary_path);
+
+    let mut processes = HashMap::new();
+    for pid in lock_holder_pids_via_proc(&storage_lock_path) {
+        if pid_is_agent_mail(pid) {
+            add_mailbox_process_surface(&mut processes, pid, |process| {
+                process.holds_storage_root_lock = true;
+            });
+        }
+    }
+    for pid in lock_holder_pids_via_proc(&sqlite_lock_path) {
+        if pid_is_agent_mail(pid) {
+            add_mailbox_process_surface(&mut processes, pid, |process| {
+                process.holds_sqlite_lock = true;
+            });
+        }
+    }
+    if primary_path.exists() {
+        for pid in pids_holding_file_via_proc(primary_path) {
+            if pid_is_agent_mail(pid) {
+                add_mailbox_process_surface(&mut processes, pid, |process| {
+                    process.holds_database_file = true;
+                });
+            }
+        }
+    }
+
+    let current_pid = std::process::id();
+    if pid_executable_deleted(current_pid) && !processes.contains_key(&current_pid) {
+        add_mailbox_process_surface(&mut processes, current_pid, |_| {});
+    }
+
+    let mut processes: Vec<_> = processes
+        .into_values()
+        .map(|mut process| {
+            process.command = pid_command_line(process.pid);
+            process.executable_path =
+                pid_executable_path(process.pid).map(|path| path.to_string_lossy().into_owned());
+            process.executable_deleted = process
+                .executable_path
+                .as_deref()
+                .is_some_and(|path| path.contains(" (deleted)"));
+            process
+        })
+        .collect();
+    processes.sort_by_key(|process| process.pid);
+
+    let (disposition, competing_pids, supervised_restart_required, detail) =
+        classify_mailbox_ownership(&processes, current_pid);
+    MailboxOwnershipState {
+        disposition,
+        storage_lock_path: storage_lock_path.display().to_string(),
+        sqlite_lock_path: sqlite_lock_path.display().to_string(),
+        processes,
+        competing_pids,
+        supervised_restart_required,
+        detail,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn refuse_mutating_mailbox_when_owned(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    let ownership = inspect_mailbox_ownership(primary_path, storage_root);
+    if !ownership.blocks_mutation() {
+        return Ok(());
+    }
+
+    let remediation = if ownership.supervised_restart_required {
+        "supervised restart or operator intervention is required before recovery"
+    } else {
+        "wait for the active owner to finish instead of competing recovery"
+    };
+    Err(SqlError::Custom(format!(
+        "mailbox mutation refused for {}: {}; {}",
+        primary_path.display(),
+        ownership.detail,
+        remediation
+    )))
 }
 
 #[allow(clippy::result_large_err)]
@@ -2940,10 +3808,17 @@ fn restore_quarantined_primary(
 /// Rebuild a healthy-but-stale SQLite file from the archive while salvaging the
 /// current primary database for any DB-only state that is not archived.
 #[allow(clippy::result_large_err)]
-pub fn reconstruct_sqlite_file_with_archive_salvage(
+fn reconstruct_sqlite_file_with_archive_salvage_inner(
     primary_path: &Path,
     storage_root: &Path,
+    capture_forensics: bool,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
+    if capture_forensics {
+        let _bundle_dir =
+            capture_automatic_recovery_bundle(primary_path, storage_root, "reconstruct")?;
+    }
+
     if !primary_path.exists() {
         if has_quarantined_primary_artifact(primary_path) {
             return Err(SqlError::Custom(format!(
@@ -2993,6 +3868,14 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
             Err(e)
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+pub fn reconstruct_sqlite_file_with_archive_salvage(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true)
 }
 
 #[allow(clippy::result_large_err)]
@@ -3142,6 +4025,10 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
         }
     }
 
+    let fallback_storage_root = primary_path.parent().unwrap_or_else(|| Path::new("."));
+    let _bundle_dir =
+        capture_automatic_recovery_bundle(primary_path, fallback_storage_root, "repair")?;
+
     if let Some(backup_path) = find_healthy_backup(primary_path) {
         restore_from_backup(primary_path, &backup_path)?;
         if sqlite_file_is_healthy(primary_path)? {
@@ -3191,6 +4078,9 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
         return Ok(());
     }
+
+    refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
+
     if had_primary {
         refuse_auto_recovery_with_live_sidecars(primary_path)?;
     }
@@ -3208,6 +4098,16 @@ pub fn ensure_sqlite_file_healthy_with_archive(
             ),
         }
     }
+
+    let _bundle_dir = if had_primary {
+        Some(capture_automatic_recovery_bundle(
+            primary_path,
+            storage_root,
+            "repair",
+        )?)
+    } else {
+        None
+    };
 
     // Priority 1: Restore from backup
     if let Some(backup_path) = find_healthy_backup(primary_path) {
@@ -3231,6 +4131,8 @@ pub fn ensure_sqlite_file_healthy_with_archive(
             // Normal fresh startup (no projects directory).
             return Ok(());
         }
+        let _bundle_dir =
+            capture_automatic_recovery_bundle(primary_path, storage_root, "reconstruct")?;
         // Missing file, but archive has projects. We want to reconstruct!
     }
 
@@ -3263,7 +4165,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         )?;
     }
 
-    match reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp) {
+    match reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, false) {
         Ok(stats) => {
             if had_primary && stats.projects == 0 && stats.agents == 0 && stats.messages == 0 {
                 if let Some(quarantined) = quarantine_reconstructed_candidate(
@@ -5937,6 +6839,102 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    #[test]
+    fn classify_mailbox_ownership_accepts_current_process_owner() {
+        let current_pid = std::process::id();
+        let processes = vec![MailboxOwnershipProcess {
+            pid: current_pid,
+            command: Some("mcp-agent-mail serve".to_string()),
+            executable_path: Some("/tmp/mcp-agent-mail".to_string()),
+            executable_deleted: false,
+            holds_storage_root_lock: true,
+            holds_sqlite_lock: true,
+            holds_database_file: true,
+        }];
+
+        let (disposition, competing_pids, supervised_restart_required, detail) =
+            classify_mailbox_ownership(&processes, current_pid);
+
+        assert_eq!(disposition, MailboxOwnershipDisposition::Unowned);
+        assert!(competing_pids.is_empty());
+        assert!(!supervised_restart_required);
+        assert!(detail.contains("no competing"));
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_flags_deleted_executable_owner() {
+        let processes = vec![MailboxOwnershipProcess {
+            pid: 4242,
+            command: Some("mcp-agent-mail serve".to_string()),
+            executable_path: Some("/tmp/mcp-agent-mail (deleted)".to_string()),
+            executable_deleted: true,
+            holds_storage_root_lock: true,
+            holds_sqlite_lock: false,
+            holds_database_file: true,
+        }];
+
+        let (disposition, competing_pids, supervised_restart_required, detail) =
+            classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(disposition, MailboxOwnershipDisposition::DeletedExecutable);
+        assert_eq!(competing_pids, vec![4242]);
+        assert!(supervised_restart_required);
+        assert!(detail.contains("deleted executable"));
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_flags_stale_live_process_without_activity_locks() {
+        let processes = vec![MailboxOwnershipProcess {
+            pid: 4343,
+            command: Some("mcp-agent-mail serve".to_string()),
+            executable_path: Some("/tmp/mcp-agent-mail".to_string()),
+            executable_deleted: false,
+            holds_storage_root_lock: false,
+            holds_sqlite_lock: false,
+            holds_database_file: true,
+        }];
+
+        let (disposition, competing_pids, supervised_restart_required, detail) =
+            classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(disposition, MailboxOwnershipDisposition::StaleLiveProcess);
+        assert_eq!(competing_pids, vec![4343]);
+        assert!(supervised_restart_required);
+        assert!(detail.contains("without mailbox activity locks"));
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_flags_split_brain() {
+        let processes = vec![
+            MailboxOwnershipProcess {
+                pid: 4444,
+                command: Some("mcp-agent-mail serve".to_string()),
+                executable_path: Some("/tmp/mcp-agent-mail".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: false,
+                holds_database_file: true,
+            },
+            MailboxOwnershipProcess {
+                pid: 5555,
+                command: Some("mcp-agent-mail serve".to_string()),
+                executable_path: Some("/tmp/mcp-agent-mail-cli".to_string()),
+                executable_deleted: false,
+                holds_storage_root_lock: false,
+                holds_sqlite_lock: true,
+                holds_database_file: true,
+            },
+        ];
+
+        let (disposition, competing_pids, supervised_restart_required, detail) =
+            classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(disposition, MailboxOwnershipDisposition::SplitBrain);
+        assert_eq!(competing_pids, vec![4444, 5555]);
+        assert!(supervised_restart_required);
+        assert!(detail.contains("split-brain"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn archive_recovery_rejects_symlinked_storage_root() {
@@ -6837,5 +7835,152 @@ mod tests {
         assert!(!config.database_url.is_empty() || config.database_url.is_empty()); // just ensure it doesn't panic
         assert!(config.min_connections > 0);
         assert!(config.max_connections >= config.min_connections);
+    }
+
+    // ── RecoveryAction / RecoveryApproval policy tests ─────────────────
+
+    #[test]
+    fn recovery_action_all_covers_every_variant() {
+        assert_eq!(
+            RecoveryAction::ALL.len(),
+            RecoveryAction::SILENT.len() + RecoveryAction::ESCALATED.len(),
+            "ALL must equal SILENT + ESCALATED"
+        );
+    }
+
+    #[test]
+    fn recovery_action_silent_list_matches_approval() {
+        for action in RecoveryAction::SILENT {
+            assert!(
+                action.is_silent(),
+                "{action} is in SILENT list but approval() is {:?}",
+                action.approval()
+            );
+            assert!(
+                !action.requires_escalation(),
+                "{action} is in SILENT list but requires_escalation() is true"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_action_escalated_list_matches_approval() {
+        for action in RecoveryAction::ESCALATED {
+            assert!(
+                action.requires_escalation(),
+                "{action} is in ESCALATED list but requires_escalation() is false"
+            );
+            assert!(
+                !action.is_silent(),
+                "{action} is in ESCALATED list but is_silent() is true"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_action_labels_are_unique() {
+        let mut seen = HashSet::new();
+        for action in RecoveryAction::ALL {
+            assert!(
+                seen.insert(action.label()),
+                "duplicate label: {}",
+                action.label()
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_action_rationale_non_empty() {
+        for action in RecoveryAction::ALL {
+            assert!(
+                !action.rationale().is_empty(),
+                "{action} has empty rationale"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_action_display_matches_label() {
+        for action in RecoveryAction::ALL {
+            assert_eq!(
+                action.to_string(),
+                action.label(),
+                "Display and label() diverged for {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_approval_display() {
+        assert_eq!(
+            RecoveryApproval::SilentSelfHeal.to_string(),
+            "silent_self_heal"
+        );
+        assert_eq!(
+            RecoveryApproval::ExplicitEscalation.to_string(),
+            "explicit_escalation"
+        );
+    }
+
+    #[test]
+    fn recovery_action_known_silent_actions() {
+        // Verify the specific actions we expect to be silent
+        let expected_silent = [
+            RecoveryAction::WalCheckpointPassive,
+            RecoveryAction::WalCheckpointTruncate,
+            RecoveryAction::StaleLockCleanup,
+            RecoveryAction::EmptyWalSidecarCleanup,
+            RecoveryAction::ConnectionPoolRefresh,
+            RecoveryAction::IndexRebuild,
+            RecoveryAction::InboxStatsRebuild,
+            RecoveryAction::RestoreFromProactiveBackup,
+            RecoveryAction::CreateProactiveBackup,
+        ];
+        for action in &expected_silent {
+            assert!(
+                action.is_silent(),
+                "{action} should be classified as silent self-heal"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_action_known_escalated_actions() {
+        // Verify the specific actions we expect to require escalation
+        let expected_escalated = [
+            RecoveryAction::ReconstructFromArchive,
+            RecoveryAction::DeleteCorruptDb,
+            RecoveryAction::ForceUnlockContested,
+            RecoveryAction::SchemaMigration,
+            RecoveryAction::PromoteReconstructedCandidate,
+            RecoveryAction::ReinitializeBlank,
+        ];
+        for action in &expected_escalated {
+            assert!(
+                action.requires_escalation(),
+                "{action} should be classified as explicit escalation"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_action_serde_roundtrip() {
+        for action in RecoveryAction::ALL {
+            let json = serde_json::to_string(action).expect("serialize");
+            let parsed: RecoveryAction = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(*action, parsed, "serde roundtrip failed for {action:?}");
+        }
+    }
+
+    #[test]
+    fn recovery_approval_serde_roundtrip() {
+        for approval in &[
+            RecoveryApproval::SilentSelfHeal,
+            RecoveryApproval::ExplicitEscalation,
+        ] {
+            let json = serde_json::to_string(approval).expect("serialize");
+            let parsed: RecoveryApproval = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(*approval, parsed, "serde roundtrip failed for {approval:?}");
+        }
     }
 }

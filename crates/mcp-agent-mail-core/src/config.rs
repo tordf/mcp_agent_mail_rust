@@ -80,6 +80,11 @@ pub struct Config {
     pub allow_absolute_attachment_paths: bool,
     pub allow_ephemeral_projects_in_default_storage: bool,
 
+    // Ephemeral isolation
+    pub ephemeral_mode: crate::ephemeral::EphemeralMode,
+    pub ephemeral_root: Option<std::path::PathBuf>,
+    pub ephemeral_ttl_hours: u64,
+
     // Disk space monitoring
     pub disk_space_monitor_enabled: bool,
     pub disk_space_warning_mb: u64,
@@ -707,6 +712,98 @@ pub fn is_default_storage_root(path: &Path) -> bool {
     path == default_storage_root_path()
 }
 
+// ── Ephemeral auto-reroute ──────────────────────────────────────────────
+
+/// Default base directory for ephemeral storage isolation.
+///
+/// Used when `ephemeral_root` is not explicitly configured.
+const DEFAULT_EPHEMERAL_BASE: &str = "/tmp/.am-ephemeral";
+
+/// Compute an isolated storage root for an ephemeral project.
+///
+/// When a project's path is detected as ephemeral (under `/tmp`, `/dev/shm`,
+/// test harness directories, etc.) and the current `storage_root` is the
+/// default global mailbox, this function returns an isolated directory
+/// derived from a SHA-1 hash of the project path.  This prevents ephemeral
+/// test/CI runs from contaminating the operator's production mail archive.
+///
+/// The isolated path is structured as:
+/// ```text
+/// <ephemeral_base>/<sha1_hex_12>/
+/// ```
+///
+/// where `ephemeral_base` defaults to `/tmp/.am-ephemeral` but can be
+/// overridden via `AM_EPHEMERAL_ROOT`.
+///
+/// Returns `None` if:
+/// - The effective ephemeral class is `Production` (no reroute needed)
+/// - The current `storage_root` is already non-default (operator explicitly
+///   chose a storage location)
+#[must_use]
+pub fn compute_ephemeral_storage_root(
+    project_root: &Path,
+    config: &Config,
+) -> Option<PathBuf> {
+    compute_ephemeral_storage_root_with_env(
+        project_root,
+        config,
+        &crate::ephemeral::std_env_lookup,
+    )
+}
+
+/// Like [`compute_ephemeral_storage_root`] but with an injectable environment
+/// lookup, allowing tests to avoid picking up the cargo-test environment.
+#[must_use]
+pub fn compute_ephemeral_storage_root_with_env(
+    project_root: &Path,
+    config: &Config,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    use crate::ephemeral::{classify_ephemeral, resolve_ephemeral_class};
+
+    // 1. Skip if the operator explicitly set a non-default storage root.
+    if !is_default_storage_root(&config.storage_root) {
+        return None;
+    }
+
+    // 2. Classify the project root.
+    let (detected, _signals) = classify_ephemeral(project_root, env);
+    let effective = resolve_ephemeral_class(config.ephemeral_mode, detected);
+
+    if !effective.is_ephemeral() {
+        return None;
+    }
+
+    // 3. Compute a deterministic hash of the project path.
+    let path_str = project_root.to_string_lossy();
+    let hash_hex = ephemeral_path_hash(&path_str);
+
+    // 4. Build the isolated root.
+    let base = config
+        .ephemeral_root
+        .as_deref()
+        .unwrap_or_else(|| Path::new(DEFAULT_EPHEMERAL_BASE));
+    Some(base.join(&hash_hex))
+}
+
+/// Compute a 12-character hex hash of a path string for ephemeral isolation.
+///
+/// Uses SHA-1 (already a crate dependency) truncated to 12 hex chars (48 bits),
+/// which gives ~281 trillion possible values — more than sufficient to avoid
+/// collisions among concurrent test/CI runs.
+fn ephemeral_path_hash(path: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(path.as_bytes());
+    let digest = hasher.finalize();
+    // Take first 6 bytes → 12 hex chars
+    digest
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Resolve `storage_root` to a canonical (symlink-free) path.
 ///
 /// If the full path exists, `std::fs::canonicalize` resolves every symlink
@@ -805,6 +902,11 @@ impl Default for Config {
             keep_original_images: false,
             allow_absolute_attachment_paths: false,
             allow_ephemeral_projects_in_default_storage: false,
+
+            // Ephemeral isolation
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ephemeral_root: None,
+            ephemeral_ttl_hours: 24,
 
             // Disk space monitoring
             disk_space_monitor_enabled: true,
@@ -1110,6 +1212,8 @@ impl std::fmt::Debug for Config {
                 &self.http_jwt_secret.as_ref().map(|_| "[REDACTED]"),
             )
             .field("storage_root", &self.storage_root)
+            .field("ephemeral_mode", &self.ephemeral_mode)
+            .field("ephemeral_root", &self.ephemeral_root)
             .field("log_level", &self.log_level)
             .field("tui_enabled", &self.tui_enabled)
             .finish_non_exhaustive()
@@ -1207,6 +1311,23 @@ impl Config {
             "ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE",
             config.allow_ephemeral_projects_in_default_storage,
         );
+
+        // Ephemeral isolation
+        if let Some(v) = env_value("AM_EPHEMERAL_MODE") {
+            config.ephemeral_mode = crate::ephemeral::EphemeralMode::from_str_lossy(&v);
+        }
+        // Legacy compat: ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE=true → Deny mode
+        if config.allow_ephemeral_projects_in_default_storage
+            && config.ephemeral_mode == crate::ephemeral::EphemeralMode::Auto
+        {
+            config.ephemeral_mode = crate::ephemeral::EphemeralMode::Deny;
+        }
+        if let Some(v) = env_value("AM_EPHEMERAL_ROOT") {
+            config.ephemeral_root = Some(std::path::PathBuf::from(
+                shellexpand::tilde(&v).into_owned(),
+            ));
+        }
+        config.ephemeral_ttl_hours = env_u64("AM_EPHEMERAL_TTL_HOURS", config.ephemeral_ttl_hours);
 
         // Disk space monitoring
         config.disk_space_monitor_enabled = env_bool(
@@ -4078,5 +4199,127 @@ mod tests {
         assert!(!cfg.is_production(), "default should be development");
         cfg.app_environment = AppEnvironment::Production;
         assert!(cfg.is_production());
+    }
+
+    // ── Ephemeral auto-reroute ───────────────────────────────────────
+
+    #[test]
+    fn ephemeral_path_hash_deterministic() {
+        let h1 = super::ephemeral_path_hash("/tmp/test-project");
+        let h2 = super::ephemeral_path_hash("/tmp/test-project");
+        assert_eq!(h1, h2, "same input should produce same hash");
+        assert_eq!(h1.len(), 12, "hash should be 12 hex chars");
+    }
+
+    #[test]
+    fn ephemeral_path_hash_distinct() {
+        let h1 = super::ephemeral_path_hash("/tmp/project-a");
+        let h2 = super::ephemeral_path_hash("/tmp/project-b");
+        assert_ne!(h1, h2, "different inputs should produce different hashes");
+    }
+
+    // Use a clean env for ephemeral reroute tests so RUST_TEST_THREADS
+    // (set by cargo test) doesn't accidentally classify production paths
+    // as ephemeral. Path-only classification is tested in ephemeral.rs.
+    fn no_env(_key: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn compute_ephemeral_storage_root_returns_isolated_path_for_tmp() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+
+        let result = compute_ephemeral_storage_root_with_env(
+            Path::new("/tmp/test-project"),
+            &config,
+            &no_env,
+        );
+        assert!(result.is_some(), "tmp path should trigger ephemeral reroute");
+        let isolated = result.unwrap();
+        assert!(
+            isolated.to_string_lossy().contains(".am-ephemeral"),
+            "isolated path should be under default ephemeral base"
+        );
+    }
+
+    #[test]
+    fn compute_ephemeral_storage_root_returns_none_for_production_path() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+
+        let result = compute_ephemeral_storage_root_with_env(
+            Path::new("/data/projects/real-project"),
+            &config,
+            &no_env,
+        );
+        assert!(result.is_none(), "production path should not trigger reroute");
+    }
+
+    #[test]
+    fn compute_ephemeral_storage_root_returns_none_for_custom_storage_root() {
+        let mut config = Config::default();
+        config.storage_root = PathBuf::from("/custom/storage");
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+
+        let result = compute_ephemeral_storage_root_with_env(
+            Path::new("/tmp/test-project"),
+            &config,
+            &no_env,
+        );
+        assert!(
+            result.is_none(),
+            "custom storage root should bypass reroute"
+        );
+    }
+
+    #[test]
+    fn compute_ephemeral_storage_root_respects_deny_mode() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Deny;
+
+        let result = compute_ephemeral_storage_root_with_env(
+            Path::new("/tmp/test-project"),
+            &config,
+            &no_env,
+        );
+        assert!(result.is_none(), "deny mode should prevent reroute");
+    }
+
+    #[test]
+    fn compute_ephemeral_storage_root_uses_custom_ephemeral_root() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        config.ephemeral_root = Some(PathBuf::from("/dev/shm/custom-eph"));
+
+        let result = compute_ephemeral_storage_root_with_env(
+            Path::new("/tmp/test-project"),
+            &config,
+            &no_env,
+        );
+        assert!(result.is_some());
+        let isolated = result.unwrap();
+        assert!(
+            isolated.starts_with("/dev/shm/custom-eph"),
+            "should use custom ephemeral_root, got: {isolated:?}"
+        );
+    }
+
+    #[test]
+    fn compute_ephemeral_storage_root_dev_shm_path() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+
+        let result = compute_ephemeral_storage_root_with_env(
+            Path::new("/dev/shm/agent-session"),
+            &config,
+            &no_env,
+        );
+        assert!(result.is_some(), "/dev/shm path should trigger reroute");
     }
 }

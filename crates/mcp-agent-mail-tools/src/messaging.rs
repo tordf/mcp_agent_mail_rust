@@ -20,8 +20,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent,
-    resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
+    legacy_tool_error, resolve_agent, resolve_project,
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
@@ -3064,13 +3064,15 @@ pub async fn fetch_inbox(
     let urgent = urgent_only.unwrap_or(false);
     reject_unsupported_topic_argument(topic.as_deref(), "fetch_inbox")?;
 
-    let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Use archive-aware read pool so that inbox reads fall back to archive
+    // snapshots when the live SQLite is suspect (DegradedReadOnly).
+    let read_pool = get_read_db_pool()?;
+    let project = resolve_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     let agent = resolve_agent(
         ctx,
-        &pool,
+        &read_pool,
         project_id,
         &agent_name,
         &project.slug,
@@ -3104,7 +3106,7 @@ pub async fn fetch_inbox(
     let inbox_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::fetch_inbox(
             ctx.cx(),
-            &pool,
+            &read_pool,
             project_id,
             agent_id,
             urgent,
@@ -3182,22 +3184,38 @@ pub async fn fetch_inbox(
     // Uses batch UPDATE (single transaction) instead of N individual
     // mark_message_read calls — ~80% latency reduction for typical 20-message
     // inbox fetches.
+    //
+    // The write-back MUST target the live DB, not the archive snapshot,
+    // because snapshot pools are read-only reconstructions. If the live DB
+    // is degraded the write will fail gracefully (already best-effort).
     {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        if let Err(e) = mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
-            pool.sqlite_path(),
-            agent_id,
-            &ids,
-        ) {
+        let write_path = match get_db_pool() {
+            Ok(live_pool) => Some(live_pool.sqlite_path().to_string()),
+            Err(_) => None,
+        };
+        if let Some(ref live_sqlite_path) = write_path {
+            if let Err(e) = mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
+                live_sqlite_path,
+                agent_id,
+                &ids,
+            ) {
+                tracing::warn!(
+                    agent_id = agent_id,
+                    count = ids.len(),
+                    error = %e,
+                    "batch auto-mark-read on fetch_inbox failed"
+                );
+            } else {
+                mcp_agent_mail_db::read_cache()
+                    .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+            }
+        } else {
             tracing::warn!(
                 agent_id = agent_id,
                 count = ids.len(),
-                error = %e,
-                "batch auto-mark-read on fetch_inbox failed"
+                "skipping auto-mark-read because the live DB pool is unavailable (degraded mode)"
             );
-        } else {
-            mcp_agent_mail_db::read_cache()
-                .invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
         }
     }
 

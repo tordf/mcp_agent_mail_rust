@@ -265,6 +265,12 @@ fn sc_doctor_check_json_fields() {
         "doctor check --json should include 'healthy' field"
     );
 
+    let summary = value.get("summary");
+    assert!(
+        summary.is_some(),
+        "doctor check --json should include 'summary' object"
+    );
+
     let checks = value.get("checks");
     assert!(
         checks.is_some(),

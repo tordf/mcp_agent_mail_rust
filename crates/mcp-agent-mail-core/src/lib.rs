@@ -35,6 +35,7 @@ pub mod config;
 pub mod conformal;
 pub mod diagnostics;
 pub mod disk;
+pub mod ephemeral;
 pub mod error;
 pub mod evidence_ledger;
 pub mod experience;
@@ -43,6 +44,7 @@ pub mod identity;
 pub mod intern;
 pub mod kpi;
 pub mod lock_order;
+pub mod mailbox_durability;
 pub mod mcp_config;
 pub mod memory;
 pub mod metrics;
@@ -87,9 +89,19 @@ pub use backpressure::{
     compute_health_level_with_signals, is_shedable_tool, level_transitions, refresh_health_level,
     set_shedding_enabled, shedding_enabled, should_shed_tool,
 };
-pub use config::{AppEnvironment, Config, InterfaceMode, ProjectIdentityMode, RateLimitBackend};
+pub use config::{
+    AppEnvironment, Config, InterfaceMode, ProjectIdentityMode, RateLimitBackend,
+    compute_ephemeral_storage_root,
+};
 pub use diagnostics::{
+    ArchiveScanDedupeRule, ArchiveScanDiagnostic, ArchiveScanScope, ArchiveScanSeverityBucket,
+    ArchiveScanSummary, ArchiveScanSummaryBucket, ArchiveScanSummaryFinding, ArtifactPointer,
+    ArtifactStatus, DiagnosticFindingCounts, DiagnosticPayload, DiagnosticPayloadSchema,
     DiagnosticReport, HealthInfo, Recommendation, SystemInfo, init_process_start,
+};
+pub use ephemeral::{
+    EphemeralClass, EphemeralMode, EphemeralSignals, EphemeralTier, classify_ephemeral,
+    path_has_ephemeral_root, resolve_ephemeral_class, std_env_lookup,
 };
 pub use error::{Error as MailError, Result as MailResult};
 pub use evidence_ledger::{
@@ -116,6 +128,13 @@ pub use kpi::{
 pub use lock_order::{
     LockContentionEntry, LockLevel, OrderedMutex, OrderedRwLock, lock_contention_reset,
     lock_contention_snapshot,
+};
+pub use mailbox_durability::{
+    MAILBOX_DURABILITY_CONTRACTS, MAILBOX_DURABILITY_INVARIANTS, MAILBOX_DURABILITY_STATES,
+    MAILBOX_DURABILITY_TRANSITIONS, MailboxDurabilityContract, MailboxDurabilityInvariant,
+    MailboxDurabilityState, MailboxDurabilityTransition, MailboxReadPolicy,
+    MailboxRecoveryRequirement, MailboxTransitionAuthority, MailboxWritePolicy,
+    mailbox_durability_invariant_by_id, validate_mailbox_durability_transition,
 };
 pub use mcp_config::{
     McpConfigDetectParams, McpConfigLocation, McpConfigTool, detect_mcp_config_locations,

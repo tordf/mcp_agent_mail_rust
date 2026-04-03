@@ -910,24 +910,9 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 // ── Startup backfill ─────────────────────────────────────────────────────
 
 pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Option<String> {
-    let path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(db_url)?;
-    let path_text = path.to_string_lossy().into_owned();
-
-    if path == Path::new(":memory:") || path.is_absolute() {
-        return Some(path_text);
-    }
-    if path_text.starts_with("./") || path_text.starts_with("../") {
-        return Some(path_text);
-    }
-    if !path.exists() {
-        let absolute_candidate = Path::new("/").join(&path);
-        if absolute_candidate.exists() {
-            return Some(absolute_candidate.to_string_lossy().into_owned());
-        }
-        return Some(path_text);
-    }
-
-    Some(crate::pool::normalize_sqlite_path_for_pool_key(&path_text))
+    crate::pool::resolve_mailbox_sqlite_path(db_url)
+        .ok()
+        .map(|resolved| resolved.canonical_path)
 }
 
 /// Backfill the Tantivy index with all messages from the database.

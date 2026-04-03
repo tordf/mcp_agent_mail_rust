@@ -1177,6 +1177,23 @@ pub struct StartupReport {
     pub results: Vec<ProbeResult>,
 }
 
+const STARTUP_PRIMARY_FAILURE_PRIORITY: &[&str] = &[
+    "database",
+    "db-lock",
+    "storage",
+    "integrity",
+    "port",
+    "auth",
+    "http_path",
+];
+
+fn startup_failure_priority(name: &str) -> usize {
+    STARTUP_PRIMARY_FAILURE_PRIORITY
+        .iter()
+        .position(|candidate| *candidate == name)
+        .unwrap_or(STARTUP_PRIMARY_FAILURE_PRIORITY.len())
+}
+
 impl StartupReport {
     /// Returns all failures.
     #[must_use]
@@ -1196,19 +1213,44 @@ impl StartupReport {
         self.failures().is_empty()
     }
 
+    /// Returns the failure that best explains why startup is blocked.
+    #[must_use]
+    pub fn primary_failure(&self) -> Option<&ProbeFailure> {
+        self.failures()
+            .into_iter()
+            .min_by_key(|failure| startup_failure_priority(failure.name))
+    }
+
     /// Format a human-readable error block for terminal output.
     #[must_use]
     pub fn format_errors(&self) -> String {
         use fmt::Write;
         let failures = self.failures();
-        if failures.is_empty() {
+        let Some(primary) = self.primary_failure() else {
             return String::new();
-        }
+        };
+        let secondary: Vec<_> = failures
+            .into_iter()
+            .filter(|failure| !std::ptr::eq(*failure, primary))
+            .collect();
         let mut out = String::new();
-        out.push_str("\n  Startup failed — the following checks did not pass:\n\n");
-        for (i, fail) in failures.iter().enumerate() {
-            let _ = writeln!(out, "  {}. [{}] {}", i + 1, fail.name, fail.problem);
-            let _ = writeln!(out, "     Fix: {}\n", fail.fix);
+        out.push_str("\n  Startup probe summary:\n\n");
+        let _ = writeln!(
+            out,
+            "  Primary issue: [{}] {}",
+            primary.name, primary.problem
+        );
+        let _ = writeln!(out, "  Next action: {}", primary.fix);
+        if !secondary.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n  Secondary findings: {} additional failing probe(s).",
+                secondary.len()
+            );
+            for (i, fail) in secondary.iter().enumerate() {
+                let _ = writeln!(out, "  {}. [{}] {}", i + 1, fail.name, fail.problem);
+                let _ = writeln!(out, "     Next action: {}", fail.fix);
+            }
         }
         out
     }
@@ -2091,6 +2133,41 @@ mod tests {
         let errors = report.format_errors();
         assert!(errors.contains("Port 8765 is in use"));
         assert!(errors.contains("Use a different port"));
+    }
+
+    #[test]
+    fn format_errors_prioritizes_primary_root_cause_before_secondary_findings() {
+        let report = StartupReport {
+            results: vec![
+                ProbeResult::Fail(ProbeFailure {
+                    name: "integrity",
+                    problem: "SQLite integrity check could not run because the mailbox is busy"
+                        .into(),
+                    fix: "Stop the running process and retry.".into(),
+                }),
+                ProbeResult::Fail(ProbeFailure {
+                    name: "db-lock",
+                    problem: "Database file is exclusively locked by PID 42".into(),
+                    fix: "Stop PID 42 or wait for it to finish.".into(),
+                }),
+            ],
+        };
+
+        let errors = report.format_errors();
+        let primary_pos = errors
+            .find("Primary issue: [db-lock]")
+            .expect("primary issue");
+        let secondary_pos = errors
+            .find("1. [integrity]")
+            .expect("secondary integrity finding");
+        assert!(
+            primary_pos < secondary_pos,
+            "expected db-lock to lead the output:\n{errors}"
+        );
+        assert!(
+            errors.contains("Secondary findings: 1 additional failing probe(s)."),
+            "expected secondary summary in output:\n{errors}"
+        );
     }
 
     #[test]

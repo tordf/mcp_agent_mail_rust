@@ -1450,6 +1450,10 @@ fn doctor_check_json_mode() {
         Some(true),
         "expected healthy=true in JSON"
     );
+    assert!(
+        value.get("summary").and_then(|v| v.as_object()).is_some(),
+        "expected summary object"
+    );
     let checks = value.get("checks").and_then(|v| v.as_array());
     assert!(checks.is_some(), "expected checks array");
     assert!(!checks.unwrap().is_empty(), "expected non-empty checks");
@@ -1468,6 +1472,10 @@ fn doctor_check_verbose_shows_details() {
     );
     assert!(out.status.success(), "expected success");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Primary issue:") || stdout.contains("Summary:"),
+        "expected operator summary block:\n{stdout}"
+    );
     // Verbose mode shows details after the check name
     assert!(
         stdout.contains("SQLite database accessible") || stdout.contains(" - "),

@@ -901,10 +901,23 @@ macro_rules! try_in_tx {
     };
 }
 
+/// Maximum retry attempts for durability probe transient busy errors.
+///
+/// Durability probes are read-only SELECTs on a fresh connection; they should
+/// not be blocked for long.  3 retries with 25–200 ms backoff (~0.4 s total)
+/// are enough to outlast transient WAL checkpoint stalls without hiding real
+/// failures.
+const DURABILITY_PROBE_MAX_RETRIES: u32 = 3;
+
 /// Execute a durability probe query from a fresh connection when file-backed.
 ///
 /// This avoids false positives where the writer connection can still observe
 /// transient state that is not yet durable/visible from independent handles.
+///
+/// Transient `SQLITE_BUSY` / `database is locked` errors are retried up to
+/// [`DURABILITY_PROBE_MAX_RETRIES`] times with exponential backoff so that a
+/// concurrent WAL checkpoint does not cause the caller to see a spurious
+/// `DATABASE_ERROR busy` for a mutation that already committed successfully.
 async fn durability_probe_query(
     cx: &Cx,
     pool: &DbPool,
@@ -922,22 +935,64 @@ async fn durability_probe_query(
         return map_sql_outcome(traw_query(cx, &tracked, sql, params).await);
     }
 
-    // Use a plain open — no recovery, no fallback paths.  Durability probes
-    // must be side-effect-free so they never trigger REINDEX or open a fallback
-    // database, which could make committed rows appear to vanish.
-    let probe_conn = match crate::DbConn::open_file(pool.sqlite_path()) {
-        Ok(conn) => conn,
-        Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
-    };
-    if let Err(e) = probe_conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL) {
-        return Outcome::Err(DbError::Sqlite(format!(
-            "durability probe connection init failed: {e}"
-        )));
+    for attempt in 0..=DURABILITY_PROBE_MAX_RETRIES {
+        // Use a plain open — no recovery, no fallback paths.  Durability probes
+        // must be side-effect-free so they never trigger REINDEX or open a fallback
+        // database, which could make committed rows appear to vanish.
+        let probe_conn = match crate::DbConn::open_file(pool.sqlite_path()) {
+            Ok(conn) => conn,
+            Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
+        };
+        if let Err(e) = probe_conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL) {
+            return Outcome::Err(DbError::Sqlite(format!(
+                "durability probe connection init failed: {e}"
+            )));
+        }
+        let probe_tracked = tracked(&probe_conn);
+        let out = map_sql_outcome(traw_query(cx, &probe_tracked, sql, params).await);
+        drop(probe_conn);
+
+        match &out {
+            Outcome::Err(e)
+                if is_probe_transient_busy(e) && attempt < DURABILITY_PROBE_MAX_RETRIES =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_retries = DURABILITY_PROBE_MAX_RETRIES,
+                    error = %e,
+                    "durability probe hit transient busy, retrying"
+                );
+                durability_probe_backoff(attempt).await;
+                continue;
+            }
+            _ => return out,
+        }
     }
-    let probe_tracked = tracked(&probe_conn);
-    let out = map_sql_outcome(traw_query(cx, &probe_tracked, sql, params).await);
-    drop(probe_conn);
-    out
+
+    // Unreachable: the loop always returns on the final attempt.
+    Outcome::Err(DbError::Internal(
+        "durability probe retry loop fell through".to_string(),
+    ))
+}
+
+/// Check if a durability-probe error is a transient busy/locked condition
+/// that is safe to retry (the probe is a read-only SELECT).
+fn is_probe_transient_busy(e: &DbError) -> bool {
+    is_plain_write_contention_error(e) || is_mvcc_error(e)
+}
+
+/// Exponential backoff for durability probe retries.
+///
+/// Base: 25 ms, max: 200 ms (lightweight — probes should unblock quickly).
+async fn durability_probe_backoff(attempt: u32) {
+    use crate::retry::RetryConfig;
+    let config = RetryConfig {
+        base_delay: std::time::Duration::from_millis(25),
+        max_delay: std::time::Duration::from_millis(200),
+        use_circuit_breaker: false,
+        ..Default::default()
+    };
+    let () = sleep(wall_now(), config.delay_for_attempt(attempt)).await;
 }
 
 /// Fetch an agent row directly from `SQLite` after commit to verify durability.
@@ -12488,6 +12543,132 @@ mod tests {
             .execute_raw("ROLLBACK")
             .expect("release sqlite lock");
         probe_thread.join().expect("join probe thread");
+    }
+
+    /// Regression test for br-97gc6.2.1: a successful COMMIT followed by a
+    /// transient BUSY on the durability probe must NOT propagate the error to
+    /// the caller. The probe retry loop should absorb the transient failure and
+    /// return the committed row.
+    #[test]
+    fn durability_probe_retries_transient_busy_after_committed_write() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("probe_busy_retry.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'busy-retry-project', '/tmp/am-probe-busy-retry', 0)",
+            )
+            .expect("seed project");
+        // Insert the agent (committed and durable).
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'durable', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed committed agent");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        // Hold an EXCLUSIVE lock on the DB from a separate connection to force
+        // the first probe attempt to get SQLITE_BUSY.  We use a 1ms busy_timeout
+        // on the blocker so the probe's own busy_timeout can expire quickly.
+        let blocker_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open blocker");
+        blocker_conn
+            .execute_raw("PRAGMA busy_timeout = 1")
+            .expect("set blocker busy_timeout");
+        blocker_conn
+            .execute_raw("BEGIN EXCLUSIVE")
+            .expect("acquire exclusive lock to block probe");
+
+        // Run the durability probe in a background thread so we can release
+        // the lock from the main thread partway through.
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let pool_for_probe = pool;
+        let probe_thread = std::thread::spawn(move || {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build probe runtime");
+            let cx = asupersync::Cx::for_testing();
+            let result = rt.block_on(async {
+                verify_agent_visible_after_commit(&cx, &pool_for_probe, 1, "BlueLake")
+                    .await
+                    .into_result()
+                    .map(|agent| agent.name)
+                    .map_err(|err| format!("{err}"))
+            });
+            result_tx.send(result).expect("send result");
+        });
+
+        // Wait a moment then release the exclusive lock so the retry succeeds.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        blocker_conn
+            .execute_raw("ROLLBACK")
+            .expect("release exclusive lock");
+
+        let probed_name = match result_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => result.expect(
+                "durability probe should succeed after transient busy (br-97gc6.2.1 regression)",
+            ),
+            Err(err) => {
+                probe_thread.join().expect("join after timeout");
+                panic!("durability probe stalled or failed: {err}");
+            }
+        };
+        assert_eq!(probed_name, "BlueLake");
+        probe_thread.join().expect("join probe thread");
+    }
+
+    /// Verify that `is_probe_transient_busy` correctly classifies errors.
+    #[test]
+    fn probe_transient_busy_classification() {
+        // ResourceBusy with "database is busy" → transient
+        assert!(is_probe_transient_busy(&DbError::ResourceBusy(
+            "database is busy".to_string()
+        )));
+        // Sqlite with "database is locked" → transient
+        assert!(is_probe_transient_busy(&DbError::Sqlite(
+            "database is locked".to_string()
+        )));
+        // ResourceBusy with "snapshot conflict on pages: 5" → transient (MVCC)
+        assert!(is_probe_transient_busy(&DbError::ResourceBusy(
+            "database is busy (snapshot conflict on pages: 5)".to_string()
+        )));
+        // Internal error → not transient
+        assert!(!is_probe_transient_busy(&DbError::Internal(
+            "agent row not visible after commit".to_string()
+        )));
+        // Pool error → not transient
+        assert!(!is_probe_transient_busy(&DbError::Pool(
+            "pool exhausted".to_string()
+        )));
     }
 
     #[test]

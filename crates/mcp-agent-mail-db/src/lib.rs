@@ -33,11 +33,14 @@
     clippy::missing_const_for_fn
 )]
 
+pub mod archive_anomaly;
 pub mod cache;
 pub mod coalesce;
 pub mod error;
+pub mod forensics;
 pub mod integrity;
 pub mod mail_explorer;
+pub mod mailbox_verdict;
 pub mod migrate;
 pub mod models;
 pub mod pool;
@@ -95,9 +98,18 @@ pub mod tracking;
 pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
 pub use error::{DbError, DbResult, is_corruption_error, is_lock_error, is_pool_exhausted_error};
+pub use forensics::{MailboxForensicCapture, capture_mailbox_forensic_bundle};
 pub use integrity::{
-    CheckKind, IntegrityCheckResult, IntegrityMetrics, attempt_vacuum_recovery, full_check,
-    incremental_check, integrity_metrics, is_full_check_due, quick_check,
+    CheckKind, IntegrityCheckResult, IntegrityMetrics, MailboxIntegrityStatus,
+    MailboxIntegrityVerdict, attempt_vacuum_recovery, full_check, incremental_check,
+    inspect_mailbox_integrity, integrity_details_are_suspect, integrity_metrics, is_full_check_due,
+    quick_check,
+};
+pub use mailbox_verdict::{
+    DURABILITY_TRANSITIONS, DurabilityState, DurabilityTransition, MailboxArchiveDriftState,
+    MailboxArchiveDriftVerdict, MailboxHealthVerdict, MailboxSqlitePathVerdict, MailboxState,
+    ProbeResult, ProbeSeverity, VerdictOptions, compute_mailbox_verdict,
+    validate_durability_transition,
 };
 pub use migrate::{
     ColumnConversionResult, MigrationError, MigrationSummary, TIMESTAMP_COLUMNS, TimestampFormat,
@@ -106,10 +118,13 @@ pub use migrate::{
 };
 pub use models::*;
 pub use pool::{
-    DbPool, DbPoolConfig, auto_pool_size, create_pool, ensure_sqlite_file_healthy,
-    ensure_sqlite_file_healthy_with_archive, get_or_create_pool, is_corruption_error_message,
-    is_sqlite_recovery_error_message, is_sqlite_snapshot_conflict_error_message,
-    open_sqlite_file_with_recovery, reconstruct_sqlite_file_with_archive_salvage,
+    DbPool, DbPoolConfig, MailboxDbInventory, MailboxRecoveryLockState, MailboxSidecarState,
+    RecoveryAction, RecoveryApproval, ResolvedMailboxSqlitePath, auto_pool_size, create_pool,
+    ensure_sqlite_file_healthy, ensure_sqlite_file_healthy_with_archive, get_or_create_pool,
+    inspect_mailbox_db_inventory, inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state,
+    is_corruption_error_message, is_sqlite_recovery_error_message,
+    is_sqlite_snapshot_conflict_error_message, open_sqlite_file_with_recovery,
+    reconstruct_sqlite_file_with_archive_salvage, resolve_mailbox_sqlite_path,
 };
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use reconstruct::{

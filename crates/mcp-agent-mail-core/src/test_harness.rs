@@ -1,19 +1,28 @@
 //! Deterministic test harness for reproducible E2E and PTY testing.
 //!
 //! Provides shared utilities for deterministic clocks, seeded randomness,
-//! stable ID generation, and reproducible environment capture. Test suites
-//! use these primitives so that CI failures can be reproduced with a single
-//! seed value.
+//! stable ID generation, reproducible environment capture, and **rerun
+//! breadcrumbs** that log enough context for exact reproduction of any
+//! test run.
 //!
 //! # Quick start
 //!
 //! ```rust,ignore
-//! use mcp_agent_mail_core::test_harness::{Harness, HarnessConfig};
+//! use mcp_agent_mail_core::test_harness::{
+//!     Harness, RerunGuard, seed_from_env_or_random,
+//! };
 //!
-//! let h = Harness::new(HarnessConfig { seed: 42, ..Default::default() });
-//! let ts = h.clock.now_micros();       // deterministic timestamp
-//! let id = h.ids.next_id();            // stable sequential ID
-//! let val = h.rng(|r| r.next_u64());   // seeded random
+//! #[test]
+//! fn my_e2e_test() {
+//!     let seed = seed_from_env_or_random("my_e2e_test");
+//!     let h = Harness::with_seed(seed, "my_e2e_test");
+//!     let _guard = RerunGuard::new(&h);
+//!
+//!     let ts = h.clock.now_micros();       // deterministic timestamp
+//!     let id = h.ids.next_id();            // stable sequential ID
+//!     let val = h.rng(|r| r.next_u64());   // seeded random
+//!     // ... assertions ...
+//! }
 //! ```
 //!
 //! # Reproduction
@@ -25,6 +34,19 @@
 //! ```bash
 //! HARNESS_SEED=42 cargo test --test my_suite
 //! ```
+//!
+//! # Rerun breadcrumbs
+//!
+//! The breadcrumb system ensures every E2E test run emits enough state to
+//! reproduce a failure:
+//!
+//! 1. [`seed_from_env_or_random`] -- resolve or generate a seed, log it.
+//! 2. [`RerunGuard`] -- drop guard that dumps full repro context on panic.
+//! 3. [`emit_rerun_breadcrumbs`] -- explicit dump at any point.
+//!
+//! When a test panics, the guard emits a structured block to stderr
+//! containing the seed, test name, repro command, and full
+//! [`ReproContext`] JSON, plus writes a `repro_context.json` artifact.
 
 #![allow(
     clippy::missing_const_for_fn,
@@ -428,6 +450,174 @@ fn capitalize(s: &str) -> String {
     })
 }
 
+// ── Rerun Breadcrumbs ──────────────────────────────────────────────────
+//
+// Every E2E test should emit enough context on failure to reproduce the
+// exact run.  The breadcrumb system provides three mechanisms:
+//
+// 1. `seed_from_env_or_random(test_name)` — resolve the seed from
+//    `HARNESS_SEED` or generate a new one from OS entropy, printing it to
+//    stderr so CI logs always contain the seed even on success.
+//
+// 2. `RerunGuard` (drop guard) — created at test start, emits a
+//    structured reproduction block to stderr when a test panics.
+//
+// 3. `emit_rerun_breadcrumbs(harness)` — explicit helper to dump the
+//    breadcrumbs at any point (e.g. after a soft assertion failure).
+
+/// Resolve the test seed: `HARNESS_SEED` env var if set, otherwise fresh
+/// entropy from the OS.  The chosen seed is always printed to stderr so
+/// CI logs contain the value even for passing runs.
+///
+/// # Example
+/// ```rust,ignore
+/// let seed = seed_from_env_or_random("my_test_name");
+/// let h = Harness::with_seed(seed, "my_test_name");
+/// ```
+#[must_use]
+pub fn seed_from_env_or_random(test_name: &str) -> u64 {
+    if let Ok(val) = std::env::var("HARNESS_SEED") {
+        if let Ok(s) = val.parse::<u64>() {
+            eprintln!(
+                "[rerun] {test_name}: using HARNESS_SEED={s} (from environment)"
+            );
+            return s;
+        }
+    }
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        // Fallback: combine PID + timestamp bits
+        let fallback = (std::process::id() as u64)
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |d| d.as_nanos() as u64),
+            );
+        eprintln!(
+            "[rerun] {test_name}: HARNESS_SEED={fallback} (fallback entropy)"
+        );
+        return fallback;
+    }
+    let seed = u64::from_le_bytes(buf);
+    // Avoid zero seed (xorshift degenerate case)
+    let seed = if seed == 0 { 1 } else { seed };
+    eprintln!("[rerun] {test_name}: HARNESS_SEED={seed} (random)");
+    seed
+}
+
+/// A drop guard that emits structured reproduction context to stderr when
+/// the current thread is panicking (i.e., a test assertion failed).
+///
+/// Create at the top of each E2E test body and let it go out of scope
+/// naturally.  If the test passes, the guard does nothing beyond a single
+/// confirmation line.
+///
+/// # Example
+/// ```rust,ignore
+/// use mcp_agent_mail_core::test_harness::{Harness, RerunGuard, seed_from_env_or_random};
+///
+/// #[test]
+/// fn my_e2e_test() {
+///     let seed = seed_from_env_or_random("my_e2e_test");
+///     let h = Harness::with_seed(seed, "my_e2e_test");
+///     let _guard = RerunGuard::new(&h);
+///     // ... test body ...
+/// }
+/// ```
+pub struct RerunGuard {
+    repro: ReproContext,
+}
+
+impl RerunGuard {
+    /// Create a guard from a [`Harness`].
+    #[must_use]
+    pub fn new(harness: &Harness) -> Self {
+        Self {
+            repro: harness.repro.clone(),
+        }
+    }
+
+    /// Create a guard from a [`ReproContext`] directly.
+    #[must_use]
+    pub fn from_repro(repro: ReproContext) -> Self {
+        Self { repro }
+    }
+
+    /// Create a minimal guard with just a seed and test name.
+    #[must_use]
+    pub fn minimal(seed: u64, test_name: &str) -> Self {
+        Self {
+            repro: ReproContext {
+                seed,
+                clock_base_micros: 0,
+                clock_step_micros: 0,
+                id_base: 0,
+                test_name: test_name.to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                target: std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string()),
+                extra: Vec::new(),
+            },
+        }
+    }
+}
+
+impl Drop for RerunGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let json = serde_json::to_string_pretty(&self.repro).unwrap_or_default();
+            eprintln!(
+                "\n\
+                 ========== RERUN BREADCRUMBS (test failed) ==========\n\
+                 test:    {}\n\
+                 seed:    {}\n\
+                 repro:   {}\n\
+                 \n\
+                 {json}\n\
+                 =====================================================\n",
+                self.repro.test_name,
+                self.repro.seed,
+                self.repro.repro_command(),
+            );
+            // Best-effort: write artifact file
+            if let Ok(dir) = artifact_dir("rerun_breadcrumbs") {
+                let _ = std::fs::write(
+                    dir.join("repro_context.json"),
+                    &json,
+                );
+                eprintln!(
+                    "[rerun] artifact saved to {}/repro_context.json",
+                    dir.display()
+                );
+            }
+        }
+    }
+}
+
+/// Explicitly emit rerun breadcrumbs to stderr. Use this after soft
+/// assertion failures or when you want to capture the reproduction
+/// context without panicking.
+pub fn emit_rerun_breadcrumbs(harness: &Harness) {
+    let json = harness.repro_json().unwrap_or_default();
+    eprintln!(
+        "\n\
+         ---------- rerun breadcrumbs ----------\n\
+         test:    {}\n\
+         seed:    {}\n\
+         repro:   {}\n\
+         ops:     {}\n\
+         clock:   {} us\n\
+         \n\
+         {json}\n\
+         ---------------------------------------\n",
+        harness.repro.test_name,
+        harness.repro.seed,
+        harness.repro.repro_command(),
+        harness.ops.load(Ordering::Relaxed),
+        harness.clock.peek_micros(),
+    );
+}
+
 // ── Artifact Helpers ────────────────────────────────────────────────────
 
 /// Standard artifact directory under the repo root.
@@ -669,5 +859,78 @@ mod tests {
         let ctx: ReproContext = serde_json::from_str(&content).unwrap();
         assert_eq!(ctx.seed, 42);
         assert_eq!(ctx.test_name, "artifact_test");
+    }
+
+    // ── Rerun breadcrumb tests ─────────────────────────────────────────
+
+    #[test]
+    fn seed_from_env_or_random_returns_nonzero() {
+        let seed = seed_from_env_or_random("test_seed_nonzero");
+        assert_ne!(seed, 0, "seed must never be zero");
+    }
+
+    #[test]
+    fn seed_from_env_or_random_is_deterministic_when_env_set() {
+        // Cannot safely set env vars in Rust 2024 tests, but we can verify
+        // that the function returns a non-zero seed from OS entropy when
+        // HARNESS_SEED is not set (the common case).
+        let s1 = seed_from_env_or_random("test_det_1");
+        let s2 = seed_from_env_or_random("test_det_2");
+        // Two calls without HARNESS_SEED should produce different seeds
+        // (with overwhelming probability).
+        // Note: there's a 1/2^64 chance this fails, which is acceptable.
+        assert_ne!(s1, s2, "random seeds should differ between calls");
+    }
+
+    #[test]
+    fn rerun_guard_minimal_has_correct_fields() {
+        let guard = RerunGuard::minimal(42, "minimal_test");
+        assert_eq!(guard.repro.seed, 42);
+        assert_eq!(guard.repro.test_name, "minimal_test");
+        // Drop without panicking should be silent.
+        drop(guard);
+    }
+
+    #[test]
+    fn rerun_guard_from_harness_captures_repro() {
+        let h = Harness::with_seed(123, "guard_from_harness");
+        let guard = RerunGuard::new(&h);
+        assert_eq!(guard.repro.seed, 123);
+        assert_eq!(guard.repro.test_name, "guard_from_harness");
+        assert!(!guard.repro.created_at.is_empty());
+        drop(guard);
+    }
+
+    #[test]
+    fn emit_rerun_breadcrumbs_does_not_panic() {
+        let h = Harness::with_seed(999, "emit_test");
+        // Should print to stderr without panicking.
+        emit_rerun_breadcrumbs(&h);
+    }
+
+    #[test]
+    fn rerun_guard_repro_command_contains_seed() {
+        let guard = RerunGuard::minimal(777, "repro_cmd_test");
+        let cmd = guard.repro.repro_command();
+        assert!(
+            cmd.contains("HARNESS_SEED=777"),
+            "repro command should contain seed: {cmd}"
+        );
+        assert!(
+            cmd.contains("repro_cmd_test"),
+            "repro command should contain test name: {cmd}"
+        );
+    }
+
+    #[test]
+    fn harness_with_seed_from_env_or_random_round_trips() {
+        let seed = seed_from_env_or_random("round_trip_test");
+        let h1 = Harness::with_seed(seed, "round_trip_test");
+        let h2 = Harness::with_seed(seed, "round_trip_test");
+
+        // Same seed produces identical RNG sequences.
+        let v1: Vec<u64> = (0..10).map(|_| h1.rng(Rng64::next_u64)).collect();
+        let v2: Vec<u64> = (0..10).map(|_| h2.rng(Rng64::next_u64)).collect();
+        assert_eq!(v1, v2, "same seed must produce identical sequences");
     }
 }

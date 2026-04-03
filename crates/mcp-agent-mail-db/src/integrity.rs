@@ -18,12 +18,14 @@
 
 use crate::DbConn;
 use crate::error::{DbError, DbResult};
+use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row, Value};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Result of an integrity check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityCheckResult {
     /// Whether the check passed (no corruption detected).
     pub ok: bool,
@@ -36,7 +38,7 @@ pub struct IntegrityCheckResult {
 }
 
 /// The kind of integrity check that was run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckKind {
     /// `PRAGMA quick_check` — fast subset.
     Quick,
@@ -90,12 +92,29 @@ fn state() -> &'static IntegrityCheckState {
 }
 
 /// Snapshot of integrity check metrics for health reporting.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityMetrics {
     pub last_ok_ts: i64,
     pub last_check_ts: i64,
     pub checks_total: u64,
     pub failures_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxIntegrityStatus {
+    Healthy,
+    Suspect,
+    Broken,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxIntegrityVerdict {
+    pub status: MailboxIntegrityStatus,
+    pub metrics: IntegrityMetrics,
+    pub check: Option<IntegrityCheckResult>,
+    pub detail: String,
 }
 
 /// Get current integrity check metrics.
@@ -115,6 +134,86 @@ pub fn integrity_metrics() -> IntegrityMetrics {
             .load(Ordering::Relaxed)
             .saturating_add(runtime_failures),
     }
+}
+
+#[must_use]
+pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxIntegrityVerdict {
+    let metrics_before = integrity_metrics();
+    if db_path.as_os_str() == ":memory:" {
+        return MailboxIntegrityVerdict {
+            status: MailboxIntegrityStatus::Skipped,
+            metrics: metrics_before,
+            check: None,
+            detail: "In-memory database (integrity check skipped)".to_string(),
+        };
+    }
+
+    let path_str = db_path.display().to_string();
+    let conn = match crate::DbConn::open_file(&path_str) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return MailboxIntegrityVerdict {
+                status: MailboxIntegrityStatus::Broken,
+                metrics: metrics_before,
+                check: None,
+                detail: format!("Cannot open database for integrity check: {error}"),
+            };
+        }
+    };
+
+    match run_check(
+        &conn,
+        match kind {
+            CheckKind::Quick => "PRAGMA quick_check",
+            CheckKind::Incremental => "PRAGMA integrity_check(1)",
+            CheckKind::Full => "PRAGMA integrity_check",
+        },
+        kind,
+    ) {
+        Ok(check) => MailboxIntegrityVerdict {
+            status: MailboxIntegrityStatus::Healthy,
+            metrics: integrity_metrics(),
+            detail: format!("{} passed", check.kind),
+            check: Some(check),
+        },
+        Err(DbError::IntegrityCorruption { details, .. })
+            if integrity_details_are_suspect(&details) =>
+        {
+            MailboxIntegrityVerdict {
+                status: MailboxIntegrityStatus::Suspect,
+                metrics: integrity_metrics(),
+                detail: format!(
+                    "{} reported benign/suspect findings: {}",
+                    kind,
+                    details.join("; ")
+                ),
+                check: Some(IntegrityCheckResult {
+                    ok: false,
+                    details,
+                    duration_us: 0,
+                    kind,
+                }),
+            }
+        }
+        Err(error) => MailboxIntegrityVerdict {
+            status: MailboxIntegrityStatus::Broken,
+            metrics: integrity_metrics(),
+            check: None,
+            detail: error.to_string(),
+        },
+    }
+}
+
+#[must_use]
+pub fn integrity_details_are_suspect(details: &[String]) -> bool {
+    !details.is_empty()
+        && details.iter().all(|detail| {
+            let lower = detail.to_ascii_lowercase();
+            lower == "ok"
+                || lower.contains("never used")
+                || lower.contains("unused")
+                || lower.contains("wal without shm")
+        })
 }
 
 /// Run `PRAGMA quick_check` on an open connection.

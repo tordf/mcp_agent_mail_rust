@@ -95,6 +95,683 @@ pub struct Recommendation {
     pub message: String,
 }
 
+/// Severity bucket for archive scan findings after operator-facing condensation.
+///
+/// This is intentionally narrower than the raw anomaly taxonomy. The goal is to
+/// separate stop-what-you-are-doing issues from hygiene debt while keeping
+/// terminal output compact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveScanSeverityBucket {
+    /// Immediate operator attention is required before trusting recovery or promotion.
+    Critical,
+    /// Actionable hygiene debt that should be scheduled and remediated.
+    Warning,
+    /// Low-risk oddities that belong in artifacts rather than loud terminal output.
+    Info,
+}
+
+impl ArchiveScanSeverityBucket {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::Warning => "warning",
+            Self::Info => "info",
+        }
+    }
+
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::Critical => 3,
+            Self::Warning => 2,
+            Self::Info => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveScanSeverityBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether a deduped archive finding blocks progress now or is hygiene debt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveScanScope {
+    /// This finding should be treated as action-now operator work.
+    ImmediateAction,
+    /// This finding is real but should not eclipse live incident handling.
+    HygieneDebt,
+}
+
+impl ArchiveScanScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ImmediateAction => "immediate_action",
+            Self::HygieneDebt => "hygiene_debt",
+        }
+    }
+
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::ImmediateAction => 2,
+            Self::HygieneDebt => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveScanScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Stable dedupe rule for archive scan findings.
+///
+/// This makes it explicit why repeated low-level findings collapse into a
+/// single operator-facing summary row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveScanDedupeRule {
+    /// One logical archive message id may fan out to many duplicate file paths.
+    MessageId,
+    /// Project metadata drift should collapse to one row per project directory.
+    ProjectDir,
+    /// Corrupt or malformed canonical content is distinct per file path.
+    CanonicalPath,
+    /// Profile corruption is distinct per agent profile path.
+    AgentProfilePath,
+    /// Identity drift is distinct per archive identity pair.
+    ArchiveIdentity,
+    /// No richer scope exists; collapse by finding kind only.
+    KindOnly,
+}
+
+impl ArchiveScanDedupeRule {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageId => "message_id",
+            Self::ProjectDir => "project_dir",
+            Self::CanonicalPath => "canonical_path",
+            Self::AgentProfilePath => "agent_profile_path",
+            Self::ArchiveIdentity => "archive_identity",
+            Self::KindOnly => "kind_only",
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveScanDedupeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One machine-readable archive scan diagnostic before summary condensation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveScanDiagnostic {
+    /// Stable anomaly or finding code, for example `duplicate_canonical_id`.
+    pub code: String,
+    /// Operator-facing severity bucket.
+    pub severity: ArchiveScanSeverityBucket,
+    /// Whether this finding is urgent now or hygiene debt.
+    pub scope: ArchiveScanScope,
+    /// How callers should dedupe repeated low-level findings.
+    pub dedupe_rule: ArchiveScanDedupeRule,
+    /// Scope value used with `dedupe_rule` to construct the stable dedupe key.
+    pub dedupe_value: String,
+    /// Concise one-line summary for the deduped group.
+    pub summary: String,
+    /// Short next-step guidance when the finding survives summary condensation.
+    pub recommendation: Option<String>,
+}
+
+impl ArchiveScanDiagnostic {
+    /// Stable dedupe key used by `ArchiveScanSummary`.
+    #[must_use]
+    pub fn dedupe_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.code,
+            self.dedupe_rule.as_str(),
+            self.dedupe_value
+        )
+    }
+}
+
+/// Deduped finding retained in the concise summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveScanSummaryFinding {
+    /// Stable finding code.
+    pub code: String,
+    /// Whether this is immediate-action work or hygiene debt.
+    pub scope: ArchiveScanScope,
+    /// Dedupe rule used to collapse repeated low-level findings.
+    pub dedupe_rule: ArchiveScanDedupeRule,
+    /// Stable summary key (`code:rule:value`).
+    pub dedupe_key: String,
+    /// Number of raw findings collapsed into this summary row.
+    pub occurrence_count: usize,
+    /// Concise operator copy for the deduped group.
+    pub summary: String,
+    /// Optional next-step guidance for this group.
+    pub recommendation: Option<String>,
+}
+
+/// Per-severity bucket in the concise archive scan summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveScanSummaryBucket {
+    /// Severity bucket represented by this section.
+    pub severity: ArchiveScanSeverityBucket,
+    /// Raw finding count before dedupe.
+    pub raw_count: usize,
+    /// Unique finding groups after dedupe.
+    pub deduped_count: usize,
+    /// Number of additional deduped groups omitted from `findings`.
+    pub overflow_count: usize,
+    /// Representative findings for terminal-friendly output.
+    pub findings: Vec<ArchiveScanSummaryFinding>,
+}
+
+/// Compact, operator-oriented summary for archive scan diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveScanSummary {
+    /// Highest severity present, or `None` when the archive is clean.
+    pub highest_severity: Option<ArchiveScanSeverityBucket>,
+    /// One-line summary optimized for doctor/startup surfaces.
+    pub headline: String,
+    /// Best next action at the summary level.
+    pub next_action: Option<String>,
+    /// Raw finding count before dedupe.
+    pub total_findings: usize,
+    /// Unique finding groups after dedupe.
+    pub deduped_findings: usize,
+    /// Deduped groups that require operator attention now.
+    pub immediate_action_count: usize,
+    /// Deduped groups that are hygiene debt.
+    pub hygiene_debt_count: usize,
+    /// Maximum number of representative findings retained per bucket.
+    pub sample_limit: usize,
+    /// Severity-ordered summary buckets.
+    pub buckets: Vec<ArchiveScanSummaryBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveScanSummaryAccumulator {
+    code: String,
+    severity: ArchiveScanSeverityBucket,
+    scope: ArchiveScanScope,
+    dedupe_rule: ArchiveScanDedupeRule,
+    dedupe_key: String,
+    summary: String,
+    recommendation: Option<String>,
+    occurrence_count: usize,
+}
+
+impl ArchiveScanSummaryAccumulator {
+    fn from_diagnostic(diagnostic: ArchiveScanDiagnostic) -> Self {
+        let dedupe_key = diagnostic.dedupe_key();
+        Self {
+            code: diagnostic.code,
+            severity: diagnostic.severity,
+            scope: diagnostic.scope,
+            dedupe_rule: diagnostic.dedupe_rule,
+            dedupe_key,
+            summary: diagnostic.summary,
+            recommendation: diagnostic.recommendation,
+            occurrence_count: 1,
+        }
+    }
+
+    fn merge(&mut self, diagnostic: ArchiveScanDiagnostic) {
+        self.occurrence_count = self.occurrence_count.saturating_add(1);
+        let candidate_severity = diagnostic.severity.priority();
+        let existing_severity = self.severity.priority();
+        let candidate_scope = diagnostic.scope.priority();
+        let existing_scope = self.scope.priority();
+        if candidate_severity > existing_severity
+            || (candidate_severity == existing_severity && candidate_scope > existing_scope)
+        {
+            self.severity = diagnostic.severity;
+            self.scope = diagnostic.scope;
+            self.summary = diagnostic.summary;
+            self.recommendation = diagnostic.recommendation;
+        } else if self.recommendation.is_none() {
+            self.recommendation = diagnostic.recommendation;
+        }
+    }
+}
+
+impl ArchiveScanSummary {
+    fn empty(sample_limit: usize) -> Self {
+        Self {
+            highest_severity: None,
+            headline: "No archive scan findings detected.".to_string(),
+            next_action: None,
+            total_findings: 0,
+            deduped_findings: 0,
+            immediate_action_count: 0,
+            hygiene_debt_count: 0,
+            sample_limit,
+            buckets: Vec::new(),
+        }
+    }
+
+    fn accumulate<I>(
+        diagnostics: I,
+    ) -> (
+        std::collections::BTreeMap<ArchiveScanSeverityBucket, usize>,
+        std::collections::BTreeMap<String, ArchiveScanSummaryAccumulator>,
+    )
+    where
+        I: IntoIterator<Item = ArchiveScanDiagnostic>,
+    {
+        let mut raw_counts: std::collections::BTreeMap<ArchiveScanSeverityBucket, usize> =
+            std::collections::BTreeMap::new();
+        let mut deduped: std::collections::BTreeMap<String, ArchiveScanSummaryAccumulator> =
+            std::collections::BTreeMap::new();
+        for diagnostic in diagnostics {
+            raw_counts
+                .entry(diagnostic.severity)
+                .and_modify(|count: &mut usize| *count = count.saturating_add(1))
+                .or_insert(1);
+            let key = diagnostic.dedupe_key();
+            match deduped.entry(key) {
+                std::collections::btree_map::Entry::Occupied(mut existing) => {
+                    existing.get_mut().merge(diagnostic);
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(ArchiveScanSummaryAccumulator::from_diagnostic(diagnostic));
+                }
+            }
+        }
+        (raw_counts, deduped)
+    }
+
+    fn headline_and_next_action(
+        raw_total: usize,
+        immediate_action_count: usize,
+        hygiene_debt_count: usize,
+    ) -> (String, Option<String>) {
+        if immediate_action_count > 0 {
+            (
+                format!(
+                    "Immediate action required: {immediate_action_count} group(s) need operator review now; {hygiene_debt_count} group(s) are hygiene debt.",
+                ),
+                Some(
+                    "Inspect immediate-action groups before trusting archive recovery or promotion; keep terminal output concise and use full artifacts for per-path detail."
+                        .to_string(),
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "Archive hygiene debt detected: {hygiene_debt_count} deduped group(s) across {raw_total} raw finding(s).",
+                ),
+                Some(
+                    "Use the concise summary for triage, then inspect full artifact detail only for the remaining hygiene-debt groups."
+                        .to_string(),
+                ),
+            )
+        }
+    }
+
+    fn summarize_buckets(
+        raw_counts: &std::collections::BTreeMap<ArchiveScanSeverityBucket, usize>,
+        deduped: std::collections::BTreeMap<String, ArchiveScanSummaryAccumulator>,
+        sample_limit: usize,
+    ) -> Vec<ArchiveScanSummaryBucket> {
+        let mut bucket_findings: std::collections::BTreeMap<
+            ArchiveScanSeverityBucket,
+            Vec<ArchiveScanSummaryFinding>,
+        > = std::collections::BTreeMap::new();
+        for item in deduped.into_values() {
+            bucket_findings
+                .entry(item.severity)
+                .or_default()
+                .push(ArchiveScanSummaryFinding {
+                    code: item.code,
+                    scope: item.scope,
+                    dedupe_rule: item.dedupe_rule,
+                    dedupe_key: item.dedupe_key,
+                    occurrence_count: item.occurrence_count,
+                    summary: item.summary,
+                    recommendation: item.recommendation,
+                });
+        }
+
+        let mut buckets = Vec::new();
+        for severity in [
+            ArchiveScanSeverityBucket::Critical,
+            ArchiveScanSeverityBucket::Warning,
+            ArchiveScanSeverityBucket::Info,
+        ] {
+            let Some(mut findings) = bucket_findings.remove(&severity) else {
+                continue;
+            };
+            findings.sort_by(|left, right| {
+                right
+                    .scope
+                    .priority()
+                    .cmp(&left.scope.priority())
+                    .then_with(|| right.occurrence_count.cmp(&left.occurrence_count))
+                    .then_with(|| left.code.cmp(&right.code))
+                    .then_with(|| left.dedupe_key.cmp(&right.dedupe_key))
+            });
+            let deduped_count = findings.len();
+            let limited_findings: Vec<_> = findings.into_iter().take(sample_limit).collect();
+            buckets.push(ArchiveScanSummaryBucket {
+                severity,
+                raw_count: raw_counts.get(&severity).copied().unwrap_or(0),
+                deduped_count,
+                overflow_count: deduped_count.saturating_sub(limited_findings.len()),
+                findings: limited_findings,
+            });
+        }
+
+        buckets
+    }
+
+    /// Build a concise, severity-bucketed summary from raw archive findings.
+    #[must_use]
+    pub fn build<I>(diagnostics: I, sample_limit: usize) -> Self
+    where
+        I: IntoIterator<Item = ArchiveScanDiagnostic>,
+    {
+        let diagnostics: Vec<_> = diagnostics.into_iter().collect();
+        if diagnostics.is_empty() {
+            return Self::empty(sample_limit);
+        }
+
+        let (raw_counts, deduped) = Self::accumulate(diagnostics);
+        let raw_total = raw_counts.values().copied().sum();
+        let deduped_findings = deduped.len();
+        let highest_severity = deduped
+            .values()
+            .map(|item| item.severity)
+            .max_by_key(|sev| sev.priority());
+        let immediate_action_count = deduped
+            .values()
+            .filter(|item| item.scope == ArchiveScanScope::ImmediateAction)
+            .count();
+        let hygiene_debt_count = deduped_findings.saturating_sub(immediate_action_count);
+        let (headline, next_action) =
+            Self::headline_and_next_action(raw_total, immediate_action_count, hygiene_debt_count);
+        let buckets = Self::summarize_buckets(&raw_counts, deduped, sample_limit);
+
+        Self {
+            highest_severity,
+            headline,
+            next_action,
+            total_findings: raw_total,
+            deduped_findings,
+            immediate_action_count,
+            hygiene_debt_count,
+            sample_limit,
+            buckets,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Machine-readable diagnostic payloads with artifact pointers
+// ---------------------------------------------------------------------------
+
+/// Status of an artifact referenced from a diagnostic payload.
+///
+/// Vocabulary matches the forensic bundle manifest spec (v1):
+/// `captured`, `missing`, `referenced`, or `skipped`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStatus {
+    /// Artifact file was captured and exists on disk at the referenced path.
+    Captured,
+    /// Artifact was expected but not found (e.g. WAL/SHM file absent).
+    Missing,
+    /// Artifact content is not copied into the payload; the path points to
+    /// the canonical on-disk location where it can be read separately.
+    Referenced,
+    /// Artifact capture was intentionally skipped (e.g. dry-run mode).
+    Skipped,
+}
+
+impl ArtifactStatus {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Captured => "captured",
+            Self::Missing => "missing",
+            Self::Referenced => "referenced",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// A pointer to a single artifact file relevant to a diagnostic surface.
+///
+/// Downstream consumers use these to locate forensic bundles, scan reports,
+/// database files, and archive directories without parsing wall-of-text output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactPointer {
+    /// Machine-stable artifact kind, e.g. `"forensic_bundle"`, `"scan_report"`,
+    /// `"sqlite_db"`, `"archive_root"`, `"wal_sidecar"`.
+    pub kind: String,
+    /// Absolute path to the artifact on disk. May be absent for referenced-only
+    /// artifacts that were not materialized.
+    pub path: Option<String>,
+    /// Capture status per the forensic bundle manifest vocabulary.
+    pub status: ArtifactStatus,
+    /// Human-readable label for the artifact in diagnostic display contexts.
+    pub label: String,
+    /// Optional additional detail (e.g. integrity status, byte count, schema).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ArtifactPointer {
+    /// Convenience constructor for a captured artifact at a known path.
+    #[must_use]
+    pub fn captured(kind: &str, path: &str, label: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            path: Some(path.to_string()),
+            status: ArtifactStatus::Captured,
+            label: label.to_string(),
+            detail: None,
+        }
+    }
+
+    /// Convenience constructor for a referenced (not copied) artifact.
+    #[must_use]
+    pub fn referenced(kind: &str, path: &str, label: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            path: Some(path.to_string()),
+            status: ArtifactStatus::Referenced,
+            label: label.to_string(),
+            detail: None,
+        }
+    }
+
+    /// Convenience constructor for a missing artifact.
+    #[must_use]
+    pub fn missing(kind: &str, label: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            path: None,
+            status: ArtifactStatus::Missing,
+            label: label.to_string(),
+            detail: None,
+        }
+    }
+
+    /// Convenience constructor for a skipped artifact.
+    #[must_use]
+    pub fn skipped(kind: &str, label: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            path: None,
+            status: ArtifactStatus::Skipped,
+            label: label.to_string(),
+            detail: None,
+        }
+    }
+
+    /// Set optional detail text and return self for builder chaining.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// Machine-readable diagnostic payload emitted by doctor and archive-scan
+/// commands, designed for programmatic consumption by other surfaces.
+///
+/// This struct avoids duplicating full scan or check detail inline. Instead it
+/// carries a concise summary alongside [`ArtifactPointer`] entries that let
+/// consumers locate full detail artifacts on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticPayload {
+    /// Schema identity for forward-compatible parsing.
+    pub schema: DiagnosticPayloadSchema,
+    /// Which command or surface produced this payload.
+    pub source: String,
+    /// ISO-8601 timestamp when the payload was generated.
+    pub generated_at: String,
+    /// Overall status: `"ok"`, `"warn"`, or `"fail"`.
+    pub status: String,
+    /// One-line headline for the diagnostic result.
+    pub headline: String,
+    /// Optional next-action guidance for the operator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    /// Machine-readable finding counts by severity.
+    pub finding_counts: DiagnosticFindingCounts,
+    /// Pointers to artifacts that hold full diagnostic detail.
+    pub artifacts: Vec<ArtifactPointer>,
+}
+
+/// Schema version for [`DiagnosticPayload`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticPayloadSchema {
+    /// Schema name.
+    pub name: &'static str,
+    /// Major version (breaking changes).
+    pub major: u32,
+    /// Minor version (additive-only changes).
+    pub minor: u32,
+}
+
+/// Per-severity finding counts embedded in the diagnostic payload.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct DiagnosticFindingCounts {
+    /// Number of critical-severity findings.
+    pub critical: usize,
+    /// Number of warning-severity findings.
+    pub warning: usize,
+    /// Number of info-severity findings.
+    pub info: usize,
+    /// Total raw finding count before any deduplication.
+    pub total: usize,
+}
+
+impl DiagnosticPayload {
+    /// Schema name for all diagnostic payloads.
+    pub const SCHEMA_NAME: &'static str = "mcp-agent-mail-diagnostic-payload";
+    /// Current schema major version.
+    pub const SCHEMA_MAJOR: u32 = 1;
+    /// Current schema minor version.
+    pub const SCHEMA_MINOR: u32 = 0;
+
+    /// Build a diagnostic payload from a doctor check result.
+    #[must_use]
+    pub fn from_doctor_check(
+        status: &str,
+        headline: &str,
+        fail_count: usize,
+        warn_count: usize,
+        artifacts: Vec<ArtifactPointer>,
+    ) -> Self {
+        Self {
+            schema: DiagnosticPayloadSchema {
+                name: Self::SCHEMA_NAME,
+                major: Self::SCHEMA_MAJOR,
+                minor: Self::SCHEMA_MINOR,
+            },
+            source: "doctor-check".to_string(),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            status: status.to_string(),
+            headline: headline.to_string(),
+            next_action: if status != "ok" {
+                Some("Run `am doctor fix --dry-run` to preview remediation.".to_string())
+            } else {
+                None
+            },
+            finding_counts: DiagnosticFindingCounts {
+                critical: fail_count,
+                warning: warn_count,
+                info: 0,
+                total: fail_count.saturating_add(warn_count),
+            },
+            artifacts,
+        }
+    }
+
+    /// Build a diagnostic payload from an archive scan summary.
+    #[must_use]
+    pub fn from_archive_scan(
+        summary: &ArchiveScanSummary,
+        artifacts: Vec<ArtifactPointer>,
+    ) -> Self {
+        let status = match summary.highest_severity {
+            Some(ArchiveScanSeverityBucket::Critical) => "fail",
+            Some(ArchiveScanSeverityBucket::Warning) => "warn",
+            Some(ArchiveScanSeverityBucket::Info) | None => "ok",
+        };
+        let mut critical = 0usize;
+        let mut warning = 0usize;
+        let mut info = 0usize;
+        for bucket in &summary.buckets {
+            match bucket.severity {
+                ArchiveScanSeverityBucket::Critical => {
+                    critical = critical.saturating_add(bucket.raw_count);
+                }
+                ArchiveScanSeverityBucket::Warning => {
+                    warning = warning.saturating_add(bucket.raw_count);
+                }
+                ArchiveScanSeverityBucket::Info => {
+                    info = info.saturating_add(bucket.raw_count);
+                }
+            }
+        }
+        Self {
+            schema: DiagnosticPayloadSchema {
+                name: Self::SCHEMA_NAME,
+                major: Self::SCHEMA_MAJOR,
+                minor: Self::SCHEMA_MINOR,
+            },
+            source: "archive-scan".to_string(),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            status: status.to_string(),
+            headline: summary.headline.clone(),
+            next_action: summary.next_action.clone(),
+            finding_counts: DiagnosticFindingCounts {
+                critical,
+                warning,
+                info,
+                total: summary.total_findings,
+            },
+            artifacts,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Static system info
 // ---------------------------------------------------------------------------
@@ -511,6 +1188,148 @@ mod tests {
         assert!(!info.os.is_empty());
     }
 
+    fn archive_scan_diagnostic(
+        code: &str,
+        severity: ArchiveScanSeverityBucket,
+        scope: ArchiveScanScope,
+        dedupe_rule: ArchiveScanDedupeRule,
+        dedupe_value: &str,
+        summary: &str,
+    ) -> ArchiveScanDiagnostic {
+        ArchiveScanDiagnostic {
+            code: code.to_string(),
+            severity,
+            scope,
+            dedupe_rule,
+            dedupe_value: dedupe_value.to_string(),
+            summary: summary.to_string(),
+            recommendation: None,
+        }
+    }
+
+    #[test]
+    fn archive_scan_summary_empty_is_clean() {
+        let summary = ArchiveScanSummary::build(Vec::<ArchiveScanDiagnostic>::new(), 3);
+        assert_eq!(summary.highest_severity, None);
+        assert_eq!(summary.total_findings, 0);
+        assert_eq!(summary.deduped_findings, 0);
+        assert!(summary.buckets.is_empty());
+        assert_eq!(summary.headline, "No archive scan findings detected.");
+        assert!(summary.next_action.is_none());
+    }
+
+    #[test]
+    fn archive_scan_summary_dedupes_and_counts_scope() {
+        let summary = ArchiveScanSummary::build(
+            vec![
+                archive_scan_diagnostic(
+                    "missing_project_metadata",
+                    ArchiveScanSeverityBucket::Warning,
+                    ArchiveScanScope::HygieneDebt,
+                    ArchiveScanDedupeRule::ProjectDir,
+                    "/archive/projects/demo",
+                    "missing project.json for demo",
+                ),
+                archive_scan_diagnostic(
+                    "missing_project_metadata",
+                    ArchiveScanSeverityBucket::Warning,
+                    ArchiveScanScope::HygieneDebt,
+                    ArchiveScanDedupeRule::ProjectDir,
+                    "/archive/projects/demo",
+                    "missing project.json for demo",
+                ),
+                archive_scan_diagnostic(
+                    "malformed_message",
+                    ArchiveScanSeverityBucket::Critical,
+                    ArchiveScanScope::ImmediateAction,
+                    ArchiveScanDedupeRule::CanonicalPath,
+                    "/archive/projects/demo/messages/2026/04/bad.md",
+                    "canonical message file is malformed",
+                ),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            summary.highest_severity,
+            Some(ArchiveScanSeverityBucket::Critical)
+        );
+        assert_eq!(summary.total_findings, 3);
+        assert_eq!(summary.deduped_findings, 2);
+        assert_eq!(summary.immediate_action_count, 1);
+        assert_eq!(summary.hygiene_debt_count, 1);
+        assert_eq!(summary.buckets.len(), 2);
+        assert_eq!(
+            summary.buckets[0].severity,
+            ArchiveScanSeverityBucket::Critical
+        );
+        assert_eq!(summary.buckets[0].raw_count, 1);
+        assert_eq!(summary.buckets[0].deduped_count, 1);
+        assert_eq!(
+            summary.buckets[1].severity,
+            ArchiveScanSeverityBucket::Warning
+        );
+        assert_eq!(summary.buckets[1].raw_count, 2);
+        assert_eq!(summary.buckets[1].deduped_count, 1);
+        assert_eq!(summary.buckets[1].findings[0].occurrence_count, 2);
+        assert_eq!(
+            summary.buckets[1].findings[0].dedupe_rule,
+            ArchiveScanDedupeRule::ProjectDir
+        );
+    }
+
+    #[test]
+    fn archive_scan_summary_respects_sample_limit() {
+        let summary = ArchiveScanSummary::build(
+            vec![
+                archive_scan_diagnostic(
+                    "duplicate_canonical_id",
+                    ArchiveScanSeverityBucket::Critical,
+                    ArchiveScanScope::ImmediateAction,
+                    ArchiveScanDedupeRule::MessageId,
+                    "7",
+                    "message id 7 has duplicate canonical files",
+                ),
+                archive_scan_diagnostic(
+                    "duplicate_canonical_id",
+                    ArchiveScanSeverityBucket::Critical,
+                    ArchiveScanScope::ImmediateAction,
+                    ArchiveScanDedupeRule::MessageId,
+                    "9",
+                    "message id 9 has duplicate canonical files",
+                ),
+                archive_scan_diagnostic(
+                    "invalid_project_metadata",
+                    ArchiveScanSeverityBucket::Critical,
+                    ArchiveScanScope::ImmediateAction,
+                    ArchiveScanDedupeRule::ProjectDir,
+                    "/archive/projects/demo",
+                    "project metadata cannot be auto-normalized",
+                ),
+                archive_scan_diagnostic(
+                    "suspicious_ephemeral_project",
+                    ArchiveScanSeverityBucket::Info,
+                    ArchiveScanScope::HygieneDebt,
+                    ArchiveScanDedupeRule::ProjectDir,
+                    "/archive/projects/tmp-demo",
+                    "project looks ephemeral in the archive",
+                ),
+            ],
+            2,
+        );
+
+        assert_eq!(
+            summary.buckets[0].severity,
+            ArchiveScanSeverityBucket::Critical
+        );
+        assert_eq!(summary.buckets[0].raw_count, 3);
+        assert_eq!(summary.buckets[0].deduped_count, 3);
+        assert_eq!(summary.buckets[0].findings.len(), 2);
+        assert_eq!(summary.buckets[0].overflow_count, 1);
+        assert_eq!(summary.buckets[1].severity, ArchiveScanSeverityBucket::Info);
+        assert_eq!(summary.buckets[1].overflow_count, 0);
+    }
+
     // -- health_recommendations direct tests --
 
     fn zero_signals() -> HealthSignals {
@@ -822,5 +1641,186 @@ mod tests {
         assert!(recs.iter().any(|r| r.subsystem == "health"));
         assert!(recs.iter().any(|r| r.subsystem == "database"));
         assert!(recs.iter().any(|r| r.subsystem == "tools"));
+    }
+
+    // -- ArtifactPointer tests --
+
+    #[test]
+    fn artifact_pointer_captured_has_path_and_status() {
+        let ap = ArtifactPointer::captured("sqlite_db", "/tmp/test.db", "Test database");
+        assert_eq!(ap.kind, "sqlite_db");
+        assert_eq!(ap.path.as_deref(), Some("/tmp/test.db"));
+        assert_eq!(ap.status, ArtifactStatus::Captured);
+        assert_eq!(ap.label, "Test database");
+        assert!(ap.detail.is_none());
+    }
+
+    #[test]
+    fn artifact_pointer_referenced_has_path() {
+        let ap = ArtifactPointer::referenced("archive_root", "/tmp/archive", "Archive root");
+        assert_eq!(ap.status, ArtifactStatus::Referenced);
+        assert!(ap.path.is_some());
+    }
+
+    #[test]
+    fn artifact_pointer_missing_has_no_path() {
+        let ap = ArtifactPointer::missing("wal_sidecar", "WAL file");
+        assert_eq!(ap.status, ArtifactStatus::Missing);
+        assert!(ap.path.is_none());
+    }
+
+    #[test]
+    fn artifact_pointer_skipped_has_no_path() {
+        let ap = ArtifactPointer::skipped("forensic_bundle", "Forensic bundle");
+        assert_eq!(ap.status, ArtifactStatus::Skipped);
+        assert!(ap.path.is_none());
+    }
+
+    #[test]
+    fn artifact_pointer_with_detail_chains() {
+        let ap = ArtifactPointer::captured("sqlite_db", "/tmp/test.db", "DB")
+            .with_detail("bytes=1024");
+        assert_eq!(ap.detail.as_deref(), Some("bytes=1024"));
+    }
+
+    #[test]
+    fn artifact_status_as_str_round_trips() {
+        assert_eq!(ArtifactStatus::Captured.as_str(), "captured");
+        assert_eq!(ArtifactStatus::Missing.as_str(), "missing");
+        assert_eq!(ArtifactStatus::Referenced.as_str(), "referenced");
+        assert_eq!(ArtifactStatus::Skipped.as_str(), "skipped");
+    }
+
+    #[test]
+    fn artifact_pointer_serializes_to_json() {
+        let ap = ArtifactPointer::captured("sqlite_db", "/tmp/test.db", "DB")
+            .with_detail("bytes=512");
+        let json = serde_json::to_value(&ap).expect("serialize");
+        assert_eq!(json["kind"], "sqlite_db");
+        assert_eq!(json["path"], "/tmp/test.db");
+        assert_eq!(json["status"], "captured");
+        assert_eq!(json["label"], "DB");
+        assert_eq!(json["detail"], "bytes=512");
+    }
+
+    #[test]
+    fn artifact_pointer_omits_detail_when_none() {
+        let ap = ArtifactPointer::missing("wal_sidecar", "WAL file");
+        let json = serde_json::to_value(&ap).expect("serialize");
+        assert!(json.get("detail").is_none(), "detail should be omitted via skip_serializing_if");
+    }
+
+    // -- DiagnosticPayload tests --
+
+    #[test]
+    fn diagnostic_payload_from_doctor_check_ok() {
+        let payload = DiagnosticPayload::from_doctor_check(
+            "ok",
+            "All checks passed.",
+            0,
+            0,
+            vec![ArtifactPointer::referenced("sqlite_db", "/tmp/db", "DB")],
+        );
+        assert_eq!(payload.schema.name, DiagnosticPayload::SCHEMA_NAME);
+        assert_eq!(payload.schema.major, 1);
+        assert_eq!(payload.schema.minor, 0);
+        assert_eq!(payload.source, "doctor-check");
+        assert_eq!(payload.status, "ok");
+        assert_eq!(payload.headline, "All checks passed.");
+        assert!(payload.next_action.is_none());
+        assert_eq!(payload.finding_counts.total, 0);
+        assert_eq!(payload.artifacts.len(), 1);
+    }
+
+    #[test]
+    fn diagnostic_payload_from_doctor_check_fail_has_next_action() {
+        let payload = DiagnosticPayload::from_doctor_check(
+            "fail",
+            "2 check(s) failed.",
+            2,
+            1,
+            Vec::new(),
+        );
+        assert_eq!(payload.status, "fail");
+        assert!(payload.next_action.is_some());
+        assert_eq!(payload.finding_counts.critical, 2);
+        assert_eq!(payload.finding_counts.warning, 1);
+        assert_eq!(payload.finding_counts.total, 3);
+    }
+
+    #[test]
+    fn diagnostic_payload_from_archive_scan_empty() {
+        let summary = ArchiveScanSummary::build(Vec::<ArchiveScanDiagnostic>::new(), 3);
+        let payload = DiagnosticPayload::from_archive_scan(&summary, Vec::new());
+        assert_eq!(payload.source, "archive-scan");
+        assert_eq!(payload.status, "ok");
+        assert_eq!(payload.finding_counts.total, 0);
+        assert_eq!(payload.finding_counts.critical, 0);
+    }
+
+    #[test]
+    fn diagnostic_payload_from_archive_scan_with_findings() {
+        let summary = ArchiveScanSummary::build(
+            vec![
+                archive_scan_diagnostic(
+                    "malformed_message",
+                    ArchiveScanSeverityBucket::Critical,
+                    ArchiveScanScope::ImmediateAction,
+                    ArchiveScanDedupeRule::CanonicalPath,
+                    "/archive/bad.md",
+                    "malformed",
+                ),
+                archive_scan_diagnostic(
+                    "missing_project_metadata",
+                    ArchiveScanSeverityBucket::Warning,
+                    ArchiveScanScope::HygieneDebt,
+                    ArchiveScanDedupeRule::ProjectDir,
+                    "/archive/demo",
+                    "missing metadata",
+                ),
+            ],
+            3,
+        );
+        let artifacts = vec![
+            ArtifactPointer::referenced("archive_root", "/tmp/archive", "Archive"),
+            ArtifactPointer::referenced("sqlite_db", "/tmp/db", "DB"),
+        ];
+        let payload = DiagnosticPayload::from_archive_scan(&summary, artifacts);
+        assert_eq!(payload.status, "fail");
+        assert_eq!(payload.finding_counts.critical, 1);
+        assert_eq!(payload.finding_counts.warning, 1);
+        assert_eq!(payload.finding_counts.total, 2);
+        assert_eq!(payload.artifacts.len(), 2);
+        assert!(payload.next_action.is_some());
+    }
+
+    #[test]
+    fn diagnostic_payload_serializes_to_json() {
+        let payload = DiagnosticPayload::from_doctor_check(
+            "warn",
+            "1 warning found.",
+            0,
+            1,
+            vec![
+                ArtifactPointer::referenced("sqlite_db", "/tmp/db", "DB"),
+                ArtifactPointer::missing("wal_sidecar", "WAL"),
+            ],
+        );
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(json["schema"]["name"], DiagnosticPayload::SCHEMA_NAME);
+        assert_eq!(json["schema"]["major"], 1);
+        assert_eq!(json["source"], "doctor-check");
+        assert_eq!(json["status"], "warn");
+        assert!(json["artifacts"].is_array());
+        assert_eq!(json["artifacts"].as_array().unwrap().len(), 2);
+        assert_eq!(json["finding_counts"]["warning"], 1);
+        assert_eq!(json["finding_counts"]["total"], 1);
+    }
+
+    #[test]
+    fn diagnostic_payload_schema_version_constants() {
+        assert_eq!(DiagnosticPayload::SCHEMA_NAME, "mcp-agent-mail-diagnostic-payload");
+        assert_eq!(DiagnosticPayload::SCHEMA_MAJOR, 1);
+        assert_eq!(DiagnosticPayload::SCHEMA_MINOR, 0);
     }
 }

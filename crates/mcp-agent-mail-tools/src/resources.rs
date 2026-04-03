@@ -263,6 +263,30 @@ impl std::ops::Deref for ResourceReadPool {
     }
 }
 
+/// Check whether the live SQLite database is suspect for resource reads.
+///
+/// Delegates to the fast mailbox verdict. When `DurabilityState` is
+/// `DegradedReadOnly` (or worse), resource reads should fall back to
+/// archive-based data instead of the potentially corrupt live file.
+fn resource_live_db_is_suspect(database_url: &str, storage_root: &Path) -> bool {
+    let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
+        database_url,
+        storage_root,
+        &mcp_agent_mail_db::VerdictOptions::fast(),
+    );
+    let durability = mcp_agent_mail_db::DurabilityState::from_mailbox_state(verdict.state);
+    if durability.is_degraded() {
+        tracing::info!(
+            verdict_state = %verdict.state,
+            durability_state = %durability,
+            "live SQLite is suspect; resource reads will prefer archive snapshots"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     let config = Config::from_env();
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
@@ -283,34 +307,44 @@ fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     let resolved_path = PathBuf::from(&sqlite_path);
     let archive_has_state = resource_archive_inventory_has_state(&config.storage_root);
 
-    let use_archive_snapshot = match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
-        Ok(conn) => {
-            let archive_ahead = resource_archive_is_ahead(&config.storage_root, &conn);
-            drop(conn);
-            match archive_ahead {
-                Ok(true) => true,
-                Err(error) if archive_has_state => {
-                    tracing::warn!(
-                        source = %resolved_path.display(),
-                        storage_root = %config.storage_root.display(),
-                        error = %error,
-                        "using archive-backed resource snapshot because the live sqlite inventory probe failed"
-                    );
-                    true
+    // When the durability verdict says the live DB is suspect or worse,
+    // force archive-snapshot reads even if the archive isn't strictly
+    // "ahead" of the DB by row count.
+    let durability_forces_snapshot =
+        archive_has_state && resource_live_db_is_suspect(&config.database_url, &config.storage_root);
+
+    let use_archive_snapshot = if durability_forces_snapshot {
+        true
+    } else {
+        match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
+            Ok(conn) => {
+                let archive_ahead = resource_archive_is_ahead(&config.storage_root, &conn);
+                drop(conn);
+                match archive_ahead {
+                    Ok(true) => true,
+                    Err(error) if archive_has_state => {
+                        tracing::warn!(
+                            source = %resolved_path.display(),
+                            storage_root = %config.storage_root.display(),
+                            error = %error,
+                            "using archive-backed resource snapshot because the live sqlite inventory probe failed"
+                        );
+                        true
+                    }
+                    Ok(false) | Err(_) => false,
                 }
-                Ok(false) | Err(_) => false,
             }
+            Err(error) if archive_has_state => {
+                tracing::warn!(
+                    source = %resolved_path.display(),
+                    storage_root = %config.storage_root.display(),
+                    error = %error,
+                    "using archive-backed resource snapshot because the live sqlite source could not be opened"
+                );
+                true
+            }
+            Err(_) => false,
         }
-        Err(error) if archive_has_state => {
-            tracing::warn!(
-                source = %resolved_path.display(),
-                storage_root = %config.storage_root.display(),
-                error = %error,
-                "using archive-backed resource snapshot because the live sqlite source could not be opened"
-            );
-            true
-        }
-        Err(_) => false,
     };
 
     if !use_archive_snapshot {

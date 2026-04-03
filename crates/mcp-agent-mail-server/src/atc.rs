@@ -2734,6 +2734,18 @@ impl CusumDetector {
     pub fn recent_changes(&self, n: usize) -> impl Iterator<Item = &RegimeChange> {
         self.regime_changes.iter().rev().take(n)
     }
+
+    /// When the current regime started (microseconds since epoch).
+    #[must_use]
+    pub const fn regime_start(&self) -> i64 {
+        self.regime_start
+    }
+
+    /// Total number of regime changes in the history buffer.
+    #[must_use]
+    pub fn regime_change_count(&self) -> usize {
+        self.regime_changes.len()
+    }
 }
 
 /// Counterfactual regret tracker.
@@ -3210,6 +3222,18 @@ impl CalibrationGuard {
     #[must_use]
     pub const fn safe_mode_since(&self) -> i64 {
         self.safe_mode_since
+    }
+
+    /// How many consecutive correct predictions since the last incorrect.
+    #[must_use]
+    pub const fn consecutive_correct(&self) -> u64 {
+        self.consecutive_correct
+    }
+
+    /// Required consecutive correct predictions to exit safe mode.
+    #[must_use]
+    pub const fn recovery_count(&self) -> u64 {
+        self.recovery_count
     }
 
     /// Force safe mode on/off (operator override).
@@ -3954,6 +3978,24 @@ pub struct AtcEngine {
     pending_liveness_feedback: HashMap<String, PendingLivenessFeedback>,
     /// Engine tick count.
     tick_count: u64,
+    /// Monotonic snapshot sequence counter.
+    snapshot_seq: u64,
+    /// Number of feedback resolutions received (resolved experiences).
+    resolved_experience_count: u64,
+    /// Per-agent intervention counts for concentration detection.
+    agent_intervention_counts: HashMap<String, u64>,
+    /// Cached state from the previous snapshot for delta computation.
+    prev_snapshot_state: PrevSnapshotState,
+}
+
+/// Minimal cached state from the prior summary snapshot for delta computation.
+#[derive(Debug, Clone, Default)]
+struct PrevSnapshotState {
+    posture: Option<ExecutionPosture>,
+    regime: Option<SummaryRegimeState>,
+    policy_revision: u64,
+    agent_count: usize,
+    safe_mode: bool,
 }
 
 #[derive(Debug, Default)]
@@ -4063,6 +4105,10 @@ impl AtcEngine {
             last_event_seq: 0,
             pending_liveness_feedback: HashMap::new(),
             tick_count: 0,
+            snapshot_seq: 0,
+            resolved_experience_count: 0,
+            agent_intervention_counts: HashMap::new(),
+            prev_snapshot_state: PrevSnapshotState::default(),
         }
     }
 
@@ -4302,6 +4348,11 @@ impl AtcEngine {
         correct: bool,
         timestamp_micros: i64,
     ) {
+        self.resolved_experience_count = self.resolved_experience_count.saturating_add(1);
+        *self
+            .agent_intervention_counts
+            .entry(agent.to_string())
+            .or_insert(0) += 1;
         self.eprocess
             .update(correct, AtcSubsystem::Liveness, Some(agent));
         self.cusum.update(!correct, timestamp_micros);
@@ -5044,10 +5095,13 @@ impl AtcEngine {
         budget: &AtcBudgetTelemetry,
         policy: &AtcPolicyTelemetry,
     ) -> AtcSummarySnapshot {
+        self.snapshot_seq = self.snapshot_seq.saturating_add(1);
+
+        // ── agent snapshots (deterministic order) ────────────────────
         let mut agent_states = Vec::with_capacity(self.agents.len());
         let agent_names: Vec<String> = self.sorted_agent_names().to_vec();
-        for name in agent_names {
-            let Some(entry) = self.agents.get(&name) else {
+        for name in &agent_names {
+            let Some(entry) = self.agents.get(name) else {
                 continue;
             };
             agent_states.push(AgentStateSnapshot {
@@ -5055,19 +5109,116 @@ impl AtcEngine {
                 state: entry.state,
                 silence_secs: entry.rhythm.silence_duration(now_micros) / 1_000_000,
                 posterior_alive: entry.core.posterior_probability(LivenessState::Alive),
+                intervention_count: self
+                    .agent_intervention_counts
+                    .get(name)
+                    .copied()
+                    .unwrap_or(0),
             });
         }
 
+        // ── execution posture ────────────────────────────────────────
+        let safe_mode = self.is_safe_mode();
+        let execution_posture = if safe_mode {
+            ExecutionPosture::SafeMode
+        } else if self.eprocess.miscalibrated()
+            || matches!(
+                self.slow_controller.probe_budget_fraction < 0.5,
+                true
+            )
+        {
+            ExecutionPosture::Cautious
+        } else {
+            ExecutionPosture::Normal
+        };
+
+        // ── regret trend ─────────────────────────────────────────────
+        let regret_avg = self.regret.average_regret();
+        let regret_recent_avg = self.regret.recent_average_regret();
+        let regret_trend = if self.regret.outcome_count() < 10 {
+            TrendDirection::Flat
+        } else {
+            let ratio = if regret_avg.abs() < 1e-12 {
+                0.0
+            } else {
+                regret_recent_avg / regret_avg
+            };
+            if ratio > 1.15 {
+                TrendDirection::Worsening
+            } else if ratio < 0.85 {
+                TrendDirection::Improving
+            } else {
+                TrendDirection::Flat
+            }
+        };
+
+        // ── regime state ─────────────────────────────────────────────
+        let (regime_state, regime_dwell_micros) =
+            if let Some(last_change) = self.cusum.recent_changes(1).next() {
+                let state = match last_change.direction {
+                    ChangeDirection::Degradation => SummaryRegimeState::Degraded,
+                    ChangeDirection::Improvement => SummaryRegimeState::Improved,
+                };
+                (state, now_micros.saturating_sub(last_change.timestamp))
+            } else {
+                (SummaryRegimeState::Stable, now_micros.saturating_sub(self.cusum.regime_start()))
+            };
+        let regime_change_count = self.cusum.regime_change_count();
+
+        // ── most-impacted agent ──────────────────────────────────────
+        let most_impacted_agent = self
+            .agent_intervention_counts
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .and_then(|(name, count)| (*count > 0).then(|| name.clone()));
+
+        // ── delta computation ────────────────────────────────────────
+        let prev = &self.prev_snapshot_state;
+        let delta = SummaryDelta {
+            posture_changed: prev.posture.is_some_and(|p| p != execution_posture),
+            regime_changed: prev.regime.is_some_and(|r| r != regime_state),
+            policy_revision_changed: prev.policy_revision != self.policy_revision,
+            agents_added: agent_states.len().saturating_sub(prev.agent_count),
+            agents_removed: prev.agent_count.saturating_sub(agent_states.len()),
+            safe_mode_transition: prev.safe_mode != safe_mode && self.snapshot_seq > 1,
+        };
+
+        // ── cache state for next delta ───────────────────────────────
+        self.prev_snapshot_state = PrevSnapshotState {
+            posture: Some(execution_posture),
+            regime: Some(regime_state),
+            policy_revision: self.policy_revision,
+            agent_count: agent_states.len(),
+            safe_mode,
+        };
+
         AtcSummarySnapshot {
+            snapshot_seq: self.snapshot_seq,
+            generated_at_micros: now_micros,
+            completeness: SnapshotCompleteness::Full,
             enabled: self.enabled(),
-            safe_mode: self.is_safe_mode(),
+            safe_mode,
+            execution_posture,
             tick_count: self.tick_count(),
             tracked_agents: agent_states,
             deadlock_cycles: self.deadlock_cycle_total,
-            eprocess_value: self.eprocess().e_value(),
-            regret_avg: self.regret().average_regret(),
-            decisions_total: self.ledger().latest_id(),
-            recent_decisions: self.ledger().recent(16).cloned().collect(),
+            eprocess_value: self.eprocess.e_value(),
+            eprocess_alert: self.eprocess.miscalibrated(),
+            regret_avg,
+            regret_recent_avg,
+            regret_trend,
+            decisions_total: self.ledger.latest_id(),
+            experiences_open: self.pending_liveness_feedback.len(),
+            experiences_resolved: self.resolved_experience_count,
+            calibration_consecutive_correct: self.calibration.consecutive_correct(),
+            calibration_recovery_target: self.calibration.recovery_count(),
+            regime_state,
+            regime_dwell_micros,
+            regime_change_count,
+            policy_revision: self.policy_revision,
+            most_impacted_agent,
+            delta,
+            recent_decisions: self.ledger.recent(16).cloned().collect(),
             stage_timings: stage_timings.clone(),
             kernel: kernel.clone(),
             budget: budget.clone(),
@@ -9223,16 +9374,156 @@ pub fn atc_summary() -> Option<AtcSummarySnapshot> {
     ))
 }
 
+/// Whether the ATC system is exercising normal authority, operating
+/// cautiously, or fully locked down. Derived from safe-mode, budget
+/// pressure, and eprocess state — not stored separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPosture {
+    /// All subsystems nominal; full intervention authority.
+    Normal,
+    /// Budget is under pressure or eprocess is elevated; interventions
+    /// proceed but with reduced probe frequency.
+    Cautious,
+    /// Calibration guard is active (safe mode); only advisory actions
+    /// are permitted.
+    SafeMode,
+}
+
+impl ExecutionPosture {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Cautious => "cautious",
+            Self::SafeMode => "safe_mode",
+        }
+    }
+}
+
+/// How complete the snapshot is. A `Full` snapshot reads all maintained
+/// statistics; `Partial` indicates some subsystem locks were contended;
+/// `Fallback` means only cached/stale data was available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotCompleteness {
+    /// All subsystem data was freshly read.
+    Full,
+    /// Some subsystem data was unavailable; snapshot is best-effort.
+    Partial,
+    /// Only cached/stale data was used (lock contention or startup).
+    Fallback,
+}
+
+/// Concise regime state for the summary: is the system stable, changing,
+/// or recovering from a detected change?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryRegimeState {
+    /// No regime change detected; system is stationary.
+    Stable,
+    /// A degradation was detected and has not recovered.
+    Degraded,
+    /// An improvement was detected; system has shifted for the better.
+    Improved,
+}
+
+/// Direction indicator for a trend (computed from recent vs. lifetime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendDirection {
+    /// Recent values are lower than lifetime average.
+    Improving,
+    /// Recent values are close to lifetime average.
+    Flat,
+    /// Recent values are higher than lifetime average.
+    Worsening,
+}
+
+/// Stable delta hint: tells consumers what materially changed since the
+/// last snapshot without requiring a full diff.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SummaryDelta {
+    /// Whether the execution posture changed.
+    pub posture_changed: bool,
+    /// Whether the regime state changed.
+    pub regime_changed: bool,
+    /// Whether the policy revision changed.
+    pub policy_revision_changed: bool,
+    /// Number of agents added since the prior snapshot.
+    pub agents_added: usize,
+    /// Number of agents removed since the prior snapshot.
+    pub agents_removed: usize,
+    /// Whether safe mode was entered or exited.
+    pub safe_mode_transition: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct AtcSummarySnapshot {
+    // ── identity & freshness (machine-facing) ────────────────────────
+    /// Monotonically increasing snapshot sequence for change detection.
+    pub snapshot_seq: u64,
+    /// Timestamp when this snapshot was generated (micros since epoch).
+    pub generated_at_micros: i64,
+    /// How complete this snapshot is.
+    pub completeness: SnapshotCompleteness,
+
+    // ── top-level state (operator-facing) ────────────────────────────
     pub enabled: bool,
     pub safe_mode: bool,
+    /// Derived posture: normal, cautious, or safe-mode.
+    pub execution_posture: ExecutionPosture,
     pub tick_count: u64,
+
+    // ── agent liveness (operator-facing, deterministic order) ────────
     pub tracked_agents: Vec<AgentStateSnapshot>,
     pub deadlock_cycles: usize,
+
+    // ── learning state (machine-facing) ──────────────────────────────
+    /// E-process martingale value (>threshold = miscalibrated).
     pub eprocess_value: f64,
+    /// Whether the eprocess has crossed the alert threshold.
+    pub eprocess_alert: bool,
+    /// Lifetime average regret per decision.
     pub regret_avg: f64,
+    /// Recent-window average regret.
+    pub regret_recent_avg: f64,
+    /// Trend direction for regret (recent vs. lifetime).
+    pub regret_trend: TrendDirection,
+    /// Total decisions recorded in the evidence ledger.
     pub decisions_total: u64,
+    /// Open experiences (decisions awaiting ground-truth feedback).
+    pub experiences_open: usize,
+    /// Resolved experiences (decisions with feedback received).
+    pub experiences_resolved: u64,
+
+    // ── calibration & regime (operator-facing) ───────────────────────
+    /// Calibration guard state: consecutive correct predictions toward
+    /// recovery (0 if not in safe mode).
+    pub calibration_consecutive_correct: u64,
+    /// Required consecutive correct predictions to exit safe mode.
+    pub calibration_recovery_target: u64,
+    /// Regime state: stable, degraded, or improved.
+    pub regime_state: SummaryRegimeState,
+    /// How long the current regime has been active (microseconds).
+    pub regime_dwell_micros: i64,
+    /// Number of regime changes detected in history.
+    pub regime_change_count: usize,
+
+    // ── policy (machine-facing) ─────────────────────────────────────
+    /// Monotonic policy revision counter.
+    pub policy_revision: u64,
+
+    // ── fairness / concentration (operator-facing) ──────────────────
+    /// Name of the agent bearing the most interventions, if any.
+    /// `None` if no agents have been intervened on or all share equal load.
+    pub most_impacted_agent: Option<String>,
+
+    // ── delta hints (machine-facing) ────────────────────────────────
+    /// What materially changed vs. the previous snapshot.
+    pub delta: SummaryDelta,
+
+    // ── detailed telemetry (machine-facing) ─────────────────────────
     pub recent_decisions: Vec<AtcDecisionRecord>,
     pub stage_timings: AtcStageTimings,
     pub kernel: AtcKernelTelemetry,
@@ -9246,6 +9537,8 @@ pub struct AgentStateSnapshot {
     pub state: LivenessState,
     pub silence_secs: i64,
     pub posterior_alive: f64,
+    /// Number of decisions targeting this agent (for concentration detection).
+    pub intervention_count: u64,
 }
 
 // ── Tests for alien-artifact enhancements ───────────────────────────
@@ -9679,6 +9972,23 @@ mod alien_enhancement_tests {
             .map(|agent| agent.name.as_str())
             .collect();
         assert_eq!(names, vec!["Alpha", "Mike", "Zulu"]);
+
+        // Verify new learning-state fields have sane defaults.
+        assert_eq!(summary.execution_posture, ExecutionPosture::Normal);
+        assert_eq!(summary.completeness, SnapshotCompleteness::Full);
+        assert_eq!(summary.regime_state, SummaryRegimeState::Stable);
+        assert_eq!(summary.regret_trend, TrendDirection::Flat);
+        assert!(!summary.eprocess_alert);
+        assert_eq!(summary.experiences_open, 0);
+        assert_eq!(summary.experiences_resolved, 0);
+        assert_eq!(summary.regime_change_count, 0);
+        assert!(summary.snapshot_seq > 0);
+        assert!(summary.generated_at_micros > 0);
+        assert!(summary.most_impacted_agent.is_none());
+        // All agents should have zero interventions initially.
+        for agent in &summary.tracked_agents {
+            assert_eq!(agent.intervention_count, 0);
+        }
     }
 
     #[test]

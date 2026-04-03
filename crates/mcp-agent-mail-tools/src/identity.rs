@@ -311,45 +311,25 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
     );
 }
 
-fn path_has_ephemeral_root(path: &Path) -> bool {
-    let temp_root = std::env::temp_dir();
-    if path.starts_with(&temp_root) {
-        return true;
-    }
+/// If the project root is ephemeral and the current storage root is the
+/// default global mailbox, compute an isolated storage root and return a
+/// rerouted clone of `config`.  Returns `None` when no reroute is needed
+/// (production path, or operator already set a custom `STORAGE_ROOT`).
+fn maybe_reroute_ephemeral_storage(config: &Config, human_key: &str) -> Option<Config> {
+    let isolated = mcp_agent_mail_core::config::compute_ephemeral_storage_root(
+        Path::new(human_key),
+        config,
+    )?;
 
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    normalized == "/tmp"
-        || normalized.starts_with("/tmp/")
-        || normalized == "/var/tmp"
-        || normalized.starts_with("/var/tmp/")
-        || normalized == "/private/tmp"
-        || normalized.starts_with("/private/tmp/")
-        || normalized == "/var/folders"
-        || normalized.starts_with("/var/folders/")
-}
+    tracing::info!(
+        human_key,
+        isolated_root = %isolated.display(),
+        "Auto-rerouting ephemeral project to isolated storage root",
+    );
 
-fn reject_ephemeral_project_in_default_storage(config: &Config, human_key: &str) -> McpResult<()> {
-    if config.allow_ephemeral_projects_in_default_storage
-        || !mcp_agent_mail_core::config::is_default_storage_root(&config.storage_root)
-        || !path_has_ephemeral_root(Path::new(human_key))
-    {
-        return Ok(());
-    }
-
-    Err(legacy_tool_error(
-        "EPHEMERAL_PROJECT_REQUIRES_STORAGE_ROOT",
-        format!(
-            "Refusing to register temporary project path '{human_key}' into the default global mailbox storage root '{}'. \
-Set STORAGE_ROOT to an isolated directory for this run, or explicitly opt in with ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE=true if you really intend to persist temporary projects in the operator mailbox archive.",
-            config.storage_root.display()
-        ),
-        true,
-        json!({
-            "field": "human_key",
-            "error_detail": human_key,
-            "storage_root": config.storage_root.display().to_string(),
-        }),
-    ))
+    let mut rerouted = config.clone();
+    rerouted.storage_root = isolated;
+    Some(rerouted)
 }
 
 fn enqueue_project_semantic_index(project: &mcp_agent_mail_db::ProjectRow) {
@@ -762,8 +742,12 @@ Check that all parameters have valid values."
         ));
     }
 
-    let config = &Config::get();
-    reject_ephemeral_project_in_default_storage(config, &human_key)?;
+    let base_config = Config::get();
+    let config = match maybe_reroute_ephemeral_storage(&base_config, &human_key) {
+        Some(rerouted) => rerouted,
+        None => base_config,
+    };
+    let config = &config;
     let pool = get_db_pool()?;
 
     // Log identity_mode if provided (future: resolve project identity via git remotes, etc.)
@@ -1853,6 +1837,7 @@ mod tests {
 
     #[test]
     fn path_has_ephemeral_root_detects_common_temp_locations() {
+        use mcp_agent_mail_core::ephemeral::path_has_ephemeral_root;
         assert!(path_has_ephemeral_root(Path::new("/tmp/test-project")));
         assert!(path_has_ephemeral_root(Path::new("/var/tmp/test-project")));
         assert!(path_has_ephemeral_root(Path::new(
@@ -1861,34 +1846,110 @@ mod tests {
         assert!(path_has_ephemeral_root(Path::new(
             "/var/folders/aa/bb/T/test-project"
         )));
+        assert!(path_has_ephemeral_root(Path::new("/dev/shm/test-session")));
         assert!(!path_has_ephemeral_root(Path::new(
             "/data/projects/not-temporary"
         )));
     }
 
     #[test]
-    fn reject_ephemeral_project_in_default_storage_blocks_tmp_projects() {
+    fn ephemeral_reroute_redirects_tmp_projects() {
         let mut config = Config::default();
         config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
         config.allow_ephemeral_projects_in_default_storage = false;
+        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
 
-        let err = reject_ephemeral_project_in_default_storage(&config, "/tmp/test-project")
-            .expect_err("tmp project should be rejected for default global storage");
-        let message = err.to_string();
-        assert!(message.contains("Refusing to register temporary project path"));
-        assert!(message.contains("ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE=true"));
+        let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
+        assert!(rerouted.is_some(), "tmp project should trigger auto-reroute");
+        let rerouted = rerouted.unwrap();
+        assert_ne!(rerouted.storage_root, config.storage_root);
+        assert!(
+            rerouted
+                .storage_root
+                .to_string_lossy()
+                .contains(".am-ephemeral"),
+            "rerouted path should be under .am-ephemeral"
+        );
     }
 
     #[test]
-    fn reject_ephemeral_project_in_default_storage_allows_custom_storage_roots() {
+    fn ephemeral_reroute_skips_custom_storage_roots() {
         let config = Config {
             storage_root: PathBuf::from("/tmp/custom-storage-root"),
             allow_ephemeral_projects_in_default_storage: false,
             ..Config::default()
         };
 
-        reject_ephemeral_project_in_default_storage(&config, "/tmp/test-project")
-            .expect("custom storage root should allow tmp project");
+        let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
+        assert!(
+            rerouted.is_none(),
+            "custom storage root should skip auto-reroute"
+        );
+    }
+
+    #[test]
+    fn ephemeral_reroute_respects_deny_mode() {
+        let mut config = Config::default();
+        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
+        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Deny;
+
+        // Deny mode treats all contexts as production, so no reroute
+        let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
+        assert!(
+            rerouted.is_none(),
+            "deny mode should skip auto-reroute"
+        );
+    }
+
+    #[test]
+    fn ephemeral_reroute_deterministic_hash() {
+        let mut config = Config::default();
+        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
+        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+
+        let r1 = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
+        let r2 = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
+        assert_eq!(
+            r1.as_ref().map(|c| &c.storage_root),
+            r2.as_ref().map(|c| &c.storage_root),
+            "same project path should produce the same isolated root"
+        );
+
+        let r3 = maybe_reroute_ephemeral_storage(&config, "/tmp/different-project");
+        assert_ne!(
+            r1.as_ref().map(|c| &c.storage_root),
+            r3.as_ref().map(|c| &c.storage_root),
+            "different project paths should produce different isolated roots"
+        );
+    }
+
+    #[test]
+    fn ephemeral_reroute_uses_custom_ephemeral_root() {
+        let mut config = Config::default();
+        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
+        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+        config.ephemeral_root = Some(PathBuf::from("/dev/shm/my-ephemeral"));
+
+        let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
+        assert!(rerouted.is_some());
+        let root = rerouted.unwrap().storage_root;
+        assert!(
+            root.starts_with("/dev/shm/my-ephemeral"),
+            "rerouted path should be under custom ephemeral root, got: {root:?}"
+        );
+    }
+
+    #[test]
+    fn ephemeral_reroute_skips_production_paths() {
+        let mut config = Config::default();
+        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
+        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+
+        let rerouted = maybe_reroute_ephemeral_storage(&config, "/data/projects/real-project");
+        assert!(
+            rerouted.is_none(),
+            "production path should not trigger auto-reroute"
+        );
     }
 
     // ── Agent name validation extended ──
