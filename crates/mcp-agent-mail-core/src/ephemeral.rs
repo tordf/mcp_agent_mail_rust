@@ -416,7 +416,12 @@ pub fn classify_ephemeral(
 ) -> (EphemeralClass, EphemeralSignals) {
     let mut signals = EphemeralSignals::default();
 
-    let normalized = project_root.to_string_lossy().replace('\\', "/");
+    // Resolve symlinks so that a project at `/data/projects/foo` which is a
+    // symlink to `/tmp/test-foo/` is correctly detected as ephemeral.
+    // Falls back to the raw path if canonicalization fails (e.g. broken symlink).
+    let resolved = std::fs::canonicalize(project_root)
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let normalized = resolved.to_string_lossy().replace('\\', "/");
 
     // ---- Tier 1: System temp (path-based) ----
     signals.path_tmp = normalized == "/tmp" || normalized.starts_with("/tmp/");
@@ -473,12 +478,15 @@ pub fn classify_ephemeral(
 /// portion of `classify_ephemeral`, without environment checks.
 #[must_use]
 pub fn path_has_ephemeral_root(path: &Path) -> bool {
+    // Resolve symlinks so `/data/projects/foo` → `/tmp/test/` is detected.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
     let temp_root = std::env::temp_dir();
-    if path.starts_with(&temp_root) {
+    if resolved.starts_with(&temp_root) {
         return true;
     }
 
-    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = resolved.to_string_lossy().replace('\\', "/");
     starts_with_system_temp(&normalized)
 }
 
