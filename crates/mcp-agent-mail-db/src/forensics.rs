@@ -532,8 +532,6 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
 
 #[cfg(target_os = "linux")]
 fn process_holders_for_paths(paths: &[(&str, PathBuf)]) -> Vec<ForensicProcessHolder> {
-    use std::os::unix::fs::MetadataExt;
-
     let mut identities = Vec::new();
     for (role, path) in paths {
         if let Some(identity) = file_identity(path) {
@@ -1197,7 +1195,7 @@ mod tests {
         assert_eq!(snap.storage_root.as_deref(), Some(dir.path().to_str().unwrap()));
         assert_eq!(
             snap.database_url_redacted.as_deref(),
-            Some("sqlite:///secret@host/db.sqlite3")
+            Some("sqlite://****@host/db.sqlite3")
         );
         // Verify JSON includes the environment fields.
         let json = serde_json::to_value(&snap).expect("serialize");

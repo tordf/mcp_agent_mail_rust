@@ -23,8 +23,6 @@
 //! Do NOT introduce randomness, wall-clock reads, or external I/O.  All
 //! timestamps are synthetic microsecond values.
 
-use std::collections::HashMap;
-
 use crate::atc::{AtcConfig, AtcEngine, AtcSubsystem, LivenessAction, LivenessState};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1979,7 +1977,7 @@ fn scenario_cusum_regime_change() -> ScenarioManifest {
     }
 
     // Sudden regime shift to high error rate.
-    for i in 0..30 {
+    for _i in 0..30 {
         events.push(ScenarioEvent::CalibrationOutcome {
             correct: false,
             subsystem: AtcSubsystem::Liveness,

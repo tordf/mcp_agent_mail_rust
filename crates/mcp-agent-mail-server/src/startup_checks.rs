@@ -1877,9 +1877,17 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
 
     // Capture live DB family, lock holders, and process inventory *before*
     // any repair or reconstruct mutates the mailbox state.
-    let _pre_snapshot =
+    let pre_snapshot =
         mcp_agent_mail_db::capture_pre_recovery_snapshot(&db_path, "startup-integrity")
             .with_environment(storage_root, &config.database_url);
+    tracing::info!(
+        trigger = pre_snapshot.trigger,
+        db_bytes = ?pre_snapshot.db_bytes,
+        wal_bytes = ?pre_snapshot.wal_bytes,
+        holders = pre_snapshot.process_holders.len(),
+        recovery_lock_active = pre_snapshot.recovery_lock_active,
+        "startup pre-recovery snapshot captured"
+    );
 
     let result = if storage_root.is_dir() {
         mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(&db_path, storage_root)

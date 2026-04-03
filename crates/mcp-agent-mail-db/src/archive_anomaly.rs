@@ -743,7 +743,7 @@ pub const ALL_ANOMALY_TAGS: &[&str] = &[
 // Archive anomaly scanner
 // ============================================================================
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Required frontmatter fields for a complete message.

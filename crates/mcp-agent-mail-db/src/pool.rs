@@ -1019,8 +1019,8 @@ impl DeferredWriteQueue {
 
         // Hard-stop: oldest entry exceeded max age → recovery is stalled.
         if let Some(oldest) = inner.entries.first() {
-            let age_us = now_us.saturating_sub(oldest.deferred_at_us);
-            let age_secs = (age_us / 1_000_000) as u64;
+            let age_us = now_us.saturating_sub(oldest.deferred_at_us).max(0);
+            let age_secs = u64::try_from(age_us / 1_000_000).unwrap_or(0);
             if age_secs > inner.policy.max_age_secs {
                 inner.shed_count = inner.shed_count.saturating_add(1);
                 return DeferralOutcome::HardStopAge {
@@ -1197,8 +1197,8 @@ fn oldest_entry_age_secs(inner: &DeferredWriteQueueInner) -> u64 {
     match inner.entries.first() {
         Some(oldest) => {
             let now_us = crate::now_micros();
-            let age_us = now_us.saturating_sub(oldest.deferred_at_us);
-            (age_us / 1_000_000) as u64
+            let age_us = now_us.saturating_sub(oldest.deferred_at_us).max(0);
+            u64::try_from(age_us / 1_000_000).unwrap_or(0)
         }
         None => 0,
     }
@@ -3886,9 +3886,18 @@ fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
     let storage_root_path = config.storage_root.as_path();
 
     // Capture pre-recovery snapshot before any mutation.
-    let _snapshot =
+    let snapshot =
         crate::forensics::capture_pre_recovery_snapshot(primary_path, "automatic-recovery")
             .with_environment(storage_root_path, &config.database_url);
+    tracing::info!(
+        trigger = snapshot.trigger,
+        db_bytes = ?snapshot.db_bytes,
+        wal_bytes = ?snapshot.wal_bytes,
+        holders = snapshot.process_holders.len(),
+        locks = snapshot.file_locks.len(),
+        recovery_lock_active = snapshot.recovery_lock_active,
+        "pre-recovery snapshot captured"
+    );
     if is_real_directory(storage_root_path) {
         return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
     }
