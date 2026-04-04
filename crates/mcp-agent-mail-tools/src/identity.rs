@@ -1782,6 +1782,7 @@ mod tests {
             integrity: None,
             semantic_indexing: None,
             two_tier_indexing: None,
+            recovery: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -2223,6 +2224,7 @@ mod tests {
             integrity: None,
             semantic_indexing: None,
             two_tier_indexing: None,
+            recovery: None,
         };
         let json_str = serde_json::to_string(&r).unwrap();
         assert!(!json_str.contains("pool_utilization"));
@@ -2231,6 +2233,7 @@ mod tests {
         assert!(!json_str.contains("integrity"));
         assert!(!json_str.contains("semantic_indexing"));
         assert!(!json_str.contains("two_tier_indexing"));
+        assert!(!json_str.contains("recovery"));
     }
 
     #[test]
