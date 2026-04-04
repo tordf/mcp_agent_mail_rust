@@ -13413,7 +13413,12 @@ fn doctor_ordered_checks<'a>(
         } else {
             3
         };
-        (category_bucket, status_bucket, doctor_check_priority(check_name), *index)
+        (
+            category_bucket,
+            status_bucket,
+            doctor_check_priority(check_name),
+            *index,
+        )
     });
     ordered.into_iter().map(|(_, check)| check).collect()
 }
@@ -16526,7 +16531,11 @@ fn handle_doctor_check_with(
 
     // Output — enrich each check with its category before building the payload.
     for check in &mut checks {
-        if let Some(name) = check.get("check").and_then(|v| v.as_str()).map(String::from) {
+        if let Some(name) = check
+            .get("check")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        {
             if let Some(obj) = check.as_object_mut() {
                 obj.insert(
                     "category".to_string(),
@@ -16537,14 +16546,8 @@ fn handle_doctor_check_with(
     }
 
     let all_ok = checks.iter().all(|c| c["status"] != "fail");
-    let fail_count = checks
-        .iter()
-        .filter(|c| c["status"] == "fail")
-        .count();
-    let warn_count = checks
-        .iter()
-        .filter(|c| c["status"] == "warn")
-        .count();
+    let fail_count = checks.iter().filter(|c| c["status"] == "fail").count();
+    let warn_count = checks.iter().filter(|c| c["status"] == "warn").count();
     let database_fix_strategy = doctor_database_fix_strategy(database_url, storage_root).ok();
     let summary = build_doctor_check_summary(
         &checks,
@@ -16569,21 +16572,28 @@ fn handle_doctor_check_with(
                 if p.exists() {
                     diagnostic_artifacts.push(
                         ArtifactPointer::referenced("sqlite_db", &resolved, "SQLite database")
-                            .with_detail(format!("bytes={}", p.metadata().map(|m| m.len()).unwrap_or(0))),
+                            .with_detail(format!(
+                                "bytes={}",
+                                p.metadata().map(|m| m.len()).unwrap_or(0)
+                            )),
                     );
                     // WAL sidecar
                     let wal_path = format!("{resolved}-wal");
                     if Path::new(&wal_path).exists() {
-                        diagnostic_artifacts.push(
-                            ArtifactPointer::referenced("wal_sidecar", &wal_path, "WAL sidecar"),
-                        );
+                        diagnostic_artifacts.push(ArtifactPointer::referenced(
+                            "wal_sidecar",
+                            &wal_path,
+                            "WAL sidecar",
+                        ));
                     }
                     // SHM sidecar
                     let shm_path = format!("{resolved}-shm");
                     if Path::new(&shm_path).exists() {
-                        diagnostic_artifacts.push(
-                            ArtifactPointer::referenced("shm_sidecar", &shm_path, "SHM sidecar"),
-                        );
+                        diagnostic_artifacts.push(ArtifactPointer::referenced(
+                            "shm_sidecar",
+                            &shm_path,
+                            "SHM sidecar",
+                        ));
                     }
                 } else {
                     diagnostic_artifacts.push(
@@ -16598,26 +16608,22 @@ fn handle_doctor_check_with(
 
     // Storage root (archive) pointer.
     if storage_root.exists() {
-        diagnostic_artifacts.push(
-            ArtifactPointer::referenced(
-                "archive_root",
-                &storage_root.display().to_string(),
-                "Git mailbox archive root",
-            ),
-        );
+        diagnostic_artifacts.push(ArtifactPointer::referenced(
+            "archive_root",
+            &storage_root.display().to_string(),
+            "Git mailbox archive root",
+        ));
     }
 
     // Forensic bundles directory pointer.
     {
         let forensics_dir = storage_root.join("doctor").join("forensics");
         if forensics_dir.exists() {
-            diagnostic_artifacts.push(
-                ArtifactPointer::referenced(
-                    "forensic_bundles_dir",
-                    &forensics_dir.display().to_string(),
-                    "Forensic bundles directory",
-                ),
-            );
+            diagnostic_artifacts.push(ArtifactPointer::referenced(
+                "forensic_bundles_dir",
+                &forensics_dir.display().to_string(),
+                "Forensic bundles directory",
+            ));
         }
     }
 
@@ -16625,13 +16631,11 @@ fn handle_doctor_check_with(
     {
         let reports_dir = storage_root.join("doctor").join("reports");
         if reports_dir.exists() {
-            diagnostic_artifacts.push(
-                ArtifactPointer::referenced(
-                    "doctor_reports_dir",
-                    &reports_dir.display().to_string(),
-                    "Doctor scan reports directory",
-                ),
-            );
+            diagnostic_artifacts.push(ArtifactPointer::referenced(
+                "doctor_reports_dir",
+                &reports_dir.display().to_string(),
+                "Doctor scan reports directory",
+            ));
         }
     }
 
@@ -16639,13 +16643,11 @@ fn handle_doctor_check_with(
     {
         let backups_dir = storage_root.join("backups");
         if backups_dir.exists() {
-            diagnostic_artifacts.push(
-                ArtifactPointer::referenced(
-                    "backups_dir",
-                    &backups_dir.display().to_string(),
-                    "Database backups directory",
-                ),
-            );
+            diagnostic_artifacts.push(ArtifactPointer::referenced(
+                "backups_dir",
+                &backups_dir.display().to_string(),
+                "Database backups directory",
+            ));
         }
     }
 
@@ -16728,12 +16730,7 @@ fn handle_doctor_check_with(
             } else {
                 String::new()
             };
-            ftui_runtime::ftui_println!(
-                "  [{}] {}{}",
-                icon,
-                check_name,
-                detail
-            );
+            ftui_runtime::ftui_println!("  [{}] {}{}", icon, check_name, detail);
         }
         if all_ok {
             ftui_runtime::ftui_println!("All checks passed.");
@@ -27934,13 +27931,8 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
             ],
             || {
-                handle_doctor_archive_normalize(
-                    false,
-                    true,
-                    false,
-                    NormalizeApplyMode::Quarantine,
-                )
-                .expect("archive normalization should succeed");
+                handle_doctor_archive_normalize(false, true, false, NormalizeApplyMode::Quarantine)
+                    .expect("archive normalization should succeed");
             },
         );
 
@@ -27998,13 +27990,8 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
             ],
             || {
-                handle_doctor_archive_normalize(
-                    false,
-                    true,
-                    false,
-                    NormalizeApplyMode::Quarantine,
-                )
-                .expect("archive normalization should succeed");
+                handle_doctor_archive_normalize(false, true, false, NormalizeApplyMode::Quarantine)
+                    .expect("archive normalization should succeed");
             },
         );
 
@@ -28051,13 +28038,8 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
             ],
             || {
-                handle_doctor_archive_normalize(
-                    false,
-                    true,
-                    false,
-                    NormalizeApplyMode::Annotate,
-                )
-                .expect("archive normalization in annotate mode should succeed");
+                handle_doctor_archive_normalize(false, true, false, NormalizeApplyMode::Annotate)
+                    .expect("archive normalization in annotate mode should succeed");
             },
         );
 
@@ -41658,13 +41640,11 @@ fn handle_doctor_archive_scan(
     let mut scan_artifacts: Vec<ArtifactPointer> = Vec::new();
 
     // Archive root pointer.
-    scan_artifacts.push(
-        ArtifactPointer::referenced(
-            "archive_root",
-            &storage_root.display().to_string(),
-            "Git mailbox archive root",
-        ),
-    );
+    scan_artifacts.push(ArtifactPointer::referenced(
+        "archive_root",
+        &storage_root.display().to_string(),
+        "Git mailbox archive root",
+    ));
 
     // Projects directory pointer.
     {
@@ -41678,9 +41658,7 @@ fn handle_doctor_archive_scan(
                 )
                 .with_detail(format!(
                     "projects={}, agents={}, messages={}",
-                    report.inventory.projects,
-                    report.inventory.agents,
-                    report.inventory.messages,
+                    report.inventory.projects, report.inventory.agents, report.inventory.messages,
                 )),
             );
         }
@@ -41690,13 +41668,11 @@ fn handle_doctor_archive_scan(
     {
         let forensics_dir = storage_root.join("doctor").join("forensics");
         if forensics_dir.exists() {
-            scan_artifacts.push(
-                ArtifactPointer::referenced(
-                    "forensic_bundles_dir",
-                    &forensics_dir.display().to_string(),
-                    "Forensic bundles directory",
-                ),
-            );
+            scan_artifacts.push(ArtifactPointer::referenced(
+                "forensic_bundles_dir",
+                &forensics_dir.display().to_string(),
+                "Forensic bundles directory",
+            ));
         }
     }
 
@@ -41704,13 +41680,11 @@ fn handle_doctor_archive_scan(
     {
         let reports_dir = storage_root.join("doctor").join("reports");
         if reports_dir.exists() {
-            scan_artifacts.push(
-                ArtifactPointer::referenced(
-                    "doctor_reports_dir",
-                    &reports_dir.display().to_string(),
-                    "Doctor scan reports directory",
-                ),
-            );
+            scan_artifacts.push(ArtifactPointer::referenced(
+                "doctor_reports_dir",
+                &reports_dir.display().to_string(),
+                "Doctor scan reports directory",
+            ));
         }
     }
 
@@ -41725,13 +41699,11 @@ fn handle_doctor_archive_scan(
             if db_path != ":memory:" {
                 let resolved = resolve_sqlite_path_with_absolute_candidate(&db_path);
                 if Path::new(&resolved).exists() {
-                    scan_artifacts.push(
-                        ArtifactPointer::referenced(
-                            "sqlite_db",
-                            &resolved,
-                            "SQLite database (archive cross-reference)",
-                        ),
-                    );
+                    scan_artifacts.push(ArtifactPointer::referenced(
+                        "sqlite_db",
+                        &resolved,
+                        "SQLite database (archive cross-reference)",
+                    ));
                 }
             }
         }
@@ -41741,13 +41713,11 @@ fn handle_doctor_archive_scan(
     {
         let quarantine_dir = storage_root.join("doctor").join("quarantine");
         if quarantine_dir.exists() {
-            scan_artifacts.push(
-                ArtifactPointer::referenced(
-                    "quarantine_dir",
-                    &quarantine_dir.display().to_string(),
-                    "Quarantined duplicate files directory",
-                ),
-            );
+            scan_artifacts.push(ArtifactPointer::referenced(
+                "quarantine_dir",
+                &quarantine_dir.display().to_string(),
+                "Quarantined duplicate files directory",
+            ));
         }
     }
 
@@ -41920,8 +41890,7 @@ fn handle_doctor_archive_normalize(
                     result.duplicate_files_quarantined += 1;
                 }
                 NormalizeApplyMode::Annotate => {
-                    let sidecar_path =
-                        normalization_annotation_sidecar_path(&duplicate_path);
+                    let sidecar_path = normalization_annotation_sidecar_path(&duplicate_path);
                     let annotation_detail = format!(
                         "keep {}; annotate duplicate at {}",
                         group.keep,

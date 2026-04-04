@@ -84,7 +84,10 @@ impl ReplayDiffReport {
 
     fn assert_clean(&self) {
         if !self.is_clean() {
-            let mut report = format!("Replay diff report for '{}' has mismatches:\n", self.scenario);
+            let mut report = format!(
+                "Replay diff report for '{}' has mismatches:\n",
+                self.scenario
+            );
             for mismatch in &self.mismatches {
                 report.push_str(&format!("  {mismatch}\n"));
             }
@@ -174,7 +177,8 @@ fn write_agent_profile(
 
 /// Create a minimal salvage database with the given tables and data.
 fn create_salvage_db(path: &Path) -> SqliteDbConn {
-    let conn = SqliteDbConn::open_file(path.to_str().expect("valid path")).expect("open salvage db");
+    let conn =
+        SqliteDbConn::open_file(path.to_str().expect("valid path")).expect("open salvage db");
     conn.execute_raw(
         "CREATE TABLE projects (
             id INTEGER PRIMARY KEY,
@@ -248,8 +252,8 @@ struct DbSnapshot {
 }
 
 fn snapshot_db(db_path: &Path) -> DbSnapshot {
-    let conn =
-        SqliteDbConn::open_file(db_path.to_str().expect("valid path")).expect("open reconstructed db");
+    let conn = SqliteDbConn::open_file(db_path.to_str().expect("valid path"))
+        .expect("open reconstructed db");
 
     let project_rows = conn
         .query_sync("SELECT id, slug, human_key FROM projects ORDER BY id", &[])
@@ -283,10 +287,7 @@ fn snapshot_db(db_path: &Path) -> DbSnapshot {
         .collect();
 
     let msg_rows = conn
-        .query_sync(
-            "SELECT id, subject, body_md FROM messages ORDER BY id",
-            &[],
-        )
+        .query_sync("SELECT id, subject, body_md FROM messages ORDER BY id", &[])
         .unwrap_or_default();
     let messages: Vec<(i64, String, String)> = msg_rows
         .iter()
@@ -355,7 +356,13 @@ fn snapshot_db(db_path: &Path) -> DbSnapshot {
 fn build_standard_archive(storage_root: &Path) {
     // Project A: proj-alpha with agents Alice and Bob, 3 messages
     write_project_metadata(storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     write_agent_profile(storage_root, "proj-alpha", "Bob", "codex", "o3-pro");
 
     write_archive_message(
@@ -460,10 +467,16 @@ fn replay_clean_reconstruct_from_archive() {
     .expect("forensic bundle capture");
 
     // Verify bundle has the expected structure
-    assert!(bundle_dir.join("manifest.json").exists(), "manifest missing");
+    assert!(
+        bundle_dir.join("manifest.json").exists(),
+        "manifest missing"
+    );
     assert!(bundle_dir.join("summary.json").exists(), "summary missing");
     assert!(
-        bundle_dir.join("references").join("archive-drift.json").exists(),
+        bundle_dir
+            .join("references")
+            .join("archive-drift.json")
+            .exists(),
         "archive-drift reference missing"
     );
 
@@ -497,25 +510,45 @@ fn replay_clean_reconstruct_from_archive() {
         report.add_mismatch("stats", "messages", "4", &stats.messages.to_string());
     }
     if stats.parse_errors != 0 {
-        report.add_mismatch("stats", "parse_errors", "0", &stats.parse_errors.to_string());
+        report.add_mismatch(
+            "stats",
+            "parse_errors",
+            "0",
+            &stats.parse_errors.to_string(),
+        );
     }
 
     // Verify DB contents match expected outcomes
     let snapshot = snapshot_db(&db_path);
 
     if snapshot.projects.len() != 2 {
-        report.add_mismatch("db", "project_count", "2", &snapshot.projects.len().to_string());
+        report.add_mismatch(
+            "db",
+            "project_count",
+            "2",
+            &snapshot.projects.len().to_string(),
+        );
     }
     if snapshot.agents.len() != 3 {
         report.add_mismatch("db", "agent_count", "3", &snapshot.agents.len().to_string());
     }
     if snapshot.messages.len() != 4 {
-        report.add_mismatch("db", "message_count", "4", &snapshot.messages.len().to_string());
+        report.add_mismatch(
+            "db",
+            "message_count",
+            "4",
+            &snapshot.messages.len().to_string(),
+        );
     }
 
     // Check specific messages
     let subjects: Vec<&str> = snapshot.messages.iter().map(|m| m.1.as_str()).collect();
-    for expected_subject in &["Hello from Alice", "Reply from Bob", "March update", "Self-note"] {
+    for expected_subject in &[
+        "Hello from Alice",
+        "Reply from Bob",
+        "March update",
+        "Self-note",
+    ] {
         if !subjects.contains(expected_subject) {
             report.add_mismatch("messages", "subject", expected_subject, "<missing>");
         }
@@ -527,7 +560,12 @@ fn replay_clean_reconstruct_from_archive() {
         .iter()
         .any(|a| a.1 == "Alice" && a.2 == "proj-alpha");
     if !alice_in_alpha {
-        report.add_mismatch("agents", "Alice project", "proj-alpha", "<wrong or missing>");
+        report.add_mismatch(
+            "agents",
+            "Alice project",
+            "proj-alpha",
+            "<wrong or missing>",
+        );
     }
     let carol_in_beta = snapshot
         .agents
@@ -554,8 +592,8 @@ fn replay_clean_reconstruct_from_archive() {
     }
 
     // Archive drift against the reconstructed DB should show zero drift
-    let drift = compute_archive_drift_report(&storage_root, &db_path)
-        .expect("drift report should succeed");
+    let drift =
+        compute_archive_drift_report(&storage_root, &db_path).expect("drift report should succeed");
     if drift.has_message_drift() {
         report.add_mismatch(
             "drift",
@@ -584,7 +622,13 @@ fn replay_salvage_merge_reconstruction() {
 
     // Archive has Alice and Bob in proj-alpha with messages 1 and 2
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     write_agent_profile(&storage_root, "proj-alpha", "Bob", "codex", "o3-pro");
 
     write_archive_message(
@@ -711,18 +755,18 @@ fn replay_salvage_merge_reconstruction() {
     // DB should have all 3 messages
     let snapshot = snapshot_db(&db_path);
     if snapshot.messages.len() != 3 {
-        report.add_mismatch("db", "message_count", "3", &snapshot.messages.len().to_string());
+        report.add_mismatch(
+            "db",
+            "message_count",
+            "3",
+            &snapshot.messages.len().to_string(),
+        );
     }
 
     // DB-only message subject should be present
     let has_db_only = snapshot.messages.iter().any(|m| m.1 == "DB-only msg");
     if !has_db_only {
-        report.add_mismatch(
-            "messages",
-            "DB-only msg",
-            "present",
-            "<missing>",
-        );
+        report.add_mismatch("messages", "DB-only msg", "present", "<missing>");
     }
 
     // Dave should be in the agents list (salvaged)
@@ -732,9 +776,10 @@ fn replay_salvage_merge_reconstruction() {
     }
 
     // Agent links should include Alice -> Bob
-    let has_link = snapshot.agent_links.iter().any(|l| {
-        l.1 == "Alice" && l.2 == "Bob" && l.3 == "allowed"
-    });
+    let has_link = snapshot
+        .agent_links
+        .iter()
+        .any(|l| l.1 == "Alice" && l.2 == "Bob" && l.3 == "allowed");
     if !has_link {
         report.add_mismatch(
             "agent_links",
@@ -745,8 +790,8 @@ fn replay_salvage_merge_reconstruction() {
     }
 
     // Verify read_ts/ack_ts were merged from salvage
-    let conn =
-        SqliteDbConn::open_file(db_path.to_str().expect("valid path")).expect("open reconstructed db");
+    let conn = SqliteDbConn::open_file(db_path.to_str().expect("valid path"))
+        .expect("open reconstructed db");
     let bob_recipient = conn
         .query_sync(
             "SELECT mr.read_ts, mr.ack_ts
@@ -792,7 +837,13 @@ fn replay_drift_detection_archive_ahead() {
 
     // Build archive with 3 messages
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     write_agent_profile(&storage_root, "proj-alpha", "Bob", "codex", "o3-pro");
 
     for i in 1..=3 {
@@ -815,15 +866,24 @@ fn replay_drift_detection_archive_ahead() {
     }
 
     // Reconstruct DB with only message 1 (simulating a lagging DB)
-    let stats = reconstruct_from_archive(&db_path, &storage_root)
-        .expect("reconstruct should succeed");
-    assert_eq!(stats.messages, 3, "should have reconstructed all 3 messages");
+    let stats =
+        reconstruct_from_archive(&db_path, &storage_root).expect("reconstruct should succeed");
+    assert_eq!(
+        stats.messages, 3,
+        "should have reconstructed all 3 messages"
+    );
 
     // Now create a second DB that only has message 1 (to simulate drift)
     let drift_db_path = tmp.path().join("lagging.db");
     let lagging_storage = tmp.path().join("lagging-storage");
     write_project_metadata(&lagging_storage, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&lagging_storage, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &lagging_storage,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     write_agent_profile(&lagging_storage, "proj-alpha", "Bob", "codex", "o3-pro");
     write_archive_message(
         &lagging_storage,
@@ -894,7 +954,13 @@ fn replay_drift_detection_db_ahead() {
 
     // Archive has 1 message
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     write_archive_message(
         &storage_root,
         "proj-alpha",
@@ -916,7 +982,13 @@ fn replay_drift_detection_db_ahead() {
     let db_path = tmp.path().join("db-ahead.db");
     let full_storage = tmp.path().join("full-storage");
     write_project_metadata(&full_storage, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&full_storage, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &full_storage,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     for i in 1..=3 {
         write_archive_message(
             &full_storage,
@@ -935,12 +1007,11 @@ fn replay_drift_detection_db_ahead() {
             &format!("Body {i}."),
         );
     }
-    reconstruct_from_archive(&db_path, &full_storage)
-        .expect("full reconstruct should succeed");
+    reconstruct_from_archive(&db_path, &full_storage).expect("full reconstruct should succeed");
 
     // Drift: small archive vs full DB
-    let drift = compute_archive_drift_report(&storage_root, &db_path)
-        .expect("drift report should succeed");
+    let drift =
+        compute_archive_drift_report(&storage_root, &db_path).expect("drift report should succeed");
 
     assert!(
         drift.has_message_drift(),
@@ -966,7 +1037,13 @@ fn replay_corrupt_salvage_degrades_gracefully() {
 
     // Build a minimal archive
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     write_archive_message(
         &storage_root,
         "proj-alpha",
@@ -985,7 +1062,8 @@ fn replay_corrupt_salvage_degrades_gracefully() {
     );
 
     // Write garbage bytes as the salvage DB
-    std::fs::write(&salvage_db_path, b"THIS IS NOT A SQLITE DATABASE").expect("write corrupt salvage");
+    std::fs::write(&salvage_db_path, b"THIS IS NOT A SQLITE DATABASE")
+        .expect("write corrupt salvage");
 
     // Should succeed (salvage is skipped with a warning, not fatal)
     let stats =
@@ -995,7 +1073,10 @@ fn replay_corrupt_salvage_degrades_gracefully() {
     assert_eq!(stats.projects, 1);
     assert_eq!(stats.agents, 1);
     assert_eq!(stats.messages, 1);
-    assert_eq!(stats.salvaged_projects, 0, "corrupt salvage should not contribute");
+    assert_eq!(
+        stats.salvaged_projects, 0,
+        "corrupt salvage should not contribute"
+    );
     assert_eq!(stats.salvaged_agents, 0);
     assert_eq!(stats.salvaged_messages, 0);
     assert!(
@@ -1021,7 +1102,13 @@ fn replay_no_salvage_path_is_clean_reconstruct() {
     let storage_root = tmp.path().join("storage");
 
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     write_archive_message(
         &storage_root,
         "proj-alpha",
@@ -1116,7 +1203,12 @@ fn replay_archive_inventory_matches_expected_counts() {
 
     let mut report = ReplayDiffReport::new("archive-inventory");
     if inventory.projects != 2 {
-        report.add_mismatch("inventory", "projects", "2", &inventory.projects.to_string());
+        report.add_mismatch(
+            "inventory",
+            "projects",
+            "2",
+            &inventory.projects.to_string(),
+        );
     }
     if inventory.agents != 3 {
         report.add_mismatch("inventory", "agents", "3", &inventory.agents.to_string());
@@ -1159,7 +1251,13 @@ fn replay_duplicate_canonical_messages_are_deduplicated() {
     let storage_root = tmp.path().join("storage");
 
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
 
     // Write the same message ID twice in different files
     write_archive_message(
@@ -1219,7 +1317,13 @@ fn replay_malformed_archive_messages_produce_parse_errors() {
     let storage_root = tmp.path().join("storage");
 
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
 
     // Valid message
     write_archive_message(
@@ -1262,7 +1366,10 @@ fn replay_malformed_archive_messages_produce_parse_errors() {
     let stats = reconstruct_from_archive(&db_path, &storage_root)
         .expect("should succeed despite malformed messages");
 
-    assert_eq!(stats.messages, 1, "only the good message should be ingested");
+    assert_eq!(
+        stats.messages, 1,
+        "only the good message should be ingested"
+    );
     assert!(
         stats.parse_errors >= 1,
         "should report parse errors for malformed messages; got {}",
@@ -1310,8 +1417,7 @@ fn replay_full_round_trip_capture_reconstruct_verify() {
     )
     .expect("parse manifest");
     assert_eq!(
-        bundle_manifest["artifacts"]["sqlite"]["db"]["status"],
-        "captured",
+        bundle_manifest["artifacts"]["sqlite"]["db"]["status"], "captured",
         "bundle should contain captured SQLite file"
     );
 
@@ -1446,12 +1552,17 @@ fn replay_interrupted_bundle_still_has_valid_metadata() {
     let storage_root = tmp.path().join("storage");
 
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
 
     // Create a real DB to capture
     let db_path = tmp.path().join("original.db");
-    reconstruct_from_archive(&db_path, &storage_root)
-        .expect("initial reconstruct should succeed");
+    reconstruct_from_archive(&db_path, &storage_root).expect("initial reconstruct should succeed");
 
     // Capture a bundle
     let bundle_dir = capture_mailbox_forensic_bundle(MailboxForensicCapture {
@@ -1467,7 +1578,10 @@ fn replay_interrupted_bundle_still_has_valid_metadata() {
     // Simulate interruption: truncate the SQLite copy in the bundle
     let sqlite_dir = bundle_dir.join("sqlite");
     if sqlite_dir.is_dir() {
-        for entry in std::fs::read_dir(&sqlite_dir).expect("read sqlite dir").flatten() {
+        for entry in std::fs::read_dir(&sqlite_dir)
+            .expect("read sqlite dir")
+            .flatten()
+        {
             let path = entry.path();
             if path.is_file() {
                 // Truncate to 10 bytes (corrupt the bundle's SQLite copy)
@@ -1498,13 +1612,17 @@ fn replay_interrupted_bundle_still_has_valid_metadata() {
 
     // Archive drift reference should still be readable
     let drift_ref_path = bundle_dir.join("references").join("archive-drift.json");
-    assert!(drift_ref_path.exists(), "archive drift reference should exist");
-    let drift_ref: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&drift_ref_path).expect("read drift ref"),
-    )
-    .expect("parse drift ref");
     assert!(
-        drift_ref["archive"]["storage_root_exists"].as_bool().unwrap_or(false),
+        drift_ref_path.exists(),
+        "archive drift reference should exist"
+    );
+    let drift_ref: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&drift_ref_path).expect("read drift ref"))
+            .expect("parse drift ref");
+    assert!(
+        drift_ref["archive"]["storage_root_exists"]
+            .as_bool()
+            .unwrap_or(false),
         "archive drift ref should record storage root exists"
     );
 }
@@ -1541,7 +1659,13 @@ fn replay_cc_bcc_recipients_are_preserved() {
     let storage_root = tmp.path().join("storage");
 
     write_project_metadata(&storage_root, "proj-alpha", "/home/user/proj-alpha");
-    write_agent_profile(&storage_root, "proj-alpha", "Alice", "claude-code", "opus-4.6");
+    write_agent_profile(
+        &storage_root,
+        "proj-alpha",
+        "Alice",
+        "claude-code",
+        "opus-4.6",
+    );
     write_agent_profile(&storage_root, "proj-alpha", "Bob", "codex", "o3-pro");
     write_agent_profile(&storage_root, "proj-alpha", "Carol", "aider", "sonnet-4");
 
@@ -1563,8 +1687,8 @@ fn replay_cc_bcc_recipients_are_preserved() {
         "Message with to and cc.",
     );
 
-    let stats = reconstruct_from_archive(&db_path, &storage_root)
-        .expect("reconstruct should succeed");
+    let stats =
+        reconstruct_from_archive(&db_path, &storage_root).expect("reconstruct should succeed");
 
     assert_eq!(stats.messages, 1);
     // Bob (to) + Carol (cc) = 2 recipients
@@ -1582,9 +1706,19 @@ fn replay_cc_bcc_recipients_are_preserved() {
         .map(|r| (r.1.as_str(), r.2.as_str()))
         .collect();
 
-    let has_bob_to = msg1_recipients.iter().any(|(name, kind)| *name == "Bob" && *kind == "to");
-    let has_carol_cc = msg1_recipients.iter().any(|(name, kind)| *name == "Carol" && *kind == "cc");
+    let has_bob_to = msg1_recipients
+        .iter()
+        .any(|(name, kind)| *name == "Bob" && *kind == "to");
+    let has_carol_cc = msg1_recipients
+        .iter()
+        .any(|(name, kind)| *name == "Carol" && *kind == "cc");
 
-    assert!(has_bob_to, "Bob should be a 'to' recipient; got: {msg1_recipients:?}");
-    assert!(has_carol_cc, "Carol should be a 'cc' recipient; got: {msg1_recipients:?}");
+    assert!(
+        has_bob_to,
+        "Bob should be a 'to' recipient; got: {msg1_recipients:?}"
+    );
+    assert!(
+        has_carol_cc,
+        "Carol should be a 'cc' recipient; got: {msg1_recipients:?}"
+    );
 }

@@ -1628,8 +1628,8 @@ mod tests {
     use super::*;
     use crate::metrics::{
         CanaryMetricsSnapshot, DbMetricsSnapshot, GlobalMetricsSnapshot, HistogramSnapshot,
-        HttpMetricsSnapshot, SearchMetricsSnapshot, StorageMetricsSnapshot,
-        SystemMetricsSnapshot, ToolsMetricsSnapshot,
+        HttpMetricsSnapshot, SearchMetricsSnapshot, StorageMetricsSnapshot, SystemMetricsSnapshot,
+        ToolsMetricsSnapshot,
     };
     use std::sync::Mutex;
     use std::thread;

@@ -93,7 +93,8 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
         DurabilityState::Healthy => "No action required".to_string(),
         DurabilityState::DegradedReadOnly => {
             if recovery_lock.active {
-                "Recovery in progress; wait for completion or check recovery lock holder".to_string()
+                "Recovery in progress; wait for completion or check recovery lock holder"
+                    .to_string()
             } else {
                 "Run `am doctor repair` to attempt automatic recovery".to_string()
             }
@@ -124,7 +125,10 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
 }
 
 /// Find the most recently created forensic bundle directory.
-fn find_latest_forensic_bundle(storage_root: &std::path::Path, db_path: &std::path::Path) -> Option<String> {
+fn find_latest_forensic_bundle(
+    storage_root: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Option<String> {
     let forensics_dir = if storage_root.is_dir() {
         storage_root.join("doctor").join("forensics")
     } else {
@@ -463,10 +467,8 @@ fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &ser
 /// rerouted clone of `config`.  Returns `None` when no reroute is needed
 /// (production path, or operator already set a custom `STORAGE_ROOT`).
 fn maybe_reroute_ephemeral_storage(config: &Config, human_key: &str) -> Option<Config> {
-    let isolated = mcp_agent_mail_core::config::compute_ephemeral_storage_root(
-        Path::new(human_key),
-        config,
-    )?;
+    let isolated =
+        mcp_agent_mail_core::config::compute_ephemeral_storage_root(Path::new(human_key), config)?;
 
     tracing::info!(
         human_key,
@@ -2029,7 +2031,10 @@ mod tests {
         config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
 
         let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
-        assert!(rerouted.is_some(), "tmp project should trigger auto-reroute");
+        assert!(
+            rerouted.is_some(),
+            "tmp project should trigger auto-reroute"
+        );
         let rerouted = rerouted.unwrap();
         assert_ne!(rerouted.storage_root, config.storage_root);
         assert!(
@@ -2064,10 +2069,7 @@ mod tests {
 
         // Deny mode treats all contexts as production, so no reroute
         let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
-        assert!(
-            rerouted.is_none(),
-            "deny mode should skip auto-reroute"
-        );
+        assert!(rerouted.is_none(), "deny mode should skip auto-reroute");
     }
 
     #[test]

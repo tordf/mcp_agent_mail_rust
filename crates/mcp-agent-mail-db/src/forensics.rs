@@ -10,8 +10,8 @@ use crate::{
         inspect_mailbox_db_inventory, inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state,
     },
     reconstruct::{
-        ArchiveMessageInventory, archive_missing_project_identities,
-        compute_archive_drift_report, scan_archive_message_inventory,
+        ArchiveMessageInventory, archive_missing_project_identities, compute_archive_drift_report,
+        scan_archive_message_inventory,
     },
 };
 use serde::Serialize;
@@ -1166,7 +1166,10 @@ mod tests {
         let snap = capture_pre_recovery_snapshot(&db_path, "corrupt");
 
         assert_eq!(snap.db_bytes, Some(25));
-        assert!(snap.page_size.is_none(), "non-sqlite header should yield None");
+        assert!(
+            snap.page_size.is_none(),
+            "non-sqlite header should yield None"
+        );
         assert!(snap.page_count.is_none());
     }
 
@@ -1200,7 +1203,10 @@ mod tests {
         let snap = capture_pre_recovery_snapshot(&db_path, "env-test")
             .with_environment(dir.path(), "sqlite:///secret@host/db.sqlite3");
 
-        assert_eq!(snap.storage_root.as_deref(), Some(dir.path().to_str().unwrap()));
+        assert_eq!(
+            snap.storage_root.as_deref(),
+            Some(dir.path().to_str().unwrap())
+        );
         assert_eq!(
             snap.database_url_redacted.as_deref(),
             Some("sqlite://****@host/db.sqlite3")
@@ -1223,7 +1229,10 @@ mod tests {
 
         let snap = capture_pre_recovery_snapshot(&db_path, "lock-test");
 
-        assert!(snap.recovery_lock_active, "should detect live recovery lock");
+        assert!(
+            snap.recovery_lock_active,
+            "should detect live recovery lock"
+        );
         assert_eq!(snap.recovery_lock_pid, Some(std::process::id()));
     }
 
@@ -1239,7 +1248,10 @@ mod tests {
 
         let snap = capture_pre_recovery_snapshot(&db_path, "stale-lock");
 
-        assert!(!snap.recovery_lock_active, "stale lock should not be active");
+        assert!(
+            !snap.recovery_lock_active,
+            "stale lock should not be active"
+        );
         assert_eq!(snap.recovery_lock_pid, Some(999_999_999));
     }
 

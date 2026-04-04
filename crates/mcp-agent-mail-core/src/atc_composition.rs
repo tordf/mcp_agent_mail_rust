@@ -228,9 +228,9 @@ impl Timescale {
     #[must_use]
     pub const fn hysteresis_hold_off_micros(self) -> i64 {
         match self {
-            Self::Fast => 500_000,        // 0.5 seconds
-            Self::Medium => 5_000_000,    // 5 seconds
-            Self::Slow => 30_000_000,     // 30 seconds
+            Self::Fast => 500_000,     // 0.5 seconds
+            Self::Medium => 5_000_000, // 5 seconds
+            Self::Slow => 30_000_000,  // 30 seconds
         }
     }
 }
@@ -393,11 +393,7 @@ pub const AUTHORITY_BOUNDARIES: [AuthorityBoundary; 14] = [
             "identifiability_debt_tracking",
         ],
         can_veto: &[],
-        must_not: &[
-            "modify_policy",
-            "release_reservations",
-            "force_reservation",
-        ],
+        must_not: &["modify_policy", "release_reservations", "force_reservation"],
         reads_from: &[
             ControllerId::AdmissibilityGates,
             ControllerId::FairnessGuards,
@@ -592,11 +588,7 @@ impl HysteresisGuard {
     /// If `proposed_state` is new, it enters the pending queue.  It will
     /// only commit once both the tick stability requirement AND the
     /// wall-clock hold-off have elapsed.
-    pub fn propose(
-        &mut self,
-        proposed_state: &str,
-        now_micros: i64,
-    ) -> HysteresisOutcome {
+    pub fn propose(&mut self, proposed_state: &str, now_micros: i64) -> HysteresisOutcome {
         // Already in the proposed state — cancel any pending reversal.
         if proposed_state == self.committed_state {
             if self.pending.is_some() {
@@ -615,8 +607,8 @@ impl HysteresisGuard {
                 self.pending_stable_ticks = self.pending_stable_ticks.saturating_add(1);
 
                 // Check both conditions for committing.
-                let wall_clock_ok = now_micros.saturating_sub(pending.proposed_at_micros)
-                    >= self.hold_off_micros;
+                let wall_clock_ok =
+                    now_micros.saturating_sub(pending.proposed_at_micros) >= self.hold_off_micros;
                 let tick_ok = self.pending_stable_ticks >= self.min_stable_ticks;
 
                 if wall_clock_ok && tick_ok {
@@ -1346,9 +1338,24 @@ mod tests {
             let timescale = controller.timescale();
             let order = controller.eval_order();
             match timescale {
-                Timescale::Fast => assert!(order < 50, "{} is fast but order {}", controller.as_str(), order),
-                Timescale::Medium => assert!((50..100).contains(&order), "{} is medium but order {}", controller.as_str(), order),
-                Timescale::Slow => assert!(order >= 100, "{} is slow but order {}", controller.as_str(), order),
+                Timescale::Fast => assert!(
+                    order < 50,
+                    "{} is fast but order {}",
+                    controller.as_str(),
+                    order
+                ),
+                Timescale::Medium => assert!(
+                    (50..100).contains(&order),
+                    "{} is medium but order {}",
+                    controller.as_str(),
+                    order
+                ),
+                Timescale::Slow => assert!(
+                    order >= 100,
+                    "{} is slow but order {}",
+                    controller.as_str(),
+                    order
+                ),
             }
         }
     }
@@ -1356,7 +1363,10 @@ mod tests {
     #[test]
     fn hysteresis_guard_no_change_for_same_state() {
         let mut guard = HysteresisGuard::new(ControllerId::CalibrationGuard, "nominal");
-        assert_eq!(guard.propose("nominal", 1_000_000), HysteresisOutcome::NoChange);
+        assert_eq!(
+            guard.propose("nominal", 1_000_000),
+            HysteresisOutcome::NoChange
+        );
         assert_eq!(guard.committed_state(), "nominal");
         assert!(!guard.has_pending());
     }
@@ -1368,7 +1378,10 @@ mod tests {
         let min_ticks = 2u64; // fast controllers need 2 stable ticks
 
         // First proposal: enters pending.
-        assert_eq!(guard.propose("safe_mode", 1_000_000), HysteresisOutcome::Pending);
+        assert_eq!(
+            guard.propose("safe_mode", 1_000_000),
+            HysteresisOutcome::Pending
+        );
         assert!(guard.has_pending());
         assert_eq!(guard.committed_state(), "nominal");
 
@@ -1386,10 +1399,16 @@ mod tests {
         let mut guard = HysteresisGuard::new(ControllerId::CalibrationGuard, "nominal");
 
         // Propose change.
-        assert_eq!(guard.propose("safe_mode", 1_000_000), HysteresisOutcome::Pending);
+        assert_eq!(
+            guard.propose("safe_mode", 1_000_000),
+            HysteresisOutcome::Pending
+        );
 
         // Reverse before hold-off expires.
-        assert_eq!(guard.propose("nominal", 1_100_000), HysteresisOutcome::Suppressed);
+        assert_eq!(
+            guard.propose("nominal", 1_100_000),
+            HysteresisOutcome::Suppressed
+        );
         assert!(!guard.has_pending());
         assert_eq!(guard.committed_state(), "nominal");
         assert_eq!(guard.suppressed_count(), 1);
@@ -1405,10 +1424,19 @@ mod tests {
         );
 
         // Need 3 ticks AND 10s hold-off.
-        assert_eq!(guard.propose("transitioning", 0), HysteresisOutcome::Pending);
-        assert_eq!(guard.propose("transitioning", 3_000_000), HysteresisOutcome::Pending);
+        assert_eq!(
+            guard.propose("transitioning", 0),
+            HysteresisOutcome::Pending
+        );
+        assert_eq!(
+            guard.propose("transitioning", 3_000_000),
+            HysteresisOutcome::Pending
+        );
         // Third tick at 10s mark should commit.
-        assert_eq!(guard.propose("transitioning", 10_000_000), HysteresisOutcome::Committed);
+        assert_eq!(
+            guard.propose("transitioning", 10_000_000),
+            HysteresisOutcome::Committed
+        );
         assert_eq!(guard.committed_state(), "transitioning");
     }
 
@@ -1417,9 +1445,15 @@ mod tests {
         let mut guard = HysteresisGuard::new(ControllerId::SlowController, "nominal");
 
         // Propose A.
-        assert_eq!(guard.propose("pressure", 1_000_000), HysteresisOutcome::Pending);
+        assert_eq!(
+            guard.propose("pressure", 1_000_000),
+            HysteresisOutcome::Pending
+        );
         // Propose B (different from A and from committed).
-        assert_eq!(guard.propose("conservative", 2_000_000), HysteresisOutcome::Pending);
+        assert_eq!(
+            guard.propose("conservative", 2_000_000),
+            HysteresisOutcome::Pending
+        );
         assert_eq!(guard.pending_state(), Some("conservative"));
         // The switch from A to B counted as a suppression.
         assert_eq!(guard.suppressed_count(), 1);
@@ -1448,13 +1482,11 @@ mod tests {
 
     #[test]
     fn veto_chain_multiple_vetoes() {
-        let result = evaluate_veto_chain("release_reservations", 0, &|id| {
-            match id {
-                ControllerId::CalibrationGuard => Some("safe mode".to_string()),
-                ControllerId::ConformalRiskBudget => Some("budget exhausted".to_string()),
-                ControllerId::FairnessGuards => Some("burden concentration".to_string()),
-                _ => None,
-            }
+        let result = evaluate_veto_chain("release_reservations", 0, &|id| match id {
+            ControllerId::CalibrationGuard => Some("safe mode".to_string()),
+            ControllerId::ConformalRiskBudget => Some("budget exhausted".to_string()),
+            ControllerId::FairnessGuards => Some("burden concentration".to_string()),
+            _ => None,
         });
         assert!(result.is_vetoed());
         // CalibrationGuard, ConformalRiskBudget, AdmissibilityGates, FairnessGuards
@@ -1578,6 +1610,9 @@ mod tests {
         assert_eq!(guard.committed_state(), "safe_mode");
 
         // Now check micros_since.
-        assert_eq!(guard.micros_since_last_transition(hold_off + 1_000_000), 1_000_000);
+        assert_eq!(
+            guard.micros_since_last_transition(hold_off + 1_000_000),
+            1_000_000
+        );
     }
 }

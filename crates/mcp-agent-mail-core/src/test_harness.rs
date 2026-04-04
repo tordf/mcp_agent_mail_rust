@@ -486,9 +486,7 @@ fn capitalize(s: &str) -> String {
 pub fn seed_from_env_or_random(test_name: &str) -> u64 {
     if let Ok(val) = std::env::var("HARNESS_SEED") {
         if let Ok(s) = val.parse::<u64>() {
-            eprintln!(
-                "[rerun] {test_name}: using HARNESS_SEED={s} (from environment)"
-            );
+            eprintln!("[rerun] {test_name}: using HARNESS_SEED={s} (from environment)");
             return s;
         }
     }
@@ -502,9 +500,7 @@ pub fn seed_from_env_or_random(test_name: &str) -> u64 {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(1, |d| d.as_nanos() as u64),
             );
-        eprintln!(
-            "[rerun] {test_name}: HARNESS_SEED={fallback} (fallback entropy)"
-        );
+        eprintln!("[rerun] {test_name}: HARNESS_SEED={fallback} (fallback entropy)");
         return fallback;
     }
     let seed = u64::from_le_bytes(buf);
@@ -589,10 +585,7 @@ impl Drop for RerunGuard {
             );
             // Best-effort: write artifact file
             if let Ok(dir) = artifact_dir("rerun_breadcrumbs") {
-                let _ = std::fs::write(
-                    dir.join("repro_context.json"),
-                    &json,
-                );
+                let _ = std::fs::write(dir.join("repro_context.json"), &json);
                 eprintln!(
                     "[rerun] artifact saved to {}/repro_context.json",
                     dir.display()

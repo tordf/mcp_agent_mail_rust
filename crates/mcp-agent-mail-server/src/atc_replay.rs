@@ -200,9 +200,7 @@ pub enum ScenarioEvent {
         timestamp_micros: i64,
     },
     /// Evaluate liveness at a given timestamp (trigger ATC tick).
-    EvaluateLiveness {
-        timestamp_micros: i64,
-    },
+    EvaluateLiveness { timestamp_micros: i64 },
     /// Record a calibration prediction outcome.
     CalibrationOutcome {
         correct: bool,
@@ -210,14 +208,9 @@ pub enum ScenarioEvent {
         agent: Option<String>,
     },
     /// Force safe mode on or off (operator override).
-    SetSafeMode {
-        active: bool,
-        timestamp_micros: i64,
-    },
+    SetSafeMode { active: bool, timestamp_micros: i64 },
     /// Advance virtual time without any event (gap marker).
-    Tick {
-        timestamp_micros: i64,
-    },
+    Tick { timestamp_micros: i64 },
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -485,9 +478,7 @@ fn verify_checkpoint(engine: &mut AtcEngine, checkpoint: &Checkpoint) -> Checkpo
     if let Some(expected_safe) = checkpoint.expected_safe_mode {
         let actual = engine.is_safe_mode();
         if actual != expected_safe {
-            failures.push(format!(
-                "safe mode: expected {expected_safe}, got {actual}"
-            ));
+            failures.push(format!("safe mode: expected {expected_safe}, got {actual}"));
         }
     }
 
@@ -632,13 +623,11 @@ fn scenario_healthy_liveness() -> ScenarioManifest {
 // ── Scenario 2: Silent Agent ────────────────────────────────────────
 
 fn scenario_silent_agent() -> ScenarioManifest {
-    let mut events = vec![
-        ScenarioEvent::RegisterAgent {
-            name: "Beta".into(),
-            program: "claude-code".into(),
-            project_key: None,
-        },
-    ];
+    let mut events = vec![ScenarioEvent::RegisterAgent {
+        name: "Beta".into(),
+        program: "claude-code".into(),
+        project_key: None,
+    }];
 
     // Establish rhythm: 5 observations at 60s intervals.
     for i in 0..5 {
@@ -986,11 +975,7 @@ fn scenario_conflict_resolution() -> ScenarioManifest {
         ScenarioEvent::ReservationConflict {
             requester: "Theta".into(),
             project: "/tmp/project".into(),
-            conflicts: vec![(
-                "Eta".into(),
-                "src/main.rs".into(),
-                "src/*.rs".into(),
-            )],
+            conflicts: vec![("Eta".into(), "src/main.rs".into(), "src/*.rs".into())],
             timestamp_micros: 2 * US_PER_SEC,
         },
         // Eta releases.
@@ -2029,7 +2014,11 @@ mod tests {
     fn scenario_healthy_liveness_passes() {
         let result = replay_with_lock(ScenarioId::HealthyLiveness);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2038,7 +2027,11 @@ mod tests {
     fn scenario_silent_agent_passes() {
         let result = replay_with_lock(ScenarioId::SilentAgent);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2047,7 +2040,11 @@ mod tests {
     fn scenario_flaky_agent_passes() {
         let result = replay_with_lock(ScenarioId::FlakyAgent);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2056,7 +2053,11 @@ mod tests {
     fn scenario_false_probe_passes() {
         let result = replay_with_lock(ScenarioId::FalseProbe);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2065,7 +2066,11 @@ mod tests {
     fn scenario_advisory_success_passes() {
         let result = replay_with_lock(ScenarioId::AdvisorySuccess);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2074,7 +2079,11 @@ mod tests {
     fn scenario_advisory_failure_passes() {
         let result = replay_with_lock(ScenarioId::AdvisoryFailure);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2083,7 +2092,11 @@ mod tests {
     fn scenario_conflict_resolution_passes() {
         let result = replay_with_lock(ScenarioId::ConflictResolution);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2092,7 +2105,11 @@ mod tests {
     fn scenario_deliberate_no_op_passes() {
         let result = replay_with_lock(ScenarioId::DeliberateNoOp);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2101,7 +2118,11 @@ mod tests {
     fn scenario_safe_to_ignore_noise_passes() {
         let result = replay_with_lock(ScenarioId::SafeToIgnoreNoise);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2110,7 +2131,11 @@ mod tests {
     fn scenario_suppressed_unsafe_action_passes() {
         let result = replay_with_lock(ScenarioId::SuppressedUnsafeAction);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2119,7 +2144,11 @@ mod tests {
     fn scenario_drift_onset_passes() {
         let result = replay_with_lock(ScenarioId::DriftOnset);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2128,7 +2157,11 @@ mod tests {
     fn scenario_calibration_rollback_passes() {
         let result = replay_with_lock(ScenarioId::CalibrationRollback);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2137,7 +2170,11 @@ mod tests {
     fn scenario_restart_recovery_passes() {
         let result = replay_with_lock(ScenarioId::RestartRecovery);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2146,7 +2183,11 @@ mod tests {
     fn scenario_degraded_learning_safe_mode_passes() {
         let result = replay_with_lock(ScenarioId::DegradedLearningSafeMode);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2155,7 +2196,11 @@ mod tests {
     fn scenario_spoofed_liveness_passes() {
         let result = replay_with_lock(ScenarioId::SpoofedLiveness);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2164,7 +2209,11 @@ mod tests {
     fn scenario_duplicate_events_passes() {
         let result = replay_with_lock(ScenarioId::DuplicateEvents);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2173,7 +2222,11 @@ mod tests {
     fn scenario_coordinated_reservation_churn_passes() {
         let result = replay_with_lock(ScenarioId::CoordinatedReservationChurn);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2182,7 +2235,11 @@ mod tests {
     fn scenario_overlapping_interventions_passes() {
         let result = replay_with_lock(ScenarioId::OverlappingInterventions);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2191,7 +2248,11 @@ mod tests {
     fn scenario_concurrent_operator_changes_passes() {
         let result = replay_with_lock(ScenarioId::ConcurrentOperatorChanges);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2200,7 +2261,11 @@ mod tests {
     fn scenario_natural_recovery_attribution_passes() {
         let result = replay_with_lock(ScenarioId::NaturalRecoveryAttribution);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2209,7 +2274,11 @@ mod tests {
     fn scenario_deadlock_cycle_passes() {
         let result = replay_with_lock(ScenarioId::DeadlockCycle);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2218,7 +2287,11 @@ mod tests {
     fn scenario_multi_agent_conflict_passes() {
         let result = replay_with_lock(ScenarioId::MultiAgentConflict);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2227,7 +2300,11 @@ mod tests {
     fn scenario_posterior_convergence_passes() {
         let result = replay_with_lock(ScenarioId::PosteriorConvergence);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2236,7 +2313,11 @@ mod tests {
     fn scenario_eprocess_miscalibration_passes() {
         let result = replay_with_lock(ScenarioId::EProcessMiscalibration);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2245,7 +2326,11 @@ mod tests {
     fn scenario_cusum_regime_change_passes() {
         let result = replay_with_lock(ScenarioId::CusumRegimeChange);
         for cp in &result.checkpoints {
-            assert!(cp.passed, "checkpoint '{}' failed: {:?}", cp.label, cp.failures);
+            assert!(
+                cp.passed,
+                "checkpoint '{}' failed: {:?}",
+                cp.label, cp.failures
+            );
         }
         assert!(result.all_passed);
     }
@@ -2297,16 +2382,24 @@ mod tests {
         crate::atc::reset_global_atc_state_for_test(&config);
         let result2 = replay_scenario(&manifest);
 
-        assert_eq!(result1.final_decision_count, result2.final_decision_count,
-            "determinism violated: decision counts differ between runs");
-        assert_eq!(result1.final_safe_mode, result2.final_safe_mode,
-            "determinism violated: safe mode differs between runs");
-        assert_eq!(result1.all_passed, result2.all_passed,
-            "determinism violated: pass/fail differs between runs");
+        assert_eq!(
+            result1.final_decision_count, result2.final_decision_count,
+            "determinism violated: decision counts differ between runs"
+        );
+        assert_eq!(
+            result1.final_safe_mode, result2.final_safe_mode,
+            "determinism violated: safe mode differs between runs"
+        );
+        assert_eq!(
+            result1.all_passed, result2.all_passed,
+            "determinism violated: pass/fail differs between runs"
+        );
         for (cp1, cp2) in result1.checkpoints.iter().zip(result2.checkpoints.iter()) {
-            assert_eq!(cp1.passed, cp2.passed,
+            assert_eq!(
+                cp1.passed, cp2.passed,
                 "determinism violated at checkpoint '{}': pass={} vs {}",
-                cp1.label, cp1.passed, cp2.passed);
+                cp1.label, cp1.passed, cp2.passed
+            );
         }
     }
 

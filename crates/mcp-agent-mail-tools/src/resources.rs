@@ -310,8 +310,8 @@ fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     // When the durability verdict says the live DB is suspect or worse,
     // force archive-snapshot reads even if the archive isn't strictly
     // "ahead" of the DB by row count.
-    let durability_forces_snapshot =
-        archive_has_state && resource_live_db_is_suspect(&config.database_url, &config.storage_root);
+    let durability_forces_snapshot = archive_has_state
+        && resource_live_db_is_suspect(&config.database_url, &config.storage_root);
 
     let use_archive_snapshot = if durability_forces_snapshot {
         true

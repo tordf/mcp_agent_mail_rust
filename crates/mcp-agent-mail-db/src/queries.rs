@@ -12594,8 +12594,8 @@ mod tests {
         // Hold an EXCLUSIVE lock on the DB from a separate connection to force
         // the first probe attempt to get SQLITE_BUSY.  We use a 1ms busy_timeout
         // on the blocker so the probe's own busy_timeout can expire quickly.
-        let blocker_conn = crate::DbConn::open_file(db_path.display().to_string())
-            .expect("open blocker");
+        let blocker_conn =
+            crate::DbConn::open_file(db_path.display().to_string()).expect("open blocker");
         blocker_conn
             .execute_raw("PRAGMA busy_timeout = 1")
             .expect("set blocker busy_timeout");

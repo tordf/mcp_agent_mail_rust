@@ -143,7 +143,6 @@ pub enum RecoveryApproval {
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryAction {
     // ── Silent self-heal actions ──────────────────────────────────────
-
     /// `PRAGMA wal_checkpoint(PASSIVE)` — non-blocking, best-effort.
     WalCheckpointPassive,
 
@@ -179,7 +178,6 @@ pub enum RecoveryAction {
     CreateProactiveBackup,
 
     // ── Explicit escalation actions ──────────────────────────────────
-
     /// Reconstruct the SQLite database from the Git-backed mail archive.
     /// This replaces the live DB file entirely and may lose non-archived
     /// state (e.g. local draft metadata).
@@ -270,36 +268,51 @@ impl RecoveryAction {
     #[must_use]
     pub const fn rationale(&self) -> &'static str {
         match self {
-            Self::WalCheckpointPassive =>
-                "Non-blocking best-effort; never mutates user data or blocks writers",
-            Self::WalCheckpointTruncate =>
-                "May briefly block writers but always converges; no user data mutation",
-            Self::StaleLockCleanup =>
-                "Only removes locks whose owning PID no longer exists; idempotent",
-            Self::EmptyWalSidecarCleanup =>
-                "Only removes zero-byte WAL files that prevent clean open; idempotent",
-            Self::ConnectionPoolRefresh =>
-                "Closes stale file descriptors and opens fresh connections; no data mutation",
-            Self::IndexRebuild =>
-                "REINDEX rebuilds derived index structures; user data rows are untouched",
-            Self::InboxStatsRebuild =>
-                "Rebuilds a derived materialized view from ground-truth message data",
-            Self::RestoreFromProactiveBackup =>
-                "Quarantines (renames) the corrupt file and copies back the system-created .bak",
-            Self::CreateProactiveBackup =>
-                "Copies the primary database to a .bak sibling; purely additive",
-            Self::ReconstructFromArchive =>
-                "Replaces the live database from Git archive; may lose non-archived local state",
-            Self::DeleteCorruptDb =>
-                "Quarantines and replaces the corrupt database; irreversible data loss if no backup",
-            Self::ForceUnlockContested =>
-                "Overrides locks held by a potentially live process; risk of split-brain writes",
-            Self::SchemaMigration =>
-                "Alters table structure on the live database; irreversible without backup",
-            Self::PromoteReconstructedCandidate =>
-                "Replaces the live database with a reconstructed candidate; loses any non-archived state",
-            Self::ReinitializeBlank =>
-                "Creates an empty database discarding all existing data; total data loss",
+            Self::WalCheckpointPassive => {
+                "Non-blocking best-effort; never mutates user data or blocks writers"
+            }
+            Self::WalCheckpointTruncate => {
+                "May briefly block writers but always converges; no user data mutation"
+            }
+            Self::StaleLockCleanup => {
+                "Only removes locks whose owning PID no longer exists; idempotent"
+            }
+            Self::EmptyWalSidecarCleanup => {
+                "Only removes zero-byte WAL files that prevent clean open; idempotent"
+            }
+            Self::ConnectionPoolRefresh => {
+                "Closes stale file descriptors and opens fresh connections; no data mutation"
+            }
+            Self::IndexRebuild => {
+                "REINDEX rebuilds derived index structures; user data rows are untouched"
+            }
+            Self::InboxStatsRebuild => {
+                "Rebuilds a derived materialized view from ground-truth message data"
+            }
+            Self::RestoreFromProactiveBackup => {
+                "Quarantines (renames) the corrupt file and copies back the system-created .bak"
+            }
+            Self::CreateProactiveBackup => {
+                "Copies the primary database to a .bak sibling; purely additive"
+            }
+            Self::ReconstructFromArchive => {
+                "Replaces the live database from Git archive; may lose non-archived local state"
+            }
+            Self::DeleteCorruptDb => {
+                "Quarantines and replaces the corrupt database; irreversible data loss if no backup"
+            }
+            Self::ForceUnlockContested => {
+                "Overrides locks held by a potentially live process; risk of split-brain writes"
+            }
+            Self::SchemaMigration => {
+                "Alters table structure on the live database; irreversible without backup"
+            }
+            Self::PromoteReconstructedCandidate => {
+                "Replaces the live database with a reconstructed candidate; loses any non-archived state"
+            }
+            Self::ReinitializeBlank => {
+                "Creates an empty database discarding all existing data; total data loss"
+            }
         }
     }
 
@@ -571,9 +584,7 @@ impl RecoveryAdmissionController {
             in_progress: self.in_progress.load(std::sync::atomic::Ordering::SeqCst),
             consecutive_failures: state.consecutive_failures,
             attempts_in_window: state.window_attempts.len(),
-            suppressed: state
-                .suppressed_until
-                .map_or(false, |until| now < until),
+            suppressed: state.suppressed_until.map_or(false, |until| now < until),
             current_backoff: Self::backoff_delay(state.consecutive_failures),
         }
     }
@@ -836,12 +847,7 @@ impl ReplayCompensationLog {
 
     /// Drain all records from the log for persistence or reporting.
     pub fn drain(&self) -> Vec<ReplayCompensationRecord> {
-        std::mem::take(
-            &mut *self
-                .entries
-                .lock()
-                .expect("ReplayCompensationLog poisoned"),
-        )
+        std::mem::take(&mut *self.entries.lock().expect("ReplayCompensationLog poisoned"))
     }
 }
 
@@ -1042,7 +1048,11 @@ impl DeferredWriteQueue {
 
         // Fairness: per-operation limit.
         let fairness_limit = inner.policy.fairness_limit();
-        let op_count = inner.per_operation_counts.get(operation).copied().unwrap_or(0);
+        let op_count = inner
+            .per_operation_counts
+            .get(operation)
+            .copied()
+            .unwrap_or(0);
         if op_count >= fairness_limit {
             inner.shed_count = inner.shed_count.saturating_add(1);
             return DeferralOutcome::FairnessLimitReached {
@@ -1228,9 +1238,9 @@ fn compute_backlog_pressure(inner: &DeferredWriteQueueInner) -> BacklogPressure 
     }
 
     // Elevated: above warn threshold.
-    let warn_threshold =
-        (inner.policy.max_entries as u64 * u64::from(DEFERRED_WRITE_WARN_THRESHOLD_PCT) / 100)
-            as usize;
+    let warn_threshold = (inner.policy.max_entries as u64
+        * u64::from(DEFERRED_WRITE_WARN_THRESHOLD_PCT)
+        / 100) as usize;
     if inner.entries.len() >= warn_threshold {
         return BacklogPressure::Elevated;
     }
@@ -1413,8 +1423,11 @@ pub fn evaluate_write_route(
     if ownership.blocks_mutation() && !is_authority {
         let owner_detail = match ownership.disposition {
             MailboxOwnershipDisposition::ActiveOtherOwner => {
-                let pids: Vec<String> =
-                    ownership.processes.iter().map(|p| p.pid.to_string()).collect();
+                let pids: Vec<String> = ownership
+                    .processes
+                    .iter()
+                    .map(|p| p.pid.to_string())
+                    .collect();
                 format!(
                     "Another active process owns this mailbox (pid {}). \
                      Route writes through that process or stop it first.",
@@ -9515,7 +9528,11 @@ mod tests {
     #[test]
     fn deferred_write_queue_inactive_rejects_writes() {
         let q = DeferredWriteQueue::new(10);
-        let out = q.enqueue("INSERT INTO x VALUES(?)".into(), vec![Value::BigInt(1)], "test");
+        let out = q.enqueue(
+            "INSERT INTO x VALUES(?)".into(),
+            vec![Value::BigInt(1)],
+            "test",
+        );
         assert_eq!(out, DeferralOutcome::NotRecovering);
         assert!(q.is_empty());
     }
@@ -9526,7 +9543,11 @@ mod tests {
         q.activate();
         assert!(q.is_active());
 
-        let out = q.enqueue("INSERT INTO x VALUES(?)".into(), vec![Value::BigInt(1)], "test_op");
+        let out = q.enqueue(
+            "INSERT INTO x VALUES(?)".into(),
+            vec![Value::BigInt(1)],
+            "test_op",
+        );
         assert!(matches!(out, DeferralOutcome::Queued { position: 0 }));
         assert_eq!(q.len(), 1);
 
@@ -9611,7 +9632,11 @@ mod tests {
     fn deferred_write_queue_entries_have_timestamps_and_operation() {
         let q = DeferredWriteQueue::new(10);
         q.activate();
-        q.enqueue("INSERT INTO t VALUES(?)".into(), vec![Value::BigInt(42)], "send_message");
+        q.enqueue(
+            "INSERT INTO t VALUES(?)".into(),
+            vec![Value::BigInt(42)],
+            "send_message",
+        );
         let entries = q.seal_and_drain();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].operation, "send_message");
@@ -9750,7 +9775,11 @@ mod tests {
         );
 
         // Different operation type should still be accepted
-        let out = q.enqueue("UPDATE agents SET name='x'".into(), vec![], "register_agent");
+        let out = q.enqueue(
+            "UPDATE agents SET name='x'".into(),
+            vec![],
+            "register_agent",
+        );
         assert!(
             matches!(out, DeferralOutcome::Queued { .. }),
             "different operation should not be affected by send_message fairness limit"
@@ -9840,7 +9869,11 @@ mod tests {
         q.enqueue("INSERT INTO t VALUES(3)".into(), vec![], "op");
         let out = q.enqueue("INSERT INTO t VALUES(4)".into(), vec![], "op");
         assert!(matches!(out, DeferralOutcome::BackpressureFull { .. }));
-        assert_eq!(q.shed_count(), 2, "shed_count should be lifetime across resets");
+        assert_eq!(
+            q.shed_count(),
+            2,
+            "shed_count should be lifetime across resets"
+        );
     }
 
     #[test]
@@ -9852,11 +9885,19 @@ mod tests {
             fairness_limit_pct: 0,
         });
         q.activate();
-        q.enqueue("INSERT INTO large_table VALUES(1, 'data')".into(), vec![], "op");
+        q.enqueue(
+            "INSERT INTO large_table VALUES(1, 'data')".into(),
+            vec![],
+            "op",
+        );
         assert!(q.estimated_bytes() > 0);
 
         q.seal_and_drain();
-        assert_eq!(q.estimated_bytes(), 0, "seal_and_drain should reset estimated bytes");
+        assert_eq!(
+            q.estimated_bytes(),
+            0,
+            "seal_and_drain should reset estimated bytes"
+        );
     }
 
     // ── Replay compensation tests (br-97gc6.5.2.1.14) ───────────────
@@ -9980,7 +10021,9 @@ mod tests {
         config.storage_root = Some(custom.clone());
 
         let would = config.would_reroute_for_project(Path::new("/tmp/test"));
-        let cloned = config.clone().with_ephemeral_reroute(Path::new("/tmp/test"));
+        let cloned = config
+            .clone()
+            .with_ephemeral_reroute(Path::new("/tmp/test"));
 
         // Both should agree: custom storage root prevents reroute.
         assert!(would.is_none());

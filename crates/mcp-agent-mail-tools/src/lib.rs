@@ -492,8 +492,7 @@ pub mod tool_util {
             storage_root,
             &mcp_agent_mail_db::VerdictOptions::fast(),
         );
-        let durability =
-            mcp_agent_mail_db::DurabilityState::from_mailbox_state(verdict.state);
+        let durability = mcp_agent_mail_db::DurabilityState::from_mailbox_state(verdict.state);
         if durability.is_degraded() && durability.allows_reads() {
             // DegradedReadOnly — reads should come from archive snapshots.
             tracing::info!(

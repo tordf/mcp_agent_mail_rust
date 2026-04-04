@@ -919,9 +919,7 @@ impl WarningFloodGate {
         self.all_warnings
             .iter()
             .filter(|warning| {
-                let seen = per_category_seen
-                    .entry(&warning.category)
-                    .or_insert(0);
+                let seen = per_category_seen.entry(&warning.category).or_insert(0);
                 *seen += 1;
                 *seen <= self.cap_per_category
             })
@@ -940,7 +938,10 @@ impl WarningFloodGate {
     /// Extract all warning messages (convenience for artifact output).
     #[must_use]
     pub fn all_messages(&self) -> Vec<&str> {
-        self.all_warnings.iter().map(|w| w.message.as_str()).collect()
+        self.all_warnings
+            .iter()
+            .map(|w| w.message.as_str())
+            .collect()
     }
 
     /// Build a summary of flood-gate state.
@@ -995,10 +996,7 @@ impl WarningFloodGate {
     /// compatibility with existing `Vec<String>` warning fields).
     #[must_use]
     pub fn into_all_messages(self) -> Vec<String> {
-        self.all_warnings
-            .into_iter()
-            .map(|w| w.message)
-            .collect()
+        self.all_warnings.into_iter().map(|w| w.message).collect()
     }
 
     /// Consume the gate and return only terminal-visible warnings as owned
@@ -1928,8 +1926,8 @@ mod tests {
 
     #[test]
     fn artifact_pointer_with_detail_chains() {
-        let ap = ArtifactPointer::captured("sqlite_db", "/tmp/test.db", "DB")
-            .with_detail("bytes=1024");
+        let ap =
+            ArtifactPointer::captured("sqlite_db", "/tmp/test.db", "DB").with_detail("bytes=1024");
         assert_eq!(ap.detail.as_deref(), Some("bytes=1024"));
     }
 
@@ -1943,8 +1941,8 @@ mod tests {
 
     #[test]
     fn artifact_pointer_serializes_to_json() {
-        let ap = ArtifactPointer::captured("sqlite_db", "/tmp/test.db", "DB")
-            .with_detail("bytes=512");
+        let ap =
+            ArtifactPointer::captured("sqlite_db", "/tmp/test.db", "DB").with_detail("bytes=512");
         let json = serde_json::to_value(&ap).expect("serialize");
         assert_eq!(json["kind"], "sqlite_db");
         assert_eq!(json["path"], "/tmp/test.db");
@@ -1957,7 +1955,10 @@ mod tests {
     fn artifact_pointer_omits_detail_when_none() {
         let ap = ArtifactPointer::missing("wal_sidecar", "WAL file");
         let json = serde_json::to_value(&ap).expect("serialize");
-        assert!(json.get("detail").is_none(), "detail should be omitted via skip_serializing_if");
+        assert!(
+            json.get("detail").is_none(),
+            "detail should be omitted via skip_serializing_if"
+        );
     }
 
     // -- DiagnosticPayload tests --
@@ -1984,13 +1985,8 @@ mod tests {
 
     #[test]
     fn diagnostic_payload_from_doctor_check_fail_has_next_action() {
-        let payload = DiagnosticPayload::from_doctor_check(
-            "fail",
-            "2 check(s) failed.",
-            2,
-            1,
-            Vec::new(),
-        );
+        let payload =
+            DiagnosticPayload::from_doctor_check("fail", "2 check(s) failed.", 2, 1, Vec::new());
         assert_eq!(payload.status, "fail");
         assert!(payload.next_action.is_some());
         assert_eq!(payload.finding_counts.critical, 2);
@@ -2069,7 +2065,10 @@ mod tests {
 
     #[test]
     fn diagnostic_payload_schema_version_constants() {
-        assert_eq!(DiagnosticPayload::SCHEMA_NAME, "mcp-agent-mail-diagnostic-payload");
+        assert_eq!(
+            DiagnosticPayload::SCHEMA_NAME,
+            "mcp-agent-mail-diagnostic-payload"
+        );
         assert_eq!(DiagnosticPayload::SCHEMA_MAJOR, 1);
         assert_eq!(DiagnosticPayload::SCHEMA_MINOR, 0);
     }

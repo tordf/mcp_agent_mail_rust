@@ -1315,10 +1315,7 @@ fn scan_message_file(
 /// queried, the DB-side checks are skipped silently and the archive-only
 /// anomalies are still returned.
 #[must_use]
-pub fn scan_archive_anomalies_with_db(
-    storage_root: &Path,
-    db_path: &Path,
-) -> ArchiveAnomalyReport {
+pub fn scan_archive_anomalies_with_db(storage_root: &Path, db_path: &Path) -> ArchiveAnomalyReport {
     let mut report = scan_archive_anomalies(storage_root);
 
     // Gather archive inventory for comparison.
@@ -1332,8 +1329,10 @@ pub fn scan_archive_anomalies_with_db(
 
     if let Some(ref inv) = db_inventory {
         // Check for archive/DB project identity mismatches.
-        let missing =
-            crate::reconstruct::archive_missing_project_identities(&archive_inventory, &inv.project_identities);
+        let missing = crate::reconstruct::archive_missing_project_identities(
+            &archive_inventory,
+            &inv.project_identities,
+        );
         for label in missing {
             report.record(ArchiveAnomalyKind::ArchiveDbProjectMismatch {
                 archive_slug: label.clone(),

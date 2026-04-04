@@ -4211,7 +4211,6 @@ impl AtcEngine {
         &mut self.cusum
     }
 
-
     fn conflict_edge_ttl_micros(&self) -> i64 {
         self.config
             .advisory_cooldown_micros
@@ -5145,8 +5144,7 @@ impl AtcEngine {
         let safe_mode = self.is_safe_mode();
         let execution_posture = if safe_mode {
             ExecutionPosture::SafeMode
-        } else if self.eprocess.miscalibrated()
-            || self.slow_controller.probe_budget_fraction < 0.5
+        } else if self.eprocess.miscalibrated() || self.slow_controller.probe_budget_fraction < 0.5
         {
             ExecutionPosture::Cautious
         } else {
@@ -5182,7 +5180,10 @@ impl AtcEngine {
                 };
                 (state, now_micros.saturating_sub(last_change.timestamp))
             } else {
-                (SummaryRegimeState::Stable, now_micros.saturating_sub(self.cusum.regime_start()))
+                (
+                    SummaryRegimeState::Stable,
+                    now_micros.saturating_sub(self.cusum.regime_start()),
+                )
             };
         let regime_change_count = self.cusum.regime_change_count();
 
@@ -9579,14 +9580,12 @@ pub(crate) fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Conf
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh_engine;
 
-    let population_lock =
-        ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
+    let population_lock = ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
     *population_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = HierarchicalAgentModel::new();
 
-    let conformal_lock =
-        ATC_CONFORMAL.get_or_init(|| Mutex::new(AtcConformalSet::new(200, 0.90)));
+    let conformal_lock = ATC_CONFORMAL.get_or_init(|| Mutex::new(AtcConformalSet::new(200, 0.90)));
     *conformal_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = AtcConformalSet::new(200, 0.90);

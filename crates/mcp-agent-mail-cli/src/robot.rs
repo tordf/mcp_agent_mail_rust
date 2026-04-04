@@ -2170,10 +2170,12 @@ const ACK_SLA_VIOLATION_THRESHOLD_US: i64 = 60 * 60 * 1_000_000;
 const RECOVERY_STALL_THRESHOLD_SECS: u64 = 300; // 5 minutes
 
 fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
-    use mcp_agent_mail_db::mailbox_verdict::{DurabilityState, VerdictOptions, compute_mailbox_verdict};
+    use mcp_agent_mail_db::mailbox_verdict::{
+        DurabilityState, VerdictOptions, compute_mailbox_verdict,
+    };
     use mcp_agent_mail_db::pool::{
-        MailboxOwnershipDisposition, inspect_mailbox_ownership,
-        inspect_mailbox_recovery_lock, resolve_mailbox_sqlite_path,
+        MailboxOwnershipDisposition, inspect_mailbox_ownership, inspect_mailbox_recovery_lock,
+        resolve_mailbox_sqlite_path,
     };
 
     let config = mcp_agent_mail_core::Config::get();
@@ -2344,7 +2346,8 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
         match durability {
             DurabilityState::Recovering | DurabilityState::DegradedReadOnly => {
                 if recovery_lock.exists && !recovery_lock.active {
-                    "Recovery lock is stale (process exited); run `am doctor repair` to restart".to_string()
+                    "Recovery lock is stale (process exited); run `am doctor repair` to restart"
+                        .to_string()
                 } else if adm.suppressed {
                     format!(
                         "Recovery suppressed after {} consecutive failures; run `am doctor repair --force` to override",
@@ -2375,7 +2378,8 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
                             format_duration_human(age),
                         )
                     } else {
-                        "Recovery in progress; wait for completion or check recovery lock holder".to_string()
+                        "Recovery in progress; wait for completion or check recovery lock holder"
+                            .to_string()
                     }
                 } else {
                     "Run `am doctor repair` to attempt automatic recovery".to_string()
@@ -2728,7 +2732,10 @@ fn build_status(
 
     // Escalate health to "recovering" or "error" if durability is degraded.
     let health = if recovery.is_some() {
-        let mode = recovery.as_ref().map(|r| r.mode.as_str()).unwrap_or("healthy");
+        let mode = recovery
+            .as_ref()
+            .map(|r| r.mode.as_str())
+            .unwrap_or("healthy");
         match mode {
             "recovering" => "recovering".to_string(),
             "corrupt" => "error".to_string(),
@@ -13276,7 +13283,8 @@ mod tests {
         let status = RecoveryStatus {
             mode: "degraded_read_only".into(),
             owner: "none".into(),
-            next_action: "Recovery lock is stale (process exited); run `am doctor repair` to restart".into(),
+            next_action:
+                "Recovery lock is stale (process exited); run `am doctor repair` to restart".into(),
             bundle_path: None,
             elapsed_secs: Some(600),
             elapsed_display: Some("10m".into()),
@@ -13289,10 +13297,12 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["phase"], "lock_stale");
         assert_eq!(json["stall_detected"], true);
-        assert!(json["stall_reason"]
-            .as_str()
-            .unwrap()
-            .contains("stale recovery lock"));
+        assert!(
+            json["stall_reason"]
+                .as_str()
+                .unwrap()
+                .contains("stale recovery lock")
+        );
     }
 
     #[test]
@@ -13340,10 +13350,12 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["admission"]["suppressed"], true);
         assert_eq!(json["admission"]["consecutive_failures"], 5);
-        assert!(json["stall_reason"]
-            .as_str()
-            .unwrap()
-            .contains("admission controller suppressed"));
+        assert!(
+            json["stall_reason"]
+                .as_str()
+                .unwrap()
+                .contains("admission controller suppressed")
+        );
     }
 
     #[test]

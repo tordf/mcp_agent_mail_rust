@@ -860,8 +860,10 @@ mod tests {
     #[test]
     fn all_surfaces_agree_on_every_durability_state() {
         for &state in MAILBOX_DURABILITY_STATES {
-            let snapshots: Vec<SurfaceSnapshot> =
-                SURFACES.iter().map(|s| surface_snapshot(s, state)).collect();
+            let snapshots: Vec<SurfaceSnapshot> = SURFACES
+                .iter()
+                .map(|s| surface_snapshot(s, state))
+                .collect();
 
             // Compare every surface against the first (cli).
             let reference = &snapshots[0];
@@ -919,14 +921,26 @@ mod tests {
                 matrix.push(surface_snapshot(surface, state));
             }
         }
-        assert_eq!(matrix.len(), SURFACES.len() * MAILBOX_DURABILITY_STATES.len());
+        assert_eq!(
+            matrix.len(),
+            SURFACES.len() * MAILBOX_DURABILITY_STATES.len()
+        );
 
         // Verify the matrix serializes to stable JSON (regression gate).
         let json = serde_json::to_string_pretty(&matrix).expect("serialize matrix");
-        assert!(json.contains("\"healthy\""), "matrix must contain healthy state");
-        assert!(json.contains("\"escalate\""), "matrix must contain escalate state");
+        assert!(
+            json.contains("\"healthy\""),
+            "matrix must contain healthy state"
+        );
+        assert!(
+            json.contains("\"escalate\""),
+            "matrix must contain escalate state"
+        );
         assert!(json.contains("\"tui\""), "matrix must contain tui surface");
-        assert!(json.contains("\"robot\""), "matrix must contain robot surface");
+        assert!(
+            json.contains("\"robot\""),
+            "matrix must contain robot surface"
+        );
     }
 
     #[test]
@@ -953,12 +967,18 @@ mod tests {
                 }
                 MailboxDurabilityState::DegradedReadOnly => {
                     assert!(snap.writes_must_stop, "degraded_read_only must stop writes");
-                    assert!(snap.reads_may_continue, "degraded_read_only must allow reads");
+                    assert!(
+                        snap.reads_may_continue,
+                        "degraded_read_only must allow reads"
+                    );
                     assert_eq!(snap.read_policy, "ArchiveSnapshotRequired");
                 }
                 MailboxDurabilityState::Recovering => {
                     assert!(snap.writes_must_stop, "recovering must stop user writes");
-                    assert!(snap.reads_may_continue, "recovering must allow snapshot reads");
+                    assert!(
+                        snap.reads_may_continue,
+                        "recovering must allow snapshot reads"
+                    );
                     assert_eq!(snap.transition_authority, "MailboxSupervisor");
                 }
                 _ => {

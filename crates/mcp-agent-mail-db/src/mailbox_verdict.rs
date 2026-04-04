@@ -1453,7 +1453,8 @@ impl DurabilityTestArtifact {
     /// Duration of the scenario in microseconds.
     #[must_use]
     pub fn duration_micros(&self) -> i64 {
-        self.finished_at_micros.saturating_sub(self.started_at_micros)
+        self.finished_at_micros
+            .saturating_sub(self.started_at_micros)
     }
 
     /// Whether the after-state is at least as good as the before-state
@@ -1831,7 +1832,8 @@ mod tests {
         assert!(!probe.passed);
         assert_eq!(probe.severity, ProbeSeverity::Error);
         assert!(
-            probe.detail.contains("sqlite_master == 0") || probe.detail.contains("requires reconstruct"),
+            probe.detail.contains("sqlite_master == 0")
+                || probe.detail.contains("requires reconstruct"),
             "unexpected detail: {}",
             probe.detail,
         );
@@ -2085,10 +2087,16 @@ mod tests {
             (DurabilityState::Healthy, DurabilityState::DegradedReadOnly),
             (DurabilityState::Healthy, DurabilityState::Corrupt),
             (DurabilityState::DegradedReadOnly, DurabilityState::Healthy),
-            (DurabilityState::DegradedReadOnly, DurabilityState::Recovering),
+            (
+                DurabilityState::DegradedReadOnly,
+                DurabilityState::Recovering,
+            ),
             (DurabilityState::DegradedReadOnly, DurabilityState::Corrupt),
             (DurabilityState::Recovering, DurabilityState::Healthy),
-            (DurabilityState::Recovering, DurabilityState::DegradedReadOnly),
+            (
+                DurabilityState::Recovering,
+                DurabilityState::DegradedReadOnly,
+            ),
             (DurabilityState::Recovering, DurabilityState::Corrupt),
             (DurabilityState::Corrupt, DurabilityState::Recovering),
         ];
@@ -2110,7 +2118,10 @@ mod tests {
         for &(from, to) in valid_pairs {
             let trigger = validate_durability_transition(from, to)
                 .unwrap_or_else(|e| panic!("{from}->{to} should be valid: {e}"));
-            assert_ne!(trigger, "idempotent", "{from}->{to} is not a self-transition");
+            assert_ne!(
+                trigger, "idempotent",
+                "{from}->{to} is not a self-transition"
+            );
         }
 
         for &(from, to) in invalid_pairs {
@@ -2134,7 +2145,8 @@ mod tests {
                     assert!(
                         !(a.from == b.from && a.to == b.to),
                         "duplicate transition: {}->{} at indices {i} and {j}",
-                        a.from, a.to
+                        a.from,
+                        a.to
                     );
                 }
             }
@@ -2147,7 +2159,8 @@ mod tests {
             assert!(
                 !t.trigger.is_empty(),
                 "transition {}->{} has empty trigger",
-                t.from, t.to
+                t.from,
+                t.to
             );
         }
     }
@@ -2188,7 +2201,10 @@ mod tests {
                         da.severity() >= db.severity(),
                         "severity monotonicity violated: {a}(sev={}) -> {da}(sev={}), \
                          {b}(sev={}) -> {db}(sev={})",
-                        a.severity(), da.severity(), b.severity(), db.severity()
+                        a.severity(),
+                        da.severity(),
+                        b.severity(),
+                        db.severity()
                     );
                 }
             }
@@ -2223,17 +2239,41 @@ mod tests {
         // max_severity should produce the most severe of the two.
         let combos: &[(MailboxState, HealthLevel, DurabilityState)] = &[
             // Healthy verdict + Green health → Healthy
-            (MailboxState::Healthy, HealthLevel::Green, DurabilityState::Healthy),
+            (
+                MailboxState::Healthy,
+                HealthLevel::Green,
+                DurabilityState::Healthy,
+            ),
             // Healthy verdict + Red health → DegradedReadOnly (floor wins)
-            (MailboxState::Healthy, HealthLevel::Red, DurabilityState::DegradedReadOnly),
+            (
+                MailboxState::Healthy,
+                HealthLevel::Red,
+                DurabilityState::DegradedReadOnly,
+            ),
             // Broken verdict + Green health → Corrupt (verdict wins)
-            (MailboxState::Broken, HealthLevel::Green, DurabilityState::Corrupt),
+            (
+                MailboxState::Broken,
+                HealthLevel::Green,
+                DurabilityState::Corrupt,
+            ),
             // Stale verdict + Red health → DegradedReadOnly (both agree)
-            (MailboxState::Stale, HealthLevel::Red, DurabilityState::DegradedReadOnly),
+            (
+                MailboxState::Stale,
+                HealthLevel::Red,
+                DurabilityState::DegradedReadOnly,
+            ),
             // Recovering verdict + Yellow health → Recovering (verdict wins)
-            (MailboxState::Recovering, HealthLevel::Yellow, DurabilityState::Recovering),
+            (
+                MailboxState::Recovering,
+                HealthLevel::Yellow,
+                DurabilityState::Recovering,
+            ),
             // Escalate verdict + Red health → Corrupt (verdict wins, Corrupt > DegradedReadOnly)
-            (MailboxState::Escalate, HealthLevel::Red, DurabilityState::Corrupt),
+            (
+                MailboxState::Escalate,
+                HealthLevel::Red,
+                DurabilityState::Corrupt,
+            ),
         ];
 
         for &(verdict, health, expected) in combos {

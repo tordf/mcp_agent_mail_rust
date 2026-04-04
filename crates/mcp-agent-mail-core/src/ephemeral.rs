@@ -419,8 +419,8 @@ pub fn classify_ephemeral(
     // Resolve symlinks so that a project at `/data/projects/foo` which is a
     // symlink to `/tmp/test-foo/` is correctly detected as ephemeral.
     // Falls back to the raw path if canonicalization fails (e.g. broken symlink).
-    let resolved = std::fs::canonicalize(project_root)
-        .unwrap_or_else(|_| project_root.to_path_buf());
+    let resolved =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let normalized = resolved.to_string_lossy().replace('\\', "/");
 
     // ---- Tier 1: System temp (path-based) ----

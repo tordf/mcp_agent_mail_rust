@@ -740,15 +740,8 @@ const DEFAULT_EPHEMERAL_BASE: &str = "/tmp/.am-ephemeral";
 /// - The current `storage_root` is already non-default (operator explicitly
 ///   chose a storage location)
 #[must_use]
-pub fn compute_ephemeral_storage_root(
-    project_root: &Path,
-    config: &Config,
-) -> Option<PathBuf> {
-    compute_ephemeral_storage_root_with_env(
-        project_root,
-        config,
-        &crate::ephemeral::std_env_lookup,
-    )
+pub fn compute_ephemeral_storage_root(project_root: &Path, config: &Config) -> Option<PathBuf> {
+    compute_ephemeral_storage_root_with_env(project_root, config, &crate::ephemeral::std_env_lookup)
 }
 
 /// Like [`compute_ephemeral_storage_root`] but with an injectable environment
@@ -797,11 +790,7 @@ fn ephemeral_path_hash(path: &str) -> String {
     hasher.update(path.as_bytes());
     let digest = hasher.finalize();
     // Take first 6 bytes → 12 hex chars
-    digest
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Resolve `storage_root` to a canonical (symlink-free) path.
@@ -4281,7 +4270,10 @@ mod tests {
             &config,
             &no_env,
         );
-        assert!(result.is_some(), "tmp path should trigger ephemeral reroute");
+        assert!(
+            result.is_some(),
+            "tmp path should trigger ephemeral reroute"
+        );
         let isolated = result.unwrap();
         assert!(
             isolated.to_string_lossy().contains(".am-ephemeral"),
@@ -4300,7 +4292,10 @@ mod tests {
             &config,
             &no_env,
         );
-        assert!(result.is_none(), "production path should not trigger reroute");
+        assert!(
+            result.is_none(),
+            "production path should not trigger reroute"
+        );
     }
 
     #[test]
@@ -4402,11 +4397,7 @@ mod tests {
         let default_root = default_storage_root_path();
 
         for path in &["/tmp/test", "/dev/shm/smoke", "/tmp/.cache/agent"] {
-            let result = compute_ephemeral_storage_root_with_env(
-                Path::new(path),
-                &config,
-                &no_env,
-            );
+            let result = compute_ephemeral_storage_root_with_env(Path::new(path), &config, &no_env);
             if let Some(isolated) = &result {
                 assert_ne!(
                     isolated, &default_root,
@@ -4433,11 +4424,7 @@ mod tests {
             "/var/lib/agent-mail",
         ];
         for path in &production_paths {
-            let result = compute_ephemeral_storage_root_with_env(
-                Path::new(path),
-                &config,
-                &no_env,
-            );
+            let result = compute_ephemeral_storage_root_with_env(Path::new(path), &config, &no_env);
             assert!(
                 result.is_none(),
                 "production path {path} must NOT trigger ephemeral reroute"
@@ -4473,17 +4460,9 @@ mod tests {
         config.storage_root = default_storage_root_path();
         config.ephemeral_mode = crate::ephemeral::EphemeralMode::Deny;
 
-        let ephemeral_paths = [
-            "/tmp/test-project",
-            "/dev/shm/ci",
-            "/tmp/.cache/agent-work",
-        ];
+        let ephemeral_paths = ["/tmp/test-project", "/dev/shm/ci", "/tmp/.cache/agent-work"];
         for path in &ephemeral_paths {
-            let result = compute_ephemeral_storage_root_with_env(
-                Path::new(path),
-                &config,
-                &no_env,
-            );
+            let result = compute_ephemeral_storage_root_with_env(Path::new(path), &config, &no_env);
             assert!(
                 result.is_none(),
                 "deny mode must prevent reroute for {path}"
