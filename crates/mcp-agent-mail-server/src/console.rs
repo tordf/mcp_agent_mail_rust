@@ -229,6 +229,13 @@ pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
     };
     let database_url = sanitize_known_value("database_url", params.database_url)
         .unwrap_or_else(|| params.database_url.to_string());
+    // Show the resolved filesystem path instead of the raw URL scheme so the
+    // banner displays `/Users/…/storage.sqlite3` instead of
+    // `sqlite:////Users/…/storage.sqlite3` (the 4-slash form is valid but ugly).
+    let database_display = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(
+        &database_url,
+    )
+    .map_or(database_url.clone(), |p| p.display().to_string());
 
     let logo_lines = [
         "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓",
@@ -272,7 +279,7 @@ pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
     }
     lines.push(format!(
         "{secondary}│{RESET} {accent}Database:{RESET} {}",
-        compact_path(&database_url, 70)
+        compact_path(&database_display, 70)
     ));
     lines.push(format!(
         "{secondary}│{RESET} {accent}Storage:{RESET} {}",
