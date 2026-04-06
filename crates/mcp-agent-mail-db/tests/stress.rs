@@ -510,15 +510,29 @@ fn stress_concurrent_file_reservations() {
     let r1 = h1.join().unwrap();
     let r2 = h2.join().unwrap();
 
-    match (r1, r2) {
-        (Outcome::Ok(res1), Outcome::Ok(res2)) => {
-            let total = res1.len() + res2.len();
-            assert!(total >= 2, "both agents should get reservation records");
+    // Exactly one agent should win the exclusive reservation; the other must
+    // get ResourceBusy because they're both requesting exclusive access to the
+    // same path.  Previously (Bug #86) both would succeed due to stale WAL
+    // snapshots.
+    let (winner, loser) = match (&r1, &r2) {
+        (Outcome::Ok(res), Outcome::Err(_)) => {
+            assert_eq!(res.len(), 1, "winner should have exactly 1 reservation");
+            ("agent1", "agent2")
         }
-        (Outcome::Err(e), _) => panic!("agent1 reservation failed: {e:?}"),
-        (_, Outcome::Err(e)) => panic!("agent2 reservation failed: {e:?}"),
+        (Outcome::Err(_), Outcome::Ok(res)) => {
+            assert_eq!(res.len(), 1, "winner should have exactly 1 reservation");
+            ("agent2", "agent1")
+        }
+        (Outcome::Ok(_), Outcome::Ok(_)) => {
+            panic!("both agents got exclusive reservation on same path — Bug #86 not fixed");
+        }
+        (Outcome::Err(e1), Outcome::Err(e2)) => {
+            panic!("both agents failed: {e1:?} / {e2:?}");
+        }
         _ => panic!("unexpected outcome"),
-    }
+    };
+    let _winner = winner;
+    let _loser = loser;
 }
 
 // =============================================================================

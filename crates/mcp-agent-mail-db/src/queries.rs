@@ -6446,7 +6446,10 @@ pub async fn renew_reservations(
     .await
 }
 
-/// List file reservations for a project
+/// List file reservations for a project.
+///
+/// When `active_only` is true, uses `BEGIN IMMEDIATE` to acquire a fresh WAL
+/// snapshot — same rationale as [`get_active_reservations`].
 #[allow(clippy::too_many_lines)]
 pub async fn list_file_reservations(
     cx: &Cx,
@@ -6462,6 +6465,12 @@ pub async fn list_file_reservations(
     };
 
     let tracked = tracked(&*conn);
+
+    // Force a fresh WAL snapshot for active-only reads to avoid stale
+    // reservation state after a release (Bug #85) or concurrent grant.
+    if active_only {
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    }
 
     let (sql, params) = if active_only {
         let now = now_micros();
@@ -6503,45 +6512,72 @@ pub async fn list_file_reservations(
     };
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    match rows_out {
+    let result = match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 let id: i64 = match row.get_named("id") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let proj_id: i64 = match row.get_named("project_id") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let agent_id: i64 = match row.get_named("agent_id") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let path_pattern: String = match row.get_named("path_pattern") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let exclusive: i64 = match row.get_named("exclusive") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let reason: String = match row.get_named("reason") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let created_ts: i64 = match row.get_named("created_ts") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let expires_ts: i64 = match row.get_named("expires_ts") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let released_ts: Option<i64> = match row.get_named("released_ts") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        if active_only { rollback_tx(cx, &tracked).await; }
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 out.push(FileReservationRow {
                     id: Some(id),
@@ -6557,10 +6593,25 @@ pub async fn list_file_reservations(
             }
             Outcome::Ok(out)
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+        Outcome::Err(e) => {
+            if active_only { rollback_tx(cx, &tracked).await; }
+            return Outcome::Err(e);
+        }
+        Outcome::Cancelled(r) => {
+            if active_only { rollback_tx(cx, &tracked).await; }
+            return Outcome::Cancelled(r);
+        }
+        Outcome::Panicked(p) => {
+            if active_only { rollback_tx(cx, &tracked).await; }
+            return Outcome::Panicked(p);
+        }
+    };
+
+    // Commit the read-only IMMEDIATE tx.
+    if active_only {
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     }
+    result
 }
 
 /// List unreleased file reservations for a project (includes expired).
@@ -6581,6 +6632,9 @@ pub async fn list_unreleased_file_reservations(
 
     let tracked = tracked(&*conn);
 
+    // Force a fresh WAL snapshot (same rationale as get_active_reservations).
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
     let sql = format!(
         "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, \
          CASE \
@@ -6597,45 +6651,72 @@ pub async fn list_unreleased_file_reservations(
     let params = vec![Value::BigInt(project_id)];
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    match rows_out {
+    let result = match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 let id: i64 = match row.get_named("id") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let proj_id: i64 = match row.get_named("project_id") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let agent_id: i64 = match row.get_named("agent_id") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let path_pattern: String = match row.get_named("path_pattern") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let exclusive: i64 = match row.get_named("exclusive") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let reason: String = match row.get_named("reason") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let created_ts: i64 = match row.get_named("created_ts") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let expires_ts: i64 = match row.get_named("expires_ts") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 let released_ts: Option<i64> = match row.get_named("released_ts") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(map_sql_error(&e));
+                    }
                 };
                 out.push(FileReservationRow {
                     id: Some(id),
@@ -6651,10 +6732,22 @@ pub async fn list_unreleased_file_reservations(
             }
             Outcome::Ok(out)
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+        Outcome::Err(e) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(e);
+        }
+        Outcome::Cancelled(r) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(r);
+        }
+        Outcome::Panicked(p) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Panicked(p);
+        }
+    };
+
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    result
 }
 
 // =============================================================================
