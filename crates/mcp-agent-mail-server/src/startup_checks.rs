@@ -1887,49 +1887,76 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         ..DbPoolConfig::default()
     };
 
+    // Helper: returns true when the error looks like a stale WAL / snapshot
+    // conflict that can be fixed by removing WAL+SHM sidecars. These are NOT
+    // genuine "another process is busy" situations — they mean the DB file has
+    // a WAL that is inconsistent with the main file (e.g. after a crash or
+    // SIGKILL). Treating them as hard "busy" failures causes `am` to refuse
+    // to start when `doctor repair --yes` would succeed immediately.
+    let is_snapshot_conflict = |msg: &str| -> bool {
+        mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(msg)
+    };
+
+    // Helper: attempt WAL removal + pool retry, falling back to full recovery.
+    let try_wal_cleanup_and_retry =
+        |pool_config: &DbPoolConfig, config: &Config| -> ProbeResult {
+            if let Some(db_path) =
+                resolve_server_database_url_sqlite_path(&config.database_url)
+            {
+                if try_remove_corrupt_wal(&db_path) {
+                    tracing::info!(
+                        path = %db_path.display(),
+                        "removed corrupt/stale WAL/SHM sidecars; retrying pool open"
+                    );
+                    if let Ok(p) = mcp_agent_mail_db::DbPool::new(pool_config) {
+                        tracing::info!("pool open succeeded after WAL removal");
+                        match p.run_startup_integrity_check() {
+                            Ok(_) => return ProbeResult::Ok { name: "integrity" },
+                            Err(ref e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "integrity check failed after WAL removal; falling back to recovery"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            attempt_probe_recovery(config)
+        };
+
     let pool = match mcp_agent_mail_db::DbPool::new(&pool_config) {
         Ok(p) => p,
         Err(e) => {
             let err_str = e.to_string();
+
+            // Snapshot conflicts (stale WAL) are recoverable — remove the WAL
+            // and retry before giving up.  Must check BEFORE the generic
+            // is_lock_error test because snapshot conflicts match both.
+            if is_snapshot_conflict(&err_str) {
+                tracing::warn!(
+                    error = %err_str,
+                    "pool open hit snapshot conflict; attempting WAL cleanup"
+                );
+                return try_wal_cleanup_and_retry(&pool_config, config);
+            }
+
             if mcp_agent_mail_db::is_lock_error(&err_str) {
                 return integrity_busy_probe_failure(config, &err_str);
             }
-            // If pool creation failed due to corruption (often a corrupt WAL),
-            // try removing the WAL/SHM sidecars and retrying once.  A corrupt
-            // WAL with a valid main DB file is the most common crash artifact
-            // and removing it lets SQLite fall back to the main file cleanly.
+
+            // Corruption (malformed schema, WAL too small, etc.) — try WAL
+            // cleanup first, fall back to full archive reconstruction.
             if mcp_agent_mail_db::is_corruption_error_message(&err_str) {
-                if let Some(db_path) =
-                    resolve_server_database_url_sqlite_path(&config.database_url)
-                {
-                    if try_remove_corrupt_wal(&db_path) {
-                        tracing::info!(
-                            path = %db_path.display(),
-                            "removed corrupt WAL/SHM sidecars; retrying pool open"
-                        );
-                        // Retry pool open after WAL removal.
-                        if let Ok(p) = mcp_agent_mail_db::DbPool::new(&pool_config) {
-                            // Fall through to integrity check below with the
-                            // new pool.
-                            tracing::info!("pool open succeeded after WAL removal");
-                            p
-                        } else {
-                            return attempt_probe_recovery(config);
-                        }
-                    } else {
-                        return attempt_probe_recovery(config);
-                    }
-                } else {
-                    return attempt_probe_recovery(config);
-                }
-            } else {
-                return ProbeResult::Fail(ProbeFailure {
-                    name: "integrity",
-                    problem: format!("Cannot create pool for integrity check: {e}"),
-                    fix: "Check DATABASE_URL or set INTEGRITY_CHECK_ON_STARTUP=false to skip"
-                        .into(),
-                });
+                return try_wal_cleanup_and_retry(&pool_config, config);
             }
+
+            return ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem: format!("Cannot create pool for integrity check: {e}"),
+                fix: "Check DATABASE_URL or set INTEGRITY_CHECK_ON_STARTUP=false to skip"
+                    .into(),
+            });
         }
     };
 
@@ -1937,9 +1964,20 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         Ok(_) => ProbeResult::Ok { name: "integrity" },
         Err(ref e) => {
             let err_str = e.to_string();
+
+            // Snapshot conflict during integrity check — same recovery as above.
+            if is_snapshot_conflict(&err_str) {
+                tracing::warn!(
+                    error = %err_str,
+                    "integrity check hit snapshot conflict; attempting WAL cleanup"
+                );
+                return try_wal_cleanup_and_retry(&pool_config, config);
+            }
+
             if mcp_agent_mail_db::is_lock_error(&err_str) {
                 return integrity_busy_probe_failure(config, &err_str);
             }
+
             tracing::warn!(
                 error = %err_str,
                 "startup integrity check failed; attempting automatic recovery"
