@@ -2774,20 +2774,24 @@ fn cleanup_stale_db_artifacts(db_path: &Path) {
     let lock_path = PathBuf::from(lock_os);
     if lock_path.exists() {
         // Only remove if we can verify no process holds the flock.
-        // Try opening and locking — if it succeeds, the file is stale.
-        let should_remove = std::fs::OpenOptions::new()
+        // Acquire the exclusive lock, delete the file while still holding the
+        // lock (preventing a TOCTOU race), then drop the fd which releases the
+        // lock on the now-unlinked inode.
+        let removed = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&lock_path)
             .and_then(|f| {
                 fs2::FileExt::try_lock_exclusive(&f)?;
-                fs2::FileExt::unlock(&f)?;
-                Ok(true)
+                // Delete while we hold the lock — no other process can acquire
+                // this inode's flock between our check and the removal.
+                std::fs::remove_file(&lock_path)?;
+                // The flock is released when `f` drops (end of closure).
+                Ok(())
             })
-            .unwrap_or(false);
-        if should_remove {
-            tracing::debug!(path = %lock_path.display(), "removing stale activity lock file");
-            let _ = std::fs::remove_file(&lock_path);
+            .is_ok();
+        if removed {
+            tracing::debug!(path = %lock_path.display(), "removed stale activity lock file");
         }
     }
 
@@ -2795,19 +2799,18 @@ fn cleanup_stale_db_artifacts(db_path: &Path) {
     if let Some(parent) = db_path.parent() {
         let legacy_lock = parent.join(".mailbox.activity.lock");
         if legacy_lock.exists() {
-            let should_remove = std::fs::OpenOptions::new()
+            let removed = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&legacy_lock)
                 .and_then(|f| {
                     fs2::FileExt::try_lock_exclusive(&f)?;
-                    fs2::FileExt::unlock(&f)?;
-                    Ok(true)
+                    std::fs::remove_file(&legacy_lock)?;
+                    Ok(())
                 })
-                .unwrap_or(false);
-            if should_remove {
-                tracing::debug!(path = %legacy_lock.display(), "removing stale legacy activity lock file");
-                let _ = std::fs::remove_file(&legacy_lock);
+                .is_ok();
+            if removed {
+                tracing::debug!(path = %legacy_lock.display(), "removed stale legacy activity lock file");
             }
         }
     }

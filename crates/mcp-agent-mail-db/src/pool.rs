@@ -8976,14 +8976,16 @@ mod tests {
             .expect("create table");
         drop(conn);
 
-        // Create a non-empty WAL sidecar.
+        // Create a WAL sidecar with enough bytes to look like a valid header
+        // (>= 32 bytes).  The cleanup function only removes WAL files shorter
+        // than the 32-byte SQLite WAL header.
         let wal_path = dir.path().join("preserve_test.db-wal");
-        std::fs::write(&wal_path, b"some WAL content here").expect("create wal");
+        std::fs::write(&wal_path, &[0xAA; 64]).expect("create wal");
         assert!(wal_path.exists());
 
         cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
 
-        assert!(wal_path.exists(), "non-empty WAL should be preserved");
+        assert!(wal_path.exists(), "WAL >= 32 bytes should be preserved");
     }
 
     #[test]
