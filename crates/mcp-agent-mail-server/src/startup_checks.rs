@@ -2070,8 +2070,10 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
             name: "integrity",
             problem: format!("SQLite corruption detected and automatic recovery failed: {e}"),
             fix: format!(
-                "Run `am doctor repair` to attempt manual recovery, or \
-                 `am doctor reconstruct` to rebuild the database from the Git archive. \
+                "Try these in order:\n\
+                 1. `am doctor repair --yes` — automatic repair from backups/archive\n\
+                 2. `am doctor reconstruct --yes` — rebuild the database from the Git archive\n\
+                 3. `am clear-and-reset-everything` — archive current state and start completely fresh\n\
                  The corrupt file has been quarantined at {}.corrupt-*",
                 db_path.display()
             ),

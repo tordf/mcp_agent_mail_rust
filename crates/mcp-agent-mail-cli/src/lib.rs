@@ -2816,25 +2816,62 @@ fn cleanup_stale_db_artifacts(db_path: &Path) {
     }
 
     // Remove truncated/corrupt WAL and orphaned SHM sidecars.
-    // A WAL < 32 bytes (the header size) is definitely corrupt.
     const WAL_HEADER_BYTES: u64 = 32;
+    let mut wal_os = db_path.as_os_str().to_os_string();
+    wal_os.push("-wal");
+    let wal_path = PathBuf::from(wal_os);
     let mut wal_removed = false;
-    {
-        let mut wal_os = db_path.as_os_str().to_os_string();
-        wal_os.push("-wal");
-        let wal_path = PathBuf::from(wal_os);
-        if let Ok(meta) = std::fs::metadata(&wal_path) {
-            if meta.len() < WAL_HEADER_BYTES {
-                eprintln!(
-                    "[info] Removing truncated WAL file {} ({} bytes)",
-                    wal_path.display(),
-                    meta.len()
-                );
-                let _ = std::fs::remove_file(&wal_path);
-                wal_removed = true;
+
+    if let Ok(meta) = std::fs::metadata(&wal_path) {
+        if meta.len() < WAL_HEADER_BYTES {
+            // Truncated WAL — definitely corrupt, just remove.
+            eprintln!(
+                "[info] Removing truncated WAL file {} ({} bytes)",
+                wal_path.display(),
+                meta.len()
+            );
+            let _ = std::fs::remove_file(&wal_path);
+            wal_removed = true;
+        } else if meta.len() > 0 {
+            // Non-empty WAL exists.  If no process holds the DB file open, try
+            // to checkpoint it into the main file.  If that fails (snapshot
+            // conflict, corruption, etc.), remove the WAL so startup can proceed
+            // with the main file alone.  The Git archive is the real source of
+            // truth; losing uncommitted WAL data is acceptable for startup
+            // resilience.
+            let holders =
+                mcp_agent_mail_server::startup_checks::pids_holding_file(db_path);
+            if holders.is_empty() {
+                // No process holds the file — try a PASSIVE checkpoint.
+                let checkpoint_ok = db_path
+                    .to_str()
+                    .and_then(|path_str| {
+                        sqlmodel_sqlite::SqliteConnection::open_file(path_str).ok()
+                    })
+                    .and_then(|conn| {
+                        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").ok()
+                    })
+                    .is_some();
+                if checkpoint_ok {
+                    eprintln!(
+                        "[info] Checkpointed stale WAL file {} ({} bytes)",
+                        wal_path.display(),
+                        meta.len()
+                    );
+                } else {
+                    // Checkpoint failed — remove the WAL to unblock startup.
+                    eprintln!(
+                        "[info] Removing stale WAL file {} ({} bytes; checkpoint failed)",
+                        wal_path.display(),
+                        meta.len()
+                    );
+                    let _ = std::fs::remove_file(&wal_path);
+                    wal_removed = true;
+                }
             }
         }
     }
+
     if wal_removed {
         let mut shm_os = db_path.as_os_str().to_os_string();
         shm_os.push("-shm");
