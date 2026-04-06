@@ -107,7 +107,7 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
             }
         }
         DurabilityState::Corrupt => {
-            "Run `am doctor repair --force` or restore from archive backup".to_string()
+            "Run `am doctor repair --yes` or restore from archive backup".to_string()
         }
     };
 

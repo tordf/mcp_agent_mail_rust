@@ -1493,7 +1493,8 @@ pub enum DoctorCommand {
         project: Option<String>,
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, short = 'y')]
+        /// Skip confirmation prompts (also accepted as --force).
+        #[arg(long, short = 'y', alias = "force")]
         yes: bool,
         #[arg(long)]
         backup_dir: Option<PathBuf>,
@@ -2515,10 +2516,12 @@ fn is_launchd_service_active() -> bool {
     let Ok(uid) = current_uid() else {
         return false;
     };
+    // Use .output() instead of .status() to capture stderr — launchctl
+    // prints "Could not find service" noise when the agent isn't loaded.
     std::process::Command::new("launchctl")
         .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2613,6 +2616,8 @@ fn maybe_stop_conflicting_managed_service(
     if !interactive_tui {
         return Ok(());
     }
+    // The health probe may cause an old server sharing this terminal to emit
+    // noise (e.g. "Bad request.") — that output is harmless and can be ignored.
     if !matches!(check_port_status(host, port), PortStatus::AgentMailServer) {
         return Ok(());
     }
@@ -2761,7 +2766,12 @@ fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
             eprintln!("[warn] Could not check port {port}: {error} — proceeding anyway");
             return Ok(());
         }
-        Err(_) => {}
+        Err(_) => {
+            // Port is in use — the health probe we're about to send may cause the
+            // old server to emit noise (e.g. "Bad request.") to its own terminal.
+            // Print a note so the user knows it's expected.
+            eprintln!("[info] Checking whether {host}:{port} is an Agent Mail server…");
+        }
     }
 
     let status = check_port_status(host, port);

@@ -1457,13 +1457,13 @@ fn format_recovery_context() -> Option<String> {
                 if recovery_lock.exists && !recovery_lock.active {
                     "Recovery lock is stale (process exited); run `am doctor repair` to restart"
                 } else if adm.suppressed {
-                    "Recovery suppressed after repeated failures; run `am doctor repair --force` to override"
+                    "Recovery suppressed after repeated failures; run `am doctor repair --yes` to override"
                 } else {
-                    "Recovery appears stalled; investigate lock holder or run `am doctor repair --force`"
+                    "Recovery appears stalled; investigate lock holder or run `am doctor repair --yes`"
                 }
             }
             DurabilityState::Corrupt => {
-                "Run `am doctor repair --force` or restore from archive backup"
+                "Run `am doctor repair --yes` or restore from archive backup"
             }
             DurabilityState::Healthy => "No action required",
         }
@@ -1481,7 +1481,7 @@ fn format_recovery_context() -> Option<String> {
                 "Recovery in progress; wait for completion or investigate stall"
             }
             DurabilityState::Corrupt => {
-                "Run `am doctor repair --force` or restore from archive backup"
+                "Run `am doctor repair --yes` or restore from archive backup"
             }
         }
     };
@@ -1790,12 +1790,43 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         return ProbeResult::Ok { name: "integrity" };
     }
 
-    let _integrity_activity_lock = match acquire_mailbox_activity_lock_for_database_url(
-        &config.database_url,
-        MailboxActivityLockMode::Exclusive,
-    ) {
-        Ok(lock) => lock,
-        Err(err) => return integrity_busy_probe_failure(config, &err.to_string()),
+    // Retry the activity lock with short backoff.  After auto_clear_db_blockers
+    // kills a stale Agent Mail process, the kernel may need a few hundred
+    // milliseconds to fully release flock() descriptors (especially on macOS).
+    // Without this retry the integrity probe would immediately fail with a
+    // misleading "mailbox activity lock is busy" error.
+    let _integrity_activity_lock = {
+        const MAX_LOCK_ATTEMPTS: u32 = 8;
+        const LOCK_BACKOFF_MS: u64 = 150;
+        let mut last_err = String::new();
+        let mut acquired = None;
+        for attempt in 0..MAX_LOCK_ATTEMPTS {
+            match acquire_mailbox_activity_lock_for_database_url(
+                &config.database_url,
+                MailboxActivityLockMode::Exclusive,
+            ) {
+                Ok(lock) => {
+                    acquired = Some(lock);
+                    break;
+                }
+                Err(err) => {
+                    last_err = err.to_string();
+                    if attempt + 1 < MAX_LOCK_ATTEMPTS {
+                        tracing::debug!(
+                            attempt = attempt + 1,
+                            max = MAX_LOCK_ATTEMPTS,
+                            "activity lock busy during integrity probe; retrying after {}ms",
+                            LOCK_BACKOFF_MS
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(LOCK_BACKOFF_MS));
+                    }
+                }
+            }
+        }
+        match acquired {
+            Some(lock) => lock,
+            None => return integrity_busy_probe_failure(config, &last_err),
+        }
     };
 
     let pool_config = DbPoolConfig {

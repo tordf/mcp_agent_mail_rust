@@ -2350,20 +2350,20 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
                         .to_string()
                 } else if adm.suppressed {
                     format!(
-                        "Recovery suppressed after {} consecutive failures; run `am doctor repair --force` to override",
+                        "Recovery suppressed after {} consecutive failures; run `am doctor repair --yes` to override",
                         adm.consecutive_failures,
                     )
                 } else if let Some(age) = elapsed_secs {
                     format!(
-                        "Recovery has been running for {} without completing; investigate lock holder or run `am doctor repair --force`",
+                        "Recovery has been running for {} without completing; investigate lock holder or run `am doctor repair --yes`",
                         format_duration_human(age),
                     )
                 } else {
-                    "Recovery appears stalled; run `am doctor repair --force` or restore from archive backup".to_string()
+                    "Recovery appears stalled; run `am doctor repair --yes` or restore from archive backup".to_string()
                 }
             }
             DurabilityState::Corrupt => {
-                "Run `am doctor repair --force` or restore from archive backup".to_string()
+                "Run `am doctor repair --yes` or restore from archive backup".to_string()
             }
             DurabilityState::Healthy => "No action required".to_string(),
         }
@@ -2400,7 +2400,7 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
                 }
             }
             DurabilityState::Corrupt => {
-                "Run `am doctor repair --force` or restore from archive backup".to_string()
+                "Run `am doctor repair --yes` or restore from archive backup".to_string()
             }
         }
     };
@@ -13239,7 +13239,7 @@ mod tests {
         let status = RecoveryStatus {
             mode: "recovering".into(),
             owner: "pid 999 (active)".into(),
-            next_action: "Recovery has been running for 8m 20s without completing; investigate lock holder or run `am doctor repair --force`".into(),
+            next_action: "Recovery has been running for 8m 20s without completing; investigate lock holder or run `am doctor repair --yes`".into(),
             bundle_path: None,
             elapsed_secs: Some(500),
             elapsed_display: Some("8m 20s".into()),
@@ -13310,7 +13310,7 @@ mod tests {
         let status = RecoveryStatus {
             mode: "corrupt".into(),
             owner: "none".into(),
-            next_action: "Run `am doctor repair --force` or restore from archive backup".into(),
+            next_action: "Run `am doctor repair --yes` or restore from archive backup".into(),
             bundle_path: None,
             elapsed_secs: None,
             elapsed_display: None,
@@ -13332,7 +13332,7 @@ mod tests {
         let status = RecoveryStatus {
             mode: "recovering".into(),
             owner: "none".into(),
-            next_action: "Recovery suppressed after 5 consecutive failures; run `am doctor repair --force` to override".into(),
+            next_action: "Recovery suppressed after 5 consecutive failures; run `am doctor repair --yes` to override".into(),
             bundle_path: None,
             elapsed_secs: None,
             elapsed_display: None,
@@ -13363,7 +13363,7 @@ mod tests {
         let status = RecoveryStatus {
             mode: "recovering".into(),
             owner: "pid 42 (active)".into(),
-            next_action: "Recovery appears stalled; investigate lock holder or run `am doctor repair --force`".into(),
+            next_action: "Recovery appears stalled; investigate lock holder or run `am doctor repair --yes`".into(),
             bundle_path: None,
             elapsed_secs: Some(60),
             elapsed_display: Some("1m".into()),
