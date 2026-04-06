@@ -2075,6 +2075,28 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
 
                 match migration_statement_already_satisfied(cx, conn, migration, &err).await {
                     Outcome::Ok(true) => {
+                        // The ALTER TABLE (or similar DDL) failed because the
+                        // schema already has the target object. ROLLBACK the
+                        // current transaction to discard any partial schema
+                        // mutation from the failed statement, then open a fresh
+                        // transaction just for the migration record INSERT.
+                        // Without this rollback, a FrankenSQLite (pure-Rust)
+                        // ALTER TABLE ADD COLUMN that partially wrote to
+                        // sqlite_master before detecting the duplicate would
+                        // be committed, corrupting the schema.
+                        rollback_migration_txn_quietly(cx, conn).await;
+                        match conn.execute(cx, "BEGIN IMMEDIATE", &[]).await {
+                            Outcome::Ok(_) => {}
+                            Outcome::Err(begin_err) => {
+                                return Outcome::Err(migration_step_error(
+                                    migration,
+                                    "BEGIN after already-satisfied rollback",
+                                    &begin_err,
+                                ));
+                            }
+                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                            Outcome::Panicked(p) => return Outcome::Panicked(p),
+                        }
                         tracing::warn!(
                             migration_id = %migration.id,
                             error = %err,
