@@ -38,6 +38,18 @@ rustflags = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Target-specific linker settings (Windows MSVC)
+# ──────────────────────────────────────────────────────────────────────────────
+# Use /MD (dynamic CRT) to match prebuilt native libs like onnxruntime (ort).
+# Without this, C-native deps (esaxx_rs, etc.) default to /MT, causing
+# LNK2038 RuntimeLibrary mismatch errors at link time.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "link-args=/NODEFAULTLIB:LIBCMT",
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Development settings
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -60,3 +72,8 @@ protocol = "sparse"
 
 [env]
 RUST_TEST_THREADS = "1"
+# Force /MD (dynamic CRT) for C/C++ build scripts to match prebuilt
+# native libs (onnxruntime/ort). Prevents LNK2038 RuntimeLibrary mismatch.
+CFLAGS = "/MD"
+CXXFLAGS = "/MD"
+CC_ENABLE_DEBUG_OUTPUT = "0"

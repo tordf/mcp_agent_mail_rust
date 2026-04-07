@@ -2036,10 +2036,20 @@ impl Config {
         // database lives alongside the storage directory rather than relative
         // to an arbitrary CWD.
         if config.database_url == DEFAULT_LEGACY_DATABASE_URL {
-            config.database_url = format!(
-                "sqlite:///{}",
-                config.storage_root.join("storage.sqlite3").display()
-            );
+            let mut storage = config.storage_root.clone();
+            // On Windows, canonicalize returns the extended-length prefix \\?\C:\...
+            // which is not usable in a sqlite:/// URL. Strip it.
+            if cfg!(target_os = "windows") {
+                let s = storage.to_string_lossy();
+                if let Some(rest) = s.strip_prefix(r"\\?\") {
+                    storage = PathBuf::from(rest);
+                }
+            }
+            let db_path = storage
+                .join("storage.sqlite3")
+                .to_string_lossy()
+                .replace('\\', "/");
+            config.database_url = format!("sqlite:///{db_path}");
         }
 
         config

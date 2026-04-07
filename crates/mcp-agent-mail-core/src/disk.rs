@@ -183,6 +183,14 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
     } else if path.starts_with("/./") || path.starts_with("/../") {
         // Explicitly relative path (sqlite:///./path.db or sqlite:///../path.db).
         path.remove(0);
+    } else if path.len() >= 3
+        && path.starts_with('/')
+        && path.as_bytes()[1].is_ascii_alphabetic()
+        && path.as_bytes()[2] == b':'
+    {
+        // Windows drive-letter absolute path (sqlite:///C:/path/to/db.sqlite3).
+        // Strip the leading '/' so PathBuf gets "C:/..." not "/C:/...".
+        path.remove(0);
     }
 
     if path.is_empty() {
