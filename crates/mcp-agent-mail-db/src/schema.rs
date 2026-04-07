@@ -1667,13 +1667,12 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
 #[must_use]
 pub fn schema_migrations_base() -> Vec<Migration> {
     // NOTE: We intentionally do NOT filter out ADD COLUMN migrations here.
-    // The migration runner already handles "duplicate column name" errors
-    // gracefully via `migration_statement_already_satisfied()`, so ADD COLUMN
-    // migrations that target columns already present in the base schema are
-    // safe to include.  Previously we filtered them as a performance
-    // optimization, but that caused Python-imported databases (which have an
-    // older schema lacking those columns) to skip the ADD COLUMN while still
-    // running dependent CREATE INDEX migrations → "no such column" errors.
+    // The migration runner preflights `ALTER TABLE ... ADD COLUMN` migrations
+    // against the current schema and records them without execution when the
+    // target column already exists. This keeps latest-schema bootstrap paths
+    // safe while still allowing legacy Python-imported databases (which lack
+    // those columns) to receive the missing ADD COLUMN before dependent index
+    // migrations run.
     let mut migrations: Vec<Migration> = schema_migrations()
         .into_iter()
         .filter(|m| !is_unsupported_by_franken(&m.id))
@@ -1691,6 +1690,29 @@ pub fn migration_runner() -> MigrationRunner {
 #[must_use]
 pub fn migration_runner_base() -> MigrationRunner {
     MigrationRunner::new(schema_migrations_base()).table_name(MIGRATIONS_TABLE_NAME)
+}
+
+#[must_use]
+pub fn schema_migrations_runtime_canonical_followup() -> Vec<Migration> {
+    schema_migrations()
+        .into_iter()
+        .filter(|migration| {
+            matches!(
+                migration.id.as_str(),
+                "v10a_dedup_agents_case_insensitive"
+                    | "v10b_idx_agents_project_name_nocase"
+                    | "v15_add_recipients_json_to_messages"
+                    | "v15b_backfill_recipients_json"
+                    | "v15c_trg_messages_default_recipients_json"
+            )
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn migration_runner_runtime_canonical_followup() -> MigrationRunner {
+    MigrationRunner::new(schema_migrations_runtime_canonical_followup())
+        .table_name(MIGRATIONS_TABLE_NAME)
 }
 
 async fn ensure_inbox_stats_insert_trigger_compat<C: Connection>(
@@ -1851,21 +1873,25 @@ async fn run_migrations<C: Connection>(
     conn: &C,
     base_mode: bool,
 ) -> Outcome<Vec<String>, SqlError> {
-    let runner = if base_mode {
-        migration_runner_base()
+    let migrations = if base_mode {
+        schema_migrations_base()
     } else {
-        migration_runner()
+        schema_migrations()
     };
+    run_specific_migrations(cx, conn, migrations).await
+}
+
+async fn run_specific_migrations<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    migrations: Vec<Migration>,
+) -> Outcome<Vec<String>, SqlError> {
+    let runner = MigrationRunner::new(migrations.clone()).table_name(MIGRATIONS_TABLE_NAME);
     let status = match runner.status(cx, conn).await {
         Outcome::Ok(status) => status,
         Outcome::Err(err) => return Outcome::Err(err),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let migrations = if base_mode {
-        schema_migrations_base()
-    } else {
-        schema_migrations()
     };
     let mut applied = Vec::new();
     for (id, migration_status) in status {
@@ -1965,14 +1991,25 @@ async fn migration_statement_already_satisfied<C: Connection>(
     if !is_duplicate_column_error(err) {
         return Outcome::Ok(false);
     }
+    migration_preflight_already_satisfied(cx, conn, migration).await
+}
+
+async fn migration_preflight_already_satisfied<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    migration: &Migration,
+) -> Outcome<bool, SqlError> {
     let Some((table, column)) = parse_alter_table_add_column(&migration.up) else {
         return Outcome::Ok(false);
     };
 
-    let sql = format!("SELECT 1 AS present FROM pragma_table_info('{table}') WHERE name = $1");
-    let params = [Value::Text(column)];
-    match conn.query(cx, &sql, &params).await {
-        Outcome::Ok(rows) => Outcome::Ok(!rows.is_empty()),
+    let sql = format!("PRAGMA table_info({table})");
+    match conn.query(cx, &sql, &[]).await {
+        Outcome::Ok(rows) => Outcome::Ok(
+            rows.into_iter()
+                .filter_map(|row| row.get_named::<String>("name").ok())
+                .any(|name| name == column),
+        ),
         Outcome::Err(query_err) => Outcome::Err(query_err),
         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => Outcome::Panicked(payload),
@@ -2045,104 +2082,132 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
 
-        match conn.execute(cx, &migration.up, &[]).await {
-            Outcome::Ok(_) => {}
-            Outcome::Err(err) => {
-                if migration.id == "v15b_backfill_recipients_json"
-                    && is_missing_fts_messages_error(&err)
-                {
+        let already_satisfied =
+            match migration_preflight_already_satisfied(cx, conn, migration).await {
+                Outcome::Ok(value) => value,
+                Outcome::Err(err) => {
                     rollback_migration_txn_quietly(cx, conn).await;
-                    match cleanup_legacy_message_fts_artifacts(cx, conn).await {
-                        Outcome::Ok(()) => {
+                    return Outcome::Err(migration_step_error(
+                        migration,
+                        "preflight already-satisfied probe",
+                        &err,
+                    ));
+                }
+                Outcome::Cancelled(reason) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Cancelled(reason);
+                }
+                Outcome::Panicked(payload) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Panicked(payload);
+                }
+            };
+
+        if already_satisfied {
+            tracing::warn!(
+                migration_id = %migration.id,
+                "migration preflight found schema already satisfies migration; recording migration without executing DDL"
+            );
+        } else {
+            match conn.execute(cx, &migration.up, &[]).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(err) => {
+                    if migration.id == "v15b_backfill_recipients_json"
+                        && is_missing_fts_messages_error(&err)
+                    {
+                        rollback_migration_txn_quietly(cx, conn).await;
+                        match cleanup_legacy_message_fts_artifacts(cx, conn).await {
+                            Outcome::Ok(()) => {
+                                tracing::warn!(
+                                    migration_id = %migration.id,
+                                    error = %err,
+                                    "migration backfill hit stale legacy FTS artifacts; cleaned them up and retrying"
+                                );
+                                continue;
+                            }
+                            Outcome::Err(cleanup_err) => {
+                                return Outcome::Err(migration_step_error(
+                                    migration,
+                                    "legacy fts cleanup",
+                                    &cleanup_err,
+                                ));
+                            }
+                            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                        }
+                    }
+
+                    match migration_statement_already_satisfied(cx, conn, migration, &err).await {
+                        Outcome::Ok(true) => {
+                            // The ALTER TABLE (or similar DDL) failed because the
+                            // schema already has the target object. ROLLBACK the
+                            // current transaction to discard any partial schema
+                            // mutation from the failed statement, then open a fresh
+                            // transaction just for the migration record INSERT.
+                            // This path is retained as a last-resort safety net for
+                            // races or engines that surface the duplicate only after
+                            // execution begins; normal latest-schema bootstrap should
+                            // be handled by the preflight above instead.
+                            rollback_migration_txn_quietly(cx, conn).await;
+                            match conn.execute(cx, "BEGIN IMMEDIATE", &[]).await {
+                                Outcome::Ok(_) => {}
+                                Outcome::Err(begin_err) => {
+                                    return Outcome::Err(migration_step_error(
+                                        migration,
+                                        "BEGIN after already-satisfied rollback",
+                                        &begin_err,
+                                    ));
+                                }
+                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                                Outcome::Panicked(p) => return Outcome::Panicked(p),
+                            }
                             tracing::warn!(
                                 migration_id = %migration.id,
                                 error = %err,
-                                "migration backfill hit stale legacy FTS artifacts; cleaned them up and retrying"
+                                "migration statement already satisfied by existing schema; recording migration"
                             );
-                            continue;
                         }
-                        Outcome::Err(cleanup_err) => {
-                            return Outcome::Err(migration_step_error(
-                                migration,
-                                "legacy fts cleanup",
-                                &cleanup_err,
-                            ));
-                        }
-                        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-                    }
-                }
-
-                match migration_statement_already_satisfied(cx, conn, migration, &err).await {
-                    Outcome::Ok(true) => {
-                        // The ALTER TABLE (or similar DDL) failed because the
-                        // schema already has the target object. ROLLBACK the
-                        // current transaction to discard any partial schema
-                        // mutation from the failed statement, then open a fresh
-                        // transaction just for the migration record INSERT.
-                        // Without this rollback, a FrankenSQLite (pure-Rust)
-                        // ALTER TABLE ADD COLUMN that partially wrote to
-                        // sqlite_master before detecting the duplicate would
-                        // be committed, corrupting the schema.
-                        rollback_migration_txn_quietly(cx, conn).await;
-                        match conn.execute(cx, "BEGIN IMMEDIATE", &[]).await {
-                            Outcome::Ok(_) => {}
-                            Outcome::Err(begin_err) => {
+                        Outcome::Ok(false) => {
+                            rollback_migration_txn_quietly(cx, conn).await;
+                            if retries >= MIGRATION_RUN_LOCK_RETRIES
+                                || !is_retryable_migration_lock_error(&err)
+                            {
                                 return Outcome::Err(migration_step_error(
                                     migration,
-                                    "BEGIN after already-satisfied rollback",
-                                    &begin_err,
+                                    "migration statement",
+                                    &err,
                                 ));
                             }
-                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                            Outcome::Panicked(p) => return Outcome::Panicked(p),
+                            std::thread::sleep(migration_retry_delay(retries));
+                            retries += 1;
+                            continue;
                         }
-                        tracing::warn!(
-                            migration_id = %migration.id,
-                            error = %err,
-                            "migration statement already satisfied by existing schema; recording migration"
-                        );
-                    }
-                    Outcome::Ok(false) => {
-                        rollback_migration_txn_quietly(cx, conn).await;
-                        if retries >= MIGRATION_RUN_LOCK_RETRIES
-                            || !is_retryable_migration_lock_error(&err)
-                        {
+                        Outcome::Err(check_err) => {
+                            rollback_migration_txn_quietly(cx, conn).await;
                             return Outcome::Err(migration_step_error(
                                 migration,
-                                "migration statement",
-                                &err,
+                                "already-satisfied probe",
+                                &check_err,
                             ));
                         }
-                        std::thread::sleep(migration_retry_delay(retries));
-                        retries += 1;
-                        continue;
-                    }
-                    Outcome::Err(check_err) => {
-                        rollback_migration_txn_quietly(cx, conn).await;
-                        return Outcome::Err(migration_step_error(
-                            migration,
-                            "already-satisfied probe",
-                            &check_err,
-                        ));
-                    }
-                    Outcome::Cancelled(reason) => {
-                        rollback_migration_txn_quietly(cx, conn).await;
-                        return Outcome::Cancelled(reason);
-                    }
-                    Outcome::Panicked(payload) => {
-                        rollback_migration_txn_quietly(cx, conn).await;
-                        return Outcome::Panicked(payload);
+                        Outcome::Cancelled(reason) => {
+                            rollback_migration_txn_quietly(cx, conn).await;
+                            return Outcome::Cancelled(reason);
+                        }
+                        Outcome::Panicked(payload) => {
+                            rollback_migration_txn_quietly(cx, conn).await;
+                            return Outcome::Panicked(payload);
+                        }
                     }
                 }
-            }
-            Outcome::Cancelled(reason) => {
-                rollback_migration_txn_quietly(cx, conn).await;
-                return Outcome::Cancelled(reason);
-            }
-            Outcome::Panicked(payload) => {
-                rollback_migration_txn_quietly(cx, conn).await;
-                return Outcome::Panicked(payload);
+                Outcome::Cancelled(reason) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Cancelled(reason);
+                }
+                Outcome::Panicked(payload) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Panicked(payload);
+                }
             }
         }
 
@@ -2306,6 +2371,29 @@ pub async fn migrate_to_latest_base<C: Connection>(
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
     }
+}
+
+pub async fn migrate_runtime_canonical_followup<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<Vec<String>, SqlError> {
+    match init_migrations_table(cx, conn).await {
+        Outcome::Ok(()) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+    let expected = schema_migrations_runtime_canonical_followup();
+    let already_complete = match migration_set_is_complete(cx, conn, &expected).await {
+        Outcome::Ok(value) => value,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    if already_complete {
+        return Outcome::Ok(Vec::new());
+    }
+    run_specific_migrations(cx, conn, expected).await
 }
 
 #[cfg(test)]
@@ -3250,19 +3338,6 @@ mod tests {
 
     #[test]
     fn migrate_to_latest_base_handles_sqlite_seeded_legacy_db() {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        if Command::new("sqlite3")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            return;
-        }
-
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("legacy_seeded.sqlite3");
 
@@ -3340,26 +3415,17 @@ VALUES (1, 2, 'to', NULL, NULL);
 INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
 VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00', '2026-12-24 15:33:00', NULL);
 ";
-
-        let mut child = Command::new("sqlite3")
-            .arg(&db_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sqlite3");
-        child
-            .stdin
-            .as_mut()
-            .expect("sqlite3 stdin")
-            .write_all(seed_sql.as_bytes())
-            .expect("write seed sql");
-        let output = child.wait_with_output().expect("wait sqlite3");
-        assert!(
-            output.status.success(),
-            "sqlite3 seed failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let seed_conn = DbConn::open_file(&db_path.display().to_string()).expect("open seed db");
+        for statement in seed_sql
+            .split(';')
+            .map(str::trim)
+            .filter(|stmt| !stmt.is_empty())
+        {
+            seed_conn
+                .execute_raw(statement)
+                .unwrap_or_else(|error| panic!("seed statement failed: {statement}: {error}"));
+        }
+        drop(seed_conn);
 
         let conn =
             DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");

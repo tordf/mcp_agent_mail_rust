@@ -7,7 +7,7 @@
     },
     {
       "check": "db_file_sanity",
-      "detail": "quick_check OK (290816 bytes); sqlite3 quick_check OK",
+      "detail": "quick_check OK (290816 bytes); canonical quick_check OK",
       "status": "ok"
     },
     {

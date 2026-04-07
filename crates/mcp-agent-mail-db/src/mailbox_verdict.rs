@@ -1155,7 +1155,7 @@ fn probe_schema_populated(db_path: &Path, archive_count: usize) -> ProbeResult {
     }
 
     let path_str = db_path.display().to_string();
-    let conn = match sqlmodel_sqlite::SqliteConnection::open_file(&path_str) {
+    let conn = match crate::DbConn::open_file(&path_str) {
         Ok(conn) => conn,
         Err(error) => {
             return ProbeResult::error(

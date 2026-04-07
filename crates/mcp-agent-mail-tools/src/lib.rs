@@ -159,7 +159,7 @@ pub mod tool_util {
                 {
                     return legacy_tool_error(
                         "DATABASE_RECOVERED",
-                        "Database corruption was detected and automatically repaired. \
+                        "Database corruption was detected and the runtime was automatically recovered. \
                          Please retry your operation.",
                         true,
                         json!({ "error_detail": message, "recovered": true }),

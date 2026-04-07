@@ -23,11 +23,13 @@ use crate::error::{DbError, DbResult};
 use crate::schema;
 use serde::Serialize;
 use sqlmodel_core::{Error as SqlError, Value};
-use sqlmodel_sqlite::SqliteConnection as SqliteDbConn;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-type DbConn = SqliteDbConn;
+type DbConn = crate::CanonicalDbConn;
+
+#[cfg(test)]
+type SqliteDbConn = crate::CanonicalDbConn;
 
 fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
@@ -509,7 +511,7 @@ fn collect_project_archive_message_ids(
 #[allow(clippy::result_large_err)]
 pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError> {
     let db_str = db_path.to_string_lossy();
-    let conn = SqliteDbConn::open_file(db_str.as_ref()).map_err(|e| {
+    let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
         SqlError::Custom(format!(
             "collect_db_message_ids: cannot open {}: {e}",
             db_path.display()
@@ -906,7 +908,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
     }
 
     let db_str = db_path.to_string_lossy();
-    let conn = SqliteDbConn::open_file(db_str.as_ref()).map_err(|e| {
+    let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
         DbError::Sqlite(format!(
             "reconstruct: cannot open {}: {e}",
             db_path.display()
@@ -932,10 +934,11 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         .map_err(|e| DbError::Sqlite(format!("reconstruct: begin transaction: {e}")))?;
 
     let rebuild_result = (|| -> DbResult<()> {
-        // Apply schema via the migration pipeline (base mode: no FTS5 virtual
-        // tables, which FrankenConnection doesn't support). First lay down the
-        // base DDL, then run each base migration individually. This keeps the
-        // reconstructed DB aligned with the same schema state the runtime expects.
+        // Lay down the latest base schema directly (base mode: no FTS5 virtual
+        // tables, which FrankenConnection doesn't support). The base DDL already
+        // reflects the current schema, so replaying schema-altering base
+        // migrations on top of it can produce malformed tables under the
+        // FrankenConnection path (for example duplicate columns in `agents`).
         let ddl = schema::init_schema_sql_base();
         for stmt in ddl.split(';') {
             let stmt = stmt.trim();
@@ -946,8 +949,8 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
                 .map_err(|e| DbError::Sqlite(format!("reconstruct: DDL: {e}")))?;
         }
 
-        // Run base migrations so the migrations table records the correct state.
-        // This ensures the runtime won't re-run migrations on first open.
+        // Record base migrations as already applied so the runtime will not try
+        // to replay them on first open. The schema above is already current.
         let base_migrations = schema::schema_migrations_base();
         // Create the migrations tracking table first.
         conn.execute_raw(&format!(
@@ -962,23 +965,6 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
 
         let migration_ts = crate::now_micros();
         for migration in &base_migrations {
-            // Execute migration SQL. We tolerate only duplicate/exists-style
-            // idempotency errors; anything else indicates a broken reconstruction.
-            if let Err(e) = conn.execute_raw(&migration.up) {
-                let err_text = e.to_string();
-                if is_reconstruct_benign_migration_error(&err_text) {
-                    tracing::debug!(
-                        migration_id = %migration.id,
-                        error = %err_text,
-                        "reconstruct migration produced benign idempotency error; continuing"
-                    );
-                } else {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct: apply migration {}: {e}",
-                        migration.id
-                    )));
-                }
-            }
             // Record it as applied.
             conn.execute_sync(
                 &format!(
@@ -1110,7 +1096,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
 /// any additional durable state from a salvaged `SQLite` database.
 ///
 /// This is intended for doctor/recovery flows where the primary database file
-/// was corrupt, but `sqlite3 .recover` or similar tooling could still extract
+/// was unhealthy, but a directly readable salvage database could still provide
 /// additional rows that never made it into the Git archive, including DB-only
 /// contact/product-bus metadata.
 pub fn reconstruct_from_archive_with_salvage(
@@ -1132,7 +1118,7 @@ pub fn reconstruct_from_archive_with_salvage(
 }
 
 fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
-    let conn = SqliteDbConn::open_file(path.to_string_lossy().as_ref()).map_err(|e| {
+    let conn = DbConn::open_file(path.to_string_lossy().as_ref()).map_err(|e| {
         DbError::Sqlite(format!(
             "reconstruct salvage: cannot open candidate {}: {e}",
             path.display()
@@ -1149,6 +1135,7 @@ fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
 }
 
 #[must_use]
+#[cfg(test)]
 fn is_reconstruct_benign_migration_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("already exists")
@@ -2340,14 +2327,14 @@ fn merge_salvaged_database(
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     let target_conn =
-        SqliteDbConn::open_file(target_db_path.to_string_lossy().as_ref()).map_err(|e| {
+        DbConn::open_file(target_db_path.to_string_lossy().as_ref()).map_err(|e| {
             DbError::Sqlite(format!(
                 "reconstruct salvage: cannot open target {}: {e}",
                 target_db_path.display()
             ))
         })?;
-    let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_string_lossy().as_ref())
-        .map_err(|e| {
+    let salvage_conn =
+        DbConn::open_file(salvage_db_path.to_string_lossy().as_ref()).map_err(|e| {
             DbError::Sqlite(format!(
                 "reconstruct salvage: cannot open salvage {}: {e}",
                 salvage_db_path.display()
@@ -2964,7 +2951,7 @@ fn merge_salvaged_database(
                 let thread_id = row
                     .get_named::<String>("thread_id")
                     .ok()
-                    .and_then(|raw| sanitize_reconstructed_thread_id(&raw));
+                    .and_then(|raw: String| sanitize_reconstructed_thread_id(raw.as_str()));
                 let thread_value = thread_id.map_or(Value::Null, Value::Text);
                 let (recipients_json, to_names, cc_names, bcc_names) =
                     parse_salvaged_recipients_json(
@@ -3662,6 +3649,11 @@ mod tests {
         assert_eq!(stats.agents, 1);
         assert_eq!(stats.messages, 0);
         assert_eq!(stats.parse_errors, 0);
+        assert!(
+            crate::pool::sqlite_file_is_healthy(&db_path)
+                .expect("canonical sqlite health check should succeed"),
+            "reconstructed database should be healthy for canonical sqlite",
+        );
     }
 
     #[test]

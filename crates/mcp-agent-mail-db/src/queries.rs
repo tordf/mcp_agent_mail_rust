@@ -6543,63 +6543,81 @@ pub async fn list_file_reservations(
                 let id: i64 = match row.get_named("id") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
                 let proj_id: i64 = match row.get_named("project_id") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
                 let agent_id: i64 = match row.get_named("agent_id") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
                 let path_pattern: String = match row.get_named("path_pattern") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
                 let exclusive: i64 = match row.get_named("exclusive") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
                 let reason: String = match row.get_named("reason") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
                 let created_ts: i64 = match row.get_named("created_ts") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
                 let expires_ts: i64 = match row.get_named("expires_ts") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
                 let released_ts: Option<i64> = match row.get_named("released_ts") {
                     Ok(v) => v,
                     Err(e) => {
-                        if active_only { rollback_tx(cx, &tracked).await; }
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
@@ -6618,15 +6636,21 @@ pub async fn list_file_reservations(
             Outcome::Ok(out)
         }
         Outcome::Err(e) => {
-            if active_only { rollback_tx(cx, &tracked).await; }
+            if active_only {
+                rollback_tx(cx, &tracked).await;
+            }
             return Outcome::Err(e);
         }
         Outcome::Cancelled(r) => {
-            if active_only { rollback_tx(cx, &tracked).await; }
+            if active_only {
+                rollback_tx(cx, &tracked).await;
+            }
             return Outcome::Cancelled(r);
         }
         Outcome::Panicked(p) => {
-            if active_only { rollback_tx(cx, &tracked).await; }
+            if active_only {
+                rollback_tx(cx, &tracked).await;
+            }
             return Outcome::Panicked(p);
         }
     };

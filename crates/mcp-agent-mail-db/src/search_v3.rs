@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
 use crate::search_filter_compiler::compile_filters;
@@ -360,7 +360,11 @@ fn convert_results(results: &SearchResults, doc_kind: DocKind) -> Vec<PlannerRes
 
 // ── Global bridge (lazy singleton) ──────────────────────────────────────
 
-static BRIDGE: OnceLock<Option<Arc<TantivyBridge>>> = OnceLock::new();
+static BRIDGE: OnceLock<RwLock<Option<Arc<TantivyBridge>>>> = OnceLock::new();
+
+fn bridge_slot() -> &'static RwLock<Option<Arc<TantivyBridge>>> {
+    BRIDGE.get_or_init(|| RwLock::new(None))
+}
 
 fn same_index_dir(lhs: &Path, rhs: &Path) -> bool {
     match (lhs.canonicalize(), rhs.canonicalize()) {
@@ -399,34 +403,86 @@ pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
             return Err(e);
         }
     };
-    if BRIDGE.set(Some(Arc::new(bridge))).is_err() {
-        if let Some(existing) = get_bridge() {
-            if same_index_dir(existing.index_dir(), index_dir) {
-                record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
-                return Ok(());
-            }
-            let error = format!(
-                "search bridge already initialized for {}; refusing to reinitialize for {}",
-                existing.index_dir().display(),
-                index_dir.display()
-            );
-            record_warmup_failure(WarmResource::LexicalIndex, &error);
-            return Err(error);
+    let slot = bridge_slot();
+    let mut guard = slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = guard.as_ref() {
+        if same_index_dir(existing.index_dir(), index_dir) {
+            record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
+            return Ok(());
         }
         let error = format!(
-            "search bridge initialization raced for {}; global state unavailable afterward",
+            "search bridge already initialized for {}; refusing to reinitialize for {}",
+            existing.index_dir().display(),
             index_dir.display()
         );
         record_warmup_failure(WarmResource::LexicalIndex, &error);
         return Err(error);
     }
+    *guard = Some(Arc::new(bridge));
     record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
     Ok(())
 }
 
+/// Initialize the global Tantivy bridge, replacing an existing bridge when the
+/// requested index directory differs.
+pub fn init_or_switch_bridge(index_dir: &Path) -> Result<(), String> {
+    use crate::search_cache::WarmResource;
+    use crate::search_service::{record_warmup, record_warmup_failure, record_warmup_start};
+
+    record_warmup_start(WarmResource::LexicalIndex);
+    let warmup_timer = std::time::Instant::now();
+    if let Some(existing) = get_bridge()
+        && same_index_dir(existing.index_dir(), index_dir)
+    {
+        record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
+        return Ok(());
+    }
+
+    let bridge = match TantivyBridge::open(index_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            record_warmup_failure(WarmResource::LexicalIndex, &e);
+            return Err(e);
+        }
+    };
+
+    let slot = bridge_slot();
+    let mut guard = slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = guard.as_ref()
+        && same_index_dir(existing.index_dir(), index_dir)
+    {
+        record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
+        return Ok(());
+    }
+    *guard = Some(Arc::new(bridge));
+    record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
+    Ok(())
+}
+
+#[must_use]
+pub fn is_bridge_initialized_for(index_dir: &Path) -> bool {
+    get_bridge()
+        .as_ref()
+        .is_some_and(|bridge| same_index_dir(bridge.index_dir(), index_dir))
+}
+
 /// Get the global Tantivy bridge, if initialized.
 pub fn get_bridge() -> Option<Arc<TantivyBridge>> {
-    BRIDGE.get().and_then(std::clone::Clone::clone)
+    bridge_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_bridge_for_tests() {
+    *bridge_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 // ── Incremental indexing ──────────────────────────────────────────────────
@@ -1164,6 +1220,9 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static BRIDGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     use crate::search_planner::{DocKind, SearchQuery as PlannerQuery};
     use tantivy::doc;
 
@@ -1788,6 +1847,10 @@ mod tests {
 
     #[test]
     fn init_bridge_rejects_different_index_dir_after_first_init() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
         let temp_a = tempfile::tempdir().expect("tempdir a");
         let temp_b = tempfile::tempdir().expect("tempdir b");
 
@@ -1802,6 +1865,28 @@ mod tests {
                 .index_dir(),
             temp_a.path()
         );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn init_or_switch_bridge_replaces_different_index_dir() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let temp_a = tempfile::tempdir().expect("tempdir a");
+        let temp_b = tempfile::tempdir().expect("tempdir b");
+
+        init_bridge(temp_a.path()).expect("init first bridge");
+        init_or_switch_bridge(temp_b.path()).expect("switch bridge path");
+
+        assert_eq!(
+            get_bridge()
+                .expect("bridge should stay initialized")
+                .index_dir(),
+            temp_b.path()
+        );
+        reset_bridge_for_tests();
     }
 
     // -- Search with multiple hits -----------------------------------------

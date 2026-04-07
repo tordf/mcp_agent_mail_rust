@@ -4738,9 +4738,10 @@ fn build_analytics(
                 "SELECT fr1.path_pattern AS p1, fr2.path_pattern AS p2,
                         a1.name AS agent1, a2.name AS agent2
                  FROM file_reservations fr1{active_reservation_join_fr1}
-                 JOIN file_reservations fr2{active_reservation_join_fr2} ON fr1.id < fr2.id
+                 JOIN file_reservations fr2 ON fr1.id < fr2.id
                    AND fr1.project_id = fr2.project_id
                    AND fr1.agent_id != fr2.agent_id
+                 {active_reservation_join_fr2}
                  JOIN agents a1 ON a1.id = fr1.agent_id
                  JOIN agents a2 ON a2.id = fr2.agent_id
                  WHERE fr1.project_id = ? AND fr1.\"exclusive\" = 1 AND fr2.\"exclusive\" = 1
@@ -7027,11 +7028,18 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             since,
         } => {
             let config = mcp_agent_mail_core::Config::from_env();
-            let read_db = crate::open_db_sync_async_canonical_read_with_database_url(
+            let read_db = crate::open_db_sync_async_canonical_read_best_effort_with_database_url(
                 &config.database_url,
                 Some(config.storage_root.as_path()),
                 "robot search",
-            )?;
+            )
+            .or_else(|_| {
+                crate::open_db_sync_async_canonical_read_with_database_url(
+                    &config.database_url,
+                    Some(config.storage_root.as_path()),
+                    "robot search",
+                )
+            })?;
             let (project_id, project_slug) =
                 resolve_project(read_db.conn(), args.project.as_deref())?;
             let data = build_search(
@@ -12060,8 +12068,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let lock_path = db_path_str.clone();
         let lock_thread = std::thread::spawn(move || {
-            let lock_conn =
-                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            let lock_conn = mcp_agent_mail_db::DbConn::open_file(&lock_path).expect("open lock db");
             lock_conn
                 .execute_raw("PRAGMA busy_timeout = 1;")
                 .expect("set lock busy_timeout");
@@ -12374,6 +12381,45 @@ mod tests {
         assert_eq!(data.conflicts[0].path_a, "src/*/foo.rs");
         assert_eq!(data.conflicts[0].agent_b, "Bob");
         assert_eq!(data.conflicts[0].path_b, "src/bar/*.rs");
+    }
+
+    #[test]
+    fn build_analytics_handles_release_ledger_conflict_query() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "CREATE TABLE file_reservation_releases (
+                reservation_id INTEGER PRIMARY KEY,
+                released_ts INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create release ledger");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert conflicting reservations");
+
+        let anomalies = build_analytics(&conn, 1, None).expect("build analytics");
+        let reservation_conflict = anomalies
+            .iter()
+            .find(|anomaly| anomaly.category == "reservation_conflict")
+            .expect("reservation conflict anomaly");
+        assert!(
+            reservation_conflict
+                .headline
+                .contains("1 reservation conflict"),
+            "unexpected anomaly headline: {}",
+            reservation_conflict.headline
+        );
     }
 
     #[test]
@@ -13363,7 +13409,9 @@ mod tests {
         let status = RecoveryStatus {
             mode: "recovering".into(),
             owner: "pid 42 (active)".into(),
-            next_action: "Recovery appears stalled; investigate lock holder or run `am doctor repair --yes`".into(),
+            next_action:
+                "Recovery appears stalled; investigate lock holder or run `am doctor repair --yes`"
+                    .into(),
             bundle_path: None,
             elapsed_secs: Some(60),
             elapsed_display: Some("1m".into()),

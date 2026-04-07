@@ -675,8 +675,7 @@ pub async fn file_reservation_paths(
                 );
 
                 let agent_rows = db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id)
-                        .await,
+                    mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
                 )?;
                 let agent_names: HashMap<i64, String> = agent_rows
                     .into_iter()
@@ -696,16 +695,15 @@ pub async fn file_reservation_paths(
                                     agent: agent_names
                                         .get(&rref.agent_id)
                                         .cloned()
-                                        .unwrap_or_else(|| {
-                                            format!("agent_{}", rref.agent_id)
-                                        }),
+                                        .unwrap_or_else(|| format!("agent_{}", rref.agent_id)),
                                     path_pattern: rref.path_pattern.clone(),
                                     exclusive: rref.exclusive,
                                     expires_ts: micros_to_iso(rref.expires_ts),
                                 })
                                 .collect();
                         holders.sort_unstable_by(|a, b| {
-                            a.agent.cmp(&b.agent)
+                            a.agent
+                                .cmp(&b.agent)
                                 .then_with(|| a.path_pattern.cmp(&b.path_pattern))
                         });
                         db_conflicts.push(ReservationConflict {

@@ -7,6 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use include_dir::{Dir, include_dir};
+use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,10 +19,7 @@ use crate::scrub::ScrubSummary;
 use crate::{ShareError, ShareResult};
 
 static BUILTIN_VIEWER_ASSETS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/viewer_assets");
-/// Connection type for offline snapshot manipulation.
-///
-/// Uses C-backed SQLite for reliable offline operations.
-type Conn = sqlmodel_sqlite::SqliteConnection;
+type Conn = DbConn;
 
 /// Per-attachment entry in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -216,6 +216,10 @@ pub use sqlmodel_sqlite;
 /// `BEGIN CONCURRENT` write paths.
 pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
 
+/// The canonical C-SQLite connection type used for verification and one-shot
+/// recovery flows that must not rely on FrankenSQLite behavior.
+pub type CanonicalDbConn = sqlmodel_sqlite::SqliteConnection;
+
 pub fn close_db_conn(conn: DbConn, context: &'static str) {
     if let Err(error) = conn.close_sync() {
         tracing::warn!(context, error = %error, "failed to close database connection");

@@ -4,9 +4,14 @@
 
 use std::path::Path;
 
-use sqlmodel_sqlite::SqliteConnection;
+use mcp_agent_mail_db::DbConn;
 
 use crate::ShareError;
+
+type Conn = DbConn;
+
+#[cfg(test)]
+type SqliteConnection = DbConn;
 
 /// Result of the full finalization pipeline.
 #[derive(Debug, Clone)]
@@ -186,16 +191,18 @@ pub fn build_materialized_views(
     } else {
         "'' AS sender_name"
     };
-    let recipients_expr = "COALESCE( \
-             (SELECT GROUP_CONCAT(name, ', ') FROM ( \
-                 SELECT COALESCE(ag.name, '') AS name \
+    let recipients_join = "LEFT JOIN ( \
+             SELECT ordered_recipients.message_id, \
+                    GROUP_CONCAT(ordered_recipients.name, ', ') AS recipients \
+             FROM ( \
+                 SELECT mr.message_id, COALESCE(ag.name, '') AS name \
                  FROM message_recipients mr \
                  LEFT JOIN agents ag ON ag.id = mr.agent_id \
-                 WHERE mr.message_id = m.id \
                  ORDER BY ag.name \
-             )), \
-             '' \
-         ) AS recipients";
+             ) AS ordered_recipients \
+             GROUP BY ordered_recipients.message_id \
+         ) AS recipient_rollup ON recipient_rollup.message_id = m.id";
+    let recipients_expr = "COALESCE(recipient_rollup.recipients, '') AS recipients";
     let attachments_expr = "CASE \
              WHEN json_valid(COALESCE(m.attachments, '[]')) \
              THEN json_array_length(COALESCE(m.attachments, '[]')) \
@@ -218,9 +225,13 @@ pub fn build_materialized_views(
              SUBSTR(COALESCE(m.body_md, ''), 1, 280) AS latest_snippet, \
              {recipients_expr} \
          FROM messages m \
+         {recipients_join} \
          ORDER BY m.created_ts DESC"
     );
-    conn.execute_raw(&overview_sql).map_err(sql_err)?;
+    conn.execute_raw(&overview_sql)
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("message_overview_mv create failed: {e}"),
+        })?;
 
     for idx in [
         "CREATE INDEX idx_msg_overview_created ON message_overview_mv(created_ts DESC)",
@@ -228,7 +239,9 @@ pub fn build_materialized_views(
         "CREATE INDEX idx_msg_overview_project ON message_overview_mv(project_id, created_ts DESC)",
         "CREATE INDEX idx_msg_overview_importance ON message_overview_mv(importance, created_ts DESC)",
     ] {
-        conn.execute_raw(idx).map_err(sql_err)?;
+        conn.execute_raw(idx).map_err(|e| ShareError::Sqlite {
+            message: format!("message_overview_mv index create failed for {idx:?}: {e}"),
+        })?;
     }
     created.push("message_overview_mv".to_string());
 
@@ -236,54 +249,20 @@ pub fn build_materialized_views(
     conn.execute_raw("DROP TABLE IF EXISTS attachments_by_message_mv")
         .map_err(sql_err)?;
 
-    let attach_thread_expr = if has_thread_id {
-        "NULLIF(TRIM(m.thread_id), '')"
-    } else {
-        "NULL"
-    };
-    let attachments_source_expr = "CASE \
-             WHEN json_valid(COALESCE(m.attachments, '[]')) \
-             THEN COALESCE(m.attachments, '[]') \
-             ELSE '[]' \
-         END";
-    let attach_sql = format!(
-        "CREATE TABLE attachments_by_message_mv AS \
-         SELECT \
-             m.id AS message_id, \
-             m.project_id, \
-             {attach_thread_expr} AS thread_id, \
-             m.created_ts, \
-             json_extract(value, '$.type') AS attachment_type, \
-             json_extract(value, '$.media_type') AS media_type, \
-             json_extract(value, '$.path') AS path, \
-             CAST(json_extract(value, '$.bytes') AS INTEGER) AS size_bytes \
-         FROM messages m, \
-              json_each({attachments_source_expr}) \
-         WHERE {attachments_source_expr} != '[]'"
-    );
-    if let Err(e) = conn.execute_raw(&attach_sql) {
-        let msg = e.to_string();
-        if msg.contains("json_each")
-            || msg.contains("not implemented")
-            || msg.contains("supported in JOIN")
-        {
-            conn.execute_raw(
-                "CREATE TABLE attachments_by_message_mv (\
-                 message_id INTEGER, \
-                 project_id INTEGER, \
-                 thread_id TEXT, \
-                 created_ts TEXT, \
-                 attachment_type TEXT, \
-                 media_type TEXT, \
-                 path TEXT, \
-                 size_bytes INTEGER\
-                 )",
-            )
-            .map_err(sql_err)?;
-        } else {
-            return Err(sql_err(e));
-        }
-    }
+    conn.execute_raw(
+        "CREATE TABLE attachments_by_message_mv (\
+         message_id INTEGER, \
+         project_id INTEGER, \
+         thread_id TEXT, \
+         created_ts TEXT, \
+         attachment_type TEXT, \
+         media_type TEXT, \
+         path TEXT, \
+         size_bytes INTEGER\
+         )",
+    )
+    .map_err(sql_err)?;
+    populate_attachments_by_message_mv(&conn, has_thread_id)?;
 
     for idx in [
         "CREATE INDEX idx_attach_by_msg ON attachments_by_message_mv(message_id)",
@@ -292,6 +271,15 @@ pub fn build_materialized_views(
     ] {
         conn.execute_raw(idx).map_err(sql_err)?;
     }
+    conn.execute_raw(
+        "UPDATE message_overview_mv \
+         SET attachment_count = COALESCE(( \
+             SELECT COUNT(*) \
+             FROM attachments_by_message_mv AS attachments \
+             WHERE attachments.message_id = message_overview_mv.id \
+         ), 0)",
+    )
+    .map_err(sql_err)?;
     created.push("attachments_by_message_mv".to_string());
 
     // --- fts_search_overview_mv (only if FTS5 available) ---
@@ -343,6 +331,100 @@ pub fn build_materialized_views(
     }
 
     Ok(created)
+}
+
+fn populate_attachments_by_message_mv(conn: &Conn, has_thread_id: bool) -> Result<(), ShareError> {
+    let select_sql = if has_thread_id {
+        "SELECT id, project_id, thread_id, created_ts, attachments FROM messages"
+    } else {
+        "SELECT id, project_id, created_ts, attachments FROM messages"
+    };
+    let rows = conn
+        .query_sync(select_sql, &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("attachments source query failed: {e}"),
+        })?;
+
+    for row in rows {
+        let message_id: i64 = row.get_named("id").map_err(sql_err)?;
+        let project_id: Option<i64> = row.get_named("project_id").map_err(sql_err)?;
+        let created_ts: Option<String> = row.get_named("created_ts").map_err(sql_err)?;
+        let thread_id = if has_thread_id {
+            row.get_named::<Option<String>>("thread_id")
+                .map_err(sql_err)?
+                .and_then(|value| {
+                    let trimmed = value.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+        } else {
+            None
+        };
+        let attachments_json: Option<String> = row.get_named("attachments").map_err(sql_err)?;
+        let Some(attachments_json) = attachments_json else {
+            continue;
+        };
+        let Ok(serde_json::Value::Array(attachments)) =
+            serde_json::from_str::<serde_json::Value>(&attachments_json)
+        else {
+            continue;
+        };
+
+        for attachment in attachments {
+            let serde_json::Value::Object(fields) = attachment else {
+                continue;
+            };
+            let attachment_type = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let media_type = fields
+                .get("media_type")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let path = fields
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let size_bytes = fields.get("bytes").and_then(serde_json::Value::as_i64);
+
+            conn.execute_sync(
+                "INSERT INTO attachments_by_message_mv (\
+                 message_id, project_id, thread_id, created_ts, \
+                 attachment_type, media_type, path, size_bytes\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    sqlmodel_core::Value::BigInt(message_id),
+                    project_id
+                        .map(sqlmodel_core::Value::BigInt)
+                        .unwrap_or(sqlmodel_core::Value::Null),
+                    thread_id
+                        .clone()
+                        .map(sqlmodel_core::Value::Text)
+                        .unwrap_or(sqlmodel_core::Value::Null),
+                    created_ts
+                        .clone()
+                        .map(sqlmodel_core::Value::Text)
+                        .unwrap_or(sqlmodel_core::Value::Null),
+                    attachment_type
+                        .map(sqlmodel_core::Value::Text)
+                        .unwrap_or(sqlmodel_core::Value::Null),
+                    media_type
+                        .map(sqlmodel_core::Value::Text)
+                        .unwrap_or(sqlmodel_core::Value::Null),
+                    path.map(sqlmodel_core::Value::Text)
+                        .unwrap_or(sqlmodel_core::Value::Null),
+                    size_bytes
+                        .map(sqlmodel_core::Value::BigInt)
+                        .unwrap_or(sqlmodel_core::Value::Null),
+                ],
+            )
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("attachments_by_message_mv insert failed: {e}"),
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Step 6: Create performance indexes (lowercase columns + covering indexes).
@@ -439,16 +521,16 @@ pub fn create_performance_indexes(snapshot_path: &Path) -> Result<Vec<String>, S
     Ok(indexes)
 }
 
-/// Step 7: Finalize snapshot for export (journal mode, page size, VACUUM, ANALYZE).
+/// Step 7: Finalize snapshot storage for export.
 ///
-/// Must be called last, after all schema modifications.
+/// This rebuilds the snapshot into a compact fresh database with the export
+/// page size, then applies the final journal mode and statistics pragmas.
 pub fn finalize_snapshot_for_export(snapshot_path: &Path) -> Result<(), ShareError> {
-    let conn = open_conn(snapshot_path)?;
+    rewrite_snapshot_storage(snapshot_path)?;
 
+    let conn = open_conn(snapshot_path)?;
     conn.execute_raw("PRAGMA journal_mode='DELETE'")
         .map_err(sql_err)?;
-    conn.execute_raw("PRAGMA page_size=1024").map_err(sql_err)?;
-    conn.execute_raw("VACUUM").map_err(sql_err)?;
     conn.execute_raw("PRAGMA analysis_limit=400")
         .map_err(sql_err)?;
     conn.execute_raw("ANALYZE").map_err(sql_err)?;
@@ -459,10 +541,15 @@ pub fn finalize_snapshot_for_export(snapshot_path: &Path) -> Result<(), ShareErr
 
 /// Run steps 4–7 in sequence on a scoped+scrubbed snapshot.
 pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareError> {
+    finalize_snapshot_for_export(snapshot_path)?;
     let fts_enabled = build_search_indexes(snapshot_path)?;
     let views_created = build_materialized_views(snapshot_path, fts_enabled)?;
     let indexes_created = create_performance_indexes(snapshot_path)?;
-    finalize_snapshot_for_export(snapshot_path)?;
+    let conn = open_conn(snapshot_path)?;
+    conn.execute_raw("PRAGMA analysis_limit=400")
+        .map_err(sql_err)?;
+    conn.execute_raw("ANALYZE").map_err(sql_err)?;
+    conn.execute_raw("PRAGMA optimize").map_err(sql_err)?;
 
     Ok(FinalizeResult {
         fts_enabled,
@@ -471,17 +558,47 @@ pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareE
     })
 }
 
+fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
+    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
+    let parent = snapshot_path
+        .parent()
+        .ok_or_else(|| ShareError::Io(std::io::Error::other("snapshot path has no parent")))?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("am-share-finalize-")
+        .tempdir_in(parent)?;
+    let rebuilt_path = temp_dir.path().join("mailbox.sqlite3");
+
+    crate::snapshot::rebuild_sqlite_snapshot_with_pragmas(
+        &snapshot_path,
+        &rebuilt_path,
+        false,
+        &["PRAGMA journal_mode='DELETE'", "PRAGMA page_size=1024"],
+    )?;
+
+    if let Err(rename_error) = std::fs::rename(&rebuilt_path, &snapshot_path) {
+        std::fs::copy(&rebuilt_path, &snapshot_path).map_err(|copy_error| {
+            ShareError::Io(std::io::Error::other(format!(
+                "failed to replace snapshot via rename ({rename_error}) or copy ({copy_error})"
+            )))
+        })?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_os = snapshot_path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar_path = std::path::PathBuf::from(sidecar_os);
+        if sidecar_path.exists() {
+            let _ = std::fs::remove_file(sidecar_path);
+        }
+    }
+    Ok(())
+}
+
 // --- helpers ---
 
-/// Open a C-backed SQLite connection for offline snapshot manipulation.
-///
-/// Finalization requires features that FrankenSQLite does not support
-/// (PRAGMA journal_mode changes, VACUUM, FTS5 virtual tables), so we
-/// use the real C SQLite driver here.
-fn open_conn(path: &Path) -> Result<SqliteConnection, ShareError> {
+fn open_conn(path: &Path) -> Result<Conn, ShareError> {
     let path = crate::resolve_share_sqlite_path(path);
     let path_str = path.display().to_string();
-    SqliteConnection::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+    Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open {path_str}: {e}"),
     })
 }
@@ -492,7 +609,7 @@ fn sql_err(e: impl std::fmt::Display) -> ShareError {
     }
 }
 
-fn table_exists(conn: &SqliteConnection, table: &str) -> Result<bool, ShareError> {
+fn table_exists(conn: &Conn, table: &str) -> Result<bool, ShareError> {
     let sql = format!(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{}' LIMIT 1",
         table.replace('\'', "''")
@@ -503,7 +620,7 @@ fn table_exists(conn: &SqliteConnection, table: &str) -> Result<bool, ShareError
     Ok(!rows.is_empty())
 }
 
-fn column_exists(conn: &SqliteConnection, table: &str, column: &str) -> Result<bool, ShareError> {
+fn column_exists(conn: &Conn, table: &str, column: &str) -> Result<bool, ShareError> {
     // PRAGMA table_info returns 0 rows on FrankenConnection; fall back to
     // a direct SELECT probe when PRAGMA yields nothing.
     let rows = conn
@@ -907,7 +1024,7 @@ mod tests {
         let result = finalize_export_db(&db);
         assert!(
             result.is_ok(),
-            "finalize_export_db should succeed even with legacy FTS triggers"
+            "finalize_export_db should succeed even with legacy FTS triggers: {result:?}"
         );
     }
 

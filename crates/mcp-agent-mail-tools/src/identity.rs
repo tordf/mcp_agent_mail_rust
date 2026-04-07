@@ -186,12 +186,8 @@ const fn us_to_ms_ceil(us: u64) -> u64 {
 }
 
 const HEALTH_CHECK_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 5_000;
-const HEALTH_CHECK_REQUIRED_TABLES: &[&str] = &[
-    "projects",
-    "agents",
-    "messages",
-    "message_recipients",
-];
+const HEALTH_CHECK_REQUIRED_TABLES: &[&str] =
+    &["projects", "agents", "messages", "message_recipients"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticReadinessResponse {

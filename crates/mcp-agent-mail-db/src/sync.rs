@@ -55,10 +55,7 @@ pub fn update_message_thread_id(
     Ok(true)
 }
 
-/// Fetch inbox rows using native SQLite sync reads.
-///
-/// This bypasses the frankensqlite async/runtime path for inbox-style joins,
-/// which is safer for operational mailbox reads and CLI fallback paths.
+/// Fetch inbox rows using synchronous FrankenSQLite reads.
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_inbox_native_sqlite_by_ids(
     sqlite_path: &str,
@@ -71,9 +68,9 @@ pub fn fetch_inbox_native_sqlite_by_ids(
     limit: usize,
 ) -> Result<Vec<InboxRow>, DbError> {
     let conn = if sqlite_path == ":memory:" {
-        sqlmodel_sqlite::SqliteConnection::open_memory()
+        DbConn::open_memory()
     } else {
-        sqlmodel_sqlite::SqliteConnection::open_file(sqlite_path)
+        DbConn::open_file(sqlite_path)
     }
     .map_err(|e| DbError::Sqlite(e.to_string()))?;
 

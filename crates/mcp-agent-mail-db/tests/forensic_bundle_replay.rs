@@ -23,7 +23,6 @@ use mcp_agent_mail_db::reconstruct::{
     reconstruct_from_archive_with_salvage, scan_archive_message_inventory,
 };
 use serde_json::json;
-use sqlmodel_sqlite::SqliteConnection as SqliteDbConn;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -176,9 +175,9 @@ fn write_agent_profile(
 }
 
 /// Create a minimal salvage database with the given tables and data.
-fn create_salvage_db(path: &Path) -> SqliteDbConn {
-    let conn =
-        SqliteDbConn::open_file(path.to_str().expect("valid path")).expect("open salvage db");
+fn create_salvage_db(path: &Path) -> mcp_agent_mail_db::DbConn {
+    let conn = mcp_agent_mail_db::DbConn::open_file(path.to_str().expect("valid path"))
+        .expect("open salvage db");
     conn.execute_raw(
         "CREATE TABLE projects (
             id INTEGER PRIMARY KEY,
@@ -252,7 +251,7 @@ struct DbSnapshot {
 }
 
 fn snapshot_db(db_path: &Path) -> DbSnapshot {
-    let conn = SqliteDbConn::open_file(db_path.to_str().expect("valid path"))
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_str().expect("valid path"))
         .expect("open reconstructed db");
 
     let project_rows = conn
@@ -790,7 +789,7 @@ fn replay_salvage_merge_reconstruction() {
     }
 
     // Verify read_ts/ack_ts were merged from salvage
-    let conn = SqliteDbConn::open_file(db_path.to_str().expect("valid path"))
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_str().expect("valid path"))
         .expect("open reconstructed db");
     let bob_recipient = conn
         .query_sync(

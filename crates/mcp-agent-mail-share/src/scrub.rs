@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
+use mcp_agent_mail_db::DbConn;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,10 +14,7 @@ use sqlmodel_core::Value as SqlValue;
 
 use crate::{ScrubPreset, ShareError};
 
-/// Connection type for offline snapshot manipulation.
-///
-/// Uses C-backed SQLite for reliable UPDATE/changes() tracking.
-type Conn = sqlmodel_sqlite::SqliteConnection;
+type Conn = DbConn;
 
 /// Keys to remove from attachment metadata dicts during scrubbing.
 const ATTACHMENT_REDACT_KEYS: &[&str] = &[

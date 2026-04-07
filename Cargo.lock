@@ -4450,17 +4450,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libsqlite3-sys"
-version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
-dependencies = [
- "cc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "libssh2-sys"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4752,7 +4741,6 @@ dependencies = [
  "sha2",
  "similar",
  "sqlmodel-core",
- "sqlmodel-sqlite",
  "tempfile",
  "thiserror",
  "tracing",
@@ -4805,6 +4793,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "shellexpand",
+ "sqlmodel-frankensqlite",
  "tempfile",
  "thiserror",
 ]
@@ -4826,7 +4815,6 @@ dependencies = [
  "half",
  "hex",
  "indexmap",
- "libsqlite3-sys",
  "loom",
  "mcp-agent-mail-core",
  "proptest",
@@ -4957,7 +4945,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlmodel-core",
- "sqlmodel-sqlite",
  "tempfile",
  "thiserror",
  "zip 8.5.0",
@@ -7309,9 +7296,10 @@ dependencies = [
 [[package]]
 name = "sqlmodel-sqlite"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c4ef11a2cf1875e0537b16b91768bb446f9cd620a1fd100ced7790a4b30d60e"
 dependencies = [
  "asupersync",
- "libsqlite3-sys",
  "serde",
  "serde_json",
  "sqlmodel-core",

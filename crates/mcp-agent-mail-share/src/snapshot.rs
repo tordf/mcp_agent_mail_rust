@@ -1,21 +1,21 @@
 //! Step 1: SQLite snapshot creation via SQL-level dump and restore.
 //!
-//! Creates an atomic, clean C-SQLite copy of the source database suitable for
+//! Creates an atomic, clean FrankenSQLite copy of the source database suitable for
 //! offline manipulation (scoping, scrubbing, finalization with FTS5/VACUUM).
 //!
-//! The source DB may be in FrankenSQLite format (used at runtime), which is
-//! not file-level compatible with C SQLite.  Instead of a byte-level file
-//! copy we read schema + data through the FrankenSQLite driver and re-create
-//! them in a fresh C-SQLite file.
+//! Instead of a byte-level file copy we read schema + data through the runtime
+//! driver and re-create them in a fresh destination file.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use mcp_agent_mail_db::DbConn;
 use sqlmodel_core::Value;
-use sqlmodel_sqlite::SqliteConnection;
 
 use crate::ShareError;
+
+#[cfg(test)]
+type SqliteConnection = DbConn;
 
 /// Known tables produced by the `mcp-agent-mail-db` schema.
 ///
@@ -186,7 +186,7 @@ const KNOWN_TABLES: &[KnownTable] = &[
 ///
 /// 1. Opens source DB with FrankenSQLite (runtime driver).
 /// 2. If `checkpoint` is true, runs `PRAGMA wal_checkpoint(TRUNCATE)`.
-/// 3. Transfers schema + data to a fresh C-SQLite destination file.
+/// 3. Transfers schema + data to a fresh destination file.
 ///
 /// Returns the destination path on success.
 ///
@@ -200,6 +200,15 @@ pub fn create_sqlite_snapshot(
     source: &Path,
     destination: &Path,
     checkpoint: bool,
+) -> Result<PathBuf, ShareError> {
+    rebuild_sqlite_snapshot_with_pragmas(source, destination, checkpoint, &[])
+}
+
+pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
+    source: &Path,
+    destination: &Path,
+    checkpoint: bool,
+    destination_pragmas: &[&str],
 ) -> Result<PathBuf, ShareError> {
     let source = crate::resolve_share_sqlite_path(source);
 
@@ -231,53 +240,50 @@ pub fn create_sqlite_snapshot(
 
     let source_str = source.display().to_string();
 
-    // Create destination with C SQLite
+    // Create destination with FrankenSQLite. Page size must be chosen before
+    // page 1 is initialized, so honor any requested destination page_size here.
     let dest_str = dest.display().to_string();
-    let dst_conn = SqliteConnection::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
-        message: format!("cannot create destination DB {dest_str}: {e}"),
-    })?;
-
-    // Try FrankenSQLite first (runtime format), fall back to C SQLite.
-    // Runtime databases are created by FrankenSQLite which produces files that
-    // C SQLite cannot read.  Fixture/external databases are C SQLite and
-    // FrankenSQLite may not be able to read those.
-    let frank_ok = match DbConn::open_file(&source_str) {
-        Ok(src) => {
-            if checkpoint {
-                let _ = src.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
-            }
-            // Probe the schema catalog to confirm we can actually read the DB
-            // without assuming a specific application table is present.
-            match src.query_sync(
-                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') LIMIT 1",
-                &[],
-            ) {
-                Ok(_) => {
-                    transfer_tables_frank(&src, &dst_conn)?;
-                    true
-                }
-                Err(_) => false,
-            }
-        }
-        Err(_) => false,
+    let dst_conn = if let Some(page_size) = destination_page_size_bytes(destination_pragmas)? {
+        DbConn::open_file_with_page_size(&dest_str, page_size).map_err(|e| ShareError::Sqlite {
+            message: format!(
+                "cannot create destination DB {dest_str} with page size {page_size}: {e}"
+            ),
+        })?
+    } else {
+        DbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
+            message: format!("cannot create destination DB {dest_str}: {e}"),
+        })?
     };
-
-    if !frank_ok {
-        // Fall back to C SQLite for the source (e.g. fixture files).
-        let src_c = SqliteConnection::open_file(&source_str).map_err(|e| ShareError::Sqlite {
-            message: format!("cannot open source DB {source_str}: {e}"),
-        })?;
-        if checkpoint {
-            let _ = src_c.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
-        }
-        transfer_tables_c(&src_c, &dst_conn)?;
+    for pragma in destination_pragmas {
+        dst_conn
+            .execute_raw(pragma)
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("failed to apply destination pragma {pragma:?}: {e}"),
+            })?;
     }
+
+    let src = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open source DB {source_str}: {e}"),
+    })?;
+    if checkpoint {
+        let _ = src.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+    let transfer_result = transfer_tables_frank(&src, &dst_conn);
+    let src_close_result = src.close_sync().map_err(|e| ShareError::Sqlite {
+        message: format!("failed to close source DB {source_str}: {e}"),
+    });
+    let dst_close_result = dst_conn.close_sync().map_err(|e| ShareError::Sqlite {
+        message: format!("failed to close destination DB {dest_str}: {e}"),
+    });
+    transfer_result?;
+    src_close_result?;
+    dst_close_result?;
 
     Ok(dest)
 }
 
-/// Transfer tables from a FrankenSQLite source to a C-SQLite destination.
-fn transfer_tables_frank(src: &DbConn, dst: &SqliteConnection) -> Result<(), ShareError> {
+/// Transfer tables from a source snapshot to a fresh destination database.
+fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
     for table in KNOWN_TABLES {
         let source_columns = source_columns_frank(src, table.name)?;
         if source_columns.is_empty() {
@@ -350,82 +356,8 @@ fn transfer_tables_frank(src: &DbConn, dst: &SqliteConnection) -> Result<(), Sha
     Ok(())
 }
 
-/// Transfer tables from a C-SQLite source to a C-SQLite destination.
-fn transfer_tables_c(src: &SqliteConnection, dst: &SqliteConnection) -> Result<(), ShareError> {
-    for table in KNOWN_TABLES {
-        let source_columns = source_columns_c(src, table.name)?;
-        if source_columns.is_empty() {
-            continue;
-        }
-        let available_columns = available_columns(table, &source_columns);
-        if available_columns.is_empty() {
-            continue;
-        }
-
-        create_dst_table(dst, table)?;
-        let insert_sql = build_insert(table.name, table.columns);
-        let select_columns = quoted_column_list(&available_columns);
-        let page_by_column = table
-            .page_by_column
-            .filter(|column| source_columns.contains(*column));
-        let mut last_page_value: i64 = -1;
-        loop {
-            let (select_sql, params): (String, Vec<Value>) =
-                if let Some(page_by_column) = page_by_column {
-                    (
-                        format!(
-                            "SELECT {select_columns} FROM \"{}\" WHERE \"{page_by_column}\" > ?1 \
-                         ORDER BY \"{page_by_column}\" ASC LIMIT 1000",
-                            table.name
-                        ),
-                        vec![Value::BigInt(last_page_value)],
-                    )
-                } else {
-                    (
-                        format!("SELECT {select_columns} FROM \"{}\"", table.name),
-                        vec![],
-                    )
-                };
-
-            let rows = src
-                .query_sync(&select_sql, &params)
-                .map_err(|e| ShareError::Sqlite {
-                    message: format!("SELECT from {} failed: {e}", table.name),
-                })?;
-
-            if rows.is_empty() {
-                break;
-            }
-
-            for row in &rows {
-                let values: Vec<Value> = table
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        row.get_by_name(c)
-                            .cloned()
-                            .or_else(|| snapshot_default_value(table.name, c))
-                            .unwrap_or(Value::Null)
-                    })
-                    .collect();
-                if let Some(page_by_column) = page_by_column {
-                    last_page_value = extract_page_value(row, table.name, page_by_column)?;
-                }
-                dst.execute_sync(&insert_sql, &values)
-                    .map_err(|e| ShareError::Sqlite {
-                        message: format!("INSERT into {} failed: {e}", table.name),
-                    })?;
-            }
-            if page_by_column.is_none() {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Create a table in the C-SQLite destination.
-fn create_dst_table(dst: &SqliteConnection, table: &KnownTable) -> Result<(), ShareError> {
+/// Create a table in the destination database.
+fn create_dst_table(dst: &DbConn, table: &KnownTable) -> Result<(), ShareError> {
     let col_defs: Vec<String> = table.columns.iter().map(|c| format!("\"{c}\"")).collect();
 
     let pk_suffix = primary_key_suffix(table.primary_key_columns);
@@ -451,6 +383,27 @@ fn build_insert(table: &str, columns: &[&str]) -> String {
     format!("INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})")
 }
 
+fn destination_page_size_bytes(destination_pragmas: &[&str]) -> Result<Option<u32>, ShareError> {
+    let mut requested = None;
+    for pragma in destination_pragmas {
+        let compact: String = pragma
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect();
+        let compact = compact.trim_end_matches(';').to_ascii_lowercase();
+        let Some(raw_value) = compact.strip_prefix("pragmapage_size=") else {
+            continue;
+        };
+        let page_size = raw_value
+            .parse::<u32>()
+            .map_err(|_| ShareError::Validation {
+                message: format!("invalid destination page_size pragma: {pragma}"),
+            })?;
+        requested = Some(page_size);
+    }
+    Ok(requested)
+}
+
 fn quoted_column_list(columns: &[&str]) -> String {
     columns
         .iter()
@@ -467,15 +420,6 @@ fn primary_key_suffix(primary_key_columns: &[&str]) -> String {
 }
 
 fn source_columns_frank(src: &DbConn, table: &str) -> Result<HashSet<String>, ShareError> {
-    let rows = src
-        .query_sync(&format!("PRAGMA table_info(\"{table}\")"), &[])
-        .map_err(|e| ShareError::Sqlite {
-            message: format!("PRAGMA table_info({table}) failed: {e}"),
-        })?;
-    Ok(extract_column_names(&rows))
-}
-
-fn source_columns_c(src: &SqliteConnection, table: &str) -> Result<HashSet<String>, ShareError> {
     let rows = src
         .query_sync(&format!("PRAGMA table_info(\"{table}\")"), &[])
         .map_err(|e| ShareError::Sqlite {
@@ -592,12 +536,12 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        // Snapshot it (converts FrankenSQLite → C SQLite).
+        // Snapshot it into a standalone SQLite bundle database.
         let result = create_sqlite_snapshot(&source, &dest, false);
         assert!(result.is_ok());
         assert!(dest.exists());
 
-        // Verify data in copy using C SQLite.
+        // Verify data in the copied snapshot.
         let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
         let rows = copy_conn
             .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
@@ -606,7 +550,7 @@ mod tests {
         let name: String = rows[0].get_named("slug").unwrap();
         assert_eq!(name, "hello");
 
-        // Verify integrity on the C SQLite copy.
+        // Verify integrity on the copied snapshot.
         let rows = copy_conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
         let result: String = rows[0].get_named("integrity_check").unwrap();
         assert_eq!(result, "ok");

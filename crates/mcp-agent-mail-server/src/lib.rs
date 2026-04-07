@@ -10623,15 +10623,10 @@ fn readiness_check_semantic_status(
         .into_iter()
         .filter_map(|row| row.get_named::<String>("name").ok())
         .collect::<std::collections::BTreeSet<_>>();
-    let missing_tables = [
-        "projects",
-        "agents",
-        "messages",
-        "message_recipients",
-    ]
-    .into_iter()
-    .filter(|name| !present.contains(*name))
-    .collect::<Vec<_>>();
+    let missing_tables = ["projects", "agents", "messages", "message_recipients"]
+        .into_iter()
+        .filter(|name| !present.contains(*name))
+        .collect::<Vec<_>>();
     if !missing_tables.is_empty() {
         return Err(format!(
             "sqlite schema missing required readiness tables: {}",

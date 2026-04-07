@@ -17,10 +17,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
-use sqlmodel_sqlite::SqliteConnection;
 
 use crate::{ExportRedactionPolicy, RedactionAuditLog, RedactionReason, ShareError, ShareResult};
+
+#[cfg(test)]
+type SqliteConnection = DbConn;
 
 // ── Configuration ───────────────────────────────────────────────────────
 
@@ -259,7 +262,7 @@ pub fn render_static_site(
 ) -> ShareResult<StaticRenderResult> {
     let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
     let path_str = snapshot_path.display().to_string();
-    let conn = SqliteConnection::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+    let conn = DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot for static render: {e}"),
     })?;
 
@@ -494,7 +497,7 @@ pub fn render_static_site(
 
 // ── Data discovery ──────────────────────────────────────────────────────
 
-fn discover_projects(conn: &SqliteConnection) -> ShareResult<Vec<ProjectInfo>> {
+fn discover_projects(conn: &DbConn) -> ShareResult<Vec<ProjectInfo>> {
     let rows = conn
         .query_sync(
             "SELECT p.slug, p.human_key, \
@@ -519,10 +522,7 @@ fn discover_projects(conn: &SqliteConnection) -> ShareResult<Vec<ProjectInfo>> {
     Ok(projects)
 }
 
-fn discover_messages(
-    conn: &SqliteConnection,
-    config: &StaticRenderConfig,
-) -> ShareResult<Vec<MessageInfo>> {
+fn discover_messages(conn: &DbConn, config: &StaticRenderConfig) -> ShareResult<Vec<MessageInfo>> {
     // 1. Fetch all recipients grouped by message_id to avoid N+1 query pattern.
     // Order by name for determinism.
     let recipient_rows = conn

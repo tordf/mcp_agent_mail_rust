@@ -1931,6 +1931,61 @@ pub enum ToolingCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Internal FrankenSQLite-backed DB query helper for installer and harnesses.
+    #[command(name = "db-query", hide = true)]
+    DbQuery {
+        /// SQLite database file to inspect.
+        #[arg(long)]
+        db: PathBuf,
+        /// SQL query to execute.
+        #[arg(long)]
+        sql: String,
+        /// Return the first column of the first row only.
+        #[arg(long, default_value_t = false)]
+        first: bool,
+        /// Emit JSON rows instead of plain-text output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Internal FrankenSQLite-backed DB exec helper for installer and harnesses.
+    #[command(name = "db-exec", hide = true)]
+    DbExec {
+        /// SQLite database file to mutate.
+        #[arg(long)]
+        db: PathBuf,
+        /// SQL statement or script to execute. If omitted, read from stdin.
+        #[arg(long)]
+        sql: Option<String>,
+        /// Emit a small JSON acknowledgement on success.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Internal FrankenSQLite-backed DB backup helper for installer and harnesses.
+    #[command(name = "db-backup", hide = true)]
+    DbBackup {
+        /// SQLite database file to snapshot.
+        #[arg(long)]
+        db: PathBuf,
+        /// Destination snapshot path.
+        #[arg(long)]
+        output: PathBuf,
+        /// Emit a small JSON acknowledgement on success.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Internal canonical DB initialization helper for installer and harnesses.
+    #[command(name = "db-init", hide = true)]
+    DbInit {
+        /// SQLite database file to initialize.
+        #[arg(long)]
+        db: PathBuf,
+        /// Storage root used for archive-backed recovery and pool identity.
+        #[arg(long)]
+        storage_root: PathBuf,
+        /// Emit a small JSON acknowledgement on success.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2839,19 +2894,14 @@ fn cleanup_stale_db_artifacts(db_path: &Path) {
             // with the main file alone.  The Git archive is the real source of
             // truth; losing uncommitted WAL data is acceptable for startup
             // resilience.
-            let holders =
-                mcp_agent_mail_server::startup_checks::pids_holding_file(db_path);
+            let holders = mcp_agent_mail_server::startup_checks::pids_holding_file(db_path);
             if holders.is_empty() {
                 // No process holds the file — try a TRUNCATE checkpoint
                 // to merge the WAL into the main file and clear it.
                 let checkpoint_ok = db_path
                     .to_str()
-                    .and_then(|path_str| {
-                        sqlmodel_sqlite::SqliteConnection::open_file(path_str).ok()
-                    })
-                    .and_then(|conn| {
-                        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").ok()
-                    })
+                    .and_then(|path_str| mcp_agent_mail_db::DbConn::open_file(path_str).ok())
+                    .and_then(|conn| conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").ok())
                     .is_some();
                 if checkpoint_ok {
                     eprintln!(
@@ -5048,7 +5098,7 @@ fn is_snapshot_conflict_cli_error(error: &CliError) -> bool {
 }
 
 fn sqlite_conn_quick_check_ok_canonical(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
 ) -> CliResult<bool> {
     let rows = conn
         .query_sync("PRAGMA quick_check", &[])
@@ -5060,7 +5110,7 @@ fn sqlite_conn_quick_check_ok_canonical(
 }
 
 fn sqlite_conn_incremental_check_ok_canonical(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
 ) -> CliResult<bool> {
     let rows = conn
         .query_sync("PRAGMA integrity_check(1)", &[])
@@ -5087,7 +5137,7 @@ fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
 
 fn sqlite_file_is_healthy_canonical(path: &Path) -> CliResult<bool> {
     let path_string = path.to_string_lossy().into_owned();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_string)
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&path_string)
         .map_err(|e| CliError::Other(format!("cannot open sqlite file {}: {e}", path.display())))?;
     if !sqlite_conn_quick_check_ok_canonical(&conn)? {
         return Ok(false);
@@ -5181,41 +5231,6 @@ fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
     sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
 }
 
-fn sqlite_quick_check_via_cli(path: &Path) -> CliResult<Option<bool>> {
-    let output = match std::process::Command::new("sqlite3")
-        .arg(path)
-        .arg("PRAGMA quick_check;")
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(CliError::Other(format!(
-                "failed to run sqlite3 quick_check for {}: {e}",
-                path.display()
-            )));
-        }
-    };
-
-    if !output.status.success() {
-        return Ok(Some(false));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let checks: Vec<&str> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    if checks.is_empty() {
-        return Ok(Some(false));
-    }
-
-    Ok(Some(
-        checks.len() == 1 && checks[0].eq_ignore_ascii_case("ok"),
-    ))
-}
-
 fn sqlite_doctor_sanity_with_health_probe<F>(
     db_path: &str,
     mut health_probe: F,
@@ -5226,9 +5241,6 @@ where
     let mut selected_path = PathBuf::from(db_path);
     let mut used_absolute_fallback = false;
     let mut fallback_due_to_missing_configured_path = false;
-    let mut sqlite3_probe_failed = false;
-    let mut sqlite3_probe_succeeded = false;
-    let mut sqlite3_rescued_primary = false;
 
     if !selected_path.exists() {
         if let Some(absolute_candidate) = sqlite_absolute_candidate_path(db_path) {
@@ -5290,19 +5302,6 @@ where
         }
     }
 
-    if let Some(sqlite3_ok) = sqlite_quick_check_via_cli(selected_path.as_path())? {
-        if sqlite3_ok {
-            sqlite3_probe_succeeded = true;
-            if !healthy {
-                healthy = true;
-                sqlite3_rescued_primary = true;
-            }
-        } else {
-            sqlite3_probe_failed = true;
-            // Do not force healthy = false; frankensqlite might use formats that standard sqlite3 CLI rejects.
-        }
-    }
-
     let file_size = selected_path.metadata().map(|m| m.len()).map_err(|e| {
         CliError::Other(format!(
             "cannot stat database file {}: {e}",
@@ -5318,31 +5317,19 @@ where
         ));
     }
 
-    let sqlite3_note = if sqlite3_rescued_primary {
-        "; sqlite3 quick_check rescued failed primary probe".to_string()
-    } else if sqlite3_probe_failed {
-        "; sqlite3 quick_check failed".to_string()
-    } else if sqlite3_probe_succeeded {
-        "; sqlite3 quick_check OK".to_string()
-    } else {
-        String::new()
-    };
-
     if healthy {
         if used_absolute_fallback {
             let detail = if fallback_due_to_missing_configured_path {
                 format!(
-                    "quick_check OK via absolute fallback {} (configured path missing; {} bytes){}",
+                    "quick_check OK via absolute fallback {} (configured path missing; {} bytes)",
                     selected_path.display(),
                     file_size,
-                    sqlite3_note
                 )
             } else {
                 format!(
-                    "quick_check OK via absolute fallback {} ({} bytes){}",
+                    "quick_check OK via absolute fallback {} ({} bytes)",
                     selected_path.display(),
                     file_size,
-                    sqlite3_note
                 )
             };
             return Ok((
@@ -5354,7 +5341,7 @@ where
         }
         return Ok((
             true,
-            format!("quick_check OK ({file_size} bytes){sqlite3_note}"),
+            format!("quick_check OK ({file_size} bytes)"),
             used_absolute_fallback,
             fallback_due_to_missing_configured_path,
         ));
@@ -5363,9 +5350,8 @@ where
     Ok((
         false,
         format!(
-            "Health probes failed for {} (possible corruption){}",
-            selected_path.display(),
-            sqlite3_note
+            "Health probes failed for {} (possible corruption)",
+            selected_path.display()
         ),
         used_absolute_fallback,
         fallback_due_to_missing_configured_path,
@@ -5440,149 +5426,6 @@ fn find_healthy_sqlite_backup(path: &Path) -> Option<PathBuf> {
     None
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SqliteSalvageArtifacts {
-    recovered_db: PathBuf,
-    recovered_sql: PathBuf,
-}
-
-fn sqlite_salvage_artifact_path(source_db: &Path, timestamp: &str, suffix: &str) -> PathBuf {
-    let base_name = source_db
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("storage.sqlite3");
-    source_db.with_file_name(format!("{base_name}.salvage-{timestamp}{suffix}"))
-}
-
-fn attempt_sqlite_salvage_via_cli(
-    source_db: &Path,
-    timestamp: &str,
-) -> Result<Option<SqliteSalvageArtifacts>, String> {
-    use std::process::Stdio;
-
-    if !source_db.exists() {
-        return Ok(None);
-    }
-
-    let recover_output = match std::process::Command::new("sqlite3")
-        .arg(source_db)
-        .arg(".recover")
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(format!(
-                "failed to run sqlite3 .recover against {}: {err}",
-                source_db.display()
-            ));
-        }
-    };
-
-    if !recover_output.status.success() {
-        let stderr = String::from_utf8_lossy(&recover_output.stderr);
-        return Err(format!(
-            "sqlite3 .recover failed for {}: {}",
-            source_db.display(),
-            stderr.trim()
-        ));
-    }
-
-    if recover_output
-        .stdout
-        .iter()
-        .all(|byte| byte.is_ascii_whitespace())
-    {
-        return Err(format!(
-            "sqlite3 .recover produced no salvageable SQL for {}",
-            source_db.display()
-        ));
-    }
-
-    let recovered_sql = sqlite_salvage_artifact_path(source_db, timestamp, ".sql");
-    let recovered_db = sqlite_salvage_artifact_path(source_db, timestamp, ".sqlite3");
-    std::fs::write(&recovered_sql, &recover_output.stdout).map_err(|err| {
-        format!(
-            "failed to write salvage SQL {}: {err}",
-            recovered_sql.display()
-        )
-    })?;
-
-    let mut child = std::process::Command::new("sqlite3")
-        .arg(&recovered_db)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            format!(
-                "failed to launch sqlite3 to import salvage into {}: {err}",
-                recovered_db.display()
-            )
-        })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let stdout_data = recover_output.stdout.clone();
-        std::thread::spawn(move || {
-            let _ = std::io::Write::write_all(&mut stdin, &stdout_data);
-        });
-    } else {
-        return Err(format!(
-            "failed to open stdin while importing salvage into {}",
-            recovered_db.display()
-        ));
-    }
-    let import_output = child.wait_with_output().map_err(|err| {
-        format!(
-            "failed while waiting for sqlite3 salvage import {}: {err}",
-            recovered_db.display()
-        )
-    })?;
-    if !import_output.status.success() {
-        let stderr = String::from_utf8_lossy(&import_output.stderr);
-        return Err(format!(
-            "sqlite3 salvage import failed for {}: {}",
-            recovered_db.display(),
-            stderr.trim()
-        ));
-    }
-
-    match sqlite_quick_check_via_cli(&recovered_db) {
-        Ok(Some(true)) | Ok(None) => {}
-        Ok(Some(false)) => {
-            return Err(format!(
-                "salvage database quick_check failed for {}",
-                recovered_db.display()
-            ));
-        }
-        Err(err) => {
-            return Err(format!(
-                "failed to validate salvage database {}: {err}",
-                recovered_db.display()
-            ));
-        }
-    }
-
-    let conn = mcp_agent_mail_db::DbConn::open_file(recovered_db.to_string_lossy().as_ref())
-        .map_err(|err| {
-            format!(
-                "salvage import produced unreadable database {}: {err}",
-                recovered_db.display()
-            )
-        })?;
-    conn.query_sync("SELECT COUNT(*) AS cnt FROM sqlite_master", &[])
-        .map_err(|err| {
-            format!(
-                "salvage database probe failed for {}: {err}",
-                recovered_db.display()
-            )
-        })?;
-
-    Ok(Some(SqliteSalvageArtifacts {
-        recovered_db,
-        recovered_sql,
-    }))
-}
-
 #[cfg(test)]
 fn recover_sqlite_file(path: &Path) -> CliResult<()> {
     recover_sqlite_file_with_storage_root(path, None)
@@ -5636,17 +5479,18 @@ fn recover_sqlite_file_with_storage_root(
                 "No backup found. Reconstructing database from archive at {}...",
                 storage_root.display()
             );
-            // Attempt salvage from the original DB while it is still in place.
-            let salvage = {
-                match attempt_sqlite_salvage_via_cli(path, &timestamp) {
-                    Ok(salvage) => salvage,
-                    Err(err) => {
-                        ftui_runtime::ftui_eprintln!(
-                            "Warning: best-effort sqlite salvage failed for {}: {err}",
-                            path.display()
-                        );
-                        None
-                    }
+            // Attempt best-effort salvage from the original DB while it is still
+            // in place. If the file remains readable enough to inspect through
+            // FrankenSQLite, merge any DB-only rows during archive reconstruction.
+            let salvage_attempt = attempt_readable_current_db_salvage(path);
+            let salvage_db_path = match &salvage_attempt {
+                DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
+                DoctorSalvageAttempt::Failed(detail) => {
+                    ftui_runtime::ftui_eprintln!(
+                        "Warning: best-effort sqlite salvage failed for {}: {detail}",
+                        path.display()
+                    );
+                    None
                 }
             };
             // Reconstruct into a temp file so the original is untouched on failure.
@@ -5654,17 +5498,11 @@ fn recover_sqlite_file_with_storage_root(
             match mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
                 &temp_reconstruct,
                 &storage_root,
-                salvage
-                    .as_ref()
-                    .map(|artifacts| artifacts.recovered_db.as_path()),
+                salvage_db_path,
             ) {
                 Ok(mut stats) => {
-                    if let Some(salvage) = &salvage {
-                        stats.warnings.push(format!(
-                            "Merged best-effort salvage from {} (SQL dump: {})",
-                            salvage.recovered_db.display(),
-                            salvage.recovered_sql.display()
-                        ));
+                    if let DoctorSalvageAttempt::Succeeded(artifact) = &salvage_attempt {
+                        stats.warnings.push(artifact.detail.clone());
                     }
                     ftui_runtime::ftui_println!("Reconstruction complete: {}", stats);
                     if !stats.warnings.is_empty() {
@@ -5849,7 +5687,7 @@ fn open_sqlite_with_fallback_internal(
 
 fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
     retry_sync_sqlite_lock(|| {
-        let conn = sqlmodel_sqlite::SqliteConnection::open_file(path).map_err(|e| {
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path).map_err(|e| {
             sqlite_retryable_error(
                 format!("cannot open DB at {path} for schema init: {e}"),
                 &e.to_string(),
@@ -6551,6 +6389,37 @@ fn open_db_sync_async_canonical_read_with_database_url(
         pool,
         _source: source,
         _mailbox_read_locks: mailbox_read_locks,
+    })
+}
+
+fn open_db_sync_async_canonical_read_best_effort_with_database_url(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+    context: &str,
+) -> CliResult<CanonicalReadDbPool> {
+    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    // Live-current mailboxes can be searched directly without materializing a
+    // temp snapshot, which keeps robot search fast under a live server.
+    let source =
+        resolve_canonical_snapshot_source_with_database_url(database_url, &storage_root, context)?;
+    let source_path = source.actual_path().display().to_string();
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.storage_root = Some(storage_root);
+    pool_cfg.run_migrations = false;
+    pool_cfg.skip_startup_init = true;
+    pool_cfg.warmup_connections = 0;
+    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+    Ok(CanonicalReadDbPool {
+        conn,
+        pool,
+        _source: source,
+        _mailbox_read_locks: CliMailboxReadLocks {
+            _storage_root_lock: None,
+            _sqlite_lock: None,
+        },
     })
 }
 
@@ -14269,12 +14138,7 @@ fn sample_agent_mail_process_cpu(pids: &[u32]) -> (Vec<DoctorProcessSample>, Opt
 }
 
 fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<String>> {
-    let required = [
-        "projects",
-        "agents",
-        "messages",
-        "message_recipients",
-    ];
+    let required = ["projects", "agents", "messages", "message_recipients"];
     let rows = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -25320,9 +25184,8 @@ http_headers = { Authorization = "Bearer secret" }
         );
 
         // Restored DB should contain only the scoped project.
-        // The snapshot is in C SQLite format, so use SqliteConnection.
         let restored_conn =
-            sqlmodel_sqlite::SqliteConnection::open_file(restore_db.display().to_string()).unwrap();
+            mcp_agent_mail_db::DbConn::open_file(&restore_db.display().to_string()).unwrap();
         let rows = restored_conn
             .query_sync("SELECT slug FROM projects ORDER BY id", &[])
             .unwrap();
@@ -27776,7 +27639,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn doctor_reconstruct_prefers_readable_quarantined_db_as_salvage_source() {
+    fn doctor_reconstruct_prefers_readable_current_db_as_salvage_source() {
         let _guard = stdio_capture_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -27784,99 +27647,115 @@ startup_timeout_sec = 42
         let storage = tmp.path().join("storage");
         let db_path = tmp.path().join("existing.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
-
-        handle_migrate_with_database_url(&db_url).expect("migrate");
-        let conn = open_db_sync_with_database_url(&db_url).expect("open");
-        conn.execute_raw(
-            "INSERT INTO projects (slug, human_key, created_at)
-             VALUES ('legacy-project', '/tmp/legacy-project', 0)",
-        )
-        .expect("insert legacy project");
-        drop(conn);
-
-        let archive_project = storage.join("projects").join("archive-only-project");
-        let archive_agent = archive_project.join("agents").join("ArchiveFox");
-        let archive_messages = archive_project.join("messages").join("2026").join("03");
-        std::fs::create_dir_all(&archive_agent).expect("create archive agent dir");
-        std::fs::create_dir_all(&archive_messages).expect("create archive message dir");
-        std::fs::write(
-            archive_project.join("project.json"),
-            r#"{"slug":"archive-only-project","human_key":"/tmp/archive-only-project"}"#,
-        )
-        .expect("write project.json");
-        std::fs::write(
-            archive_agent.join("profile.json"),
-            r#"{"name":"ArchiveFox","program":"codex","model":"gpt-5","task_description":"archive seed","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z","attachments_policy":"auto","contact_policy":"auto"}"#,
-        )
-        .expect("write profile");
-        std::fs::write(
-            archive_messages.join("20260322T000001Z__9001.md"),
-            "---json\n{\"id\":9001,\"from\":\"ArchiveFox\",\"to\":[\"LegacyAgent\"],\"subject\":\"Archive only message\",\"thread_id\":\"archive-thread\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T00:00:01Z\",\"attachments\":[]}\n---\nRecovered from archive only.\n",
-        )
-        .expect("write archive message");
-
-        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
-        let result =
-            handle_doctor_reconstruct_with(Some(&db_path), Some(&storage), false, true, true);
-        let output = capture.drain_to_string();
-        assert!(result.is_ok(), "reconstruct failed: {result:?}");
-        assert!(db_path.exists(), "reconstructed DB file should exist");
-
-        let payload = output
-            .lines()
-            .find(|line| line.trim_start().starts_with('{'))
-            .expect("json output line");
-        let value: serde_json::Value =
-            serde_json::from_str(payload).expect("parse reconstruct json output");
-        assert_eq!(value["salvage"]["status"], "ok");
-        assert!(
-            value["salvage"]["detail"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Using readable quarantined database"),
-            "unexpected salvage detail: {payload}"
-        );
-
-        let verify = open_db_sync_with_database_url(&db_url).expect("reopen db");
-        let rows = verify
-            .query_sync("SELECT slug, human_key FROM projects ORDER BY slug", &[])
-            .expect("query projects");
-        let projects = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.get_named::<String>("slug").expect("slug"),
-                    row.get_named::<String>("human_key").expect("human_key"),
+        let storage_root_text = storage.to_string_lossy().to_string();
+        let db_url_text = db_url.clone();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", db_url_text.as_str()),
+            ],
+            || {
+                handle_migrate_with_database_url(&db_url).expect("migrate");
+                let conn = open_db_sync_with_database_url(&db_url).expect("open");
+                conn.execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at)
+                     VALUES ('legacy-project', '/tmp/legacy-project', 0)",
                 )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            projects,
-            vec![
-                (
-                    "archive-only-project".to_string(),
-                    "/tmp/archive-only-project".to_string(),
-                ),
-                (
-                    "legacy-project".to_string(),
-                    "/tmp/legacy-project".to_string(),
-                ),
-            ]
-        );
+                .expect("insert legacy project");
+                drop(conn);
 
-        let salvage_artifacts = std::fs::read_dir(tmp.path())
-            .expect("read tmp dir")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".salvage-"))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            salvage_artifacts.is_empty(),
-            "readable quarantine should not emit sqlite3 .recover artifacts: {salvage_artifacts:?}"
+                let archive_project = storage.join("projects").join("archive-only-project");
+                let archive_agent = archive_project.join("agents").join("ArchiveFox");
+                let archive_messages = archive_project.join("messages").join("2026").join("03");
+                std::fs::create_dir_all(&archive_agent).expect("create archive agent dir");
+                std::fs::create_dir_all(&archive_messages).expect("create archive message dir");
+                std::fs::write(
+                    archive_project.join("project.json"),
+                    r#"{"slug":"archive-only-project","human_key":"/tmp/archive-only-project"}"#,
+                )
+                .expect("write project.json");
+                std::fs::write(
+                    archive_agent.join("profile.json"),
+                    r#"{"name":"ArchiveFox","program":"codex","model":"gpt-5","task_description":"archive seed","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z","attachments_policy":"auto","contact_policy":"auto"}"#,
+                )
+                .expect("write profile");
+                std::fs::write(
+                    archive_messages.join("20260322T000001Z__9001.md"),
+                    "---json\n{\"id\":9001,\"from\":\"ArchiveFox\",\"to\":[\"LegacyAgent\"],\"subject\":\"Archive only message\",\"thread_id\":\"archive-thread\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T00:00:01Z\",\"attachments\":[]}\n---\nRecovered from archive only.\n",
+                )
+                .expect("write archive message");
+
+                let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+                let result = handle_doctor_reconstruct_with(
+                    Some(&db_path),
+                    Some(&storage),
+                    false,
+                    true,
+                    true,
+                );
+                let output = capture.drain_to_string();
+                assert!(result.is_ok(), "reconstruct failed: {result:?}");
+                assert!(db_path.exists(), "reconstructed DB file should exist");
+
+                let payload = output
+                    .lines()
+                    .find(|line| line.trim_start().starts_with('{'))
+                    .expect("json output line");
+                let value: serde_json::Value =
+                    serde_json::from_str(payload).expect("parse reconstruct json output");
+                assert_eq!(value["salvage"]["status"], "ok");
+                assert!(
+                    value["salvage"]["detail"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Using readable current database"),
+                    "unexpected salvage detail: {payload}"
+                );
+
+                let verify =
+                    mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                        .expect("reopen db");
+                let rows = verify
+                    .query_sync("SELECT slug, human_key FROM projects ORDER BY slug", &[])
+                    .expect("query projects");
+                let projects = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<String>("slug").expect("slug"),
+                            row.get_named::<String>("human_key").expect("human_key"),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    projects,
+                    vec![
+                        (
+                            "archive-only-project".to_string(),
+                            "/tmp/archive-only-project".to_string(),
+                        ),
+                        (
+                            "legacy-project".to_string(),
+                            "/tmp/legacy-project".to_string(),
+                        ),
+                    ]
+                );
+
+                let salvage_artifacts = std::fs::read_dir(tmp.path())
+                    .expect("read tmp dir")
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.contains(".salvage-"))
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    salvage_artifacts.is_empty(),
+                    "readable current-db salvage should not emit standalone salvage artifacts: {salvage_artifacts:?}"
+                );
+            },
         );
     }
 
@@ -28418,49 +28297,51 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn sanitize_sqlite_recover_sql_filters_internal_sqlite_tables() {
-        let recovered = "\
-BEGIN;\n\
-PRAGMA writable_schema=ON;\n\
-CREATE TABLE sqlite_sequence(name,seq);\n\
-INSERT INTO sqlite_sequence VALUES('messages',12);\n\
-CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);\n\
-INSERT INTO users VALUES(1,'alice');\n\
-CREATE TABLE sqlite_stat1(tbl,idx,stat);\n\
-INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql) VALUES('table','bad','bad',0,'x');\n\
-ANALYZE sqlite_master;\n\
-COMMIT;\n";
+    fn attempt_readable_sqlite_salvage_source_accepts_readable_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("readable-salvage.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.execute_raw("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create users table");
+        conn.execute_raw("INSERT INTO users VALUES(1, 'alice')")
+            .expect("insert user");
+        drop(conn);
 
-        let sanitized = sanitize_sqlite_recover_sql(recovered);
-
-        assert!(sanitized.contains("BEGIN;"));
-        assert!(sanitized.contains("CREATE TABLE users"));
-        assert!(sanitized.contains("INSERT INTO users"));
-        assert!(sanitized.contains("COMMIT;"));
-        assert!(!sanitized.contains("writable_schema"));
-        assert!(!sanitized.contains("sqlite_sequence"));
-        assert!(!sanitized.contains("sqlite_stat1"));
-        assert!(!sanitized.contains("sqlite_master"));
+        let salvage = attempt_readable_sqlite_salvage_source(&db_path, "database");
+        match salvage {
+            DoctorSalvageAttempt::Succeeded(artifact) => {
+                assert_eq!(artifact.db_path, db_path);
+                assert!(artifact.detail.contains("Using readable database"));
+            }
+            DoctorSalvageAttempt::Failed(detail) => {
+                panic!("expected readable salvage source, got failure: {detail}");
+            }
+        }
     }
 
     #[test]
-    fn sanitize_sqlite_recover_sql_preserves_semicolons_inside_strings() {
-        let recovered = "\
-BEGIN;\n\
-CREATE TABLE notes(body TEXT);\n\
-INSERT INTO notes VALUES('hello;still-body');\n\
-COMMIT;\n";
+    fn attempt_readable_sqlite_salvage_source_rejects_unreadable_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("unreadable-salvage.sqlite3");
+        std::fs::write(&db_path, b"THIS IS NOT A SQLITE DATABASE").expect("write garbage db");
 
-        let sanitized = sanitize_sqlite_recover_sql(recovered);
-
-        assert!(sanitized.contains("INSERT INTO notes VALUES('hello;still-body');"));
-        assert_eq!(
-            sanitized
-                .lines()
-                .filter(|line| line.contains("INSERT INTO notes"))
-                .count(),
-            1
-        );
+        let salvage = attempt_readable_sqlite_salvage_source(&db_path, "database");
+        match salvage {
+            DoctorSalvageAttempt::Succeeded(artifact) => {
+                panic!(
+                    "expected unreadable salvage source to fail, got success: {}",
+                    artifact.detail
+                );
+            }
+            DoctorSalvageAttempt::Failed(detail) => {
+                assert!(
+                    detail.contains("could not be opened directly")
+                        || detail.contains("failed a direct sqlite probe"),
+                    "unexpected salvage failure detail: {detail}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -28533,7 +28414,7 @@ COMMIT;\n";
         let storage_root = tmp.path().join("storage");
         let backup_dir = tmp.path().join("backups");
         std::fs::create_dir_all(&storage_root).unwrap();
-        sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        mcp_agent_mail_db::DbConn::open_file(&db_path.display().to_string())
             .expect("create empty valid sqlite db");
 
         let storage_root_text = storage_root.to_string_lossy().to_string();
@@ -36201,8 +36082,8 @@ COMMIT;\n";
             "orphaned foreign keys with WAL sidecars should not fail db file sanity: {detail}"
         );
         assert!(
-            detail.contains("sqlite3 quick_check"),
-            "expected sqlite3 note in detail, got: {detail}"
+            detail.contains("quick_check OK"),
+            "expected quick_check success detail, got: {detail}"
         );
     }
 
@@ -36405,9 +36286,9 @@ COMMIT;\n";
     }
 
     #[test]
-    fn sqlite_quick_check_via_cli_handles_missing_binary_and_valid_db() {
+    fn sqlite_file_is_healthy_canonical_accepts_valid_db() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("sqlite3_probe_ok.sqlite3");
+        let db_path = dir.path().join("sqlite_probe_ok.sqlite3");
         let db_path_str = db_path.to_string_lossy().into_owned();
 
         let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open sqlite db");
@@ -36417,10 +36298,11 @@ COMMIT;\n";
             .expect("insert marker");
         let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
 
-        let probe = sqlite_quick_check_via_cli(&db_path).expect("probe should not error");
-        if let Some(ok) = probe {
-            assert!(ok, "sqlite3 quick_check should report ok for healthy db");
-        }
+        let probe = sqlite_file_is_healthy_canonical(&db_path).expect("probe should not error");
+        assert!(
+            probe,
+            "canonical health probe should report ok for healthy db"
+        );
     }
 
     #[test]
@@ -36501,8 +36383,7 @@ COMMIT;\n";
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let lock_path = db_path_str.clone();
         let lock_thread = std::thread::spawn(move || {
-            let lock_conn =
-                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            let lock_conn = mcp_agent_mail_db::DbConn::open_file(&lock_path).expect("open lock db");
             lock_conn
                 .execute_raw("PRAGMA busy_timeout = 1;")
                 .expect("set lock busy_timeout");
@@ -36543,8 +36424,7 @@ COMMIT;\n";
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let lock_path = db_path_str.clone();
         let lock_thread = std::thread::spawn(move || {
-            let lock_conn =
-                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            let lock_conn = mcp_agent_mail_db::DbConn::open_file(&lock_path).expect("open lock db");
             lock_conn
                 .execute_raw("PRAGMA busy_timeout = 1;")
                 .expect("set lock busy_timeout");
@@ -36752,8 +36632,7 @@ COMMIT;\n";
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let lock_path = db_path_str.clone();
         let lock_thread = std::thread::spawn(move || {
-            let lock_conn =
-                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            let lock_conn = mcp_agent_mail_db::DbConn::open_file(&lock_path).expect("open lock db");
             lock_conn
                 .execute_raw("PRAGMA busy_timeout = 1;")
                 .expect("set lock busy_timeout");
@@ -36834,8 +36713,7 @@ COMMIT;\n";
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let lock_path = db_path_str.clone();
         let lock_thread = std::thread::spawn(move || {
-            let lock_conn =
-                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            let lock_conn = mcp_agent_mail_db::DbConn::open_file(&lock_path).expect("open lock db");
             lock_conn
                 .execute_raw("PRAGMA busy_timeout = 1;")
                 .expect("set lock busy_timeout");
@@ -36924,8 +36802,7 @@ COMMIT;\n";
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let lock_path = db_path_str.clone();
         let lock_thread = std::thread::spawn(move || {
-            let lock_conn =
-                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            let lock_conn = mcp_agent_mail_db::DbConn::open_file(&lock_path).expect("open lock db");
             lock_conn
                 .execute_raw("PRAGMA busy_timeout = 1;")
                 .expect("set lock busy_timeout");
@@ -37004,8 +36881,7 @@ COMMIT;\n";
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let lock_path = db_path_str.clone();
         let lock_thread = std::thread::spawn(move || {
-            let lock_conn =
-                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            let lock_conn = mcp_agent_mail_db::DbConn::open_file(&lock_path).expect("open lock db");
             lock_conn
                 .execute_raw("PRAGMA busy_timeout = 1;")
                 .expect("set lock busy_timeout");
@@ -37062,6 +36938,60 @@ COMMIT;\n";
         release_tx.send(()).expect("release lock thread");
         open_thread.join().expect("join open thread");
         lock_thread.join().expect("join lock thread");
+    }
+
+    #[test]
+    fn open_db_sync_async_canonical_read_best_effort_ignores_storage_root_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = dir.path().join("robot-search-best-effort.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let seed_conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open seed db");
+        for stmt in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto')",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT, created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
+            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER NOT NULL, a_agent_id INTEGER NOT NULL, b_project_id INTEGER NOT NULL, b_agent_id INTEGER NOT NULL, status TEXT NOT NULL, reason TEXT DEFAULT '', created_ts DATETIME NOT NULL, updated_ts DATETIME NOT NULL, expires_ts DATETIME)",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'robot-search', '/tmp/robot-search', '2026-03-12 11:00:00')",
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (1, 1, 'Searcher', 'codex-cli', 'test', 'robot', '2026-03-12 11:00:01', '2026-03-12 11:00:02', 'auto', 'auto')",
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) VALUES (1, 1, 1, 'robot-search', 'hello', 'world', 'normal', 0, '2026-03-12 11:00:03', '[]')",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 1, 'to', NULL, NULL)",
+        ] {
+            seed_conn.execute_raw(stmt).expect("seed statement");
+        }
+        drop(seed_conn);
+
+        let _lock = acquire_cli_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire storage root lock")
+        .expect("storage root lock guard");
+
+        let read_db = open_db_sync_async_canonical_read_best_effort_with_database_url(
+            &db_url,
+            Some(&storage_root),
+            "robot search test",
+        )
+        .expect("best-effort canonical read should ignore live storage lock");
+
+        let rows = read_db
+            .conn()
+            .query_sync("SELECT COUNT(*) AS c FROM agents", &[])
+            .expect("count agents");
+        let agent_count = rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or(0);
+        assert_eq!(
+            agent_count, 1,
+            "best-effort snapshot should preserve readable rows"
+        );
     }
 
     #[test]
@@ -39497,9 +39427,8 @@ fn iso_from_micros(micros: i64) -> String {
 }
 
 fn projects_included_from_snapshot(snapshot_path: &Path) -> CliResult<Vec<serde_json::Value>> {
-    // Snapshots are always in C SQLite format (created by the share pipeline).
     let path_str = snapshot_path.display().to_string();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_str)
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path_str)
         .map_err(|e| CliError::Other(format!("cannot open snapshot for metadata: {e}")))?;
     let rows = conn
         .query_sync(
@@ -40464,8 +40393,8 @@ fn handle_doctor_repair_with(
         return Ok(());
     }
 
-    // 1. File sanity check via canonical SQLite so doctor repair does not
-    // misclassify healthy FrankenConnection databases as corrupt.
+    // 1. File sanity check via the canonical FrankenSQLite probe so doctor
+    // repair does not misclassify healthy databases as corrupt.
     let (integrity_ok, integrity_detail, _used_absolute_fallback, _missing_configured_path) =
         sqlite_doctor_file_sanity(&reconstruct_db_path.display().to_string())?;
 
@@ -40950,7 +40879,6 @@ struct DoctorSalvageArtifact {
 
 #[derive(Debug, Clone)]
 enum DoctorSalvageAttempt {
-    NotAvailable(String),
     Failed(String),
     Succeeded(DoctorSalvageArtifact),
 }
@@ -40973,312 +40901,38 @@ fn next_doctor_artifact_path(base_path: &Path, label: &str, extension: &str) -> 
     candidate
 }
 
-fn should_keep_sqlite_recover_statement(statement: &str) -> bool {
-    let normalized = statement.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
-    }
-
-    !(normalized.starts_with("pragma writable_schema")
-        || normalized.contains("sqlite_sequence")
-        || normalized.contains("sqlite_stat")
-        || normalized.contains("insert into sqlite_master")
-        || normalized.contains("update sqlite_master")
-        || normalized.contains("delete from sqlite_master")
-        || normalized.contains("insert into sqlite_schema")
-        || normalized.contains("update sqlite_schema")
-        || normalized.contains("delete from sqlite_schema")
-        || normalized.contains("analyze sqlite_master")
-        || normalized.contains("analyze sqlite_schema"))
-}
-
-fn sanitize_sqlite_recover_sql(recovered_sql: &str) -> String {
-    let mut sanitized = String::new();
-    let mut statement = String::new();
-    let mut chars = recovered_sql.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while let Some(ch) = chars.next() {
-        if in_line_comment {
-            statement.push(ch);
-            if ch == '\n' {
-                in_line_comment = false;
-            }
-            continue;
-        }
-
-        if in_block_comment {
-            statement.push(ch);
-            if ch == '*' && chars.peek().is_some_and(|next| *next == '/') {
-                statement.push(chars.next().unwrap_or('/'));
-                in_block_comment = false;
-            }
-            continue;
-        }
-
-        if !in_single && !in_double && ch == '-' && chars.peek().is_some_and(|next| *next == '-') {
-            statement.push(ch);
-            statement.push(chars.next().unwrap_or('-'));
-            in_line_comment = true;
-            continue;
-        }
-
-        if !in_single && !in_double && ch == '/' && chars.peek().is_some_and(|next| *next == '*') {
-            statement.push(ch);
-            statement.push(chars.next().unwrap_or('*'));
-            in_block_comment = true;
-            continue;
-        }
-
-        if ch == '\'' && !in_double {
-            let escaped = chars.peek().is_some_and(|next| *next == '\'');
-            statement.push(ch);
-            if escaped {
-                statement.push(chars.next().unwrap_or('\''));
-            } else {
-                in_single = !in_single;
-            }
-            continue;
-        }
-
-        if ch == '"' && !in_single {
-            let escaped = chars.peek().is_some_and(|next| *next == '"');
-            statement.push(ch);
-            if escaped {
-                statement.push(chars.next().unwrap_or('"'));
-            } else {
-                in_double = !in_double;
-            }
-            continue;
-        }
-
-        statement.push(ch);
-        if ch == ';' && !in_single && !in_double {
-            if should_keep_sqlite_recover_statement(&statement) {
-                sanitized.push_str(statement.trim());
-                sanitized.push('\n');
-            }
-            statement.clear();
-        }
-    }
-
-    if !statement.trim().is_empty() && should_keep_sqlite_recover_statement(&statement) {
-        sanitized.push_str(statement.trim());
-        sanitized.push('\n');
-    }
-
-    sanitized
-}
-
-fn attempt_sqlite_salvage_artifact(quarantined_db: &Path) -> DoctorSalvageAttempt {
-    let recover_output = match std::process::Command::new("sqlite3")
-        .arg(quarantined_db)
-        .arg(".recover")
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return DoctorSalvageAttempt::NotAvailable(
-                "sqlite3 CLI not found; falling back to archive-only reconstruction".to_string(),
-            );
-        }
-        Err(error) => {
-            return DoctorSalvageAttempt::Failed(format!(
-                "failed to launch sqlite3 .recover for {}: {error}",
-                quarantined_db.display()
-            ));
-        }
-    };
-
-    let recover_stderr = String::from_utf8_lossy(&recover_output.stderr)
-        .trim()
-        .to_string();
-    if !recover_output.status.success() {
-        return DoctorSalvageAttempt::Failed(format!(
-            "sqlite3 .recover failed for {}: {}",
-            quarantined_db.display(),
-            if recover_stderr.is_empty() {
-                format!("exit status {}", recover_output.status)
-            } else {
-                recover_stderr
-            }
-        ));
-    }
-
-    let recovered_sql = String::from_utf8_lossy(&recover_output.stdout);
-    let sanitized_sql = sanitize_sqlite_recover_sql(&recovered_sql);
-    if sanitized_sql.trim().is_empty() {
-        return DoctorSalvageAttempt::Failed(format!(
-            "sqlite3 .recover produced no importable SQL for {} after filtering internal sqlite tables",
-            quarantined_db.display()
-        ));
-    }
-
-    let salvage_db_path = next_doctor_artifact_path(quarantined_db, "salvage", "sqlite3");
-    let mut import_child = match std::process::Command::new("sqlite3")
-        .arg(&salvage_db_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            return DoctorSalvageAttempt::Failed(format!(
-                "failed to launch sqlite3 importer for {}: {error}",
-                salvage_db_path.display()
-            ));
-        }
-    };
-
-    if let Some(mut stdin) = import_child.stdin.take() {
-        let stdout_data = sanitized_sql.into_bytes();
-        std::thread::spawn(move || {
-            let _ = std::io::Write::write_all(&mut stdin, &stdout_data);
-        });
-    } else {
-        return DoctorSalvageAttempt::Failed(format!(
-            "failed to open stdin while importing salvage into {}",
-            salvage_db_path.display()
-        ));
-    }
-
-    let import_output = match import_child.wait_with_output() {
-        Ok(output) => output,
-        Err(error) => {
-            return DoctorSalvageAttempt::Failed(format!(
-                "failed while importing recovered SQL into {}: {error}",
-                salvage_db_path.display()
-            ));
-        }
-    };
-
-    let import_stderr = String::from_utf8_lossy(&import_output.stderr)
-        .trim()
-        .to_string();
-    if !import_output.status.success() {
-        match sqlite_quick_check_via_cli(&salvage_db_path) {
-            Ok(Some(true)) | Ok(None) => {
-                let detail = if import_stderr.is_empty() {
-                    format!("sqlite3 import exited with {}", import_output.status)
-                } else {
-                    truncate_doctor_command(&import_stderr)
-                };
-                return DoctorSalvageAttempt::Succeeded(DoctorSalvageArtifact {
-                    db_path: salvage_db_path.clone(),
-                    detail: format!(
-                        "Recovered a salvage SQLite artifact at {} despite non-fatal sqlite3 import warnings ({detail})",
-                        salvage_db_path.display()
-                    ),
-                });
-            }
-            Ok(Some(false)) | Err(_) => {}
-        }
-        return DoctorSalvageAttempt::Failed(format!(
-            "sqlite3 import failed for {}: {}",
-            salvage_db_path.display(),
-            if import_stderr.is_empty() {
-                format!("exit status {}", import_output.status)
-            } else {
-                import_stderr
-            }
-        ));
-    }
-
-    match sqlite_quick_check_via_cli(&salvage_db_path) {
-        Ok(Some(true)) => {}
-        Ok(Some(false)) => {
-            return DoctorSalvageAttempt::Failed(format!(
-                "recovered salvage artifact {} did not pass sqlite3 quick_check",
-                salvage_db_path.display()
-            ));
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return DoctorSalvageAttempt::Failed(format!(
-                "failed to verify recovered salvage artifact {}: {error}",
-                salvage_db_path.display()
-            ));
-        }
-    }
-
-    let extra_note = if recover_stderr.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", truncate_doctor_command(&recover_stderr))
-    };
-    DoctorSalvageAttempt::Succeeded(DoctorSalvageArtifact {
-        db_path: salvage_db_path.clone(),
-        detail: format!(
-            "Recovered a salvage SQLite artifact at {}{}",
-            salvage_db_path.display(),
-            extra_note
-        ),
-    })
-}
-
-fn attempt_readable_quarantined_db_salvage(quarantined_db: &Path) -> DoctorSalvageAttempt {
-    match sqlite_quick_check_via_cli(quarantined_db) {
-        Ok(Some(true)) | Ok(None) => {}
-        Ok(Some(false)) => {
-            return DoctorSalvageAttempt::Failed(format!(
-                "Quarantined database {} did not pass sqlite3 quick_check; falling back to sqlite3 .recover",
-                quarantined_db.display()
-            ));
-        }
-        Err(error) => {
-            return DoctorSalvageAttempt::Failed(format!(
-                "Failed to verify quarantined database {} directly: {error}; falling back to sqlite3 .recover",
-                quarantined_db.display()
-            ));
-        }
-    }
-
-    let conn = match mcp_agent_mail_db::DbConn::open_file(quarantined_db.to_string_lossy().as_ref())
-    {
+fn attempt_readable_sqlite_salvage_source(sqlite_path: &Path, label: &str) -> DoctorSalvageAttempt {
+    let conn = match mcp_agent_mail_db::DbConn::open_file(sqlite_path.to_string_lossy().as_ref()) {
         Ok(conn) => conn,
         Err(error) => {
             return DoctorSalvageAttempt::Failed(format!(
-                "Quarantined database {} could not be opened directly: {error}; falling back to sqlite3 .recover",
-                quarantined_db.display()
+                "{label} {} could not be opened directly: {error}",
+                sqlite_path.display()
             ));
         }
     };
     if let Err(error) = conn.query_sync("SELECT COUNT(*) AS cnt FROM sqlite_master", &[]) {
         return DoctorSalvageAttempt::Failed(format!(
-            "Quarantined database {} failed a direct sqlite probe: {error}; falling back to sqlite3 .recover",
-            quarantined_db.display()
+            "{label} {} failed a direct sqlite probe: {error}",
+            sqlite_path.display()
         ));
     }
 
     DoctorSalvageAttempt::Succeeded(DoctorSalvageArtifact {
-        db_path: quarantined_db.to_path_buf(),
+        db_path: sqlite_path.to_path_buf(),
         detail: format!(
-            "Using readable quarantined database {} as salvage source",
-            quarantined_db.display()
+            "Using readable {label} {} as salvage source",
+            sqlite_path.display()
         ),
     })
 }
 
-fn attempt_best_doctor_salvage_artifact(quarantined_db: &Path) -> DoctorSalvageAttempt {
-    match attempt_readable_quarantined_db_salvage(quarantined_db) {
-        DoctorSalvageAttempt::Succeeded(artifact) => DoctorSalvageAttempt::Succeeded(artifact),
-        DoctorSalvageAttempt::Failed(direct_detail)
-        | DoctorSalvageAttempt::NotAvailable(direct_detail) => {
-            match attempt_sqlite_salvage_artifact(quarantined_db) {
-                DoctorSalvageAttempt::Succeeded(artifact) => {
-                    DoctorSalvageAttempt::Succeeded(artifact)
-                }
-                DoctorSalvageAttempt::Failed(recover_detail)
-                | DoctorSalvageAttempt::NotAvailable(recover_detail) => {
-                    DoctorSalvageAttempt::Failed(format!("{direct_detail}; {recover_detail}"))
-                }
-            }
-        }
-    }
+fn attempt_readable_current_db_salvage(current_db: &Path) -> DoctorSalvageAttempt {
+    attempt_readable_sqlite_salvage_source(current_db, "current database")
+}
+
+fn attempt_best_doctor_salvage_artifact(current_db: &Path) -> DoctorSalvageAttempt {
+    attempt_readable_current_db_salvage(current_db)
 }
 
 fn run_doctor_subcommand_quietly<F>(json: bool, operation: F) -> CliResult<()>
@@ -41395,7 +41049,7 @@ fn handle_doctor_reconstruct_with(
     }
 
     if !confirm_mutating_doctor_action(
-        "Proceed with database reconstruction? This can move the current database aside, attempt salvage of durable rows from the corrupt file, and rebuild from the Git archive.",
+        "Proceed with database reconstruction? This can move the current database aside, attempt best-effort salvage of durable rows from the current file, and rebuild from the Git archive.",
         dry_run,
         yes,
     )? {
@@ -41435,7 +41089,7 @@ fn handle_doctor_reconstruct_with(
     };
     let salvage_db_path = salvage_attempt.as_ref().and_then(|attempt| match attempt {
         DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
-        DoctorSalvageAttempt::NotAvailable(_) | DoctorSalvageAttempt::Failed(_) => None,
+        DoctorSalvageAttempt::Failed(_) => None,
     });
 
     // Reconstruct into the TEMP path — original DB is still untouched.
@@ -41478,7 +41132,7 @@ fn handle_doctor_reconstruct_with(
 
     if let Some(attempt) = &salvage_attempt {
         match attempt {
-            DoctorSalvageAttempt::NotAvailable(detail) | DoctorSalvageAttempt::Failed(detail) => {
+            DoctorSalvageAttempt::Failed(detail) => {
                 stats.warnings.push(detail.clone());
             }
             DoctorSalvageAttempt::Succeeded(_) => {}
@@ -41501,10 +41155,6 @@ fn handle_doctor_reconstruct_with(
             }),
             Some(DoctorSalvageAttempt::Failed(detail)) => serde_json::json!({
                 "status": "warn",
-                "detail": detail,
-            }),
-            Some(DoctorSalvageAttempt::NotAvailable(detail)) => serde_json::json!({
-                "status": "skip",
                 "detail": detail,
             }),
             None => serde_json::Value::Null,
@@ -45067,6 +44717,288 @@ fn handle_tooling(action: ToolingCommand) -> CliResult<()> {
             format,
             json,
         } => handle_tooling_decommission_fts(force, format, json),
+        ToolingCommand::DbQuery {
+            db,
+            sql,
+            first,
+            json,
+        } => handle_tooling_db_query(db, sql, first, json),
+        ToolingCommand::DbExec { db, sql, json } => handle_tooling_db_exec(db, sql, json),
+        ToolingCommand::DbBackup { db, output, json } => handle_tooling_db_backup(db, output, json),
+        ToolingCommand::DbInit {
+            db,
+            storage_root,
+            json,
+        } => handle_tooling_db_init(db, storage_root, json),
+    }
+}
+
+fn handle_tooling_db_query(
+    db: PathBuf,
+    sql: String,
+    first: bool,
+    json_mode: bool,
+) -> CliResult<()> {
+    let db_str = db.to_string_lossy();
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_str.as_ref())
+        .map_err(|err| CliError::Other(format!("cannot open {}: {err}", db.display())))?;
+    let rows = conn
+        .query_sync(&sql, &[])
+        .map_err(|err| CliError::Other(format!("query failed for `{sql}`: {err}")))?;
+
+    if first {
+        if let Some(value) = rows.first().and_then(|row| row.values().next()) {
+            println!("{}", tooling_sql_value_to_text(value.clone()));
+        }
+        return Ok(());
+    }
+
+    if json_mode {
+        let payload = rows
+            .iter()
+            .map(tooling_row_to_json)
+            .collect::<Vec<serde_json::Value>>();
+        let rendered = serde_json::to_string_pretty(&payload)
+            .map_err(|err| CliError::Other(err.to_string()))?;
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    for row in &rows {
+        let rendered = row
+            .values()
+            .cloned()
+            .map(tooling_sql_value_to_text)
+            .collect::<Vec<_>>();
+        println!("{}", rendered.join("|"));
+    }
+    Ok(())
+}
+
+fn handle_tooling_db_exec(db: PathBuf, sql: Option<String>, json_mode: bool) -> CliResult<()> {
+    let script = if let Some(sql) = sql {
+        sql
+    } else {
+        let mut stdin = String::new();
+        use std::io::Read as _;
+        std::io::stdin().read_to_string(&mut stdin)?;
+        stdin
+    };
+
+    if tooling_split_sql_statements(&script).is_empty() {
+        return Err(CliError::InvalidArgument(
+            "no SQL statement provided to tooling db-exec".to_string(),
+        ));
+    }
+
+    let db_str = db.to_string_lossy();
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_str.as_ref())
+        .map_err(|err| CliError::Other(format!("cannot open {}: {err}", db.display())))?;
+    for statement in tooling_split_sql_statements(&script) {
+        conn.execute_raw(&statement)
+            .map_err(|err| CliError::Other(format!("statement failed for `{statement}`: {err}")))?;
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "db": db,
+            })
+        );
+    }
+    Ok(())
+}
+
+fn handle_tooling_db_backup(db: PathBuf, output: PathBuf, json_mode: bool) -> CliResult<()> {
+    let db_str = db.to_string_lossy();
+    let conn = mcp_agent_mail_db::DbConn::open_file(db_str.as_ref())
+        .map_err(|err| CliError::Other(format!("cannot open {}: {err}", db.display())))?;
+    let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&db, &output).map_err(|err| {
+        CliError::Other(format!(
+            "backup {} from {} failed: {err}",
+            output.display(),
+            db.display()
+        ))
+    })?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "db": db,
+                "output": output,
+            })
+        );
+    }
+    Ok(())
+}
+
+fn handle_tooling_db_init(db: PathBuf, storage_root: PathBuf, json_mode: bool) -> CliResult<()> {
+    use asupersync::runtime::RuntimeBuilder;
+
+    if let Some(parent) = db.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir_all(&storage_root)?;
+
+    let absolute_db = if db.is_absolute() {
+        db
+    } else {
+        std::env::current_dir()?.join(db)
+    };
+    let database_url = format!("sqlite:///{}", absolute_db.display());
+    let pool = mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+        database_url,
+        storage_root: Some(storage_root.clone()),
+        min_connections: 1,
+        max_connections: 1,
+        acquire_timeout_ms: 5_000,
+        max_lifetime_ms: 60_000,
+        run_migrations: true,
+        warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
+    })
+    .map_err(|err| CliError::Other(format!("cannot create DB pool: {err}")))?;
+
+    let cx = asupersync::Cx::for_request();
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|err| CliError::Other(format!("failed to build runtime: {err}")))?;
+
+    match runtime.block_on(async { pool.acquire(&cx).await }) {
+        asupersync::Outcome::Ok(conn) => drop(conn),
+        asupersync::Outcome::Err(err) => {
+            return Err(CliError::Other(format!(
+                "DB init failed during acquire: {err}"
+            )));
+        }
+        asupersync::Outcome::Cancelled(reason) => {
+            return Err(CliError::Other(format!("DB init cancelled: {reason:?}")));
+        }
+        asupersync::Outcome::Panicked(payload) => {
+            return Err(CliError::Other(format!("DB init panicked: {payload}")));
+        }
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "db": absolute_db,
+                "storage_root": storage_root,
+            })
+        );
+    }
+    Ok(())
+}
+
+fn tooling_split_sql_statements(script: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in script.chars() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current.push(ch);
+            }
+            ';' if !in_single && !in_double => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    statements.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_string());
+    }
+    statements
+}
+
+fn tooling_row_to_json(row: &sqlmodel_core::Row) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for (name, value) in row.column_names().zip(row.values()) {
+        object.insert(name.to_string(), tooling_sql_value_to_json(value.clone()));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn tooling_sql_value_to_json(value: sqlmodel_core::Value) -> serde_json::Value {
+    match value {
+        sqlmodel_core::Value::Null | sqlmodel_core::Value::Default => serde_json::Value::Null,
+        sqlmodel_core::Value::Bool(flag) => serde_json::Value::Bool(flag),
+        sqlmodel_core::Value::TinyInt(n) => serde_json::Value::from(n),
+        sqlmodel_core::Value::SmallInt(n) => serde_json::Value::from(n),
+        sqlmodel_core::Value::Int(n) => serde_json::Value::from(n),
+        sqlmodel_core::Value::BigInt(n) => serde_json::Value::from(n),
+        sqlmodel_core::Value::Float(n) => serde_json::Value::from(n),
+        sqlmodel_core::Value::Double(n) => serde_json::Value::from(n),
+        sqlmodel_core::Value::Decimal(s) => serde_json::Value::String(s),
+        sqlmodel_core::Value::Text(s) => serde_json::Value::String(s),
+        sqlmodel_core::Value::Bytes(bytes) => serde_json::Value::String(hex::encode(bytes)),
+        sqlmodel_core::Value::Date(days) => serde_json::Value::from(days),
+        sqlmodel_core::Value::Time(micros) => serde_json::Value::from(micros),
+        sqlmodel_core::Value::Timestamp(micros) => serde_json::Value::from(micros),
+        sqlmodel_core::Value::TimestampTz(micros) => serde_json::Value::from(micros),
+        sqlmodel_core::Value::Uuid(uuid) => serde_json::Value::String(hex::encode(uuid)),
+        sqlmodel_core::Value::Json(json) => json,
+        sqlmodel_core::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(tooling_sql_value_to_json)
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+fn tooling_sql_value_to_text(value: sqlmodel_core::Value) -> String {
+    match value {
+        sqlmodel_core::Value::Null | sqlmodel_core::Value::Default => String::new(),
+        sqlmodel_core::Value::Bool(flag) => {
+            if flag {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        sqlmodel_core::Value::TinyInt(n) => n.to_string(),
+        sqlmodel_core::Value::SmallInt(n) => n.to_string(),
+        sqlmodel_core::Value::Int(n) => n.to_string(),
+        sqlmodel_core::Value::BigInt(n) => n.to_string(),
+        sqlmodel_core::Value::Float(n) => n.to_string(),
+        sqlmodel_core::Value::Double(n) => n.to_string(),
+        sqlmodel_core::Value::Decimal(s) => s,
+        sqlmodel_core::Value::Text(s) => s,
+        sqlmodel_core::Value::Bytes(bytes) => hex::encode(bytes),
+        sqlmodel_core::Value::Date(days) => days.to_string(),
+        sqlmodel_core::Value::Time(micros) => micros.to_string(),
+        sqlmodel_core::Value::Timestamp(micros) => micros.to_string(),
+        sqlmodel_core::Value::TimestampTz(micros) => micros.to_string(),
+        sqlmodel_core::Value::Uuid(uuid) => hex::encode(uuid),
+        sqlmodel_core::Value::Json(json) => json.to_string(),
+        sqlmodel_core::Value::Array(items) => serde_json::to_string(&items).unwrap_or_default(),
     }
 }
 

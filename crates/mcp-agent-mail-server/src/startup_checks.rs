@@ -1893,37 +1893,33 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     // a WAL that is inconsistent with the main file (e.g. after a crash or
     // SIGKILL). Treating them as hard "busy" failures causes `am` to refuse
     // to start when `doctor repair --yes` would succeed immediately.
-    let is_snapshot_conflict = |msg: &str| -> bool {
-        mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(msg)
-    };
+    let is_snapshot_conflict =
+        |msg: &str| -> bool { mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(msg) };
 
     // Helper: attempt WAL removal + pool retry, falling back to full recovery.
-    let try_wal_cleanup_and_retry =
-        |pool_config: &DbPoolConfig, config: &Config| -> ProbeResult {
-            if let Some(db_path) =
-                resolve_server_database_url_sqlite_path(&config.database_url)
-            {
-                if try_remove_corrupt_wal(&db_path) {
-                    tracing::info!(
-                        path = %db_path.display(),
-                        "removed corrupt/stale WAL/SHM sidecars; retrying pool open"
-                    );
-                    if let Ok(p) = mcp_agent_mail_db::DbPool::new(pool_config) {
-                        tracing::info!("pool open succeeded after WAL removal");
-                        match p.run_startup_integrity_check() {
-                            Ok(_) => return ProbeResult::Ok { name: "integrity" },
-                            Err(ref e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "integrity check failed after WAL removal; falling back to recovery"
-                                );
-                            }
+    let try_wal_cleanup_and_retry = |pool_config: &DbPoolConfig, config: &Config| -> ProbeResult {
+        if let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) {
+            if try_remove_corrupt_wal(&db_path) {
+                tracing::info!(
+                    path = %db_path.display(),
+                    "removed corrupt/stale WAL/SHM sidecars; retrying pool open"
+                );
+                if let Ok(p) = mcp_agent_mail_db::DbPool::new(pool_config) {
+                    tracing::info!("pool open succeeded after WAL removal");
+                    match p.run_startup_integrity_check() {
+                        Ok(_) => return ProbeResult::Ok { name: "integrity" },
+                        Err(ref e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "integrity check failed after WAL removal; falling back to recovery"
+                            );
                         }
                     }
                 }
             }
-            attempt_probe_recovery(config)
-        };
+        }
+        attempt_probe_recovery(config)
+    };
 
     let pool = match mcp_agent_mail_db::DbPool::new(&pool_config) {
         Ok(p) => p,
@@ -1954,8 +1950,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
                 problem: format!("Cannot create pool for integrity check: {e}"),
-                fix: "Check DATABASE_URL or set INTEGRITY_CHECK_ON_STARTUP=false to skip"
-                    .into(),
+                fix: "Check DATABASE_URL or set INTEGRITY_CHECK_ON_STARTUP=false to skip".into(),
             });
         }
     };

@@ -63,6 +63,7 @@ use half::f16;
 use mcp_agent_mail_core::DocKind as SearchDocKind;
 use mcp_agent_mail_core::SearchMode;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlmodel_core::{Connection, Value};
 #[cfg(feature = "hybrid")]
 use std::collections::BTreeMap;
@@ -795,7 +796,6 @@ static LEXICAL_BRIDGE_BOOTSTRAP_STATE: OnceLock<Mutex<HashMap<String, Result<(),
 static LEXICAL_BRIDGE_BACKFILL_STATE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static LEXICAL_BRIDGE_ACTIVE_DB_KEY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LEXICAL_BRIDGE_INIT_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-static DIRECT_SURFACE_INDEX_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn lexical_bootstrap_state() -> &'static Mutex<HashMap<String, Result<(), String>>> {
     LEXICAL_BRIDGE_BOOTSTRAP_STATE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -813,13 +813,28 @@ fn lexical_init_guard() -> &'static Mutex<()> {
     LEXICAL_BRIDGE_INIT_GUARD.get_or_init(|| Mutex::new(()))
 }
 
-fn direct_surface_index_dir() -> &'static PathBuf {
-    DIRECT_SURFACE_INDEX_DIR.get_or_init(|| {
-        std::env::temp_dir().join(format!(
-            "mcp-agent-mail-search-index-{}",
+fn stable_direct_surface_index_dir(pool: &DbPool) -> PathBuf {
+    if pool.sqlite_path() == ":memory:" {
+        return std::env::temp_dir().join(format!(
+            "mcp-agent-mail-search-index-memory-{}",
             std::process::id()
-        ))
-    })
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(pool.sqlite_identity_key().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    std::env::temp_dir()
+        .join("mcp-agent-mail-search-index")
+        .join(digest)
+}
+
+fn direct_surface_index_dir(pool: &DbPool) -> PathBuf {
+    let shared = pool.storage_root().join("search_index");
+    if shared.join("backfill_state.json").exists() || shared.join("meta.json").exists() {
+        return shared;
+    }
+    stable_direct_surface_index_dir(pool)
 }
 
 fn map_bridge_bootstrap_error(err: &str) -> DbError {
@@ -911,6 +926,7 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
 
 fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     let sqlite_key = sqlite_key_for_pool(pool);
+    let index_dir = direct_surface_index_dir(pool);
     let _guard = lexical_init_guard()
         .lock()
         .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
@@ -928,22 +944,17 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
 
     // Fast path: the current DB is already the active bridge source and the
     // per-DB backfill marker is present.
+    let bridge_ready = crate::search_v3::is_bridge_initialized_for(&index_dir);
     if matches!(cached_state, Some(Ok(())))
         && active_key.as_deref() == Some(sqlite_key.as_str())
-        && crate::search_v3::get_bridge().is_some()
+        && bridge_ready
         && has_run_lexical_backfill(&sqlite_key)?
     {
         return Ok(());
     }
 
-    // Direct-search surfaces (CLI/TUI/tests) bootstrap their own process-local
-    // index so unrelated cargo test binaries and ad-hoc tools never contend on
-    // one shared Tantivy lockfile.
-    let index_dir = direct_surface_index_dir();
     let result: Result<bool, String> = (|| {
-        if crate::search_v3::get_bridge().is_none() {
-            crate::search_v3::init_bridge(index_dir)?;
-        }
+        crate::search_v3::init_or_switch_bridge(&index_dir)?;
 
         if pool.sqlite_path() == ":memory:" {
             // A fresh sqlite:///:memory: connection cannot observe the live pooled
@@ -952,7 +963,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
             // because the Tantivy bridge is process-global. Backfilling against
             // a fresh empty memory DB forces a full rebuild to an empty index
             // whenever the active in-memory pool changes.
-            if active_key.as_deref() != Some(sqlite_key.as_str()) {
+            if !bridge_ready || active_key.as_deref() != Some(sqlite_key.as_str()) {
                 crate::search_v3::backfill_from_db("sqlite:///:memory:")
                     .map_err(|err| map_bridge_bootstrap_error(&err).to_string())?;
                 set_lexical_active_db_key(&sqlite_key).map_err(|err| err.to_string())?;
@@ -963,7 +974,8 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         // The lexical bridge is process-global. Re-run backfill whenever a
         // different DB becomes active so lexical results cannot drift across DB
         // boundaries in multi-pool workflows.
-        let should_backfill = active_key.as_deref() != Some(sqlite_key.as_str())
+        let should_backfill = !bridge_ready
+            || active_key.as_deref() != Some(sqlite_key.as_str())
             || !has_run_lexical_backfill(&sqlite_key).map_err(|err| err.to_string())?;
         if should_backfill {
             run_lexical_backfill_for_pool(pool).map_err(|err| err.to_string())?;
@@ -4032,6 +4044,42 @@ mod tests {
         *lexical_active_db_key()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    #[test]
+    fn direct_surface_index_dir_prefers_ready_shared_index() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("search_index")).expect("search index dir");
+        std::fs::write(root.path().join("search_index").join("meta.json"), "{}")
+            .expect("meta.json");
+
+        let config = crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", root.path().join("mail.sqlite3").display()),
+            storage_root: Some(root.path().to_path_buf()),
+            ..Default::default()
+        };
+        let pool = crate::DbPool::new(&config).expect("pool");
+
+        assert_eq!(
+            direct_surface_index_dir(&pool),
+            root.path().join("search_index")
+        );
+    }
+
+    #[test]
+    fn direct_surface_index_dir_falls_back_to_stable_temp_hash() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", root.path().join("mail.sqlite3").display()),
+            storage_root: Some(root.path().to_path_buf()),
+            ..Default::default()
+        };
+        let pool = crate::DbPool::new(&config).expect("pool");
+
+        let chosen = direct_surface_index_dir(&pool);
+        assert_ne!(chosen, root.path().join("search_index"));
+        assert!(chosen.starts_with(std::env::temp_dir().join("mcp-agent-mail-search-index")));
+        assert_eq!(chosen, stable_direct_surface_index_dir(&pool));
     }
 
     #[test]

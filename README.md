@@ -887,7 +887,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `HTTP_PORT` | `8765` | Bind port |
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
-| `DATABASE_URL` | `sqlite+aiosqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
+| `DATABASE_URL` | `sqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
 | `STORAGE_ROOT` | XDG-aware (see below) | Archive root directory |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer a per-run `STORAGE_ROOT` instead. |
 | `LOG_LEVEL` | `info` | Minimum log level |

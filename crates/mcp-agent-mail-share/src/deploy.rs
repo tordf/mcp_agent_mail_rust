@@ -9,11 +9,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlmodel_sqlite::SqliteConnection;
 
 use crate::{ShareError, ShareResult};
+
+#[cfg(test)]
+type SqliteConnection = DbConn;
 
 // ── Deployment report ───────────────────────────────────────────────────
 
@@ -1799,8 +1802,8 @@ fn validate_database_artifacts(
 fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
     let db_path = crate::resolve_share_sqlite_path(db_path);
     let db_path_str = db_path.display().to_string();
-    let conn = SqliteConnection::open_file(&db_path_str)
-        .map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
+    let conn =
+        DbConn::open_file(&db_path_str).map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
     let rows = conn
         .query_sync("PRAGMA quick_check", &[])
         .map_err(|e| format!("PRAGMA quick_check failed: {e}"))?;
@@ -1827,8 +1830,8 @@ fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
 fn validate_agent_mail_schema(db_path: &Path) -> Result<(), String> {
     let db_path = crate::resolve_share_sqlite_path(db_path);
     let db_path_str = db_path.display().to_string();
-    let conn = SqliteConnection::open_file(&db_path_str)
-        .map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
+    let conn =
+        DbConn::open_file(&db_path_str).map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
     let required = [
         ("projects", ["id", "slug", "human_key"].as_slice()),
         ("agents", ["id", "project_id", "name"].as_slice()),

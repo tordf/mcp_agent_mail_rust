@@ -1218,7 +1218,8 @@ fn is_likely_python_binary(path: &Path) -> bool {
         if magic == [0xcf, 0xfa, 0xed, 0xfe]   // MH_MAGIC_64 (little-endian)
             || magic == [0xfe, 0xed, 0xfa, 0xcf] // MH_MAGIC_64 (big-endian)
             || magic == [0xce, 0xfa, 0xed, 0xfe] // MH_MAGIC (little-endian)
-            || magic == [0xfe, 0xed, 0xfa, 0xce] // MH_MAGIC (big-endian)
+            || magic == [0xfe, 0xed, 0xfa, 0xce]
+        // MH_MAGIC (big-endian)
         {
             return false;
         }
@@ -1245,10 +1246,7 @@ fn find_installed_am_binary() -> Option<PathBuf> {
         }
     }
     // Fallback: look up `am` in PATH via `which`.
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("am")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("am").output() {
         if output.status.success() {
             let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path_str.is_empty() {
@@ -1323,9 +1321,7 @@ fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
     if !path.exists() {
         return None;
     }
-    // Use C SQLite for inspection — the source DB may be Python-created with
-    // uncheckpointed WAL pages that FrankenSQLite cannot read.
-    let conn = match sqlmodel_sqlite::SqliteConnection::open_file(path.display().to_string()) {
+    let conn = match DbConn::open_file(path.display().to_string()) {
         Ok(v) => v,
         Err(_) => {
             return Some(LegacyDbSignature {
@@ -1732,13 +1728,8 @@ fn backup_db_with_sidecars(db_path: &Path, destination_root: &Path) -> CliResult
 }
 
 fn checkpoint_sqlite_for_copy(db_path: &Path) -> CliResult<()> {
-    // MUST use C SQLite (SqliteConnection) here, not FrankenConnection (DbConn).
-    // The source database was created by Python's C SQLite and may have uncheckpointed
-    // WAL pages that FrankenSQLite cannot read (different WAL format). FrankenSQLite
-    // would see the main file's page count but miss pages in the WAL, causing a
-    // BusySnapshot error ("page N > snapshot db_size M").
     let db_path_str = db_path.to_string_lossy().into_owned();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path_str).map_err(|e| {
+    let conn = DbConn::open_file(db_path_str).map_err(|e| {
         CliError::Other(format!("cannot open sqlite DB {}: {e}", db_path.display()))
     })?;
     conn.execute_raw("PRAGMA busy_timeout = 60000;")

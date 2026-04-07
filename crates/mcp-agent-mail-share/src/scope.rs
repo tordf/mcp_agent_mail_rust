@@ -6,15 +6,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value;
 
 use crate::ShareError;
 
-/// Connection type for offline snapshot manipulation.
-///
-/// Uses C-backed SQLite for reliable offline operations.
-type Conn = sqlmodel_sqlite::SqliteConnection;
+type Conn = DbConn;
 
 /// A project record from the `projects` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]

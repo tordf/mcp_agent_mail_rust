@@ -1551,6 +1551,12 @@ pub struct DbPoolConfig {
     pub max_lifetime_ms: u64,
     /// Run migrations on init
     pub run_migrations: bool,
+    /// Skip one-time startup initialization and repair work on first acquire.
+    ///
+    /// This is intended for read-only helper pools that open an already
+    /// initialized mailbox under a live server and must avoid contending on
+    /// startup repair writes.
+    pub skip_startup_init: bool,
     /// Number of connections to eagerly open on startup (0 = disabled).
     /// Capped at `min_connections`. Warmup is bounded by `acquire_timeout_ms`.
     pub warmup_connections: usize,
@@ -1569,6 +1575,7 @@ impl Default for DbPoolConfig {
             acquire_timeout_ms: DEFAULT_POOL_TIMEOUT_MS,
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
+            skip_startup_init: false,
             warmup_connections: 0,
             cache_budget_kb: schema::DEFAULT_CACHE_BUDGET_KB,
         }
@@ -1637,6 +1644,7 @@ impl DbPoolConfig {
             acquire_timeout_ms: pool_timeout,
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
+            skip_startup_init: false,
             warmup_connections: warmup,
             cache_budget_kb: env_value("DATABASE_CACHE_BUDGET_KB")
                 .and_then(|s| s.parse::<usize>().ok())
@@ -1832,8 +1840,11 @@ pub struct DbPool {
     pool: Arc<Pool<DbConn>>,
     sqlite_path: String,
     storage_root: PathBuf,
+    cache_key: String,
+    init_gate_key: String,
     init_sql: Arc<String>,
     run_migrations: bool,
+    skip_startup_init: bool,
     stats_sampler: Arc<DbPoolStatsSampler>,
 }
 
@@ -1841,6 +1852,15 @@ impl DbPool {
     fn from_shared_pool(config: &DbPoolConfig, pool: Arc<Pool<DbConn>>) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
+        let cache_key = pool_cache_key_from_parts(
+            &sqlite_path,
+            &storage_root,
+            config.min_connections,
+            config.max_connections,
+            config.acquire_timeout_ms,
+            config.max_lifetime_ms,
+        );
+        let init_gate_key = sqlite_init_gate_key(&sqlite_path, &storage_root);
         let init_sql = Arc::new(schema::build_conn_pragmas(
             config.max_connections,
             config.cache_budget_kb,
@@ -1851,8 +1871,11 @@ impl DbPool {
             pool,
             sqlite_path,
             storage_root,
+            cache_key,
+            init_gate_key,
             init_sql,
             run_migrations: config.run_migrations,
+            skip_startup_init: config.skip_startup_init,
             stats_sampler,
         })
     }
@@ -1861,6 +1884,15 @@ impl DbPool {
     pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
+        let cache_key = pool_cache_key_from_parts(
+            &sqlite_path,
+            &storage_root,
+            config.min_connections,
+            config.max_connections,
+            config.acquire_timeout_ms,
+            config.max_lifetime_ms,
+        );
+        let init_gate_key = sqlite_init_gate_key(&sqlite_path, &storage_root);
         let init_sql = Arc::new(schema::build_conn_pragmas(
             config.max_connections,
             config.cache_budget_kb,
@@ -1879,8 +1911,11 @@ impl DbPool {
             pool: Arc::new(Pool::new(pool_config)),
             sqlite_path,
             storage_root,
+            cache_key,
+            init_gate_key,
             init_sql,
             run_migrations: config.run_migrations,
+            skip_startup_init: config.skip_startup_init,
             stats_sampler,
         })
     }
@@ -1888,6 +1923,11 @@ impl DbPool {
     #[must_use]
     pub fn sqlite_path(&self) -> &str {
         &self.sqlite_path
+    }
+
+    #[must_use]
+    pub fn storage_root(&self) -> &std::path::Path {
+        &self.storage_root
     }
 
     #[must_use]
@@ -1903,6 +1943,44 @@ impl DbPool {
         self.stats_sampler.sample_now(&self.pool);
     }
 
+    fn retire_runtime_state_after_recovery(&self, trigger_error: &str) {
+        let cache =
+            POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+        let cache_evicted = {
+            let mut guard = cache.write();
+            match guard.get(&self.cache_key) {
+                Some(cached) => match cached.upgrade() {
+                    Some(shared_pool) if Arc::ptr_eq(&shared_pool, &self.pool) => {
+                        guard.remove(&self.cache_key);
+                        true
+                    }
+                    None => {
+                        guard.remove(&self.cache_key);
+                        true
+                    }
+                    Some(_) => false,
+                },
+                None => false,
+            }
+        };
+
+        let gates = SQLITE_INIT_GATES
+            .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
+        let init_gate_cleared = gates.write().remove(&self.init_gate_key).is_some();
+
+        self.pool.close();
+
+        tracing::warn!(
+            path = %self.sqlite_path,
+            trigger = %trigger_error,
+            cache_key = %self.cache_key,
+            cache_evicted,
+            init_gate_key = %self.init_gate_key,
+            init_gate_cleared,
+            "retired cached sqlite pool after runtime recovery so the next checkout reinitializes against the repaired database"
+        );
+    }
+
     /// Acquire a pooled connection, creating and initializing a new one if needed.
     #[allow(clippy::too_many_lines)]
     pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
@@ -1910,6 +1988,7 @@ impl DbPool {
         let storage_root = self.storage_root.clone();
         let init_sql = self.init_sql.clone();
         let run_migrations = self.run_migrations;
+        let skip_startup_init = self.skip_startup_init;
         let cx2 = cx.clone();
 
         let start = Instant::now();
@@ -1932,7 +2011,7 @@ impl DbPool {
                     // before opening pooled connections.
                     // Run one-time DB initialization (schema + migrations) via a separate
                     // connection to ensure atomic setup before pool connections open.
-                    if sqlite_path != ":memory:" {
+                    if sqlite_path != ":memory:" && !skip_startup_init {
                         let init_gate = sqlite_init_gate(&sqlite_path, &storage_root);
                         let run_migrations = run_migrations;
 
@@ -2561,16 +2640,21 @@ impl DbPool {
         );
 
         let primary_path = Path::new(&self.sqlite_path);
-        match sqlite_file_is_healthy(primary_path) {
+        let on_disk_healthy = match sqlite_file_is_healthy(primary_path) {
             Ok(true) => {
                 tracing::warn!(
                     path = %self.sqlite_path,
                     trigger = %trigger_error,
-                    "runtime corruption trigger received, but health probes already pass; skipping recovery"
+                    "runtime corruption trigger received while file-level health probes pass; forcing archive-aware reconciliation and pool refresh"
                 );
-                return Ok(false);
+                true
             }
-            Ok(false) => {}
+            Ok(false) => {
+                // Record integrity failures only when the on-disk file is unhealthy.
+                let metrics = mcp_agent_mail_core::global_metrics();
+                metrics.db.integrity_failures_total.inc();
+                false
+            }
             Err(e) => {
                 tracing::warn!(
                     path = %self.sqlite_path,
@@ -2578,22 +2662,20 @@ impl DbPool {
                     error = %e,
                     "failed to run pre-recovery health probes; proceeding with recovery attempt"
                 );
+                let metrics = mcp_agent_mail_core::global_metrics();
+                metrics.db.integrity_failures_total.inc();
+                false
             }
-        }
-
-        // Record the corruption event in metrics only for confirmed/suspected unhealthy state.
-        let metrics = mcp_agent_mail_core::global_metrics();
-        metrics.db.integrity_failures_total.inc();
+        };
 
         match recover_sqlite_file(primary_path) {
             Ok(()) => {
+                self.retire_runtime_state_after_recovery(trigger_error);
                 tracing::warn!(
                     path = %self.sqlite_path,
-                    "runtime corruption recovery succeeded — clearing idle connections and returning to service"
+                    on_disk_healthy,
+                    "runtime corruption recovery succeeded — forcing fresh pool initialization before returning to service"
                 );
-                // Idle connections hold FDs to the old (corrupted/unlinked) inode.
-                // test_on_checkout(true) ensures stale connections fail health checks
-                // and get evicted on next acquire, so explicit draining is not required.
                 Ok(true)
             }
             Err(e) => {
@@ -2697,30 +2779,47 @@ fn normalize_sqlite_identity_path(path: &str) -> String {
 
 #[must_use]
 fn pool_cache_key(config: &DbPoolConfig) -> String {
-    let identity = config.sqlite_path().map_or_else(
+    let sqlite_path = config.sqlite_path().map_or_else(
         |_| config.database_url.clone(),
-        |parsed| {
-            let resolved = resolve_sqlite_path_with_absolute_fallback(&parsed);
-            normalize_sqlite_identity_path(&resolved)
-        },
+        |parsed| resolve_sqlite_path_with_absolute_fallback(&parsed),
     );
-    let storage_root_identity =
-        normalize_sqlite_identity_path(&config.resolved_storage_root().to_string_lossy());
-    format!(
-        "{identity}|storage_root={storage_root_identity}|min={}|max={}|acquire_ms={}|lifetime_ms={}",
+    pool_cache_key_from_parts(
+        &sqlite_path,
+        &config.resolved_storage_root(),
         config.min_connections,
         config.max_connections,
         config.acquire_timeout_ms,
-        config.max_lifetime_ms
+        config.max_lifetime_ms,
+    )
+}
+
+#[must_use]
+fn pool_cache_key_from_parts(
+    sqlite_path: &str,
+    storage_root: &Path,
+    min_connections: usize,
+    max_connections: usize,
+    acquire_timeout_ms: u64,
+    max_lifetime_ms: u64,
+) -> String {
+    let identity = normalize_sqlite_identity_path(sqlite_path);
+    let storage_root_identity = normalize_sqlite_identity_path(&storage_root.to_string_lossy());
+    format!(
+        "{identity}|storage_root={storage_root_identity}|min={min_connections}|max={max_connections}|acquire_ms={acquire_timeout_ms}|lifetime_ms={max_lifetime_ms}"
+    )
+}
+
+#[must_use]
+fn sqlite_init_gate_key(sqlite_path: &str, storage_root: &Path) -> String {
+    format!(
+        "{}|storage_root={}",
+        normalize_sqlite_identity_path(sqlite_path),
+        normalize_sqlite_identity_path(&storage_root.to_string_lossy())
     )
 }
 
 fn sqlite_init_gate(sqlite_path: &str, storage_root: &Path) -> Arc<OnceCell<()>> {
-    let gate_key = format!(
-        "{}|storage_root={}",
-        normalize_sqlite_identity_path(sqlite_path),
-        normalize_sqlite_identity_path(&storage_root.to_string_lossy())
-    );
+    let gate_key = sqlite_init_gate_key(sqlite_path, storage_root);
     let gates = SQLITE_INIT_GATES
         .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
 
@@ -2757,109 +2856,74 @@ async fn run_sqlite_init_once(
         cleanup_empty_wal_sidecar(sqlite_path);
     }
 
-    let missing_sqlite_file = sqlite_path != ":memory:" && !Path::new(sqlite_path).exists();
-
     if run_migrations {
-        if missing_sqlite_file {
-            let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+        let mig_conn = crate::guard_db_conn(
+            match open_sqlite_file_with_lock_retry(sqlite_path) {
                 Ok(conn) => conn,
                 Err(err) => {
                     return Outcome::Err(SqlError::Custom(format!(
-                        "sqlite init stage=open_canonical_missing_file failed: {err}"
+                        "sqlite init stage=open_file failed: {err}"
                     )));
                 }
-            };
+            },
+            "sqlite init migration connection",
+        );
 
-            if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
-                return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=canonical_missing_file_pragmas failed: {err}"
-                )));
-            }
-
-            match schema::migrate_to_latest(cx, &canonical_conn).await {
-                Outcome::Ok(_) => {}
-                Outcome::Err(err) => {
-                    return Outcome::Err(SqlError::Custom(format!(
-                        "sqlite init stage=migrate_to_latest_missing_file failed: {err}"
-                    )));
-                }
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
-
-            drop(canonical_conn);
-        } else {
-            let mig_conn = crate::guard_db_conn(
-                match open_sqlite_file_with_lock_retry(sqlite_path) {
-                    Ok(conn) => conn,
-                    Err(err) => {
-                        return Outcome::Err(SqlError::Custom(format!(
-                            "sqlite init stage=open_file failed: {err}"
-                        )));
-                    }
-                },
-                "sqlite init migration connection",
-            );
-
-            if let Err(err) = execute_sql_with_lock_retry(
-                &mig_conn,
-                sqlite_path,
-                schema::PRAGMA_DB_INIT_BASE_SQL,
-                "sqlite init base pragmas",
-            ) {
-                return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=base_pragmas failed: {err}"
-                )));
-            }
-
-            match schema::migrate_to_latest_base(cx, &*mig_conn).await {
-                Outcome::Ok(_) => {}
-                Outcome::Err(err) => {
-                    return Outcome::Err(SqlError::Custom(format!(
-                        "sqlite init stage=migrate_to_latest_base failed: {err}"
-                    )));
-                }
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
-
-            drop(mig_conn);
-
-            // Run full migrations (including v10-v15) via canonical SQLite.
-            //
-            // Base-mode migrations intentionally skip migrations that require
-            // features unsupported by FrankenConnection (e.g. ALTER TABLE ADD
-            // COLUMN reparsing). Canonical SQLite handles these correctly, so we
-            // open a second connection to apply any remaining pending migrations
-            // such as v15 (recipients_json column addition).
-            let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
-                Ok(conn) => conn,
-                Err(err) => {
-                    return Outcome::Err(SqlError::Custom(format!(
-                        "sqlite init stage=open_canonical_for_full_migrations failed: {err}"
-                    )));
-                }
-            };
-
-            if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
-                return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=canonical_pragmas failed: {err}"
-                )));
-            }
-
-            match schema::migrate_to_latest(cx, &canonical_conn).await {
-                Outcome::Ok(_) => {}
-                Outcome::Err(err) => {
-                    return Outcome::Err(SqlError::Custom(format!(
-                        "sqlite init stage=migrate_to_latest (full) failed: {err}"
-                    )));
-                }
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
-
-            drop(canonical_conn);
+        if let Err(err) = execute_sql_with_lock_retry(
+            &mig_conn,
+            sqlite_path,
+            schema::PRAGMA_DB_INIT_BASE_SQL,
+            "sqlite init base pragmas",
+        ) {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=base_pragmas failed: {err}"
+            )));
         }
+
+        match schema::migrate_to_latest_base(cx, &*mig_conn).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=migrate_to_latest_base failed: {err}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+
+        drop(mig_conn);
+
+        // Apply the small set of canonical-only runtime follow-up migrations.
+        // This completes schema requirements such as recipients_json and the
+        // case-insensitive agent index without replaying the full historical
+        // FTS create/drop chain on fresh runtime databases.
+        let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=open_canonical_for_runtime_followup failed: {err}"
+                )));
+            }
+        };
+
+        if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=canonical_pragmas failed: {err}"
+            )));
+        }
+
+        match schema::migrate_runtime_canonical_followup(cx, &canonical_conn).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=migrate_runtime_canonical_followup failed: {err}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+
+        drop(canonical_conn);
     }
 
     let runtime_conn = crate::guard_db_conn(
@@ -3258,10 +3322,10 @@ pub(crate) fn open_sqlite_file_with_lock_retry(sqlite_path: &str) -> Result<DbCo
 #[allow(clippy::result_large_err)]
 fn open_sqlite_file_with_lock_retry_canonical(
     sqlite_path: &str,
-) -> Result<sqlmodel_sqlite::SqliteConnection, SqlError> {
+) -> Result<crate::CanonicalDbConn, SqlError> {
     open_sqlite_file_with_lock_retry_impl(
         sqlite_path,
-        |path| sqlmodel_sqlite::SqliteConnection::open_file(path),
+        |path| crate::CanonicalDbConn::open_file(path),
         std::thread::sleep,
     )
 }
@@ -3519,7 +3583,7 @@ fn sqlite_incremental_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 
 #[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_details_canonical(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &crate::CanonicalDbConn,
     pragma_sql: &str,
 ) -> Result<Vec<String>, SqlError> {
     let rows = conn.query_sync(pragma_sql, &[])?;
@@ -3528,7 +3592,7 @@ fn sqlite_pragma_check_details_canonical(
 
 #[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_is_ok_canonical(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &crate::CanonicalDbConn,
     pragma_sql: &str,
 ) -> Result<bool, SqlError> {
     let details = sqlite_pragma_check_details_canonical(conn, pragma_sql)?;
@@ -3538,15 +3602,13 @@ fn sqlite_pragma_check_is_ok_canonical(
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_canonical_quick_check_is_ok(
-    conn: &sqlmodel_sqlite::SqliteConnection,
-) -> Result<bool, SqlError> {
+fn sqlite_canonical_quick_check_is_ok(conn: &crate::CanonicalDbConn) -> Result<bool, SqlError> {
     sqlite_pragma_check_is_ok_canonical(conn, "PRAGMA quick_check")
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_canonical_incremental_check_is_ok(
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &crate::CanonicalDbConn,
 ) -> Result<bool, SqlError> {
     sqlite_pragma_check_is_ok_canonical(conn, "PRAGMA integrity_check(1)")
 }
@@ -3632,7 +3694,7 @@ fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
 #[allow(clippy::result_large_err)]
 fn sqlite_file_is_healthy_canonical(path: &Path) -> Result<bool, SqlError> {
     let path_str = path.to_string_lossy();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref())?;
+    let conn = crate::CanonicalDbConn::open_file(path_str.as_ref())?;
 
     if !sqlite_canonical_quick_check_is_ok(&conn)? {
         return Ok(false);
@@ -3816,7 +3878,7 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
 #[allow(clippy::result_large_err)]
 fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError> {
     let path_str = primary_path.to_string_lossy();
-    let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref())?;
+    let conn = DbConn::open_file(path_str.as_ref())?;
     // Attempt a truncating checkpoint to fold WAL changes into the main DB
     conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
@@ -5375,28 +5437,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         "no healthy backup found; attempting database reconstruction from Git archive"
     );
 
-    // Quarantine the corrupt file first
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-
-    if primary_path.exists() {
-        let quarantined = primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
-        std::fs::rename(primary_path, &quarantined).map_err(|e| {
-            SqlError::Custom(format!(
-                "failed to quarantine corrupted database {}: {e}",
-                primary_path.display()
-            ))
-        })?;
-        quarantine_corrupt_sidecars_or_restore_primary(
-            primary_path,
-            &quarantined,
-            &timestamp,
-            "archive-aware reconstruction",
-        )?;
-    }
 
     match reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, false) {
         Ok(stats) => {
@@ -5472,7 +5513,9 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
         if let Some(pool) = guard.get(&cache_key)
             && let Some(shared_pool) = pool.upgrade()
         {
-            return DbPool::from_shared_pool(config, shared_pool);
+            if !shared_pool.is_closed() {
+                return DbPool::from_shared_pool(config, shared_pool);
+            }
         }
     }
 
@@ -5482,7 +5525,9 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     // Double-check after acquiring write lock — another thread may have won the race.
     if let Some(pool) = guard.get(&cache_key) {
         if let Some(shared_pool) = pool.upgrade() {
-            return DbPool::from_shared_pool(config, shared_pool);
+            if !shared_pool.is_closed() {
+                return DbPool::from_shared_pool(config, shared_pool);
+            }
         }
         guard.remove(&cache_key);
     }
@@ -6579,8 +6624,7 @@ mod tests {
         let db_path = dir.path().join("legacy_fixture.db");
         let db_path_str = db_path.to_string_lossy();
 
-        let seed_conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path_str.as_ref())
-            .expect("open seed sqlite db");
+        let seed_conn = DbConn::open_file(db_path_str.as_ref()).expect("open seed sqlite db");
         let seed_sql = [
             "PRAGMA foreign_keys = OFF",
             "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
@@ -6623,8 +6667,7 @@ mod tests {
             "legacy fixture should remain healthy after pool init"
         );
 
-        let verify_conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path_str.as_ref())
-            .expect("open verify sqlite db");
+        let verify_conn = DbConn::open_file(db_path_str.as_ref()).expect("open verify sqlite db");
         for (table, expected) in [
             ("projects", 1_i64),
             ("agents", 2_i64),
@@ -7026,6 +7069,173 @@ mod tests {
             !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
             "pool cache must not alias the same sqlite file across distinct storage roots"
         );
+    }
+
+    #[test]
+    fn get_or_create_pool_replaces_closed_cached_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("closed-cache.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+
+        let pool1 = get_or_create_pool(&config).expect("first get");
+        pool1.pool.close();
+
+        let pool2 = get_or_create_pool(&config).expect("replacement get");
+        assert!(
+            !Arc::ptr_eq(&pool1.pool, &pool2.pool),
+            "get_or_create_pool must not return a closed cached pool"
+        );
+        assert!(!pool2.pool.is_closed(), "replacement pool should be live");
+    }
+
+    #[test]
+    fn try_recover_from_corruption_retires_cached_pool_and_init_gate_for_healthy_db() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("runtime-recovery-refresh.db");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root),
+            ..Default::default()
+        };
+
+        let pool = get_or_create_pool(&config).expect("initial pool");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+        });
+
+        {
+            let cache = POOL_CACHE
+                .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+            let guard = cache.read();
+            assert!(
+                guard.contains_key(&pool.cache_key),
+                "pool cache entry should exist before runtime recovery"
+            );
+        }
+        {
+            let gates = SQLITE_INIT_GATES
+                .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
+            let guard = gates.read();
+            assert!(
+                guard.contains_key(&pool.init_gate_key),
+                "sqlite init gate should exist after first acquire"
+            );
+        }
+
+        assert!(
+            pool.try_recover_from_corruption("database disk image is malformed")
+                .expect("runtime recovery should succeed for healthy db")
+        );
+        assert!(
+            pool.pool.is_closed(),
+            "runtime recovery should close the old pool so stale connections cannot return"
+        );
+
+        {
+            let cache = POOL_CACHE
+                .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+            let guard = cache.read();
+            assert!(
+                !guard.contains_key(&pool.cache_key),
+                "runtime recovery must evict the cached pool entry"
+            );
+        }
+        {
+            let gates = SQLITE_INIT_GATES
+                .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
+            let guard = gates.read();
+            assert!(
+                !guard.contains_key(&pool.init_gate_key),
+                "runtime recovery must clear the sqlite init gate so the next pool re-runs init"
+            );
+        }
+
+        let replacement = get_or_create_pool(&config).expect("replacement pool");
+        assert!(
+            !Arc::ptr_eq(&pool.pool, &replacement.pool),
+            "replacement pool must not reuse the retired Arc<Pool>"
+        );
+    }
+
+    #[test]
+    fn try_recover_from_corruption_reconciles_archive_when_trigger_hits_healthy_db() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+
+        crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
+            .expect("seed initial reconstructed db");
+
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: Some(storage_root.clone()),
+            ..Default::default()
+        };
+        let pool = get_or_create_pool(&config).expect("initial pool");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().expect("acquire");
+        });
+
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-05-00Z__second__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
+        )
+        .unwrap();
+
+        assert!(
+            pool.try_recover_from_corruption("database disk image is malformed")
+                .expect("runtime recovery should succeed")
+        );
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .unwrap();
+        let row = rows.first().unwrap();
+        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
+        assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
     }
 
     /// Verify `DbPool::sqlite_path()` accessor matches config.
@@ -9333,6 +9543,83 @@ mod tests {
         assert!(
             recovery_artifacts.is_empty(),
             "fresh bootstrap should not quarantine/reconstruct missing databases: {recovery_artifacts:?}"
+        );
+
+        let agent_columns = conn
+            .query_sync("PRAGMA table_info(agents)", &[])
+            .expect("query agents table info")
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            agent_columns
+                .iter()
+                .filter(|name| name.as_str() == "reaper_exempt")
+                .count(),
+            1,
+            "fresh bootstrap should not duplicate agents.reaper_exempt"
+        );
+        assert_eq!(
+            agent_columns
+                .iter()
+                .filter(|name| name.as_str() == "registration_token")
+                .count(),
+            1,
+            "fresh bootstrap should not duplicate agents.registration_token"
+        );
+    }
+
+    #[test]
+    fn sqlite_init_zero_byte_file_bootstraps_without_duplicate_columns() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("zero_byte_bootstrap.sqlite3");
+        std::fs::File::create(&db_path).expect("create zero-byte sqlite placeholder");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        match rt.block_on(run_sqlite_init_once(&cx, db_path_str, true)) {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => panic!("sqlite init should bootstrap zero-byte files: {err}"),
+            Outcome::Cancelled(reason) => panic!("sqlite init cancelled unexpectedly: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                std::panic::panic_any(payload);
+            }
+        }
+
+        assert!(
+            sqlite_file_is_healthy(&db_path).expect("health check after zero-byte bootstrap"),
+            "zero-byte bootstrap should leave a healthy sqlite file"
+        );
+
+        let conn = open_sqlite_file_with_lock_retry(db_path_str)
+            .expect("runtime sqlite should open after zero-byte bootstrap");
+        let agent_columns = conn
+            .query_sync("PRAGMA table_info(agents)", &[])
+            .expect("query agents table info")
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            agent_columns
+                .iter()
+                .filter(|name| name.as_str() == "reaper_exempt")
+                .count(),
+            1,
+            "zero-byte bootstrap should not duplicate agents.reaper_exempt"
+        );
+        assert_eq!(
+            agent_columns
+                .iter()
+                .filter(|name| name.as_str() == "registration_token")
+                .count(),
+            1,
+            "zero-byte bootstrap should not duplicate agents.registration_token"
         );
     }
 

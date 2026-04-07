@@ -100,20 +100,10 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
         .path()
         .join(format!("query_integ_{}.db", unique_suffix()));
 
-    // Pre-initialize the DB file using canonical SQLite (NOT FrankenSQLite) and
-    // run base migrations. This avoids the br-2em1l hang:
-    //
-    // 1. FrankenSQLite files are NOT file-compatible with C SQLite, so the pool
-    //    factory's `recover_sqlite_file` health probes (which use C SQLite)
-    //    would report the file as corrupt.
-    // 2. When storage_root exists with projects, `recover_sqlite_file` attempts
-    //    Git archive reconstruction for "corrupt" (actually Franken-format) files,
-    //    which blocks the thread indefinitely.
-    //
-    // Using canonical SqliteConnection + running migrations here creates a file
-    // that passes C SQLite health probes and has the full schema.
-    let init_conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
-        .expect("open canonical connection for test pool");
+    // Pre-initialize the DB file with the same FrankenSQLite connection type the
+    // pool uses at runtime, then run base migrations before constructing the pool.
+    let init_conn = mcp_agent_mail_db::DbConn::open_file(&db_path.display().to_string())
+        .expect("open connection for test pool");
     init_conn
         .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)
         .expect("apply init PRAGMAs");
