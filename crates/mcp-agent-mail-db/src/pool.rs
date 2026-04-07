@@ -5125,7 +5125,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
         return reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp);
     }
 
-    if let Ok(conn) = open_sqlite_file_with_recovery(primary_path.to_string_lossy().as_ref()) {
+    if let Ok(conn) = open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref()) {
         let _ = conn.query_sync("PRAGMA busy_timeout=60000;", &[]);
         let _ = conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[]);
     }
