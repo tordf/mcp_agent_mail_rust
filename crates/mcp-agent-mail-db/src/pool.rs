@@ -1551,12 +1551,6 @@ pub struct DbPoolConfig {
     pub max_lifetime_ms: u64,
     /// Run migrations on init
     pub run_migrations: bool,
-    /// Skip one-time startup initialization and repair work on first acquire.
-    ///
-    /// This is intended for read-only helper pools that open an already
-    /// initialized mailbox under a live server and must avoid contending on
-    /// startup repair writes.
-    pub skip_startup_init: bool,
     /// Number of connections to eagerly open on startup (0 = disabled).
     /// Capped at `min_connections`. Warmup is bounded by `acquire_timeout_ms`.
     pub warmup_connections: usize,
@@ -1575,7 +1569,6 @@ impl Default for DbPoolConfig {
             acquire_timeout_ms: DEFAULT_POOL_TIMEOUT_MS,
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
-            skip_startup_init: false,
             warmup_connections: 0,
             cache_budget_kb: schema::DEFAULT_CACHE_BUDGET_KB,
         }
@@ -1644,7 +1637,6 @@ impl DbPoolConfig {
             acquire_timeout_ms: pool_timeout,
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
-            skip_startup_init: false,
             warmup_connections: warmup,
             cache_budget_kb: env_value("DATABASE_CACHE_BUDGET_KB")
                 .and_then(|s| s.parse::<usize>().ok())
@@ -1849,7 +1841,11 @@ pub struct DbPool {
 }
 
 impl DbPool {
-    fn from_shared_pool(config: &DbPoolConfig, pool: Arc<Pool<DbConn>>) -> DbResult<Self> {
+    fn from_shared_pool_with_options(
+        config: &DbPoolConfig,
+        pool: Arc<Pool<DbConn>>,
+        skip_startup_init: bool,
+    ) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
         let cache_key = pool_cache_key_from_parts(
@@ -1875,13 +1871,16 @@ impl DbPool {
             init_gate_key,
             init_sql,
             run_migrations: config.run_migrations,
-            skip_startup_init: config.skip_startup_init,
+            skip_startup_init,
             stats_sampler,
         })
     }
 
-    /// Create a new pool (does not open connections until first acquire).
-    pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
+    fn from_shared_pool(config: &DbPoolConfig, pool: Arc<Pool<DbConn>>) -> DbResult<Self> {
+        Self::from_shared_pool_with_options(config, pool, false)
+    }
+
+    fn new_with_options(config: &DbPoolConfig, skip_startup_init: bool) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
         let cache_key = pool_cache_key_from_parts(
@@ -1915,9 +1914,22 @@ impl DbPool {
             init_gate_key,
             init_sql,
             run_migrations: config.run_migrations,
-            skip_startup_init: config.skip_startup_init,
+            skip_startup_init,
             stats_sampler,
         })
+    }
+
+    /// Create a new pool (does not open connections until first acquire).
+    pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
+        Self::new_with_options(config, false)
+    }
+
+    /// Create a pool that skips one-time startup initialization on first acquire.
+    ///
+    /// Intended for read-only helper surfaces that open an already initialized
+    /// mailbox under a live server and must avoid contending on startup repairs.
+    pub fn new_without_startup_init(config: &DbPoolConfig) -> DbResult<Self> {
+        Self::new_with_options(config, true)
     }
 
     #[must_use]
@@ -5543,6 +5555,11 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
 /// This is kept for backwards compatibility with earlier skeleton code.
 pub fn create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     get_or_create_pool(config)
+}
+
+/// Create a read-only helper pool without entering the startup-init gate.
+pub fn create_pool_without_startup_init(config: &DbPoolConfig) -> DbResult<DbPool> {
+    DbPool::new_without_startup_init(config)
 }
 
 // ============================================================================

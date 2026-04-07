@@ -6408,9 +6408,8 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
     pool_cfg.storage_root = Some(storage_root);
     pool_cfg.run_migrations = false;
-    pool_cfg.skip_startup_init = true;
     pool_cfg.warmup_connections = 0;
-    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+    let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
     Ok(CanonicalReadDbPool {
         conn,
