@@ -313,9 +313,14 @@ PowerShell options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`.
 ```bash
 git clone https://github.com/Dicklesworthstone/mcp_agent_mail_rust
 cd mcp_agent_mail_rust
-cargo build --release
-# Binaries at target/release/mcp-agent-mail and target/release/am
+./install-local.sh          # builds release, installs to ~/.local/bin
+# DEST=/usr/local/bin ./install-local.sh   # custom destination
 ```
+
+The script resolves the correct Cargo target directory via `cargo metadata`, so the
+installed binary always matches the freshly-built artifact regardless of
+`CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
+`target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
 Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect the locally patched sibling projects used by the workspace: `../asupersync`, `../sqlmodel_rust`, `../frankensqlite`, `../frankentui`, and `../frankensearch`. `fastmcp-rust`, `beads_rust`, and `toon` are normal Cargo dependencies, not local path requirements.
 
