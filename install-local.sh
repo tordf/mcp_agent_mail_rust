@@ -44,8 +44,14 @@ BIN_SERVER="mcp-agent-mail"
 # This respects CARGO_TARGET_DIR, .cargo/config.toml [build] target-dir, etc.
 get_target_dir() {
   if command -v cargo >/dev/null 2>&1; then
-    cargo metadata --no-deps --format-version 1 2>/dev/null \
-      | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
+    local meta
+    meta=$(cargo metadata --no-deps --format-version 1 2>/dev/null)
+    if command -v jq >/dev/null 2>&1; then
+      echo "$meta" | jq -r '.target_directory'
+    else
+      # Fallback: sed-based JSON extraction (works when path has no quotes)
+      echo "$meta" | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
+    fi
   fi
 }
 
