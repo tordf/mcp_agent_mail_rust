@@ -9045,9 +9045,29 @@ pub struct AtcPopulationSyncStats {
 ///
 /// This seeds pre-existing agents on cold start and refreshes their latest
 /// known activity monotonically so periodic syncs cannot regress liveness.
+///
+/// Only agents whose `last_active_ts` falls within the recency window are
+/// hydrated. Agents that have been completely silent for longer than the
+/// window would immediately appear Dead to the liveness evaluator anyway,
+/// so loading them generates an O(agents) burst of tick effects on every
+/// cold start without any coordination value.
 pub fn atc_sync_population_from_db(
     pool: &mcp_agent_mail_db::DbPool,
 ) -> Result<AtcPopulationSyncStats, String> {
+    /// Default recency window: 7 days in microseconds.  Agents silent longer
+    /// than this are already effectively Dead; loading them generates a
+    /// cold-start effect burst without any coordination value.
+    const DEFAULT_RECENCY_MICROS: i64 = 7 * 24 * 3600 * 1_000_000;
+
+    let recency_micros =
+        mcp_agent_mail_core::config::full_env_value("AM_ATC_POPULATION_RECENCY_SECS")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map(|secs| secs.saturating_mul(1_000_000))
+            .unwrap_or(DEFAULT_RECENCY_MICROS);
+
+    let now = mcp_agent_mail_core::timestamps::now_micros();
+    let recency_cutoff = now.saturating_sub(recency_micros);
+
     let cx = asupersync::Cx::for_request_with_budget(asupersync::Budget::INFINITE);
     let projects =
         match fastmcp_core::block_on(mcp_agent_mail_db::queries::list_projects(&cx, pool)) {
@@ -9085,6 +9105,12 @@ pub fn atc_sync_population_from_db(
             stats.agents = stats.agents.saturating_add(1);
             if agent.last_active_ts > 0 {
                 stats.active_agents = stats.active_agents.saturating_add(1);
+            }
+            // Skip agents that have been silent beyond the recency window.
+            // They are already Dead from the liveness evaluator's perspective;
+            // hydrating them only floods the effect queue on cold start.
+            if agent.last_active_ts > 0 && agent.last_active_ts < recency_cutoff {
+                continue;
             }
             atc_sync_agent_snapshot(
                 &agent.name,

@@ -5388,19 +5388,29 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             });
 
         let mut visible_actions = Vec::new();
+        // Only write durable experience rows for executor modes that actually
+        // execute effects.  Shadow and DryRun modes suppress all real actions,
+        // so recording experiences for them generates write churn without any
+        // learning value.
+        let durable_writes_enabled = matches!(
+            executor_mode,
+            AtcExecutorMode::Live | AtcExecutorMode::Canary
+        );
         for mut effect in new_effects {
-            if let Some(pool) = atc_db_pool.as_ref() {
-                match append_atc_experience_for_effect(pool, &effect) {
-                    Ok(experience) => {
-                        effect.experience_id = Some(experience.experience_id);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            decision_id = effect.decision_id,
-                            effect_id = %effect.effect_id,
-                            %error,
-                            "failed to append ATC experience"
-                        );
+            if durable_writes_enabled {
+                if let Some(pool) = atc_db_pool.as_ref() {
+                    match append_atc_experience_for_effect(pool, &effect) {
+                        Ok(experience) => {
+                            effect.experience_id = Some(experience.experience_id);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                decision_id = effect.decision_id,
+                                effect_id = %effect.effect_id,
+                                %error,
+                                "failed to append ATC experience"
+                            );
+                        }
                     }
                 }
             }
